@@ -106,6 +106,11 @@ PRESETS = {
     # the embedding tail small; raise it if your tokenizer needs more.
     "b27": ModelConfig(vocab_size=32000, dim=5120, n_layers=83, n_heads=40,
                        n_kv_heads=8, hidden_dim=13824, max_seq_len=2048),
+    # width sweep (3 Oct): ~10B and ~15B with the b27 head layout (GQA, 8 KV heads of 128)
+    "b10": ModelConfig(vocab_size=32000, dim=5120, n_layers=36, n_heads=40,
+                       n_kv_heads=8, hidden_dim=13824, max_seq_len=2048),
+    "b15": ModelConfig(vocab_size=32000, dim=6144, n_layers=38, n_heads=48,
+                       n_kv_heads=8, hidden_dim=16384, max_seq_len=2048),
     # ~40B target. NOT trainable on one 12GiB card (weights alone ~8GiB ternary +
     # activations). Needs multi-GPU / big-RAM offload. Architecture is identical.
     "b40": ModelConfig(vocab_size=128000, dim=6144, n_layers=80, n_heads=48,
