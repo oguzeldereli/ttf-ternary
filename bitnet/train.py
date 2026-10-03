@@ -55,9 +55,27 @@ def get_batch(data, bs, seq_len, device, gen=None):
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 
+TWO_STAGE = [0.0]   # --two_stage F: BitNet-b1.58-style two-stage schedule (0: plain cosine)
+
+
+def two_stage_mid(tc: TrainConfig):
+    return tc.warmup_steps + (tc.max_steps - tc.warmup_steps) // 2
+
+
 def lr_at(step, tc: TrainConfig):
     if step < tc.warmup_steps:
         return tc.lr * (step + 1) / tc.warmup_steps
+    if TWO_STAGE[0] and step <= tc.max_steps:
+        # stage 1 (first half after warmup): cosine from the peak to half the peak; stage 2: restart at F x peak and
+        # cosine down to min_lr (a lower-peak cool-down after a drop at the midpoint; weight decay is set to 0 in
+        # stage 2 in the training loop). An approximation of the published BitNet b1.58 recipe, for the master baseline.
+        mid = two_stage_mid(tc)
+        if step < mid:
+            r = (step - tc.warmup_steps) / max(1, mid - tc.warmup_steps)
+            return 0.5 * tc.lr + 0.25 * tc.lr * (1 + math.cos(math.pi * r))
+        r = (step - mid) / max(1, tc.max_steps - mid)
+        p2 = TWO_STAGE[0] * tc.lr
+        return tc.min_lr + 0.5 * (p2 - tc.min_lr) * (1 + math.cos(math.pi * r))
     if step > tc.max_steps:
         return tc.min_lr
     r = (step - tc.warmup_steps) / max(1, tc.max_steps - tc.warmup_steps)
@@ -348,7 +366,11 @@ def ts_layer(l, g, state, c):
     Called from ts_step after the backward, or from the layer's backward itself (--ts_fused), right after its input
     gradient is computed, so only one layer's fp32 gradient exists at a time."""
     from .kernel import unpack_rows, pack_rows
+    if c.get("shared_v"):
+        return ts_layer_shared(l, g, state, c)
     r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
+    r = getattr(l, "_ts_rank", 0) or r                                                  # --ts_rank_kv: per-layer rank
+    diag = c.get("diag", False)                                                        # --ts_diag: this step measures
     ident = lambda X: X
     qf = _qfmt(c.get("qfmt") or ("int8" if c.get("int8") else ""))
     qm = qf if qf is not None and c.get("qwhich", "all") in ("all", "m") else ident    # the short momentum
@@ -369,7 +391,7 @@ def ts_layer(l, g, state, c):
     _host_put(st, ("v", key), (R, C), off)
     v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
     del g2
-    rs = min(c["rank_s"], l.N, l.K)
+    rs = min(getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
     if ("m", key) not in st:
         gen = torch.Generator(device=g.device).manual_seed(4_000_000 + 2 * getattr(l, "_ts_idx", 0))
         Vm = _orth(g.T @ torch.randn(l.N, rs, device=g.device, generator=gen))
@@ -377,7 +399,10 @@ def ts_layer(l, g, state, c):
     else:
         Um, Vm = _load_pair(_host_get(st, ("m", key), dev, off))
         Vn = _orth(b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um)
+        Md = (b1 * Um @ Vm.T + (1 - b1) * g) if diag else None    # the momentum before its rank-r projection
         Um = b1 * Um @ (Vm.T @ Vn) + (1 - b1) * g @ Vn; Vm = Vn
+        if diag:      # share of the momentum's energy the projection drops (Um_new = Md Vn, Vn orthonormal)
+            _ts_rec(st, "m_drop", 1 - (Um.norm() ** 2 / Md.norm().clamp_min(1e-30) ** 2).item()); del Md
     if c.get("qdiag"): _qdiag(st, key, "m", Um, Vm, t)
     _host_put(st, ("m", key), _store_pair(sm, Um, Vm) if sm else (qm(Um), qVm(Vm)), off)  # --ts_qfmt sim., --ts_store_m real
     u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
@@ -391,12 +416,22 @@ def ts_layer(l, g, state, c):
         U, V = _load_pair(_host_get(state, key, dev, off))
         U = U * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)   # --ts_tau_anneal: memory in distance, not steps
         Vn = _orth(V @ (U.T @ U) + u.T @ U)
+        Ad = (U @ V.T + u) if diag else None                     # the accumulator before its rank-r projection
         U = U @ (V.T @ Vn) + u @ Vn; V = Vn
+        if diag:      # evidence dropped by the projection (U_new = Ad Vn) and share of this step's u that is kept
+            _ts_rec(st, "a_drop", 1 - (U.norm() ** 2 / Ad.norm().clamp_min(1e-30) ** 2).item())
+            _ts_rec(st, "u_kept", ((u @ Vn).norm() ** 2 / u.norm().clamp_min(1e-30) ** 2).item()); del Ad
+    if c.get("shadow"):   # --ts_shadow: a full-rank accumulator fed the same steps and spent by the same moves
+        S = st.get(("shadow", key))
+        S = u.clone() if S is None else S.mul_(1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau).add_(u)
+        st[("shadow", key)] = S
     del u
     A = U @ V.T
     w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
     d = A.sign()
     fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
+    if diag and c.get("shadow"):   # distance of the rank-r accumulator from the full-rank one
+        _ts_rec(st, "a_vs_shadow", ((A - st[("shadow", key)]).norm() / st[("shadow", key)].norm().clamp_min(1e-30)).item())
     del A
     if c["gate"]:
         fire &= (d == -g.sign())
@@ -405,9 +440,75 @@ def ts_layer(l, g, state, c):
     nf = fire.sum()                           # a device tensor: no host sync per layer
     l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
     U = U - c["spend"] * theta * (D @ V)
+    if c.get("shadow"):
+        S = st[("shadow", key)]
+        if diag:      # which moves the full-rank accumulator would make, against the moves made
+            fs = (S.abs() >= theta) & ((w0.float() + S.sign()).abs() <= 1)
+            both = (fs & fire).sum().item()
+            _ts_rec(st, "shadow_recall", both / max(fs.sum().item(), 1)); _ts_rec(st, "shadow_precision", both / max(fire.sum().item(), 1))
+            _ts_rec(st, "shadow_moves", fs.float().mean().item()); _ts_rec(st, "moves", fire.float().mean().item())
+            del fs
+        S.sub_(c["spend"] * theta * D)
     if c.get("qdiag"): _qdiag(st, key, "a", U, V, t)
     _host_put(state, key, _store_pair(sa, U, V) if sa else (qa(U), qV(V)), off)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
+    if before is not None:
+        l._record_flips(before, l.wpacked)
+
+
+def _ts_rec(st, name, x):
+    d = st.setdefault("_dg", {}); n = d.setdefault(name, [0.0, 0]); n[0] += x; n[1] += 1
+
+
+@torch.no_grad()
+def ts_layer_shared(l, g, state, c):
+    """--ts_shared_v: the short momentum and the accumulator share ONE orthonormal basis V (K x r): stored Um (N x r),
+    U (N x r), V (K x r) instead of two (U, V) pairs, a quarter less state when N ~ K. The basis follows both matrices:
+    one subspace-iteration step on [M / |M|; A / |A|] (each normalised, so neither dominates), using the decayed
+    accumulator before this step's u (u needs the projected momentum, which needs the basis). Everything else as
+    ts_layer: factored v, bias corrections, threshold firing within [-1, 1], spend theta D V."""
+    from .kernel import unpack_rows, pack_rows
+    r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
+    assert not (c.get("store_m") or c.get("store_a") or c.get("offload") or c.get("qfmt") or c.get("int8")), \
+        "--ts_shared_v: fp32 state only"
+    ra = min(getattr(l, "_ts_rank", 0) or r, l.N, l.K)
+    st = state.setdefault("_ts", {})
+    key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
+    g2 = g * g
+    if ("v", key) in st:
+        R, C = st[("v", key)]; R = b2 * R + (1 - b2) * g2.mean(1); C = b2 * C + (1 - b2) * g2.mean(0)
+    else:
+        R, C = (1 - b2) * g2.mean(1), (1 - b2) * g2.mean(0)
+    st[("v", key)] = (R, C); del g2
+    sq = (R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)).sqrt_().add_(1e-8)
+    decay = 1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau
+    if key not in state:
+        M = (1 - b1) * g; Ao = None
+        gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
+        G = torch.randn(l.N, ra, device=g.device, generator=gen)
+        Vn = _orth(M.T @ G)
+    else:
+        Um, U, V = st[("m", key)][0], state[key][0], state[key][1]
+        M = b1 * Um @ V.T + (1 - b1) * g                       # dense, this step
+        Ao = decay * U @ V.T                                   # dense, decayed, before this step's u
+        X = M.T @ (M @ V) / M.norm().clamp_min(1e-30) ** 2 + Ao.T @ (Ao @ V) / Ao.norm().clamp_min(1e-30) ** 2
+        Vn = _orth(X); del X
+    Um = M @ Vn; del M
+    u = -(Um @ Vn.T) / (1 - b1 ** t) / sq * lr_ratio; del sq
+    U = (u @ Vn) if Ao is None else (Ao @ Vn + u @ Vn); del Ao, u
+    A = U @ Vn.T
+    w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
+    d = A.sign()
+    fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1); del A
+    if c["gate"]:
+        fire &= (d == -g.sign())
+    before = l.wpacked.clone() if l.track else None
+    D = torch.where(fire, d, torch.zeros_like(d))
+    l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
+    U = U - c["spend"] * theta * (D @ Vn)
+    st[("m", key)] = (Um,)
+    state[key] = (U, Vn)
+    st["_nf"] = st.get("_nf", 0) + fire.sum(); st["_nt"] = st.get("_nt", 0) + fire.numel()
     if before is not None:
         l._record_flips(before, l.wpacked)
 
@@ -434,7 +535,8 @@ def _qdiag(st, key, which, U, V, t):
 
 def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, b1=0.9, b2=0.95, gate=False, spend=1.0,
             tau_anneal=False, int8=False, fused=False, qfmt="", qwhich="all", qnoV=False, qdiag=False,
-            qfmt_m="", qfmt_a="", qfmt_aV="", store_m="", store_a="", offload=False):
+            qfmt_m="", qfmt_a="", qfmt_aV="", store_m="", store_a="", offload=False, diag=False, shadow=False,
+            shared_v=False):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -449,7 +551,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              theta ~ half a bin in latent units over the peak lr (~16)."""
     c = dict(r=r, lr_ratio=lr_ratio, theta=theta, tau=tau, rank_s=rank_s, b1=b1, b2=b2, gate=gate, spend=spend,
              tau_anneal=tau_anneal, int8=int8, qfmt=qfmt, qwhich=qwhich, qnoV=qnoV, qdiag=qdiag,
-             qfmt_m=qfmt_m, qfmt_a=qfmt_a, qfmt_aV=qfmt_aV, store_m=store_m, store_a=store_a, offload=offload)
+             qfmt_m=qfmt_m, qfmt_a=qfmt_a, qfmt_aV=qfmt_aV, store_m=store_m, store_a=store_a, offload=offload,
+             diag=diag, shadow=shadow, shared_v=shared_v)
     st = state.setdefault("_ts", {})
     if not fused:
         for i, l in enumerate([l for l in model.modules() if isinstance(l, KernelTernaryLinear)]):
@@ -459,6 +562,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             del g
     nf, nt = st.pop("_nf", 0), st.pop("_nt", 0)
     info = {"ts_frac": float(nf) / max(nt, 1)}
+    for k_, (tot, n_) in st.pop("_dg", {}).items():      # --ts_diag: means over layers this step
+        info["dg_" + k_] = tot / max(n_, 1)
     for w, rec in st.pop("_qd", {}).items():
         n = max(rec["n"], 1)
         info.update({f"qd_{w}_{k}": rec[k] / n for k in ("crest", "sub", "rel", "range")})
@@ -1592,6 +1697,18 @@ def main():
     ap.add_argument("--ts_store_m", default="", help="--ts: REAL storage of the short momentum (int8 | int8det | fp8 | "
                     "fp16 | fp16s | bf16), as opposed to the simulated --ts_qfmt_m")
     ap.add_argument("--ts_store_a", default="", help="--ts: REAL storage of the accumulator (same formats)")
+    ap.add_argument("--ts_rank_kv", type=int, default=0, help="--ts: rank of both states for the attention k / v "
+                    "projections (0: --lowrank / --ts_rank_s); with grouped-query attention these are narrow, so a full "
+                    "rank there costs more than dense storage")
+    ap.add_argument("--ts_shared_v", action="store_true", help="--ts: the short momentum and the accumulator share one "
+                    "orthonormal basis (a quarter less state; fp32 state only)")
+    ap.add_argument("--ts_diag", type=int, default=0, help="--ts: every N steps log what the rank-r projections drop "
+                    "(dg_m_drop, dg_a_drop, dg_u_kept) and, with --ts_shadow, the full-rank accumulator's moves")
+    ap.add_argument("--ts_shadow", action="store_true", help="--ts: keep a full-rank accumulator fed the same steps and "
+                    "spent by the same moves (diagnostic: dense N x K per layer)")
+    ap.add_argument("--two_stage", type=float, default=0.0, help="BitNet-b1.58-style schedule: stage 1 cosine from the "
+                    "peak to half of it, at the midpoint restart at F x peak and cosine to min_lr; weight decay 0 in "
+                    "stage 2 (F e.g. 0.4; 0: plain cosine)")
     ap.add_argument("--ts_offload", action="store_true", help="--ts: keep the state in pinned host memory; each layer's "
                     "state is copied to the GPU for its update and back (same stream: ordered, no host sync)")
     ap.add_argument("--ts_qwhich", default="all", choices=["all", "m", "a"],
@@ -1824,6 +1941,7 @@ def main():
         from . import kernel as _kmod
         _kmod.GEMM_BACKEND[0] = "cublas"
     ORTH_CHOL[0] = args.ts_orth if args.ts_orth != "qr" else False
+    TWO_STAGE[0] = args.two_stage
     ORTH_DEBUG = os.environ.get("TERN_ORTHDBG") == "1"
     TIME = os.environ.get("TERN_TIME") == "1"   # time the forward/backward vs the momentum step (synchronizes)
 
@@ -1884,6 +2002,12 @@ def main():
     model.train()
     if args.ckpt_skip:
         model.ckpt_skip = args.ckpt_skip
+    if args.ts_rank_kv:
+        from .model import Attention
+        for a in model.modules():
+            if isinstance(a, Attention):
+                a.wk._ts_rank = a.wv._ts_rank = args.ts_rank_kv
+        print(f"--ts_rank_kv: k / v projections at rank {args.ts_rank_kv}", flush=True)
     if args.qk_temp:
         from .model import Attention
         for a in model.modules():
@@ -2224,7 +2348,8 @@ def main():
                       b1=args.ts_b1, b2=args.ts_b2, gate=args.lr_gate, spend=args.ts_spend,
                       tau_anneal=args.ts_tau_anneal, int8=args.ts_int8, qfmt=args.ts_qfmt, qwhich=args.ts_qwhich,
                       qnoV=args.ts_qnoV, qdiag=False, qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
-                      store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload)
+                      store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload,
+                      diag=False, shadow=args.ts_shadow, shared_v=args.ts_shared_v)
         for i_, m_ in enumerate([m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]):
             m_._ts_idx = i_
             m_.on_grad = lambda layer, g, _c=ts_cfg: ts_layer(layer, g, lr_state, _c)
@@ -2274,6 +2399,7 @@ def main():
         if ts_cfg is not None:
             ts_cfg["lr_ratio"] = (lr / tc.lr) ** args.ts_anneal
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
+            ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
         rate_now = args.rate
         if args.rate_schedule != "const":
             prog = min(1.0, step / max(1, tc.max_steps))
@@ -2301,6 +2427,9 @@ def main():
         STATE.lr = lr
         for g in tail_opt.param_groups:
             g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0)
+            if TWO_STAGE[0]:          # --two_stage: weight decay off in the second stage
+                g.setdefault("wd0", g.get("weight_decay", 0.0))
+                g["weight_decay"] = g["wd0"] if step < two_stage_mid(tc) else 0.0
 
         # gradient accumulation: BitLinear hooks apply lr*g/accum each micro-step
         # (SGD is linear, so summing micro-steps approximates one averaged step).
@@ -2369,7 +2498,8 @@ def main():
                                   qfmt=args.ts_qfmt, qwhich=args.ts_qwhich, qnoV=args.ts_qnoV,
                                   qdiag=bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1),
                                   qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
-                      store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload)
+                      store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload,
+                      diag=bool(args.ts_diag) and step % args.ts_diag == 0, shadow=args.ts_shadow, shared_v=args.ts_shared_v)
             elif args.accum_flip:
                 rs_info = accum_step(model, lr_state, args.lowrank, args.lr_beta, step, args.accum_flip,
                                      args.accum_z, args.flip_seed, fresh=accum_fresh)

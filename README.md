@@ -1,143 +1,153 @@
 # ternary-LLM
 
-From-scratch **native ternary** ({-1, 0, 1}) language models — BitNet-style, but
-trained **without full-precision master weights**, with custom Triton kernels that
-keep the weights packed at **1.58 bit** (5 trits/byte) even during training.
+Native ternary ({-1, 0, 1}) language models trained **without full-precision master weights**. The weights stay
+packed at 1.6 bits (5 trits per byte) during training. The optimizer state is low-rank, so its size grows like the
+layer width rather than the number of weights.
 
-Two things live here:
-- **A systems result:** a 27B ternary model *trains* on a single 12 GB consumer
-  GPU (172 tok/s, ~9.9 GiB) — weights never materialized dense.
-- **A study:** how far can you get *without* the master weights. Flip rules driven by a
-  low-rank momentum with a long memory: at 110M / 300M tokens, validation loss 2.820
-  (perplexity 16.8) against master weights 2.751 (15.7) and fp32 2.683 (14.6), with
-  optimizer state sublinear in the parameter count. See **[docs/RUNS.md](docs/RUNS.md)**
-  (headline at the top, every run, newest findings at the bottom),
-  **[docs/FORMULAS.md](docs/FORMULAS.md)** (every update rule),
-  **[docs/RUN_INDEX.md](docs/RUN_INDEX.md)** and the overview page
-  `docs/overview/index.html`. [docs/RESULTS.md](docs/RESULTS.md) and
-  [docs/NOTES.md](docs/NOTES.md) are historical (to 25 Sep).
+The current method is **two-timescale threshold flips (TTF)**, `--ts`. A short low-rank momentum gives the direction.
+It is normalised like Adam and integrated by a long low-rank accumulator. A weight moves one level when its
+accumulated evidence crosses a threshold, and the move is then subtracted from the accumulator. It came out of an
+ablation of master-weight training, which showed what master weights actually provide: a short momentum, a per-weight
+integrator with a memory of about 1000 steps, and immediate moves.
 
-## Headline numbers
+## Results
 
-Current figures (best runs, the recipe's sweeps, where the gap to master is): [docs/figures/README.md](docs/figures/README.md)
+110M parameters, 300M tokens of English Wikipedia (Llama-2 32k tokenizer). All models are scored on the same fixed
+windows of each validation set (`scripts/eval/final_eval.py`). The rebuilt models reproduce their logged losses to
+within 6e-5. FineWeb-Edu was never used for any choice.
 
-27B training on one 12 GB GPU (seq 512):
-
-| | tok/s | peak VRAM |
-|---|---|---|
-| torch unpack+linear | 67 | 10.86 GiB |
-| + Triton kernels (fwd, grad_x, fused-flip) | **172** | **9.93 GiB** |
-| + int8 tensor-core forward, norms inside checkpoint | **170** | **8.55 GiB** |
-
-Master-free study, 110M params, seq 2048, 32,768 tokens/step, Wikipedia (32k vocab),
-everything identical except the weight-update rule (val perplexity):
-
-| training mode | per-weight state | tokens | perplexity |
+| model (seeds) | optimizer state | Wikipedia val loss | FineWeb-Edu val loss |
 |---|---|---|---|
-| latent master + STE + AdamW (**ceiling**) | 12 B/param | 300M | **15.79** |
-| stateless flips + **look-ahead filter** (stopped early, still falling) | 1.58 bit | 200M | **65.3** |
-| stateless flips, annealed rate, 600M tokens | 1.58 bit | 600M | 92.72 |
-| stateless flips, annealed rate | 1.58 bit | 300M | 98.56 |
-| stateless flips, constant rate | 1.58 bit | 300M | 135.84 |
+| **TTF, ranks 512 (3)** | low-rank, ~8 B per ternary weight at this width | **2.6888** | **3.6453** |
+| master weights + the same float extras (2) | 16 B per weight | 2.7166 | 3.6830 |
+| master weights, BitNet b1.58 recipe (3) | 16 B per weight | 2.7359 | 3.7071 |
+| our earlier flip rule | low-rank | 2.7973 | 3.7545 |
+| full-precision fp32 (reference) | 16 B per weight | 2.683 (training-time eval) | |
 
-Caveat: until `--tail_fp32` (see docs/RUNS.md, "Float tail precision"), every
-flip run trained its float tail (embeddings, norm gains) in bf16, which froze all
-RMSNorm gains at exactly 1.0. Master mode never had this. Flip-vs-flip comparisons
-are fair; flip-vs-master comparisons carry that handicap.
+- **Against master with the same float extras:** TTF is −0.028 on Wikipedia, 95% interval [−0.029, −0.027] from a
+  paired block bootstrap over windows. On FineWeb it is −0.038. Seed spread is 0.002–0.0035, so the gap is more than
+  10× the seed noise.
+- **Master learning rate:** of 7.5e-4 / 1.5e-3 / 3e-3 / 6e-3, the 1.5e-3 used for master is the best.
+- **Other scales and data** (training-time evaluation, one seed):
+  - FineWeb-Edu, 600M tokens: TTF 3.0861 vs master 3.1508.
+  - 340M: TTF 2.6268 vs master 2.6626.
+  - 1.3B: in progress, −0.011 vs master at step 8000 of 9155.
+- **Zero-shot at 110M:** LAMBADA 0.135 vs 0.123 for master + extras. The multiple-choice tasks are at chance at this
+  scale.
 
-## Layout
+## Memory
 
-```
-bitnet/                  the package: model, Triton kernels, flip rules, training loop
-  train.py               training entry point  (python -m bitnet.train --help)
-  kernel.py              packed-ternary Triton kernels (fwd GEMM, grad_x, fused flip)
-  flip.py                flip layers (stateless, evidence, kernel, look-ahead capture)
-  master.py              latent-master baseline (STE + AdamW), the ceiling
-  probe.py               in-training probes (--probe): copying, context use, norms
-  model.py, config.py    Llama-style transformer, presets (small = 110M ... b27 = 27B)
-  opt8.py, pack.py, packed.py, data_prep*.py
-scripts/
-  train/                 run launchers (screen_10m.sh, full_run.sh); legacy/ = old queues
-  analysis/              offline experiments on checkpoints (curvature, look-ahead,
-                         per-step efficiency, gradient SNR, superposition)
-  plots/                 figure scripts -> docs/figures/   (legacy/ = retired figures)
-  bench/                 kernel / throughput benchmarks (incl. 27B)
-  data/, generate/       data prep, text sampling
-tests/                   sanity tests
-docs/                    RUNS.md (lab notebook), RESULTS.md, NOTES.md, RUN_INDEX.md,
-                         figures/
-checkpoints/             run outputs, one dir per run (gitignored; see docs/RUN_INDEX.md)
-data/                    tokenized corpora (gitignored)
-```
+- **27B-class model on one 16 GB GPU, measured.** The 26.5B-parameter preset `b27` (22.85B ternary weights) trains
+  with TTF on one RTX 4070 Ti Super. Settings: ranks 256, the update inside the backward pass, int8/fp16 state kept in
+  pinned host memory, full activation checkpointing. Result: 24.6 s per 2048-token step, 14.1 GiB PyTorch peak,
+  13.7 GiB host. Script: `scripts/lab/b27_smoke.sh`.
+- **State formats.** The momentum (direction) can be stored in 8 bits with a per-column scale (int8 or fp8) at no
+  cost. The accumulator needs a 16-bit float. int8 accumulators cost 0.01–0.02 in loss.
+- **Size.** Measured at 110M: int8 + fp16 cuts the state from 685 to 258 MiB with no change in loss. At 27B the
+  state is 2 / 4 / 8 bits per weight at ranks 256 / 512 / 1024, against 128 bits for master weights + AdamW
+  (`scripts/analysis/memory_27b.py`).
 
-Everything runs **from the repo root**; scripts are modules:
-`python -m scripts.plots.plot_all`, `python -m scripts.analysis.efficiency_test <ckpts>`.
+## Evaluation and checks
+
+- `docs/THREATS.md` lists every objection we could think of, the evidence against each, and what is still open.
+- No validation article appears in the training data. At most 1.6% of validation 32-grams occur anywhere in it
+  (`scripts/analysis/val_overlap.py`).
+- `tests/test_kernel_ref.py` checks the ternary kernels against dense references: 69 checks, maximum error at bf16
+  rounding.
+- The master baseline is the BitNet b1.58 straight-through recipe. It is given exactly the same float extras as TTF
+  in the "master + extras" reference.
+- A ternary Bop baseline (latent-free flips with one timescale, `--bop`) is 0.38 behind TTF.
+
+## Method in one screen
+
+Per ternary layer and step, with ρ = lr / peak lr. Full details in [docs/FORMULAS.md](docs/FORMULAS.md) §2a.
+
+- **v:** factored second moment, one statistic per row and one per column (β₂ 0.95).
+- **m:** momentum of rank r_s (β₁ 0.9), kept by one subspace-iteration step per step.
+  The normalised step is u = −m̂ / √v̂.
+- **A:** accumulator of rank r. A ← (1 − λ/τ)·A + ρ^p·u, with τ ≈ 1000 and p = 0.5.
+- **Move:** a weight moves one level toward sign(A) where |A| ≥ θ (θ = 16) and the move stays in {−1, 0, 1}.
+  The move is then spent from the accumulator: U ← U − θ·D·V, with D the moves made.
 
 ## Quickstart
 
 ```bash
 pip install -r requirements.txt
-python -m tests.test_flip                                   # sanity
+python3 scripts/data/prep_wiki.py 4e8 --tokenizer llama --out_prefix data/wiki32k     # Wikipedia, 32k vocab
+python3 -m scripts.data.prep_fineweb 2e9 --out_prefix data/fwedu32k                    # FineWeb-Edu (optional)
 
-# data: Wikipedia with the 32k Llama tokenizer
-python -m scripts.data.prep_wiki 1.25e9
+# TTF, 110M, 300M tokens (the headline run)
+python -m bitnet.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
+    --seq_len 2048 --batch_size 16 --steps 9155 --warmup 305 --rate_schedule cosine --rate 0.0 --rate_peak 0.02 \
+    --rate_warmup 30 --g_ref 3.0 --int8 --dw_mode dense --tail_fp32 --lr 1.5e-3 --min_lr 1.5e-4 --lookahead 0 \
+    --ckpt_skip 2 --eval_interval 250 --eval_iters 30 --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp \
+    --lowrank 512 --ts --ts_rank_s 512 --ts_theta 16 --ts_tau 1000 --ts_anneal 0.5 --out_dir checkpoints/ttf
 
-# a 10M-token screen of the current best flip config (~20 min on one GPU)
-scripts/train/screen_10m.sh my_screen                       # extra flags are appended
+# master-weights reference (same data, batch, schedule)
+python -m bitnet.train --preset small --mode master --master_dtype fp32 --data data/wiki32k_train.bin \
+    --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16 --steps 9155 --warmup 305 --lr 1.5e-3 \
+    --min_lr 1.5e-4 --out_dir checkpoints/master
 
-# a full 300M-token run of the current best flip config (~10 h)
-scripts/train/full_run.sh my_run
-
-# master-weights ceiling (same data, batch, schedule)
-python -m bitnet.train --preset small --mode master --master_dtype fp32 \
-    --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 \
-    --batch_size 16 --steps 9155 --warmup 305 --lr 1.5e-3 --min_lr 1.5e-4 \
-    --out_dir checkpoints/master
-
-# resume anything
-python -m bitnet.train <same flags> --out_dir checkpoints/<run> --resume
-
-# figures
-python -m scripts.plots.plot_best     # best runs -> docs/figures/best_runs.png
-python -m scripts.plots.plot_sweeps   # decay / friction / rank sweeps -> docs/figures/sweeps.png
-python -m scripts.plots.plot_gaps     # gap to master by pair frequency and position -> docs/figures/gaps.png
+# final evaluation on fixed windows, paired comparison, zero-shot
+python scripts/eval/final_eval.py checkpoints/ttf checkpoints/master
+python scripts/eval/compare.py checkpoints/ttf checkpoints/master --set fw
+python3 scripts/eval/zeroshot_tok.py && python scripts/eval/zeroshot.py checkpoints/ttf
 ```
 
-## Training modes (`--mode`)
+Add `--resume` to continue any run. `--ts_fused` runs the update inside the backward pass, the same maths with less
+memory.
 
-| mode | what | state per weight |
-|------|------|------------------|
-| `kernel` | pure-ternary, stochastic flips, Triton kernels (fastest) | trit only |
-| `master` | latent weights + STE + AdamW — the ceiling | fp32 latent + Adam |
-| `evidence` | `kernel` + k-bit saturating counter (`--ev_bits`) | trit + k bits |
-| `stateless` | pure-ternary flips, torch path | trit only |
-| `flip` | learned flip-predictor + int8 evidence (torch) | trit + int8 |
-| `latent` | int8 latent master-free path | int8 |
-
-Key flags (kernel mode):
+## TTF flags
 
 | flag | what |
 |---|---|
-| `--lookahead 1` | look-ahead filter: keep a proposed flip only if its slope is still downhill at W+Δ (the biggest win so far; ~1.8x per step) |
-| `--rate`, `--rate_schedule cosine`, `--rate_peak`, `--rate_warmup` | flip-rate schedule (ramp to the peak, then anneal) |
-| `--g_ref` | knee of the flip-probability ramp (broad optimum 3-10) |
-| `--tail_fp32` | float tail in fp32 + AdamW like master (otherwise norm gains freeze at 1.0) |
-| `--probe 0-40:5,40-9155:250` | log copying / context-use / norm probes |
-| `--max_temp 84 --resume_temp 79` | thermal guard: pause when hot, resume when cool (on by default) |
-| `--flip_seed N` | replicate with different flip randomness, same data order |
-| `--snap_every N` | keep a checkpoint copy every N steps |
-| `--int8`, `--track_flips` | int8 tensor-core forward; per-layer flip telemetry |
-| `--lookahead_xbatch` | take the look-ahead pass(es) on fresh batches (best with `--lookahead 2`) |
-| `--compile` | torch.compile the elementwise parts (RMSNorm, RoPE, SwiGLU); differs from eager only by rounding |
-| `--ckpt_skip K` | no gradient checkpointing for the last K layers (faster, ~1.3 GiB VRAM per layer at 16x2048) |
-| `--soft_start N` | throttle the first N steps after start (off by default) |
+| `--ts`, `--lowrank R`, `--ts_rank_s R_s` | the method; accumulator rank and momentum rank |
+| `--ts_theta`, `--ts_tau`, `--ts_anneal P`, `--ts_tau_anneal` | threshold, leak, step scaling ρ^P, leak scaled with the schedule |
+| `--ts_fused` | update each layer inside its backward pass (only one layer's gradient exists at a time) |
+| `--ts_store_m int8 --ts_store_a fp16` | real compressed state: codes + per-column scales, or 16-bit |
+| `--ts_offload` | state in pinned host memory, copied per layer for its update |
+| `--ts_orth qr / chol64` | orthonormalisation: Householder (default), or two-pass Cholesky-QR in fp64. Do not use `chol`: its fp32 Gram matrix can lock subspaces at zero |
+| `--ts_rank_kv R` | separate rank for the attention k / v projections |
+| `--ts_diag N`, `--ts_shadow` | diagnostics: what the rank-r projections drop, and a full-rank shadow accumulator |
+| `--gemm cublas`, `--int8` | matrix-product path; int8 tensor-core forward |
+| `--bop`, `--bop_tau`, `--bop_gamma` | the ternary Bop baseline (comparison only) |
 
-## Honest limitations
+## Layout
 
-- **n = 1 per config, one model size (110M), one dataset**, and everything is
-  undertrained (300M tokens for a 110M model is ~7% of Chinchilla).
-- The flip runs had frozen norm gains until `--tail_fp32` (above).
-- 27B *fits* on one GPU but can't be *pretrained* there — 170 tok/s against the
-  ~540B tokens Chinchilla wants is ~100 years. The wall is compute, not memory.
-- Ternary gives a real but modest compute win on current GPUs: the int8 tensor-core
-  forward is 1.7-2.0x per layer but only **1.12-1.15x end-to-end**.
+```
+bitnet/          model, Triton kernels, TTF and other update rules, training loop
+  train.py       training entry point (python -m bitnet.train --help); ts_layer = the TTF update
+  kernel.py      packed-ternary kernels (int8 / bf16 GEMMs, input gradient, packing)
+  flip.py        ternary layers, gradient capture / fused hooks
+  master.py      master-weights baseline (BitNet b1.58 STE + AdamW); master_opt.py: its ablations
+  model.py, config.py   Llama-style transformer, presets (small = 110M, d1024_l24 = 340M, d2048_l24 = 1.3B, b27)
+scripts/
+  eval/          final_eval.py, compare.py, zeroshot*.py, rescue.sh (copy final checkpoints)
+  analysis/      memory_27b.py, val_overlap.py, audit_numbers.py, diagnostics
+  lab/, remote/, myriad/, night/   launchers for the lab PCs, the 4090 workstation, UCL Myriad (A100)
+  data/, plots/  data preparation, figures (docs/figures)
+tests/           test_kernel_ref.py (kernels vs dense references) and sanity tests
+docs/            see below
+```
+
+## Docs
+
+- [docs/RUNS.md](docs/RUNS.md): lab notebook, newest at the bottom.
+- [docs/RUN_INDEX.md](docs/RUN_INDEX.md): every run with its result.
+- [docs/FORMULAS.md](docs/FORMULAS.md): every update rule.
+- [docs/THREATS.md](docs/THREATS.md): objections and the evidence.
+- [docs/QUEUE.md](docs/QUEUE.md): what is running.
+- [docs/figures/](docs/figures/README.md): figures.
+- `docs/overview/index.html`: overview page.
+- `docs/RESULTS.md` and `docs/NOTES.md` are historical (to 25 Sep).
+
+## Open questions
+
+- **Late-training lead at larger scale.** TTF's lead over master shrinks late in training at 1.3B and at 340M with
+  low rank; at 110M and on FineWeb-Edu it holds or grows. The levers being tested are the step annealing p and the
+  leak.
+- **Rank vs width.** Ranks 512 match or beat master up to 1.3B (rank / width 0.25). Whether the rank needed stays
+  fixed as width grows, which is what makes the state small, is not settled yet. Ranks 128 and 256 trail at 340M.
+- **Wall-clock.** On an A100 at 1.3B, a TTF step is about 5 s against 4.5 s for master. The QR timing is being
+  re-measured.
+- Token budgets are small (300M–600M), and the largest finished comparison is 340M with one seed.
