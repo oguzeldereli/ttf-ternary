@@ -8,7 +8,8 @@ Running, queued, unfinished and never-run runs: [QUEUE.md](QUEUE.md) (kept curre
 (2000 windows, never used for tuning): TTF ranks 512 (3 seeds) **2.6888 / 3.6453**; master + the same float extras
 (2 seeds) 2.7166 / 3.6830; master (3 seeds) 2.7359 / 3.7071; old rule 2.7973 / 3.7545. TTF - master + extras
 -0.028 [-0.029, -0.027] / -0.038 [-0.039, -0.037]; TTF - master -0.047 / -0.062; seed spread 0.002-0.0035. Storage
-(seed 2): int8 / fp16 2.6877, fp8 / fp16 2.6874 vs fp32 2.6868. Bare TTF 2.8070 (+0.071 vs master). Training-time
+(seed 2): int8 / fp16 2.6877, fp8 / fp16 2.6874 vs fp32 2.6868. Bare TTF 2.8070 (+0.071 vs master). 1.3B (one seed each): TTF 2.5510 / 3.5009 vs master 2.5706 / 3.5489 (-0.020 [-0.021, -0.018] / -0.048).
+Training-time
 val numbers of different seeds use different windows and differ by up to 0.06 for that reason alone (RUNS.md
 "3 Oct 04:45").
 
