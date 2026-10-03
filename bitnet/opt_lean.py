@@ -26,6 +26,8 @@ def stochastic_round(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
 
 class LeanAdam(torch.optim.Optimizer):
+    CHUNK = 2048          # rows per block of a 2-D update
+
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
 
@@ -38,7 +40,6 @@ class LeanAdam(torch.optim.Optimizer):
             for p in grp["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad.float()
                 st = self.state[p]
                 two_d = p.dim() == 2
                 if not st:
@@ -55,18 +56,33 @@ class LeanAdam(torch.optim.Optimizer):
                 t = st["step"]
                 bc1, bc2 = 1 - b1 ** t, 1 - b2 ** t
                 if two_d:
-                    m = (st["mq"].float() * st["ms"]).mul_(b1).add_(g, alpha=1 - b1)
-                    s = m.abs().amax(1, keepdim=True).clamp_min(1e-30) / 127
-                    st["mq"].copy_((m / s + torch.rand_like(m)).floor_().clamp_(-127, 127).to(torch.int8))
-                    st["ms"].copy_(s)
-                    g2 = g * g
-                    st["R"].mul_(b2).add_(g2.mean(1), alpha=1 - b2)
-                    st["C"].mul_(b2).add_(g2.mean(0), alpha=1 - b2)
-                    del g2
-                    v = st["R"][:, None] * st["C"][None, :] / st["R"].mean().clamp_min(1e-30)
-                else:
-                    m = st["m"].mul_(b1).add_(g, alpha=1 - b1)
-                    v = st["v"].mul_(b2).addcmul_(g, g, value=1 - b2)
+                    # second moment first (it needs the mean over all rows), then the rest in blocks of rows so the
+                    # fp32 temporaries stay small (a 32k x 2048 embedding would otherwise need ~0.25 GiB per temporary)
+                    rs, cs = torch.zeros_like(st["R"]), torch.zeros_like(st["C"])
+                    for a in range(0, p.shape[0], self.CHUNK):
+                        gb = p.grad[a:a + self.CHUNK].float()
+                        rs[a:a + self.CHUNK] = (gb * gb).mean(1); cs += (gb * gb).sum(0)
+                    st["R"].mul_(b2).add_(rs, alpha=1 - b2)
+                    st["C"].mul_(b2).add_(cs / p.shape[0], alpha=1 - b2)
+                    rmean = st["R"].mean().clamp_min(1e-30)
+                    for a in range(0, p.shape[0], self.CHUNK):
+                        sl = slice(a, a + self.CHUNK)
+                        gb = p.grad[sl].float()
+                        m = (st["mq"][sl].float() * st["ms"][sl]).mul_(b1).add_(gb, alpha=1 - b1)
+                        sc = m.abs().amax(1, keepdim=True).clamp_min(1e-30) / 127
+                        st["mq"][sl] = (m / sc + torch.rand_like(m)).floor_().clamp_(-127, 127).to(torch.int8)
+                        st["ms"][sl] = sc
+                        v = st["R"][sl, None] * st["C"][None, :] / rmean
+                        upd = (m / bc1) / ((v / bc2).sqrt_().add_(eps))
+                        p32 = p[sl].float()
+                        if wd > 0:
+                            p32.mul_(1 - lr * wd)
+                        p32.add_(upd, alpha=-lr)
+                        p[sl] = stochastic_round(p32, p.dtype)
+                    continue
+                g = p.grad.float()
+                m = st["m"].mul_(b1).add_(g, alpha=1 - b1)
+                v = st["v"].mul_(b2).addcmul_(g, g, value=1 - b2)
                 upd = (m / bc1) / ((v / bc2).sqrt_().add_(eps))
                 p32 = p.float()
                 if wd > 0:
