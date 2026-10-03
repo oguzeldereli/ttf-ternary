@@ -299,6 +299,30 @@ def _host_put(d, k, v, off):
         d[k] = tuple(torch.empty(x.shape, dtype=x.dtype, pin_memory=True).copy_(x, non_blocking=True) for x in v)
 
 
+def mem_report(model, tail_opt, lr_state):
+    """--mem_report: MiB held by each part of training (tensors counted by their own size; CUDA context excluded)"""
+    MB = 2 ** 20
+    nbytes = lambda ts: sum(t.numel() * t.element_size() for t in ts if torch.is_tensor(t))
+    trits = nbytes([b for n, b in model.named_buffers() if n.endswith("wpacked")])
+    params = list(model.parameters())
+    opt = nbytes([v for st in tail_opt.state.values() for v in st.values()])
+    gpu, host = 0, 0
+    def walk(x):
+        nonlocal gpu, host
+        if torch.is_tensor(x):
+            if x.is_cuda: gpu += x.numel() * x.element_size()
+            else: host += x.numel() * x.element_size()
+        elif isinstance(x, (tuple, list)):
+            for y in x: walk(y)
+        elif isinstance(x, dict):
+            for y in x.values(): walk(y)
+    walk(lr_state)
+    return {"mem_trits_MB": trits / MB, "mem_tail_params_MB": nbytes(params) / MB,
+            "mem_tail_grads_MB": nbytes([p.grad for p in params if p.grad is not None]) / MB,
+            "mem_tail_opt_MB": opt / MB, "mem_ts_gpu_MB": gpu / MB, "mem_ts_host_MB": host / MB,
+            "mem_alloc_MB": torch.cuda.memory_allocated() / MB, "mem_peak_MB": torch.cuda.max_memory_allocated() / MB}
+
+
 def _ts_state_bytes(lr_state):
     """bytes held by the --ts state (accumulator pairs, short momentum, factored v), counted per stored tensor"""
     n = 0
@@ -1709,6 +1733,10 @@ def main():
     ap.add_argument("--two_stage", type=float, default=0.0, help="BitNet-b1.58-style schedule: stage 1 cosine from the "
                     "peak to half of it, at the midpoint restart at F x peak and cosine to min_lr; weight decay 0 in "
                     "stage 2 (F e.g. 0.4; 0: plain cosine)")
+    ap.add_argument("--lean_tail", action="store_true", help="float tail in bf16 (embedding, adapter) / fp16 (gains, "
+                    "scales) with LeanAdam: int8 first moment, factored second moment, stochastic-rounding updates")
+    ap.add_argument("--mem_report", action="store_true", help="log the MiB of trits, float tail, its gradients and "
+                    "optimizer state, TTF state on GPU / host, allocated and peak, at steps 10 / 50 / 100 / 1000")
     ap.add_argument("--ts_offload", action="store_true", help="--ts: keep the state in pinned host memory; each layer's "
                     "state is copied to the GPU for its update and back (same stream: ordered, no host sync)")
     ap.add_argument("--ts_qwhich", default="all", choices=["all", "m", "a"],
@@ -2055,6 +2083,28 @@ def main():
         print(f"master mode: {sum(p.numel() for p in master)/1e6:.1f}M latent "
               f"({args.master_dtype}) + {sum(p.numel() for p in emb+norms)/1e6:.1f}M tail, "
               f"AdamW fp32 states", flush=True)
+    elif args.lean_tail:
+        # --lean_tail: embedding (and the adapter, added later) in bf16, norm gains / row-column scales / attention
+        # temperature in fp16, LeanAdam (int8 first moment, factored second moment, stochastic-rounding write-back)
+        from .opt_lean import LeanAdam
+        tail = model.float_tail_parameters()
+        names = {id(p): n for n, p in model.named_parameters()}
+        small = [p for p in tail if names[id(p)].endswith(("norm.weight", "qk_logscale", "row_scale", "col_scale"))]
+        sid = {id(p) for p in small}
+        emb = [p for p in tail if id(p) not in sid]
+        for p in emb:
+            p.data = p.data.to(torch.bfloat16)
+        for p in small:
+            p.data = p.data.to(torch.float16)
+        rc = [p for p in small if names[id(p)].endswith(("row_scale", "col_scale"))]
+        rcid = {id(p) for p in rc}
+        norms = [p for p in small if id(p) not in rcid]
+        tail_groups = [{"params": emb, "weight_decay": tc.weight_decay}, {"params": norms, "weight_decay": 0.0}]
+        if rc:
+            tail_groups.append({"params": rc, "weight_decay": 0.0, "rc_lr": args.rc_lr})
+        tail_opt = LeanAdam(tail_groups, lr=tc.lr, betas=(tc.beta1, tc.beta2))
+        print(f"lean float tail: {sum(p.numel() for p in emb)/1e6:.1f}M bf16 + {sum(p.numel() for p in small)/1e3:.1f}k fp16, "
+              f"LeanAdam (int8 m, factored v, stochastic rounding)", flush=True)
     elif args.tail_fp32:
         # float tail kept in fp32 with a standard AdamW, exactly like master mode. In
         # bf16 an Adam step (~lr <= 1.5e-3) on a norm gain of 1.0 is below half the
@@ -2217,6 +2267,9 @@ def main():
         for m in model.modules():
             if isinstance(m, (KernelTernaryLinear, MasterTernaryLinear)):
                 newp += m.enable_lowrank_mag(kind, int(r))
+        if args.lean_tail:
+            for p_ in newp:
+                p_.data = p_.data.to(torch.bfloat16)
         tail.extend(newp)
         tail_opt.add_param_group({"params": newp, "weight_decay": args.mag_wd, "lr_mult": args.mag_lr_mult,
                                   "lr": lr_at(step0, tc) * args.mag_lr_mult})
@@ -2621,6 +2674,10 @@ def main():
                   f"| {dt:6.1f}s | peakVRAM {mem:.2f}GiB", flush=True)
             if args.ts and step in (10, 1000):
                 print(f"  --ts state: {_ts_state_bytes(lr_state) / 2**20:.1f} MiB stored", flush=True)
+            if args.mem_report and step in (10, 50, 100, 1000):
+                mr = mem_report(model, tail_opt, lr_state)
+                log_metrics({"step": step, **mr})
+                print("  memory (MiB): " + ", ".join(f"{k[4:-3]} {v:.1f}" for k, v in mr.items()), flush=True)
             if ORTH_STATS:
                 e = torch.tensor(ORTH_STATS); ORTH_STATS.clear()
                 print(f"  orthdbg ({len(e)} calls): |Q^T Q - I| max {e[:, 0].max():.1e} | span error vs Householder max "
