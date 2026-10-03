@@ -426,7 +426,8 @@ def ts_layer(l, g, state, c):
         Md = (b1 * Um @ Vm.T + (1 - b1) * g) if diag else None    # the momentum before its rank-r projection
         Um = b1 * Um @ (Vm.T @ Vn) + (1 - b1) * g @ Vn; Vm = Vn
         if diag:      # share of the momentum's energy the projection drops (Um_new = Md Vn, Vn orthonormal)
-            _ts_rec(st, "m_drop", 1 - (Um.norm() ** 2 / Md.norm().clamp_min(1e-30) ** 2).item()); del Md
+            x_ = 1 - (Um.norm() ** 2 / Md.norm().clamp_min(1e-30) ** 2).item(); del Md
+            _ts_rec(st, "m_drop", x_); _ts_rec(st, "m_drop_" + _TS_TYPES[getattr(l, "_ts_idx", 0) % 7], x_)
     if c.get("qdiag"): _qdiag(st, key, "m", Um, Vm, t)
     _host_put(st, ("m", key), _store_pair(sm, Um, Vm) if sm else (qm(Um), qVm(Vm)), off)  # --ts_qfmt sim., --ts_store_m real
     u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
@@ -439,12 +440,24 @@ def ts_layer(l, g, state, c):
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         U = U * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)   # --ts_tau_anneal: memory in distance, not steps
-        Vn = _orth(V @ (U.T @ U) + u.T @ U)
+        if c.get("resid"):        # --ts_resid: what the last projection discarded comes back with this step (dense)
+            R_ = st.get(("resid", key))
+            if R_ is not None:
+                u = u + R_ * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
+            Afull = U @ V.T + u
+        X_ = V @ (U.T @ U) + u.T @ U
+        if c.get("sketch"):       # --ts_sketch RHO: a random sketch of this step's u joins the basis update, so new
+            S_ = u.T @ torch.randn(l.N, X_.shape[1], device=u.device)   # directions can enter (RHO of the norm)
+            X_ = X_ + c["sketch"] * X_.norm() / S_.norm().clamp_min(1e-30) * S_; del S_
+        Vn = _orth(X_); del X_
         Ad = (U @ V.T + u) if diag else None                     # the accumulator before its rank-r projection
         U = U @ (V.T @ Vn) + u @ Vn; V = Vn
+        if c.get("resid"):
+            st[("resid", key)] = Afull - U @ V.T; del Afull
         if diag:      # evidence dropped by the projection (U_new = Ad Vn) and share of this step's u that is kept
             _ts_rec(st, "a_drop", 1 - (U.norm() ** 2 / Ad.norm().clamp_min(1e-30) ** 2).item())
-            _ts_rec(st, "u_kept", ((u @ Vn).norm() ** 2 / u.norm().clamp_min(1e-30) ** 2).item()); del Ad
+            x_ = ((u @ Vn).norm() ** 2 / u.norm().clamp_min(1e-30) ** 2).item(); del Ad
+            _ts_rec(st, "u_kept", x_); _ts_rec(st, "u_kept_" + _TS_TYPES[getattr(l, "_ts_idx", 0) % 7], x_)
     if c.get("shadow"):   # --ts_shadow: a full-rank accumulator fed the same steps and spent by the same moves
         S = st.get(("shadow", key))
         S = u.clone() if S is None else S.mul_(1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau).add_(u)
@@ -478,6 +491,9 @@ def ts_layer(l, g, state, c):
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
     if before is not None:
         l._record_flips(before, l.wpacked)
+
+
+_TS_TYPES = ("q", "k", "v", "o", "gate", "up", "down")   # order of the ternary layers in a block
 
 
 def _ts_rec(st, name, x):
@@ -517,8 +533,15 @@ def ts_layer_shared(l, g, state, c):
         Ao = decay * U @ V.T                                   # dense, decayed, before this step's u
         X = M.T @ (M @ V) / M.norm().clamp_min(1e-30) ** 2 + Ao.T @ (Ao @ V) / Ao.norm().clamp_min(1e-30) ** 2
         Vn = _orth(X); del X
-    Um = M @ Vn; del M
+    Um = M @ Vn
+    if c.get("diag"):
+        _ts_rec(st, "m_drop", 1 - (Um.norm() ** 2 / M.norm().clamp_min(1e-30) ** 2).item())
+    del M
     u = -(Um @ Vn.T) / (1 - b1 ** t) / sq * lr_ratio; del sq
+    if c.get("diag"):
+        _ts_rec(st, "u_kept", ((u @ Vn).norm() ** 2 / u.norm().clamp_min(1e-30) ** 2).item())
+        if Ao is not None:
+            Ad_ = Ao + u; _ts_rec(st, "a_drop", 1 - ((Ad_ @ Vn).norm() ** 2 / Ad_.norm().clamp_min(1e-30) ** 2).item()); del Ad_
     U = (u @ Vn) if Ao is None else (Ao @ Vn + u @ Vn); del Ao, u
     A = U @ Vn.T
     w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
@@ -560,7 +583,7 @@ def _qdiag(st, key, which, U, V, t):
 def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, b1=0.9, b2=0.95, gate=False, spend=1.0,
             tau_anneal=False, int8=False, fused=False, qfmt="", qwhich="all", qnoV=False, qdiag=False,
             qfmt_m="", qfmt_a="", qfmt_aV="", store_m="", store_a="", offload=False, diag=False, shadow=False,
-            shared_v=False):
+            shared_v=False, sketch=0.0, resid=False):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -576,7 +599,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
     c = dict(r=r, lr_ratio=lr_ratio, theta=theta, tau=tau, rank_s=rank_s, b1=b1, b2=b2, gate=gate, spend=spend,
              tau_anneal=tau_anneal, int8=int8, qfmt=qfmt, qwhich=qwhich, qnoV=qnoV, qdiag=qdiag,
              qfmt_m=qfmt_m, qfmt_a=qfmt_a, qfmt_aV=qfmt_aV, store_m=store_m, store_a=store_a, offload=offload,
-             diag=diag, shadow=shadow, shared_v=shared_v)
+             diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid)
     st = state.setdefault("_ts", {})
     if not fused:
         for i, l in enumerate([l for l in model.modules() if isinstance(l, KernelTernaryLinear)]):
@@ -1724,6 +1747,12 @@ def main():
     ap.add_argument("--ts_rank_kv", type=int, default=0, help="--ts: rank of both states for the attention k / v "
                     "projections (0: --lowrank / --ts_rank_s); with grouped-query attention these are narrow, so a full "
                     "rank there costs more than dense storage")
+    ap.add_argument("--ts_sketch", type=float, default=0.0, help="--ts: a random sketch of each step u joins the "
+                    "accumulator's basis update with this share of its norm (lets new directions in at low rank)")
+    ap.add_argument("--ts_resid", action="store_true", help="--ts: feed what the accumulator's projection discarded back "
+                    "into the next step (dense N x K per layer: an upper-bound test, not sublinear)")
+    ap.add_argument("--ts_rank_types", default="", help="--ts: per-layer-type ranks, e.g. q:64,k:64,v:96,o:64,gate:160,"
+                    "up:160,down:128 (both states; types not listed use --lowrank / --ts_rank_s)")
     ap.add_argument("--ts_shared_v", action="store_true", help="--ts: the short momentum and the accumulator share one "
                     "orthonormal basis (a quarter less state; fp32 state only)")
     ap.add_argument("--ts_diag", type=int, default=0, help="--ts: every N steps log what the rank-r projections drop "
@@ -2030,6 +2059,13 @@ def main():
     model.train()
     if args.ckpt_skip:
         model.ckpt_skip = args.ckpt_skip
+    if args.ts_rank_types:
+        rt = {k: int(v) for k, v in (x.split(":") for x in args.ts_rank_types.split(","))}
+        lays_ = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
+        for i, m in enumerate(lays_):
+            if _TS_TYPES[i % 7] in rt:
+                m._ts_rank = rt[_TS_TYPES[i % 7]]
+        print(f"--ts_rank_types: {rt}", flush=True)
     if args.ts_rank_kv:
         from .model import Attention
         for a in model.modules():
@@ -2402,7 +2438,8 @@ def main():
                       tau_anneal=args.ts_tau_anneal, int8=args.ts_int8, qfmt=args.ts_qfmt, qwhich=args.ts_qwhich,
                       qnoV=args.ts_qnoV, qdiag=False, qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
                       store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload,
-                      diag=False, shadow=args.ts_shadow, shared_v=args.ts_shared_v)
+                      diag=False, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
+                      sketch=args.ts_sketch, resid=args.ts_resid)
         for i_, m_ in enumerate([m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]):
             m_._ts_idx = i_
             m_.on_grad = lambda layer, g, _c=ts_cfg: ts_layer(layer, g, lr_state, _c)
@@ -2552,7 +2589,8 @@ def main():
                                   qdiag=bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1),
                                   qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
                       store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload,
-                      diag=bool(args.ts_diag) and step % args.ts_diag == 0, shadow=args.ts_shadow, shared_v=args.ts_shared_v)
+                      diag=bool(args.ts_diag) and step % args.ts_diag == 0, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
+                      sketch=args.ts_sketch, resid=args.ts_resid)
             elif args.accum_flip:
                 rs_info = accum_step(model, lr_state, args.lowrank, args.lr_beta, step, args.accum_flip,
                                      args.accum_z, args.flip_seed, fresh=accum_fresh)
