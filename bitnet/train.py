@@ -55,7 +55,9 @@ def get_batch(data, bs, seq_len, device, gen=None):
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 
-TWO_STAGE = [0.0]   # --two_stage F: BitNet-b1.58-style two-stage schedule (0: plain cosine)
+TWO_STAGE = [0.0]
+TS_SHADOWS = [()]                 # --ts_shadows: ranks of the shadow states (0 = full rank)
+TS_DUMP = ["", (), ()]            # --ts_dump_steps / --ts_dump_layers: directory, steps, layer indices   # --two_stage F: BitNet-b1.58-style two-stage schedule (0: plain cosine)
 
 
 def two_stage_mid(tc: TrainConfig):
@@ -431,6 +433,8 @@ def ts_layer(l, g, state, c):
     if c.get("qdiag"): _qdiag(st, key, "m", Um, Vm, t)
     _host_put(st, ("m", key), _store_pair(sm, Um, Vm) if sm else (qm(Um), qVm(Vm)), off)  # --ts_qfmt sim., --ts_store_m real
     u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
+    if c.get("shadows"):      # --ts_shadows: the same gradients into shadow states of other ranks (and full rank)
+        _ts_shadows_step(l, g, v, st, c, t, lr_ratio, key)
     del v
     ra = min(r, l.N, l.K)
     if key not in state:
@@ -477,6 +481,8 @@ def ts_layer(l, g, state, c):
     nf = fire.sum()                           # a device tensor: no host sync per layer
     l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
     U = U - c["spend"] * theta * (D @ V)
+    if c.get("shadows"):
+        _ts_shadows_after(l, st, c, key, D, w0, theta, diag, (U + c["spend"] * theta * (D @ V)) @ V.T, t)
     if c.get("shadow"):
         S = st[("shadow", key)]
         if diag:      # which moves the full-rank accumulator would make, against the moves made
@@ -494,6 +500,92 @@ def ts_layer(l, g, state, c):
 
 
 _TS_TYPES = ("q", "k", "v", "o", "gate", "up", "down")   # order of the ternary layers in a block
+
+
+@torch.no_grad()
+def _ts_shadows_step(l, g, v, st, c, t, lr_ratio, key):
+    """--ts_shadows R1,R2,...: for each rank (0 = full rank) a shadow short momentum and accumulator, fed this layer's
+    gradient with the same v and schedule as the run; spent later by the run's actual moves (_ts_shadows_after)"""
+    b1, tau = c["b1"], c["tau"]
+    decay = 1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau
+    sq = v.sqrt() + 1e-8
+    sh = st.setdefault(("shd", key), {})
+    for rr in c["shadows"]:
+        d = sh.get(rr)
+        if rr == 0:
+            M = (1 - b1) * g if d is None else d[0].mul_(b1).add_(g, alpha=1 - b1)
+            uu = -M / (1 - b1 ** t) / sq * lr_ratio
+            A = uu.clone() if d is None else d[1].mul_(decay).add_(uu)
+            sh[0] = (M, A)
+            continue
+        k = min(rr, l.N, l.K)
+        if d is None:
+            gen = torch.Generator(device=g.device).manual_seed(5_000_000 + 7 * getattr(l, "_ts_idx", 0) + rr)
+            Vm = _orth(g.T @ torch.randn(l.N, k, device=g.device, generator=gen)); Um = (1 - b1) * g @ Vm
+        else:
+            Um, Vm, U, V = d
+            Vn = _orth(b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um)
+            Um = b1 * Um @ (Vm.T @ Vn) + (1 - b1) * g @ Vn; Vm = Vn
+        uu = -(Um @ Vm.T) / (1 - b1 ** t) / sq * lr_ratio
+        if d is None:
+            gen = torch.Generator(device=g.device).manual_seed(6_000_000 + 7 * getattr(l, "_ts_idx", 0) + rr)
+            V = _orth(uu.T @ torch.randn(l.N, k, device=g.device, generator=gen)); U = uu @ V
+        else:
+            U = U * decay
+            Vn = _orth(V @ (U.T @ U) + uu.T @ U)
+            U = U @ (V.T @ Vn) + uu @ Vn; V = Vn
+        sh[rr] = (Um, Vm, U, V)
+
+
+@torch.no_grad()
+def _ts_shadows_after(l, st, c, key, D, w0, theta, diag, A_run, t):
+    """compare each shadow accumulator (and the run's own, A_run, before its spend) with the full-rank shadow on the
+    measuring steps, dump matrices of chosen layers on chosen steps, then spend every shadow by the run's moves D"""
+    sh = st[("shd", key)]
+    ty = _TS_TYPES[getattr(l, "_ts_idx", 0) % 7]
+    full = sh.get(0)
+    if diag and full is not None:
+        M_f, A_f = full
+        nf = A_f.norm().clamp_min(1e-30)
+        big = A_f.abs() >= theta / 2
+        fire_f = (A_f.abs() >= theta) & ((w0.float() + A_f.sign()).abs() <= 1)
+        sv2 = torch.linalg.svdvals(A_f) ** 2; tot = sv2.sum().clamp_min(1e-30)
+        for kk in (64, 128, 512):
+            _ts_rec(st, f"full_top{kk}", (sv2[:kk].sum() / tot).item())
+        cands = [("run", A_run, None)] + [(f"r{rr}", sh[rr][2] @ sh[rr][3].T, sh[rr][0] @ sh[rr][1].T) for rr in c["shadows"] if rr]
+        for name, X, Mx in cands:
+            fire_x = (X.abs() >= theta) & ((w0.float() + X.sign()).abs() <= 1)
+            both = (fire_x & fire_f).sum().item()
+            vals = {"cos": ((X * A_f).sum() / (X.norm().clamp_min(1e-30) * nf)).item(), "energy": (X.norm() / nf).item(),
+                    "sign_agree_big": (X.sign() == A_f.sign())[big].float().mean().item() if big.any() else float("nan"),
+                    "fire_recall": both / max(fire_f.sum().item(), 1), "fire_precision": both / max(fire_x.sum().item(), 1),
+                    "fire_frac": fire_x.float().mean().item()}
+            if Mx is not None:
+                vals["mom_cos"] = ((Mx * M_f).sum() / (Mx.norm().clamp_min(1e-30) * M_f.norm().clamp_min(1e-30))).item()
+            for k_, x_ in vals.items():
+                if x_ == x_:
+                    _ts_rec(st, f"{name}_{k_}", x_)
+                    if ty == "down":
+                        _ts_rec(st, f"{name}_{k_}_down", x_)
+        _ts_rec(st, "full_fire_frac", fire_f.float().mean().item())
+    if c.get("dump_dir") and t in c.get("dump_steps", ()) and getattr(l, "_ts_idx", -1) in c.get("dump_layers", ()):
+        import numpy as _np
+        os.makedirs(c["dump_dir"], exist_ok=True)
+        out = {"w": w0.cpu().numpy(), "A_run": A_run.half().cpu().numpy()}
+        for rr in c["shadows"]:
+            if rr == 0:
+                out["A_full"] = sh[0][1].half().cpu().numpy(); out["M_full"] = sh[0][0].float().cpu().numpy().astype("float32")
+            else:
+                out[f"A_r{rr}"] = (sh[rr][2] @ sh[rr][3].T).half().cpu().numpy()
+                out[f"M_r{rr}"] = (sh[rr][0] @ sh[rr][1].T).float().cpu().numpy()
+        _np.savez_compressed(os.path.join(c["dump_dir"], f"t{t}_layer{l._ts_idx}_{ty}.npz"), **out)
+    cs = c["spend"] * theta
+    for rr in c["shadows"]:
+        if rr == 0:
+            sh[0][1].sub_(cs * D)
+        else:
+            Um, Vm, U, V = sh[rr]
+            sh[rr] = (Um, Vm, U - cs * (D @ V), V)
 
 
 def _ts_rec(st, name, x):
@@ -583,7 +675,7 @@ def _qdiag(st, key, which, U, V, t):
 def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, b1=0.9, b2=0.95, gate=False, spend=1.0,
             tau_anneal=False, int8=False, fused=False, qfmt="", qwhich="all", qnoV=False, qdiag=False,
             qfmt_m="", qfmt_a="", qfmt_aV="", store_m="", store_a="", offload=False, diag=False, shadow=False,
-            shared_v=False, sketch=0.0, resid=False):
+            shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=()):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -599,7 +691,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
     c = dict(r=r, lr_ratio=lr_ratio, theta=theta, tau=tau, rank_s=rank_s, b1=b1, b2=b2, gate=gate, spend=spend,
              tau_anneal=tau_anneal, int8=int8, qfmt=qfmt, qwhich=qwhich, qnoV=qnoV, qdiag=qdiag,
              qfmt_m=qfmt_m, qfmt_a=qfmt_a, qfmt_aV=qfmt_aV, store_m=store_m, store_a=store_a, offload=offload,
-             diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid)
+             diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid, shadows=shadows,
+             dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers)
     st = state.setdefault("_ts", {})
     if not fused:
         for i, l in enumerate([l for l in model.modules() if isinstance(l, KernelTernaryLinear)]):
@@ -1747,6 +1840,11 @@ def main():
     ap.add_argument("--ts_rank_kv", type=int, default=0, help="--ts: rank of both states for the attention k / v "
                     "projections (0: --lowrank / --ts_rank_s); with grouped-query attention these are narrow, so a full "
                     "rank there costs more than dense storage")
+    ap.add_argument("--ts_shadows", default="", help="--ts: shadow states at these ranks (0 = full rank), fed the same "
+                    "gradients and spent by the run's moves; with --ts_diag N compared with the full-rank shadow every N "
+                    "steps (correlation, energy, sign agreement, which weights would move, momentum agreement, spectrum)")
+    ap.add_argument("--ts_dump_steps", default="", help="--ts_shadows: save the matrices at these update counts")
+    ap.add_argument("--ts_dump_layers", default="0,6", help="--ts_dump_steps: layer indices (block 0: q = 0, down = 6)")
     ap.add_argument("--ts_sketch", type=float, default=0.0, help="--ts: a random sketch of each step u joins the "
                     "accumulator's basis update with this share of its norm (lets new directions in at low rank)")
     ap.add_argument("--ts_resid", action="store_true", help="--ts: feed what the accumulator's projection discarded back "
@@ -1999,6 +2097,10 @@ def main():
         _kmod.GEMM_BACKEND[0] = "cublas"
     ORTH_CHOL[0] = args.ts_orth if args.ts_orth != "qr" else False
     TWO_STAGE[0] = args.two_stage
+    TS_SHADOWS[0] = tuple(int(x) for x in args.ts_shadows.split(",")) if args.ts_shadows else ()
+    if args.ts_dump_steps:
+        TS_DUMP[:] = [os.path.join(args.out_dir or ".", "acc_dumps"), tuple(int(x) for x in args.ts_dump_steps.split(",")),
+                      tuple(int(x) for x in args.ts_dump_layers.split(","))]
     ORTH_DEBUG = os.environ.get("TERN_ORTHDBG") == "1"
     TIME = os.environ.get("TERN_TIME") == "1"   # time the forward/backward vs the momentum step (synchronizes)
 
@@ -2439,7 +2541,8 @@ def main():
                       qnoV=args.ts_qnoV, qdiag=False, qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
                       store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload,
                       diag=False, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
-                      sketch=args.ts_sketch, resid=args.ts_resid)
+                      sketch=args.ts_sketch, resid=args.ts_resid, shadows=TS_SHADOWS[0],
+                      dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2])
         for i_, m_ in enumerate([m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]):
             m_._ts_idx = i_
             m_.on_grad = lambda layer, g, _c=ts_cfg: ts_layer(layer, g, lr_state, _c)
@@ -2590,7 +2693,8 @@ def main():
                                   qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
                       store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload,
                       diag=bool(args.ts_diag) and step % args.ts_diag == 0, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
-                      sketch=args.ts_sketch, resid=args.ts_resid)
+                      sketch=args.ts_sketch, resid=args.ts_resid, shadows=TS_SHADOWS[0],
+                      dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2])
             elif args.accum_flip:
                 rs_info = accum_step(model, lr_state, args.lowrank, args.lr_beta, step, args.accum_flip,
                                      args.accum_z, args.flip_seed, fresh=accum_fresh)
