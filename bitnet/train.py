@@ -539,7 +539,7 @@ def ts_layer(l, g, state, c):
     from .kernel import unpack_rows, pack_rows
     if c.get("shared_v"):
         return ts_layer_shared(l, g, state, c)
-    if c.get("global") or c.get("global_"):
+    if c.get("global") or c.get("global_") or (c.get("fuse") and getattr(l, "_ts_idx", 0) % 7 in (0, 1, 2, 4, 5)):
         return _ts_global_layer(l, g, state, c)
     r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
     r = getattr(l, "_ts_rank", 0) or r                                                  # --ts_rank_kv: per-layer rank
@@ -813,11 +813,16 @@ def _ts_global_layer(l, g, state, c):
     rs = c["rank_s"]
     st = state.setdefault("_ts", {})
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
-    out_side = getattr(l, "_ts_idx", 0) % 7 in _GLOBAL_OUT_SIDE
+    idx_ = getattr(l, "_ts_idx", 0)
+    if c.get("global") or c.get("global_"):
+        grp, out_side = "all", idx_ % 7 in _GLOBAL_OUT_SIDE
+    else:                      # --ts_fuse: q / k / v of a block share one input basis, gate / up another
+        grp, out_side = (("qkv" if idx_ % 7 < 3 else "gu"), idx_ // 7), False
     d = l.N if out_side else l.K
-    gl = st.setdefault("_glob", {})
-    if "V" not in gl:          # random orthonormal bases of the residual space to start
-        gen = torch.Generator(device=g.device).manual_seed(4_100_000)
+    gl = st.setdefault("_glob", {}).setdefault(grp, {"keys": set()})
+    gl["keys"].add(key)
+    if "V" not in gl:          # random orthonormal bases to start
+        gen = torch.Generator(device=g.device).manual_seed(4_100_000 + 10 * (idx_ // 7) + (idx_ % 7 >= 3))
         gl["Vm"] = torch.linalg.qr(torch.randn(d, rs, device=g.device, generator=gen))[0]
         gl["V"] = torch.linalg.qr(torch.randn(d, r, device=g.device, generator=gen))[0]
         gl["Xm"] = torch.zeros(d, rs, device=g.device); gl["Xa"] = torch.zeros(d, r, device=g.device)
@@ -871,18 +876,17 @@ def _ts_global_finish(state):
     """--ts_global, once per step after every layer: new shared bases from the accumulated products, every layer's
     coefficients rotated into them"""
     st = state.get("_ts", {})
-    gl = st.get("_glob")
-    if not gl or not gl["Xa"].abs().sum():
-        return
-    for X_, B_, pref in (("Xm", "Vm", "gm"), ("Xa", "V", "gU")):
-        if not gl[X_].abs().sum():
-            continue
-        Vn = _orth(gl[X_])
-        Rot = gl[B_].T @ Vn
-        for k_ in [k for k in st if isinstance(k, tuple) and k[0] == pref]:
-            st[k_] = st[k_] @ Rot
-        gl[B_] = Vn
-        gl[X_].zero_()
+    for gl in st.get("_glob", {}).values():      # one group ("all" for --ts_global; per block for --ts_fuse)
+        for X_, B_, pref in (("Xm", "Vm", "gm"), ("Xa", "V", "gU")):
+            if not gl[X_].abs().sum():
+                continue
+            Vn = _orth(gl[X_])
+            Rot = gl[B_].T @ Vn
+            for k_ in gl["keys"]:
+                if (pref, k_) in st:
+                    st[(pref, k_)] = st[(pref, k_)] @ Rot
+            gl[B_] = Vn
+            gl[X_].zero_()
 
 
 def _rank_sched(spec):
@@ -1131,7 +1135,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
             shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125, table=0.0, exact_spend=False, tiles=1,
             rank_sched=None, progress=0.0, rsketch=0, rsketch_every=50, locate=0.0, spend_table=False,
-            global_=False):
+            global_=False, fuse=False):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -1150,7 +1154,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid, shadows=shadows,
              rescale=rescale, refresh=refresh, refresh_frac=refresh_frac, table=table, exact_spend=exact_spend,
              tiles=tiles, rank_sched=rank_sched, progress=progress, rsketch=rsketch, rsketch_every=rsketch_every,
-             locate=locate, spend_table=spend_table, **{"global": global_},
+             locate=locate, spend_table=spend_table, fuse=fuse, **{"global": global_},
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
     if not fused:
@@ -1159,7 +1163,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             g = l.gw.float(); l.gw = None; l.capture = False
             ts_layer(l, g, state, c)
             del g
-    if c.get("global"):
+    if c.get("global") or c.get("fuse"):
         _ts_global_finish(state)
     nf, nt = st.pop("_nf", 0), st.pop("_nt", 0)
     info = {"ts_frac": float(nf) / max(nt, 1)}
@@ -2308,6 +2312,9 @@ def main():
     ap.add_argument("--ts_global", action="store_true", help="--ts: one accumulator and one short momentum for the whole "
                     "model: all matrices stacked along their residual-stream side share one basis (ranks --lowrank / "
                     "--ts_rank_s), each keeps its own coefficients")
+    ap.add_argument("--ts_fuse", action="store_true", help="--ts: matrices that read the same input share one input "
+                    "basis per state: q / k / v of a block, and gate / up of a block (each keeps its own coefficients); "
+                    "o and down as usual")
     ap.add_argument("--ts_rank_sched", default="", help="--ts: R0:R1, both ranks move linearly from R0 to R1 over training")
     ap.add_argument("--ts_spend", type=float, default=1.0,
                     help="--ts: a move spends this x theta (1: to the new trit's centre, like master --m_snap; 2: stays at "
@@ -3048,7 +3055,7 @@ def main():
                       sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale, table=args.ts_table,
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
-                      spend_table=args.ts_spend_table, global_=args.ts_global,
+                      spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
                       progress=0.0,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
@@ -3207,7 +3214,7 @@ def main():
                       sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale, table=args.ts_table,
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
-                      spend_table=args.ts_spend_table, global_=args.ts_global,
+                      spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
                       progress=step / max(1, tc.max_steps),
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
