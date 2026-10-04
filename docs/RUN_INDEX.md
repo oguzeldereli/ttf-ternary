@@ -8,7 +8,7 @@ Running, queued, unfinished and never-run runs: [QUEUE.md](QUEUE.md) (kept curre
 (2000 windows, never used for tuning): TTF ranks 512 (3 seeds) **2.6888 / 3.6453**; master + the same float extras
 (2 seeds) 2.7166 / 3.6830; master (3 seeds) 2.7359 / 3.7071; old rule 2.7973 / 3.7545. TTF - master + extras
 -0.028 [-0.029, -0.027] / -0.038 [-0.039, -0.037]; TTF - master -0.047 / -0.062; seed spread 0.002-0.0035. Storage
-(seed 2): int8 / fp16 2.6877, fp8 / fp16 2.6874 vs fp32 2.6868. Bare TTF 2.8070 (+0.071 vs master). 1.3B (one seed each): TTF 2.5510 / 3.5009 vs master 2.5706 / 3.5489 (-0.020 [-0.021, -0.018] / -0.048).
+(seed 2): int8 / fp16 2.6877, fp8 / fp16 2.6874 vs fp32 2.6868. Bare TTF 2.8070 (+0.071 vs master). 1.3B (one seed each): TTF 2.5510 / 3.5009 vs master 2.5706 / 3.5489 (-0.020 [-0.021, -0.018] / -0.048). **340M** (one seed each): TTF p 0.5 2.5774 / 3.5251 vs master + extras 2.6061 / 3.5654 (-0.029 [-0.030, -0.027] / -0.040), master 2.6461 / 3.6167.
 Training-time
 val numbers of different seeds use different windows and differ by up to 0.06 for that reason alone (RUNS.md
 "3 Oct 04:45").
@@ -20,7 +20,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 |---|---|---|
 | `x1b_ts512_la1000an05` vs `x1b_master_lr75` (Myriad) | 1.3B, fixed windows | **TTF 2.5510 vs master 2.5706 (-0.020 [-0.021, -0.018]); FineWeb 3.5009 vs 3.5489 (-0.048)**; LAMBADA 0.155 vs 0.138 |
 | `mx_big_extras_s0` (harlequin) | 340M master + the same float extras | **2.6222** (TTF ranks 512 2.6268; TTF led by 0.075 at 5000) |
-| `big_ts512an05_s0` / `big_ts512la1000an05_s0` (tope / quillback) | 340M TTF ranks 512, steps x ratio^0.5 / + leak scaled | **2.5927** / 2.6081 (training-time; master + extras 2.6222, TTF p 1 2.6268): p 0.5 fixes the late slope at 340M |
+| `big_ts512an05_s0` / `big_ts512la1000an05_s0` (tope / quillback) | 340M TTF ranks 512, steps x ratio^0.5 / + leak scaled | **2.5927** / 2.6081 (training-time; master + extras 2.6222, TTF p 1 2.6268); fixed windows 2.5774 / 2.5916 vs master + extras 2.6061 (**-0.029 [-0.030, -0.027]**, FineWeb -0.040): p 0.5 fixes the late slope at 340M |
 | `mx_lr075_s0` / `mx_lr3e3_s0` / `mx_lr6e3_s0` | master lr sweep | 2.7785 / 2.8136 / diverged (lr 1.5e-3 2.7513 is best) |
 | `mx_2stage_s0` / `mx_2stage_lr3e3_s0` | master with a BitNet-style two-stage schedule | 2.7577 / 2.8153 (no gain) |
 | `bop_g1e3_t02/t05/t15_s0` | ternary Bop baseline (one timescale) | 3.0885 / 3.9898 / 3.2451 (rerun 3.2407) |

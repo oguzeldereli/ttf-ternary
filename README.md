@@ -30,8 +30,9 @@ within 6e-5. FineWeb-Edu was never used for any choice.
 - **Master learning rate:** of 7.5e-4 / 1.5e-3 / 3e-3 / 6e-3, the 1.5e-3 used for master is the best.
 - **1.3B** (fixed windows, one seed each): TTF 2.5510 vs master 2.5706 (−0.020 [−0.021, −0.018]); FineWeb-Edu
   3.5009 vs 3.5489 (−0.048).
-- **340M** (training-time evaluation, one seed): TTF 2.6268, master 2.6626, master + the same float extras 2.6222. TTF
-  led master + extras by 0.075 at step 5000; master + extras caught up in the last ~1500 steps.
+- **340M** (fixed windows, one seed each, seed 2 running): TTF 2.5774 vs master + the same float extras 2.6061
+  (−0.029 [−0.030, −0.027]) and master 2.6461; FineWeb-Edu 3.5251 vs 3.5654 / 3.6167. With the older step scaling
+  (p = 1) TTF was level with master + extras.
 - **FineWeb-Edu, 600M tokens** (110M): TTF 3.0861 vs master 3.1508.
 - **Zero-shot at 110M:** LAMBADA 0.135 vs 0.123 for master + extras. The multiple-choice tasks are at chance at this
   scale.
@@ -146,11 +147,11 @@ docs/            see below
 
 ## Open questions
 
-- **Late-training slope.** At 340M master + extras catches TTF in the last ~1500 steps; at 1.3B the lead shrank to
-  −0.008 and widened again to −0.020 at the end. The levers being tested are the step annealing p and the leak.
+- **Late-training slope.** With steps × ρ^0.5 (p = 0.5) the 340M lead holds to the end (with p = 1 master + extras
+  caught up). At 1.3B (p = 0.5) the lead shrank to −0.008 and widened again to −0.020 at the end.
 - **Rank vs width.** Ranks 512 match or beat master up to 1.3B (rank / width 0.25). Low rank fails in the accumulator,
   whose energy is spread over many directions (the top 64 hold ~50%); that share stays flat from width 768 to 2048,
   which supports a fixed rank. A width sweep up to 15B and 1x / 2x / 4x compute runs at ranks 64 / 128 are running.
 - **Wall-clock.** On an A100 at 1.3B, a TTF step is about 5 s against 4.5 s for master. The QR timing is being
   re-measured.
-- Token budgets are small (300M–600M), and the largest finished comparison is 340M with one seed.
+- Token budgets are small (300M–600M), and the 340M and 1.3B comparisons have one seed each.
