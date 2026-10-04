@@ -2,7 +2,7 @@
 # Myriad: 1.3B model (d2048_l24, width 2048), 300M tokens of wiki32k, 1 A100.
 # Ranks 256 at 1.3B (does the rank penalty shrink with width? 110M: +0.075 vs 512; 340M +0.066): short momentum rank 256 + accumulator rank 256, tau 1000, leak and steps x
 # (lr ratio)^0.5, theta 16; float tail at peak lr 7.5e-4 (matched to x1b_master_lr75, 2.5868).
-#   qsub scripts/myriad/run_1b_ts.sh      (from ~/Scratch/ternary-LLM; resubmit to resume)
+#   qsub scripts/myriad/run_1b_ts256.sh   (from ~/Scratch/ternary-LLM; resubmit to resume)
 #$ -N tern_1b_ts256
 #$ -l h_rt=40:00:00
 #$ -l mem=8G

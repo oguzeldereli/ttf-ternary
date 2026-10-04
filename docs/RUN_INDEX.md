@@ -20,6 +20,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 |---|---|---|
 | `x1b_ts512_la1000an05` vs `x1b_master_lr75` (Myriad) | 1.3B, fixed windows | **TTF 2.5510 vs master 2.5706 (-0.020 [-0.021, -0.018]); FineWeb 3.5009 vs 3.5489 (-0.048)**; LAMBADA 0.155 vs 0.138 |
 | `mx_big_extras_s0` (harlequin) | 340M master + the same float extras | **2.6222** (TTF ranks 512 2.6268; TTF led by 0.075 at 5000) |
+| `big_ts512an05_s0` / `big_ts512la1000an05_s0` (tope / quillback) | 340M TTF ranks 512, steps x ratio^0.5 / + leak scaled | **2.5927** / 2.6081 (training-time; master + extras 2.6222, TTF p 1 2.6268): p 0.5 fixes the late slope at 340M |
 | `mx_lr075_s0` / `mx_lr3e3_s0` / `mx_lr6e3_s0` | master lr sweep | 2.7785 / 2.8136 / diverged (lr 1.5e-3 2.7513 is best) |
 | `mx_2stage_s0` / `mx_2stage_lr3e3_s0` | master with a BitNet-style two-stage schedule | 2.7577 / 2.8153 (no gain) |
 | `bop_g1e3_t02/t05/t15_s0` | ternary Bop baseline (one timescale) | 3.0885 / 3.9898 / 3.2451 (rerun 3.2407) |
@@ -29,7 +30,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts512an05_kv128_s0` / `ts512an05_sharedV_s0` | k / v at rank 128 / shared basis | +0.023 / +0.047 (fixed windows); k, v / down stop moving |
 | `ts{128,64}an05_*` fixes | sketch / residual / theta 8 / theta 11 / lr 3e-3 / ranks by input width | +0.17 / -0.03 / +0.14 / +0.05 / -0.02 / 0.00 vs the same-rank baseline (2.8837 / 2.9928) |
 | `fwc_*` (running) | ranks 512 / 128 / 64 at 1x / 2x / 4x compute, FineWeb-Edu | capacity or direction? |
-| `w{110m,340m,1b,10b,15b}_r{64,256,512}` (running) | width sweep, batch 2, 1000 steps, shadows | top-64 energy share 0.57 / 0.54 / 0.53 at width 768 / 1024 / 2048 |
+| `w{110m,340m,1b,10b,15b}_r{64,256,512}` (15B running) | width sweep, batch 2, 1000 steps, shadows | top-64 energy share 0.57 / 0.54 / 0.53 / 0.58 at width 768 / 1024 / 2048 / 5120 (flat); 10B ranks 64 / 256 at 1000: 5.4370 / 5.4984; at batch 16 ranks 512 captures 0.96 / 0.91 / 0.77 of the energy at 110M / 340M / 1.3B |
 | `lean_mem.sh`, `b27_smoke.sh` | measured memory | 110M 0.38-0.63 GiB, 340M 0.68-1.35, 1.3B 1.61-2.97, 10B 12.3, 15B 17.0, 26.5B 14.1 (ranks 256) |
 
 ## Best so far (110M, 300M tokens, from scratch, final validation loss / perplexity)
