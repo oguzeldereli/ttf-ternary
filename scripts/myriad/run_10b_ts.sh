@@ -3,7 +3,9 @@
 # (16 x 2048 tokens per step, one pass: the fused update cannot accumulate micro-batches without a full gradient per
 # layer), lean: update inside the backward, int8 direction / 12-bit accumulator stored for real, lean float tail
 # (bf16 / fp16 values, int8 first moment), every layer checkpointed, loss in chunks, no flip tracking (a mask per weight).
-# State on the GPU (an A100 has room; host offload is only for 16 GB cards). Ranks 512, tau 1000, theta 16, leak and steps
+# State on the GPU (an A100 has room; host offload is only for 16 GB cards). Needs an 80 GB A100 (node types U / V): the
+# 20-step test on a 40 GB A100 peaked at 37.8 GiB in step 0 and ran out of memory in step 1 (6.5 GiB persistent; the rest
+# is activations of 32k tokens); ~39 s per step. Ranks 512, tau 1000, theta 16, leak and steps
 # x (lr ratio)^0.5 (the 1.3B recipe), float tail at lr 5e-4.
 #   qsub -v MODE=test -l h_rt=1:00:00 scripts/myriad/run_10b_ts.sh    (20 steps: memory and step time)
 #   qsub scripts/myriad/run_10b_ts.sh                                  (3000 steps, 98M tokens; resubmit to resume)
@@ -11,7 +13,7 @@
 #$ -l h_rt=48:00:00
 #$ -l mem=8G
 #$ -l gpu=1
-#$ -ac allow=LUV
+#$ -ac allow=UV
 #$ -pe smp 4
 #$ -l tmpfs=20G
 #$ -wd /home/zcabogu/Scratch/ternary-LLM
