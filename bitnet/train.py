@@ -290,6 +290,8 @@ def _load_pair(t):
 def _host_get(d, k, dev, off):
     """--ts_offload: a state tuple kept in pinned host memory, copied to the GPU for this layer's update (the copy is
     queued on the current stream, so it is ordered before the kernels that read it; no host sync)"""
+    if off == "async":
+        return _OFFLOAD.get(d, k, dev)
     v = d[k]
     return tuple(x.to(dev, non_blocking=True) for x in v) if off else v
 
@@ -300,6 +302,8 @@ def _host_put(d, k, v, off):
     if not off:
         d[k] = v
         return
+    if off == "async":
+        return _OFFLOAD.put(d, k, v)
     old = d.get(k)
     if (old is not None and len(old) == len(v) and all(o.device.type == "cpu" and o.shape == x.shape and o.dtype == x.dtype
                                                        for o, x in zip(old, v))):
@@ -307,6 +311,73 @@ def _host_put(d, k, v, off):
             o.copy_(x, non_blocking=True)
     else:
         d[k] = tuple(torch.empty(x.shape, dtype=x.dtype, pin_memory=True).copy_(x, non_blocking=True) for x in v)
+
+
+class _AsyncOffload:
+    """--ts_offload_async: the --ts_offload copies on two side streams (host-to-device prefetch, device-to-host
+    write-back), so the PCIe traffic overlaps with the backward pass instead of stalling it. The order in which the
+    update reads its states (v, m, accumulator per layer) is recorded during the first step that reads them and repeats
+    every step; from then on, reading state j prefetches states j+1 .. j+AHEAD (wrapping into the next step). Each
+    write-back records an event that the next fetch of the same state waits for; tensors used on another stream than the
+    one they were allocated on are marked with record_stream, so the caching allocator cannot hand them out early.
+    Host buffers are read by the host only in save_ckpt, which synchronizes first."""
+    AHEAD = 3                                     # one layer's states
+
+    def __init__(self):
+        self.up = self.down = None
+        self.order, self.idx, self.pre, self.done, self.fixed = [], {}, {}, {}, False
+
+    def _fetch(self, d, k, dev):
+        tag = (id(d), k)
+        with torch.cuda.stream(self.up):
+            if tag in self.done:
+                self.up.wait_event(self.done[tag])
+            y = tuple(x.to(dev, non_blocking=True) for x in d[k])
+            ev = self.up.record_event()
+        return y, ev
+
+    def get(self, d, k, dev):
+        if self.up is None:
+            self.up, self.down = torch.cuda.Stream(dev), torch.cuda.Stream(dev)
+        cur, tag = torch.cuda.current_stream(dev), (id(d), k)
+        if not self.fixed:
+            if tag in self.idx:
+                self.fixed = True
+            else:
+                self.idx[tag] = len(self.order); self.order.append((d, k))
+        y, ev = self.pre.pop(tag, None) or self._fetch(d, k, dev)
+        cur.wait_event(ev)
+        for x in y:
+            x.record_stream(cur)
+        if self.fixed and tag in self.idx:
+            n, j = len(self.order), self.idx[tag]
+            for a in range(1, min(self.AHEAD, n - 1) + 1):
+                d2, k2 = self.order[(j + a) % n]
+                if (id(d2), k2) not in self.pre and k2 in d2:
+                    self.pre[(id(d2), k2)] = self._fetch(d2, k2, dev)
+        return y
+
+    def put(self, d, k, v):
+        dev = v[0].device
+        if self.up is None:
+            self.up, self.down = torch.cuda.Stream(dev), torch.cuda.Stream(dev)
+        cur, tag = torch.cuda.current_stream(dev), (id(d), k)
+        self.pre.pop(tag, None)                   # a prefetch issued before this write would be stale
+        self.down.wait_stream(cur)
+        old = d.get(k)
+        with torch.cuda.stream(self.down):
+            if (old is not None and len(old) == len(v) and all(o.device.type == "cpu" and o.shape == x.shape and
+                                                               o.dtype == x.dtype for o, x in zip(old, v))):
+                for o, x in zip(old, v):
+                    o.copy_(x, non_blocking=True)
+            else:
+                d[k] = tuple(torch.empty(x.shape, dtype=x.dtype, pin_memory=True).copy_(x, non_blocking=True) for x in v)
+            for x in v:
+                x.record_stream(self.down)
+            self.done[tag] = self.down.record_event()
+
+
+_OFFLOAD = _AsyncOffload()
 
 
 def mem_report(model, tail_opt, lr_state):
@@ -1880,6 +1951,8 @@ def main():
                     "optimizer state, TTF state on GPU / host, allocated and peak, at steps 10 / 50 / 100 / 1000")
     ap.add_argument("--ts_offload", action="store_true", help="--ts: keep the state in pinned host memory; each layer's "
                     "state is copied to the GPU for its update and back (same stream: ordered, no host sync)")
+    ap.add_argument("--ts_offload_async", action="store_true", help="--ts_offload with the copies on side streams: the "
+                    "next layer's state is prefetched while this layer updates, write-backs overlap with compute")
     ap.add_argument("--ts_qwhich", default="all", choices=["all", "m", "a"],
                     help="--ts_qfmt applies to both matrices / the short momentum only / the accumulator only")
     ap.add_argument("--ts_qnoV", action="store_true", help="--ts_qfmt: keep the orthonormal bases V in fp32")
@@ -2375,6 +2448,8 @@ def main():
 
     def save_ckpt(step):
         # atomic: write tmp then rename, so a kill mid-save never corrupts ckpt.pt
+        if args.ts_offload_async and torch.cuda.is_available():
+            torch.cuda.synchronize()      # the host copies of the state are written on a side stream
         tmp = ckpt_path + ".tmp"
         # flip-tracking masks are plain attributes (not state_dict buffers), so they
         # are saved alongside: otherwise "never flipped since init" silently resets
@@ -2561,7 +2636,7 @@ def main():
                       b1=args.ts_b1, b2=args.ts_b2, gate=args.lr_gate, spend=args.ts_spend,
                       tau_anneal=args.ts_tau_anneal, int8=args.ts_int8, qfmt=args.ts_qfmt, qwhich=args.ts_qwhich,
                       qnoV=args.ts_qnoV, qdiag=False, qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
-                      store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload,
+                      store_m=args.ts_store_m, store_a=args.ts_store_a, offload="async" if args.ts_offload_async else args.ts_offload,
                       diag=False, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
                       sketch=args.ts_sketch, resid=args.ts_resid, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
@@ -2714,7 +2789,7 @@ def main():
                                   qfmt=args.ts_qfmt, qwhich=args.ts_qwhich, qnoV=args.ts_qnoV,
                                   qdiag=bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1),
                                   qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
-                      store_m=args.ts_store_m, store_a=args.ts_store_a, offload=args.ts_offload,
+                      store_m=args.ts_store_m, store_a=args.ts_store_a, offload="async" if args.ts_offload_async else args.ts_offload,
                       diag=bool(args.ts_diag) and step % args.ts_diag == 0, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
                       sketch=args.ts_sketch, resid=args.ts_resid, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
