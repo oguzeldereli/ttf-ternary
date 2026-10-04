@@ -643,18 +643,39 @@ def ts_layer(l, g, state, c):
         S = st.get(("shadow", key))
         S = u.clone() if S is None else S.mul_(1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau).add_(u)
         st[("shadow", key)] = S
-    use_tab = (c.get("table") or 0) > 0 or c.get("exact_spend")
-    if use_tab:   # --ts_table F / --ts_exact_spend: a sparse table of exact corrections on top of the low-rank A
+    lk = 1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau
+    tabmode = ("locate" if (c.get("locate") or 0) > 0 else "table" if (c.get("table") or 0) > 0 else
+               "spendtab" if c.get("spend_table") else "xspend" if c.get("exact_spend") else "")
+    use_tab, rsk = bool(tabmode), int(c.get("rsketch") or 0)
+    if tabmode in ("table", "locate") or rsk:
+        res = u - (u @ V) @ V.T            # this step's evidence that the rank-r basis does not hold (dense)
+    if rsk:   # --ts_rsketch K: a two-sided random sketch of everything the basis has dropped, leaked like A
+        Om, Psi = _rsk_maps(l, rsk, u.device)
+        Y_, W_ = st.get(("rsk", key), (None, None))
+        Y_ = res @ Om if Y_ is None else lk * Y_ + res @ Om
+        W_ = Psi @ res if W_ is None else lk * W_ + Psi @ res
+        if t % int(c.get("rsketch_every") or 50) == 0:   # refresh: best rank-r part of (low rank + sketched residual)
+            U, V, Y_, W_ = _rsk_merge(U, V, Y_, W_, Om, Psi, V.shape[1])
+        st[("rsk", key)] = (Y_, W_)
+    if use_tab:   # --ts_table / --ts_locate / --ts_exact_spend / --ts_spend_table: sparse exact corrections on top of A
         E = torch.zeros(l.N, l.K, device=dev)
         T0 = st.get(("tab", key))
+        if tabmode == "locate":           # count-sketch of the dropped evidence: estimates for entries not in the table
+            CS = st.get(("cs", key))
+            CS = _cs_update(l, c, None if CS is None else CS * lk, res)
+            st[("cs", key)] = CS
+            E = _cs_query(l, c, CS)
+            tmask = torch.zeros(l.N * l.K, dtype=torch.bool, device=dev)
         if T0 is not None:
-            E.view(-1)[T0[0]] = T0[1] * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
-        if (c.get("table") or 0) > 0:     # this step's evidence that the rank-r basis does not hold
-            E += u - (u @ V) @ V.T
+            E.view(-1)[T0[0]] = T0[1] * lk + (res.view(-1)[T0[0]] if tabmode == "locate" else 0)
+            if tabmode == "locate":
+                tmask[T0[0]] = True
+        if tabmode == "table":
+            E += res
     del u
     A = U @ V.T
     if use_tab:
-        A = A + E
+        A = A + (E * tmask.view(l.N, l.K) if tabmode == "locate" else E)   # locate: fire on exact table entries only
     w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
     d = A.sign()
     th = theta
@@ -670,23 +691,36 @@ def ts_layer(l, g, state, c):
     D = torch.where(fire, d, torch.zeros_like(d))
     nf = fire.sum()                           # a device tensor: no host sync per layer
     l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
-    U = U - c["spend"] * th * (D @ V)
-    if use_tab:   # exact spend: the part of the move the basis does not hold goes into the table
-        DV = D @ V
-        Er = c["spend"] * th * (D - DV @ V.T)
-        E -= Er if (c.get("table") or 0) > 0 else Er * (D != 0)
-        if (c.get("table") or 0) > 0:     # keep the F * N * K entries that decide moves: largest |low-rank + table|
-            kk = max(1, int(c["table"] * E.numel()))
+    if tabmode != "spendtab":
+        U = U - c["spend"] * th * (D @ V)
+    if use_tab or rsk:
+        Er = None if tabmode == "spendtab" and not rsk else c["spend"] * th * (D - (D @ V) @ V.T)   # unprojected spend
+    if rsk:
+        Y_, W_ = st[("rsk", key)]
+        st[("rsk", key)] = (Y_ - Er @ Om, W_ - Psi @ Er)
+    if use_tab:
+        if tabmode == "spendtab":         # --ts_spend_table: the whole spend in the table, nothing leaks to unmoved entries
+            E -= c["spend"] * th * D
+        elif tabmode == "xspend":
+            E -= Er * (D != 0)
+        else:
+            E -= Er
+            if tabmode == "locate":
+                st[("cs", key)] = _cs_update(l, c, st[("cs", key)], -Er)
+        if tabmode in ("table", "locate"):   # keep the F * N * K entries that decide moves: largest |low-rank + table|
+            kk = max(1, int((c.get("table") or 0.02) * E.numel()))
             sc_ = (U @ V.T + E).abs().view(-1)
             idx = sc_.topk(kk, sorted=False).indices
-        else:                             # exact spend only: corrections of recent moves until they fade below 0.5
+        else:                                # corrections of recent moves until they fade below 0.5
             ae = E.abs().view(-1)
             idx = (ae >= 0.5).nonzero().squeeze(1)
-            kmax = max(1, int(0.02 * E.numel()))
+            kmax = max(1, int((0.05 if tabmode == "spendtab" else 0.02) * E.numel()))
             if idx.numel() > kmax:
                 idx = idx[ae[idx].topk(kmax, sorted=False).indices]
         st[("tab", key)] = (idx, E.view(-1)[idx].clone())
-        del E, Er, DV
+        del E
+    if use_tab or rsk:
+        del Er
     if shadow_here:
         _ts_shadows_after(l, st, c, key, D, w0, theta, diag, (U + c["spend"] * theta * (D @ V)) @ V.T, t)
     if c.get("shadow"):
@@ -703,6 +737,55 @@ def ts_layer(l, g, state, c):
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
     if before is not None:
         l._record_flips(before, l.wpacked)
+
+
+def _rsk_maps(l, k, dev):
+    """--ts_rsketch: the fixed random maps of a layer's residual sketch (regenerated from a seed: no memory)"""
+    gen = torch.Generator(device=dev).manual_seed(9_000_000 + 2 * getattr(l, "_ts_idx", 0))
+    return (torch.randn(l.K, k, device=dev, generator=gen) / k ** 0.5,
+            torch.randn(2 * k + 1, l.N, device=dev, generator=gen) / (2 * k + 1) ** 0.5)
+
+
+def _rsk_merge(U, V, Y, W, Om, Psi, r):
+    """best rank-r part of U V^T + R, with R reconstructed from its two-sided sketch (Y = R Om, W = Psi R): R ~ Q X,
+    Q = orth(Y), X = (Psi Q)^+ W. Returns the new U, V and the sketches of what was dropped."""
+    Q = _orth(Y)
+    X = torch.linalg.lstsq(Psi @ Q, W).solution                     # k x K
+    Qu, Ru = torch.linalg.qr(torch.cat([U, Q], 1))
+    Qv, Rv = torch.linalg.qr(torch.cat([V, X.T], 1))
+    P, S_, Wh = torch.linalg.svd(Ru @ Rv.T)
+    U2, V2 = Qu @ P[:, :r] * S_[:r], Qv @ Wh[:r].T
+    Dl, Dr = Qu @ P[:, r:] * S_[r:], Qv @ Wh[r:].T                  # the dropped part, Dl Dr^T
+    return U2, V2, Dl @ (Dr.T @ Om), (Psi @ Dl) @ Dr.T
+
+
+def _cs_hash(l, b, j, dev):
+    """--ts_locate: bucket and sign of every entry for count-sketch row j (recomputed: no memory)"""
+    idx = torch.arange(l.N * l.K, device=dev, dtype=torch.int64)
+    a_ = (2654435761, 2246822519, 3266489917)[j]; c_ = (97, 1013904223, 1664525)[j]
+    hv = (idx * a_ + c_) % 2147483647
+    return hv % b, ((hv // b) % 2).float() * 2 - 1
+
+
+def _cs_update(l, c, CS, X):
+    """add the dense matrix X into the count-sketch CS (3 rows of b buckets)"""
+    b = max(1, int(c["locate"] * l.N * l.K))
+    if CS is None:
+        CS = torch.zeros(3, b, device=X.device)
+    for j in range(3):
+        h, sg = _cs_hash(l, b, j, X.device)
+        CS[j].index_add_(0, h, sg * X.reshape(-1))
+    return CS
+
+
+def _cs_query(l, c, CS):
+    """count-sketch estimate of every entry (median of the 3 rows), as an N x K matrix"""
+    b = CS.shape[1]
+    ests = []
+    for j in range(3):
+        h, sg = _cs_hash(l, b, j, CS.device)
+        ests.append(sg * CS[j][h])
+    return torch.stack(ests).median(0).values.view(l.N, l.K)
 
 
 def _rank_sched(spec):
@@ -950,7 +1033,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             qfmt_m="", qfmt_a="", qfmt_aV="", store_m="", store_a="", offload=False, diag=False, shadow=False,
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
             shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125, table=0.0, exact_spend=False, tiles=1,
-            rank_sched=None, progress=0.0):
+            rank_sched=None, progress=0.0, rsketch=0, rsketch_every=50, locate=0.0, spend_table=False):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -968,7 +1051,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              qfmt_m=qfmt_m, qfmt_a=qfmt_a, qfmt_aV=qfmt_aV, store_m=store_m, store_a=store_a, offload=offload,
              diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid, shadows=shadows,
              rescale=rescale, refresh=refresh, refresh_frac=refresh_frac, table=table, exact_spend=exact_spend,
-             tiles=tiles, rank_sched=rank_sched, progress=progress,
+             tiles=tiles, rank_sched=rank_sched, progress=progress, rsketch=rsketch, rsketch_every=rsketch_every,
+             locate=locate, spend_table=spend_table,
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
     if not fused:
@@ -2112,6 +2196,14 @@ def main():
                     "does not hold is kept in a sparse table on the moved entries until it fades below 0.5 (<= 2%% of entries)")
     ap.add_argument("--ts_tiles", type=int, default=1, help="--ts: the accumulator as T x T tiles, each of rank lowrank / T "
                     "(the same memory as one rank-lowrank pair); fp32 state only")
+    ap.add_argument("--ts_rsketch", type=int, default=0, help="--ts: a two-sided random sketch (size K) of everything the "
+                    "accumulator's basis drops; every --ts_rsketch_every steps the basis becomes the best rank-r part of "
+                    "low rank + sketched residual")
+    ap.add_argument("--ts_rsketch_every", type=int, default=50, help="--ts_rsketch: refresh period in steps")
+    ap.add_argument("--ts_locate", type=float, default=0.0, help="--ts: a count-sketch (3 rows of F * N * K buckets) of the "
+                    "dropped evidence chooses the entries of the exact table (size --ts_table, default 0.02)")
+    ap.add_argument("--ts_spend_table", action="store_true", help="--ts: spend moves only in a sparse table on the moved "
+                    "entries (nothing spent in low rank, so no spend leaks into unmoved entries); <= 5%% of entries")
     ap.add_argument("--ts_rank_sched", default="", help="--ts: R0:R1, both ranks move linearly from R0 to R1 over training")
     ap.add_argument("--ts_spend", type=float, default=1.0,
                     help="--ts: a move spends this x theta (1: to the new trit's centre, like master --m_snap; 2: stays at "
@@ -2851,6 +2943,8 @@ def main():
                       diag=False, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
                       sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale, table=args.ts_table,
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
+                      rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
+                      spend_table=args.ts_spend_table,
                       progress=0.0,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
@@ -3008,6 +3102,8 @@ def main():
                       diag=bool(args.ts_diag) and step % args.ts_diag == 0, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
                       sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale, table=args.ts_table,
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
+                      rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
+                      spend_table=args.ts_spend_table,
                       progress=step / max(1, tc.max_steps),
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
