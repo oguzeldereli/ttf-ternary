@@ -711,13 +711,19 @@ def ts_layer(l, g, state, c):
             kk = max(1, int((c.get("table") or 0.02) * E.numel()))
             sc_ = (U @ V.T + E).abs().view(-1)
             idx = sc_.topk(kk, sorted=False).indices
+            if tabmode == "locate":          # the sketch only chooses: a new entry starts from this step's exact value
+                new_ = ~tmask[idx]
+                vals = E.view(-1)[idx].clone()
+                vals[new_] = (res - Er).view(-1)[idx][new_]
+                st[("tab", key)] = (idx, vals)
         else:                                # corrections of recent moves until they fade below 0.5
             ae = E.abs().view(-1)
             idx = (ae >= 0.5).nonzero().squeeze(1)
             kmax = max(1, int((0.05 if tabmode == "spendtab" else 0.02) * E.numel()))
             if idx.numel() > kmax:
                 idx = idx[ae[idx].topk(kmax, sorted=False).indices]
-        st[("tab", key)] = (idx, E.view(-1)[idx].clone())
+        if tabmode != "locate":
+            st[("tab", key)] = (idx, E.view(-1)[idx].clone())
         del E
     if use_tab or rsk:
         del Er
@@ -2201,7 +2207,8 @@ def main():
                     "low rank + sketched residual")
     ap.add_argument("--ts_rsketch_every", type=int, default=50, help="--ts_rsketch: refresh period in steps")
     ap.add_argument("--ts_locate", type=float, default=0.0, help="--ts: a count-sketch (3 rows of F * N * K buckets) of the "
-                    "dropped evidence chooses the entries of the exact table (size --ts_table, default 0.02)")
+                    "dropped evidence chooses the entries of the exact table (size --ts_table, default 0.02); a new entry "
+                    "starts from that step's exact value and moves fire only on exact values")
     ap.add_argument("--ts_spend_table", action="store_true", help="--ts: spend moves only in a sparse table on the moved "
                     "entries (nothing spent in low rank, so no spend leaks into unmoved entries); <= 5%% of entries")
     ap.add_argument("--ts_rank_sched", default="", help="--ts: R0:R1, both ranks move linearly from R0 to R1 over training")
