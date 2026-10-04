@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Lab PC: --ts_offload_async against --ts_offload (copies on the compute stream) and the state on the GPU.
-#   offload_async_test.sh eq     110M, 40 steps each: the loss lines must be identical (same seed; the copies only move)
+#   offload_async_test.sh eq     110M, 40 steps each, the GPU run twice: the loss differences between the variants must be
+#                                no larger than between two identical GPU runs (the kernels are not bitwise deterministic)
 #   offload_async_test.sh time   1.3B micro-batch 1 x 2048 (the lean_mem.sh setting), 30 steps each: s/step and peak
 # Summary ~/ternary-sync/offload_async_MODE.txt
 S=/tmp/$USER/tern; source $S/env.sh || exit 1; cd $S/repo || exit 1
@@ -12,12 +13,18 @@ B="--mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_
    --ts_anneal 0.5 --ts_fused --ts_store_m int8 --ts_store_a fp16 --lean_tail --mem_report --lowrank 512 --ts_rank_s 512"
 echo "$(date '+%F %T') start on $(hostname) $(nvidia-smi --query-gpu=name,memory.used --format=csv,noheader)" > $R
 if [ $M = eq ]; then P="--preset small --batch_size 2 --stop_after 41"; else P="--preset d2048_l24 --batch_size 1 --stop_after 31"; fi
-for v in gpu sync async; do
-  case $v in gpu) F="";; sync) F="--ts_offload";; async) F="--ts_offload_async";; esac
+for v in gpu gpu2 sync async; do
+  case $v in gpu|gpu2) F="";; sync) F="--ts_offload";; async) F="--ts_offload_async";; esac
   rm -rf $O/${M}_$v
   TERN_TIME=1 python -m bitnet.train $(echo $B $P) $F --out_dir $O/${M}_$v > $O/${M}_$v.log 2>&1
   grep -E '^step ' $O/${M}_$v.log | sed -E 's/\| +[0-9.]+s \|.*//' > $O/${M}_$v.loss
-  echo "$v: $(grep 'memory (MiB)' $O/${M}_$v.log | tail -1 | sed 's/  memory (MiB): //') | $(grep -E '^step ' $O/${M}_$v.log | awk -F'|' '{gsub(/[ s]/,"",$6); n=$1; sub(/step */,"",n); if (n+0==10) {a=$6; s0=n} b=$6; s1=n} END {printf "%.2f s/step (10-%d)", (b-a)/(s1-s0), s1}') | last $(tail -1 $O/${M}_$v.loss) $(grep -m1 -E 'Error|out of memory' $O/${M}_$v.log | cut -c1-120)" >> $R
+  echo "$v: $(grep 'memory (MiB)' $O/${M}_$v.log | tail -1 | sed 's/  memory (MiB): //') | $(grep -E '^step ' $O/${M}_$v.log | awk -F'|' '{for (i=2;i<=NF;i++) if ($i ~ /^ *[0-9.]+s *$/) {t=$i; gsub(/[ s]/,"",t)}; n=$1; sub(/step */,"",n); if (n+0==10) {a=t; s0=n} b=t; s1=n} END {printf "%.2f s/step (10-%d)", (b-a)/(s1-s0), s1}') | last $(tail -1 $O/${M}_$v.loss) $(grep -m1 -E 'Error|out of memory' $O/${M}_$v.log | cut -c1-120)" >> $R
 done
-echo "sync vs async loss lines: $(cmp -s $O/${M}_sync.loss $O/${M}_async.loss && echo IDENTICAL || echo DIFFER) ($(wc -l < $O/${M}_async.loss) lines); gpu vs sync: $(cmp -s $O/${M}_gpu.loss $O/${M}_sync.loss && echo IDENTICAL || echo DIFFER)" >> $R
+python - $O/${M}_gpu $O/${M}_gpu2 $O/${M}_sync $O/${M}_async >> $R <<'PY'
+import json, sys
+L = {d.rsplit("_", 1)[1]: [json.loads(l)["loss"] for l in open(d + "/metrics.jsonl") if '"loss"' in l] for d in sys.argv[1:]}
+for a, b in [("gpu", "gpu2"), ("gpu", "sync"), ("gpu", "async"), ("sync", "async")]:
+    n = min(len(L[a]), len(L[b])); d = [abs(x - y) for x, y in zip(L[a][:n], L[b][:n])]
+    print(f"{a} vs {b}: max |loss diff| {max(d):.2e} over {n} logged steps (first nonzero at {next((i for i, x in enumerate(d) if x), -1)})")
+PY
 echo "$(date '+%F %T') done" >> $R
