@@ -541,6 +541,11 @@ def ts_layer(l, g, state, c):
         return ts_layer_shared(l, g, state, c)
     r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
     r = getattr(l, "_ts_rank", 0) or r                                                  # --ts_rank_kv: per-layer rank
+    rk_sched = None
+    if c.get("rank_sched"):   # --ts_rank_sched R0:R1: both ranks move linearly from R0 to R1 over training (multiples of 8)
+        r0_, r1_ = c["rank_sched"]
+        rk_sched = max(8, int(round((r0_ + (r1_ - r0_) * min(max(c.get("progress", 0.0), 0.0), 1.0)) / 8)) * 8)
+        r = rk_sched
     diag = c.get("diag", False)                                                        # --ts_diag: this step measures
     ident = lambda X: X
     qf = _qfmt(c.get("qfmt") or ("int8" if c.get("int8") else ""))
@@ -562,7 +567,7 @@ def ts_layer(l, g, state, c):
     _host_put(st, ("v", key), (R, C), off)
     v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
     del g2
-    rs = min(getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
+    rs = min(rk_sched or getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
     if ("m", key) not in st:
         gen = torch.Generator(device=g.device).manual_seed(4_000_000 + 2 * getattr(l, "_ts_idx", 0))
         Vm = _orth(g.T @ torch.randn(l.N, rs, device=g.device, generator=gen))
@@ -575,6 +580,8 @@ def ts_layer(l, g, state, c):
         if diag:      # share of the momentum's energy the projection drops (Um_new = Md Vn, Vn orthonormal)
             x_ = 1 - (Um.norm() ** 2 / Md.norm().clamp_min(1e-30) ** 2).item(); del Md
             _ts_rec(st, "m_drop", x_); _ts_rec(st, "m_drop_" + _TS_TYPES[getattr(l, "_ts_idx", 0) % 7], x_)
+        if Vm.shape[1] != rs:     # --ts_rank_sched: grow / shrink the momentum to this step's rank
+            Um, Vm = _resize_lowrank(Um, Vm, rs, g, 1 - b1, 7_000_000 + 2 * getattr(l, "_ts_idx", 0) + t)
     if c.get("qdiag"): _qdiag(st, key, "m", Um, Vm, t)
     _host_put(st, ("m", key), _store_pair(sm, Um, Vm) if sm else (qm(Um), qVm(Vm)), off)  # --ts_qfmt sim., --ts_store_m real
     u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
@@ -583,6 +590,8 @@ def ts_layer(l, g, state, c):
         _ts_shadows_step(l, g, v, st, c, t, lr_ratio, key)
     del v
     ra = min(r, l.N, l.K)
+    if c.get("tiles", 1) > 1:     # --ts_tiles T: the accumulator as T x T tiles, each of rank ra / T (same memory)
+        return _ts_tiled_rest(l, u, state, st, c, key, ra)
     if key not in state:
         gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
         V = _orth(u.T @ torch.randn(l.N, ra, device=g.device, generator=gen))
@@ -622,6 +631,8 @@ def ts_layer(l, g, state, c):
             V[:, idx] = Q_; U[:, idx] = u @ Q_
             del Q_
         del uVn
+        if V.shape[1] != ra:      # --ts_rank_sched: grow / shrink the accumulator to this step's rank
+            U, V = _resize_lowrank(U, V, ra, u, 1.0, 8_000_000 + 2 * getattr(l, "_ts_idx", 0) + t)
         if c.get("resid"):
             st[("resid", key)] = Afull - U @ V.T; del Afull
         if diag:      # evidence dropped by the projection (U_new = Ad Vn) and share of this step's u that is kept
@@ -632,8 +643,18 @@ def ts_layer(l, g, state, c):
         S = st.get(("shadow", key))
         S = u.clone() if S is None else S.mul_(1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau).add_(u)
         st[("shadow", key)] = S
+    use_tab = (c.get("table") or 0) > 0 or c.get("exact_spend")
+    if use_tab:   # --ts_table F / --ts_exact_spend: a sparse table of exact corrections on top of the low-rank A
+        E = torch.zeros(l.N, l.K, device=dev)
+        T0 = st.get(("tab", key))
+        if T0 is not None:
+            E.view(-1)[T0[0]] = T0[1] * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
+        if (c.get("table") or 0) > 0:     # this step's evidence that the rank-r basis does not hold
+            E += u - (u @ V) @ V.T
     del u
     A = U @ V.T
+    if use_tab:
+        A = A + E
     w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
     d = A.sign()
     th = theta
@@ -650,6 +671,22 @@ def ts_layer(l, g, state, c):
     nf = fire.sum()                           # a device tensor: no host sync per layer
     l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
     U = U - c["spend"] * th * (D @ V)
+    if use_tab:   # exact spend: the part of the move the basis does not hold goes into the table
+        DV = D @ V
+        Er = c["spend"] * th * (D - DV @ V.T)
+        E -= Er if (c.get("table") or 0) > 0 else Er * (D != 0)
+        if (c.get("table") or 0) > 0:     # keep the F * N * K entries that decide moves: largest |low-rank + table|
+            kk = max(1, int(c["table"] * E.numel()))
+            sc_ = (U @ V.T + E).abs().view(-1)
+            idx = sc_.topk(kk, sorted=False).indices
+        else:                             # exact spend only: corrections of recent moves until they fade below 0.5
+            ae = E.abs().view(-1)
+            idx = (ae >= 0.5).nonzero().squeeze(1)
+            kmax = max(1, int(0.02 * E.numel()))
+            if idx.numel() > kmax:
+                idx = idx[ae[idx].topk(kmax, sorted=False).indices]
+        st[("tab", key)] = (idx, E.view(-1)[idx].clone())
+        del E, Er, DV
     if shadow_here:
         _ts_shadows_after(l, st, c, key, D, w0, theta, diag, (U + c["spend"] * theta * (D @ V)) @ V.T, t)
     if c.get("shadow"):
@@ -663,6 +700,73 @@ def ts_layer(l, g, state, c):
         S.sub_(c["spend"] * theta * D)
     if c.get("qdiag"): _qdiag(st, key, "a", U, V, t)
     _host_put(state, key, _store_pair(sa, U, V) if sa else (qa(U), qV(V)), off)
+    st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
+    if before is not None:
+        l._record_flips(before, l.wpacked)
+
+
+def _rank_sched(spec):
+    """--ts_rank_sched "R0:R1" -> (R0, R1), or None"""
+    if not spec:
+        return None
+    a_, b_ = spec.split(":")
+    return (int(a_), int(b_))
+
+
+def _resize_lowrank(U, V, r_new, X, coef, seed):
+    """--ts_rank_sched: a low-rank pair U V^T resized to rank r_new. Shrink: the best rank-r_new part of U V^T (SVD of
+    the N x r factor U, since V is orthonormal). Grow: the top directions of X (this step's gradient or step) outside
+    span(V), found by a randomized range finder with one power iteration, with coefficients coef * X Q."""
+    r_old = V.shape[1]
+    if r_new == r_old:
+        return U, V
+    if r_new < r_old:
+        P, S_, Vh = torch.linalg.svd(U, full_matrices=False)
+        return P[:, :r_new] * S_[:r_new], V @ Vh[:r_new].T
+    k = r_new - r_old
+    gen = torch.Generator(device=X.device).manual_seed(seed)
+    Om = torch.randn(X.shape[0], k, device=X.device, generator=gen)
+    XV = X @ V
+    Y = X.T @ Om - V @ (XV.T @ Om)
+    Z = X @ Y - XV @ (V.T @ Y)
+    Y = X.T @ Z - V @ (XV.T @ Z)
+    Q = _orth(Y - V @ (V.T @ Y))
+    return torch.cat([U, coef * (X @ Q)], 1), torch.cat([V, Q], 1)
+
+
+def _ts_tiled_rest(l, u, state, st, c, key, ra):
+    """--ts_tiles T: the accumulator split into T x T tiles of (N / T) x (K / T), each with its own rank ra // T basis
+    (T * (ra // T) * (N + K) numbers: the memory of one rank-ra pair), updated by batched subspace iteration; firing
+    and spend as in ts_layer. Momentum and v stay global."""
+    from .kernel import unpack_rows, pack_rows
+    T_ = c["tiles"]; n_, k_ = l.N // T_, l.K // T_; rt = max(1, ra // T_)
+    assert n_ * T_ == l.N and k_ * T_ == l.K, "--ts_tiles: N and K must divide by T"
+    theta, tau, lr_ratio = c["theta"], c["tau"], c["lr_ratio"]
+    til = lambda X: X.reshape(T_, n_, T_, k_).permute(0, 2, 1, 3).reshape(T_ * T_, n_, k_)
+    until = lambda X: X.reshape(T_, T_, n_, k_).permute(0, 2, 1, 3).reshape(l.N, l.K)
+    ub = til(u)
+    if key not in state:
+        gen = torch.Generator(device=u.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
+        Om = torch.randn(T_ * T_, n_, rt, device=u.device, generator=gen)
+        V = torch.linalg.qr(ub.transpose(1, 2) @ Om)[0]
+        U = ub @ V
+    else:
+        U, V = state[key]
+        U = U * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
+        Vn = torch.linalg.qr(V @ (U.transpose(1, 2) @ U) + ub.transpose(1, 2) @ U)[0]
+        U = U @ (V.transpose(1, 2) @ Vn) + ub @ Vn; V = Vn
+    del ub, u
+    A = until(U @ V.transpose(1, 2))
+    w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
+    d = A.sign()
+    fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
+    del A
+    before = l.wpacked.clone() if l.track else None
+    D = torch.where(fire, d, torch.zeros_like(d))
+    nf = fire.sum()
+    l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
+    U = U - c["spend"] * theta * (til(D) @ V)
+    state[key] = (U, V)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
     if before is not None:
         l._record_flips(before, l.wpacked)
@@ -845,7 +949,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             tau_anneal=False, int8=False, fused=False, qfmt="", qwhich="all", qnoV=False, qdiag=False,
             qfmt_m="", qfmt_a="", qfmt_aV="", store_m="", store_a="", offload=False, diag=False, shadow=False,
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
-            shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125):
+            shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125, table=0.0, exact_spend=False, tiles=1,
+            rank_sched=None, progress=0.0):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -862,7 +967,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              tau_anneal=tau_anneal, int8=int8, qfmt=qfmt, qwhich=qwhich, qnoV=qnoV, qdiag=qdiag,
              qfmt_m=qfmt_m, qfmt_a=qfmt_a, qfmt_aV=qfmt_aV, store_m=store_m, store_a=store_a, offload=offload,
              diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid, shadows=shadows,
-             rescale=rescale, refresh=refresh, refresh_frac=refresh_frac,
+             rescale=rescale, refresh=refresh, refresh_frac=refresh_frac, table=table, exact_spend=exact_spend,
+             tiles=tiles, rank_sched=rank_sched, progress=progress,
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
     if not fused:
@@ -1999,6 +2105,14 @@ def main():
     ap.add_argument("--ts_refresh", type=int, default=0, help="--ts: every R steps replace the weakest columns of the "
                     "accumulator's basis by the top directions of the step's evidence outside the basis")
     ap.add_argument("--ts_refresh_frac", type=float, default=0.125, help="--ts_refresh: share of the columns replaced")
+    ap.add_argument("--ts_table", type=float, default=0.0, help="--ts: a sparse table of F * N * K exact entries on top of "
+                    "the low-rank accumulator: each step's evidence outside the basis and the unprojected part of every "
+                    "spend, kept where |low-rank + table| is largest (memory ~6 F bytes per weight)")
+    ap.add_argument("--ts_exact_spend", action="store_true", help="--ts: the part of each move's spend that the basis "
+                    "does not hold is kept in a sparse table on the moved entries until it fades below 0.5 (<= 2%% of entries)")
+    ap.add_argument("--ts_tiles", type=int, default=1, help="--ts: the accumulator as T x T tiles, each of rank lowrank / T "
+                    "(the same memory as one rank-lowrank pair); fp32 state only")
+    ap.add_argument("--ts_rank_sched", default="", help="--ts: R0:R1, both ranks move linearly from R0 to R1 over training")
     ap.add_argument("--ts_spend", type=float, default=1.0,
                     help="--ts: a move spends this x theta (1: to the new trit's centre, like master --m_snap; 2: stays at "
                          "the boundary it crossed, like master)")
@@ -2735,7 +2849,9 @@ def main():
                       qnoV=args.ts_qnoV, qdiag=False, qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
                       store_m=args.ts_store_m, store_a=args.ts_store_a, offload="async" if args.ts_offload_async else args.ts_offload,
                       diag=False, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
-                      sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale,
+                      sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale, table=args.ts_table,
+                      exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
+                      progress=0.0,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
                       shadow_layers=TS_SHADOWS[1])
@@ -2787,6 +2903,7 @@ def main():
         lr = lr_at(step, tc)
         if ts_cfg is not None:
             ts_cfg["lr_ratio"] = (lr / tc.lr) ** args.ts_anneal
+            ts_cfg["progress"] = step / max(1, tc.max_steps)
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
         rate_now = args.rate
@@ -2889,7 +3006,9 @@ def main():
                                   qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
                       store_m=args.ts_store_m, store_a=args.ts_store_a, offload="async" if args.ts_offload_async else args.ts_offload,
                       diag=bool(args.ts_diag) and step % args.ts_diag == 0, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
-                      sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale,
+                      sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale, table=args.ts_table,
+                      exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
+                      progress=step / max(1, tc.max_steps),
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
                       shadow_layers=TS_SHADOWS[1])
