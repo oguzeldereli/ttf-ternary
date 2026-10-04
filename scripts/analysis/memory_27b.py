@@ -41,10 +41,11 @@ lean_tail = TAIL_P * 5 / GiB          # bf16 / fp16 values + 16-bit gradients + 
 rows_ = dict(zip("q k v o gate up down".split(), mats))
 
 
-def state_gib(r, r_s, bm=1, ba=2, rs_type=None):
-    """momentum (rank r_s, or per type) bm bytes / entry, accumulator rank r with U and V at ba bytes, factored v fp32"""
+def state_gib(r, r_s, bm=1, ba=2, rs_type=None, bv=None):
+    """momentum (rank r_s, or per type) bm bytes / entry, accumulator rank r with U at ba and V at bv (default ba) bytes,
+    factored v fp32"""
     mom = sum(L * (n + k) * (rs_type[t] if rs_type else r_s) for t, (n, k) in rows_.items()) * bm
-    return (mom + (Nsum + Ksum) * r * ba + nk * 4) / GiB
+    return (mom + (Nsum * ba + Ksum * (ba if bv is None else bv)) * r + nk * 4) / GiB
 
 
 host_base = M_HOST - state_gib(256, 256)  # host RSS besides the state (libraries, CUDA context, pinned staging)
@@ -53,18 +54,19 @@ print(f"\nbudget (16 GB card, micro-batch 1 x 2048, state on the host): packed {
 print("| ranks (acc / momentum) | state format | evidence for quality | state GiB | GPU peak GiB (fp32 / lean tail) | host GiB |")
 print("|---|---|---|---|---|---|")
 half = lambda r: dict(q=r // 4, k=r // 4, v=r // 4, o=r // 4, gate=3 * r // 4, up=3 * r // 4, down=3 * r // 4)
-for r, r_s, bm, ba, rst, fmt, ev in [
+for r, r_s, bm, ba, rst, fmt, ev, *bv in [
         (256, 256, 1, 2, None, "int8 / fp16", "measured run (b27 smoke); quality: +0.075 at 110M vs 512"),
         (512, 512, 1, 2, None, "int8 / fp16", "free at 110M (2 seeds)"),
-        (512, 0, 1, 2, half(512), "int8 / fp16, momentum by type", "pending (`ts512an05_mtype_s0`)"),
-        (512, 256, 1, 2, None, "int8 / fp16, momentum 256", "pending (`ts512an05_m256_s0`)"),
-        (512, 512, 0.5, 2, None, "int4 / fp16", "pending (`qm4a16_s0`)"),
-        (512, 512, 1, 1.5, None, "int8 / 12-bit", "pending (precision ladder)"),
+        (512, 0, 1, 2, half(512), "int8 / fp16, momentum by type", "**costs** +0.04 (110M, to 4750)"),
+        (512, 256, 1, 2, None, "int8 / fp16, momentum 256", "**costs** +0.034 (110M, at 2250)"),
+        (512, 512, 0.5, 2, None, "int4 / fp16", "**fails** (+0.50 at 1000)"),
+        (512, 512, 1, 2, None, "int8 / fp16, accumulator V int8", "costs +0.011 (110M final)", 1),
+        (512, 512, 1, 1.5, None, "int8 / 12-bit", "5 mantissa bits free to 6750 (+0.0002); 12-bit packing not built"),
         (1024, 1024, 1, 2, None, "int8 / fp16", "110M full rank 2.6746 (other leak) vs 512 2.7067; 1.3B untested"),
-        (1024, 1024, 1, 1.5, None, "int8 / 12-bit", "pending (precision ladder)"),
-        (1024, 512, 1, 1.5, None, "int8 / 12-bit, momentum 512", "pending"),
+        (1024, 1024, 1, 1.5, None, "int8 / 12-bit", "as above"),
+        (1024, 512, 1, 1.5, None, "int8 / 12-bit, momentum 512", "momentum below the accumulator rank costs at 110M"),
 ]:
-    st = state_gib(r, r_s, bm, ba, rst)
+    st = state_gib(r, r_s, bm, ba, rst, bv[0] if bv else None)
     cp = 2 * st / L                                    # two layers' state copied in at a time
     gpu = packed / GiB + transient + cp - 2 * state_gib(256, 256) / L
     print(f"| {r} / {'by type' if rst else r_s} | {fmt} | {ev} | {st:.2f} | {gpu + fp32_tail:.1f} / {gpu + lean_tail:.1f} |"
