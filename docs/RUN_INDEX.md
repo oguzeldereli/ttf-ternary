@@ -35,7 +35,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts512an05_spend0_s0` (lamprey, 3 Oct) | TTF without spending after a move (`--ts_spend 0`) | 2.7748 (+0.068 vs spend theta 2.7067) |
 | `ts512an05_kv128_s0` / `ts512an05_sharedV_s0` | k / v at rank 128 / shared basis | +0.023 / +0.047 (fixed windows); k, v / down stop moving |
 | `ts{128,64}an05_*` fixes | sketch / residual / theta 8 / theta 11 / lr 3e-3 / ranks by input width | +0.17 / -0.03 / +0.14 / +0.05 / -0.02 / 0.00 vs the same-rank baseline (2.8837 / 2.9928) |
-| `fwc_*` (running) | ranks 512 / 128 / 64 at 1x / 2x / 4x compute, FineWeb-Edu | capacity or direction? |
+| `fwc_*` | ranks 512 / 128 / 64 at 1x / 2x / 4x compute, FineWeb-Edu | ranks 512 1x 3.2265; ranks 128 3.4156 / 3.2747 / **3.1793**; ranks 64 3.5391 / 3.4105 / 3.3090: ranks 128 matches ranks 512 at ~2.8x compute, ranks 64 ~8x |
 | `w{110m,340m,1b,10b,15b}_r{64,256,512}` (15B running) | width sweep, batch 2, 1000 steps, shadows | top-64 energy share 0.57 / 0.54 / 0.53 / 0.58 at width 768 / 1024 / 2048 / 5120 (flat); 10B ranks 64 / 256 at 1000: 5.4370 / 5.4984; at batch 16 ranks 512 captures 0.96 / 0.91 / 0.77 of the energy at 110M / 340M / 1.3B |
 | `lean_mem.sh`, `b27_smoke.sh` | measured memory | 110M 0.38-0.63 GiB, 340M 0.68-1.35, 1.3B 1.61-2.97, 10B 12.3, 15B 17.0, 26.5B 14.1 (ranks 256) |
 
