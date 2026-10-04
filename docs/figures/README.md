@@ -39,3 +39,10 @@ noted. Validation loss is in nats per token; perplexity = e^loss. Formulas behin
 Deleted on 30 Sep (one-off views, superseded by `best_runs.png` and `night_runs.png`): `today_runs.png`,
 `sharp_run.png`, `undo_run.png` (their scripts are in `scripts/plots/legacy/`). Deleted on 27 Sep: the stateless-flip
 phase figures, `live.png`, `s20.png`.
+- `oct4_width.png` (`scripts/plots/plot_oct4.py`): width sweep at batch 2 (110M to ~15B, 1000 steps): loss of ranks 64 /
+  512 minus ranks 256; energy of the full-rank accumulator in its top 64 / 512 directions (batch 2, and batch 16 from the
+  shadow runs at 110M / 340M / 1.3B); cosine of rank-r accumulators with full rank.
+- `oct4_capacity.png`: 110M on FineWeb-Edu, ranks 512 / 128 / 64 at 1x / 2x / 4x compute; compute multiple of the 1x runs.
+- `oct4_memory.png`: measured GPU peak and host memory of 26.5B / 15B on one 16 GB card (3 Oct vs 4 Oct); host memory of
+  26.5B by rank with torch's pinned allocator vs exact allocation (and a 12-bit accumulator); loss cost of the
+  accumulator's mantissa bits along training.
