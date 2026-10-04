@@ -139,7 +139,7 @@ def memory_fig():
     # (a) measured on one RTX 4070 Ti Super 16 GB, micro-batch 1 x 2048 (RUNS.md 3 Oct 07:20, 4 Oct 06:40 / 07:40):
     # torch peak GiB, host max RSS GiB
     meas = [("26.5B r256\n3 Oct", 14.10, 13.7), ("26.5B r256\n4 Oct", 11.08, 11795760 / 2**20),
-            ("26.5B r512\n4 Oct", 11.12, 17843912 / 2**20), ("15B r64\n4 Oct", 9.40, 6102528 / 2**20), ("15B r256\n4 Oct", 9.45, 7992312 / 2**20)]
+            ("26.5B r512\n4 Oct", 11.12, 17843912 / 2**20), ("26.5B r1024\n12-bit acc.", 11.61, 23.7), ("15B r64\n4 Oct", 9.40, 6102528 / 2**20), ("15B r256\n4 Oct", 9.45, 7992312 / 2**20)]
     x = np.arange(len(meas))
     ax[0].bar(x - 0.2, [m[1] for m in meas], 0.4, color="tab:blue", label="GPU peak (torch)")
     ax[0].bar(x + 0.2, [m[2] or 0 for m in meas], 0.4, color="tab:orange", label="host RSS")
@@ -155,6 +155,7 @@ def memory_fig():
     ax[1].plot(rk, [M["state_gib"](r, r, 1, 1.5) + M["host_base"] for r in rk], "o--", color="tab:green", label="exact, 12-bit accumulator")
     ax[1].plot([256, 512], [11795760 / 2**20, 17843912 / 2**20], "k*", ms=10, label="measured (exact)")
     ax[1].plot([256], [13.7], "rx", ms=9, label="measured 3 Oct (torch pinned)")
+    ax[1].plot([512, 1024], [15.4, 23.7], "k^", ms=8, mfc="white", label="measured, 12-bit accumulator")
     ax[1].axhline(30 / 1.074, color="k", lw=0.8, ls="--"); ax[1].text(260, 28.3, "30 GB host", fontsize=8)
     ax[1].set_xscale("log", base=2); ax[1].set_xticks(rk); ax[1].set_xticklabels(rk)
     ax[1].set_xlabel("ranks"); ax[1].set_ylabel("host GiB"); ax[1].set_title("26.5B: host memory by rank"); ax[1].legend(fontsize=7)
