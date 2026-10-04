@@ -539,6 +539,8 @@ def ts_layer(l, g, state, c):
     from .kernel import unpack_rows, pack_rows
     if c.get("shared_v"):
         return ts_layer_shared(l, g, state, c)
+    if c.get("global") or c.get("global_"):
+        return _ts_global_layer(l, g, state, c)
     r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
     r = getattr(l, "_ts_rank", 0) or r                                                  # --ts_rank_kv: per-layer rank
     rk_sched = None
@@ -794,6 +796,95 @@ def _cs_query(l, c, CS):
     return torch.stack(ests).median(0).values.view(l.N, l.K)
 
 
+_GLOBAL_OUT_SIDE = (3, 6)   # o and down write to the residual stream (output side); q k v gate up read it (input side)
+
+
+@torch.no_grad()
+def _ts_global_layer(l, g, state, c):
+    """--ts_global: ONE accumulator and ONE short momentum for the whole model. Every ternary matrix touches the residual
+    stream on one side (q k v gate up read it, o down write it), so all of them are stacked along that side into one tall
+    matrix whose rank-r state is U_all V^T with V (d x r) shared by every layer and U_l (rows x r) per matrix (the
+    momentum likewise, rank_s). Each layer updates its own coefficients against the bases of the previous step and adds
+    its share of the subspace-iteration product to X (d x r); _ts_global_finish turns X into the new bases once per step
+    and rotates every layer's coefficients into them (one-step lag). v stays factored per layer; firing and spend as
+    ts_layer. State: r (sum of rows + d) numbers instead of r (N + K) per matrix."""
+    from .kernel import unpack_rows, pack_rows
+    r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
+    rs = c["rank_s"]
+    st = state.setdefault("_ts", {})
+    key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
+    out_side = getattr(l, "_ts_idx", 0) % 7 in _GLOBAL_OUT_SIDE
+    d = l.N if out_side else l.K
+    gl = st.setdefault("_glob", {})
+    if "V" not in gl:          # random orthonormal bases of the residual space to start
+        gen = torch.Generator(device=g.device).manual_seed(4_100_000)
+        gl["Vm"] = torch.linalg.qr(torch.randn(d, rs, device=g.device, generator=gen))[0]
+        gl["V"] = torch.linalg.qr(torch.randn(d, r, device=g.device, generator=gen))[0]
+        gl["Xm"] = torch.zeros(d, rs, device=g.device); gl["Xa"] = torch.zeros(d, r, device=g.device)
+    Vm, V = gl["Vm"], gl["V"]
+    assert Vm.shape[0] == d, "--ts_global: every matrix must touch the residual stream (width d) on one side"
+    g2 = g * g
+    if ("v", key) in st:
+        R, C = st[("v", key)]; R = b2 * R + (1 - b2) * g2.mean(1); C = b2 * C + (1 - b2) * g2.mean(0)
+    else:
+        R, C = (1 - b2) * g2.mean(1), (1 - b2) * g2.mean(0)
+    st[("v", key)] = (R, C)
+    v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
+    del g2
+    G = g.T if out_side else g                     # rows x d
+    vv = v.T if out_side else v
+    Um = st.get(("gm", key))
+    if Um is None:
+        Um = torch.zeros(G.shape[0], rs, device=g.device)
+    gl["Xm"] += b1 * Vm @ (Um.T @ Um) + (1 - b1) * G.T @ Um      # this matrix's part of M'^T U_m
+    Um = b1 * Um + (1 - b1) * G @ Vm
+    st[("gm", key)] = Um
+    u = -(Um @ Vm.T) / (1 - b1 ** t) / (vv.sqrt() + 1e-8) * lr_ratio
+    del v, vv
+    U = st.get(("gU", key))
+    if U is None:
+        U = torch.zeros(G.shape[0], r, device=g.device)
+    U = U * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
+    gl["Xa"] += V @ (U.T @ U) + u.T @ U
+    U = U + u @ V
+    del u
+    S = U @ V.T
+    A = S.T if out_side else S                     # N x K
+    del S
+    w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
+    dsg = A.sign()
+    fire = (A.abs() >= theta) & ((w0.float() + dsg).abs() <= 1)
+    del A
+    before = l.wpacked.clone() if l.track else None
+    D = torch.where(fire, dsg, torch.zeros_like(dsg))
+    nf = fire.sum()
+    l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
+    U = U - c["spend"] * theta * ((D.T if out_side else D) @ V)
+    st[("gU", key)] = U
+    st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
+    if before is not None:
+        l._record_flips(before, l.wpacked)
+
+
+@torch.no_grad()
+def _ts_global_finish(state):
+    """--ts_global, once per step after every layer: new shared bases from the accumulated products, every layer's
+    coefficients rotated into them"""
+    st = state.get("_ts", {})
+    gl = st.get("_glob")
+    if not gl or not gl["Xa"].abs().sum():
+        return
+    for X_, B_, pref in (("Xm", "Vm", "gm"), ("Xa", "V", "gU")):
+        if not gl[X_].abs().sum():
+            continue
+        Vn = _orth(gl[X_])
+        Rot = gl[B_].T @ Vn
+        for k_ in [k for k in st if isinstance(k, tuple) and k[0] == pref]:
+            st[k_] = st[k_] @ Rot
+        gl[B_] = Vn
+        gl[X_].zero_()
+
+
 def _rank_sched(spec):
     """--ts_rank_sched "R0:R1" -> (R0, R1), or None"""
     if not spec:
@@ -1039,7 +1130,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             qfmt_m="", qfmt_a="", qfmt_aV="", store_m="", store_a="", offload=False, diag=False, shadow=False,
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
             shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125, table=0.0, exact_spend=False, tiles=1,
-            rank_sched=None, progress=0.0, rsketch=0, rsketch_every=50, locate=0.0, spend_table=False):
+            rank_sched=None, progress=0.0, rsketch=0, rsketch_every=50, locate=0.0, spend_table=False,
+            global_=False):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -1058,7 +1150,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid, shadows=shadows,
              rescale=rescale, refresh=refresh, refresh_frac=refresh_frac, table=table, exact_spend=exact_spend,
              tiles=tiles, rank_sched=rank_sched, progress=progress, rsketch=rsketch, rsketch_every=rsketch_every,
-             locate=locate, spend_table=spend_table,
+             locate=locate, spend_table=spend_table, **{"global": global_},
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
     if not fused:
@@ -1067,6 +1159,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             g = l.gw.float(); l.gw = None; l.capture = False
             ts_layer(l, g, state, c)
             del g
+    if c.get("global"):
+        _ts_global_finish(state)
     nf, nt = st.pop("_nf", 0), st.pop("_nt", 0)
     info = {"ts_frac": float(nf) / max(nt, 1)}
     for k_, (tot, n_) in st.pop("_dg", {}).items():      # --ts_diag: means over layers this step
@@ -2211,6 +2305,9 @@ def main():
                     "starts from that step's exact value and moves fire only on exact values")
     ap.add_argument("--ts_spend_table", action="store_true", help="--ts: spend moves only in a sparse table on the moved "
                     "entries (nothing spent in low rank, so no spend leaks into unmoved entries); <= 5%% of entries")
+    ap.add_argument("--ts_global", action="store_true", help="--ts: one accumulator and one short momentum for the whole "
+                    "model: all matrices stacked along their residual-stream side share one basis (ranks --lowrank / "
+                    "--ts_rank_s), each keeps its own coefficients")
     ap.add_argument("--ts_rank_sched", default="", help="--ts: R0:R1, both ranks move linearly from R0 to R1 over training")
     ap.add_argument("--ts_spend", type=float, default=1.0,
                     help="--ts: a move spends this x theta (1: to the new trit's centre, like master --m_snap; 2: stays at "
@@ -2951,7 +3048,7 @@ def main():
                       sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale, table=args.ts_table,
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
-                      spend_table=args.ts_spend_table,
+                      spend_table=args.ts_spend_table, global_=args.ts_global,
                       progress=0.0,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
@@ -3110,7 +3207,7 @@ def main():
                       sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale, table=args.ts_table,
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
-                      spend_table=args.ts_spend_table,
+                      spend_table=args.ts_spend_table, global_=args.ts_global,
                       progress=step / max(1, tc.max_steps),
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
