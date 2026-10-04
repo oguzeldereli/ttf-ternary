@@ -583,7 +583,8 @@ def ts_layer(l, g, state, c):
     else:
         Um, Vm = _load_pair(_host_get(st, ("m", key), dev, off))
         oe_ = int(c.get("orth_every") or 1)
-        if c.get("orth_defer"):   # --ts_orth_defer: project on this basis now, orthonormalise at the end of the step
+        if c.get("orth_defer") and not (oe_ > 1 and t % oe_):   # --ts_orth_defer: project now, orthonormalise at the
+            # end of the step (with --ts_orth_every k only on every k-th step)
             st.setdefault("_defer", []).append((st, ("m", key), b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um, "m"))
             Vn = Vm
         elif oe_ > 1 and t % oe_:  # --ts_orth_every k: the basis stays put between orthonormalisations
@@ -625,7 +626,7 @@ def ts_layer(l, g, state, c):
                 u = u + R_ * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
             Afull = U @ V.T + u
         oe_ = int(c.get("orth_every") or 1)
-        if c.get("orth_defer"):
+        if c.get("orth_defer") and not (oe_ > 1 and t % oe_):
             st.setdefault("_defer", []).append((state, key, V @ (U.T @ U) + u.T @ U, "a"))
             Vn = V
         elif oe_ > 1 and t % oe_:
