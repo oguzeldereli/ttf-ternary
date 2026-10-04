@@ -50,6 +50,7 @@ within 6e-5. FineWeb-Edu was never used for any choice.
   |---|---|---|---|
   | 256 | int8 / fp16 | 11.1 GiB | 11.2 GiB |
   | 512 | int8 / fp16 | 11.1 GiB | 17.0 GiB |
+  | 512 | int8 / 12-bit | 11.5 GiB | 15.4 GiB |
   | 1024 | int8 / 12-bit | 11.6 GiB | 23.7 GiB |
 
   Ranks 256 / 512 were measured on an RTX 4070 Ti Super (16 GB) with 30 GB RAM, ranks 1024 on a 3090 Ti with 125 GB RAM
