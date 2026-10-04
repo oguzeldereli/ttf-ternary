@@ -265,6 +265,9 @@ def _store_codec(name):
     elif name == "fp16s":
         def enc(X):
             sc = cs(X, 32768); return ((X / sc).to(torch.float16), sc)
+    elif name == "fp12s":     # fp16s with the low 4 mantissa bits rounded off: sign, 5 exponent, 6 mantissa bits
+        def enc(X):
+            sc = cs(X, 32768); return (_pack12((X / sc).to(torch.float16)), sc)
     elif name in ("fp16", "bf16"):
         dt = torch.float16 if name == "fp16" else torch.bfloat16
         def enc(X):
@@ -272,6 +275,35 @@ def _store_codec(name):
     else:
         raise ValueError(name)
     return enc
+
+
+def _pack12(Y):
+    """fp16 (..., n) -> uint8 (..., 3 * ceil(n / 2)): each value rounded (nearest, ties to even) to 12 bits (sign, 5
+    exponent, 6 mantissa bits) and two values packed into 3 bytes. |Y| <= 32768 (the fp16s scaling), so rounding up
+    never reaches the infinity code."""
+    if Y.shape[-1] % 2:
+        Y = torch.cat([Y, torch.zeros_like(Y[..., :1])], -1)
+    h = Y.view(torch.int16).to(torch.int32) & 0xFFFF
+    m = h & 0x7FFF
+    m = (m + 7 + ((m >> 4) & 1)) >> 4
+    v = (((h >> 15) << 11) | m).reshape(*Y.shape[:-1], Y.shape[-1] // 2, 2)
+    a, b = v[..., 0], v[..., 1]
+    return torch.stack([a & 0xFF, (a >> 8) | ((b & 0xF) << 4), b >> 4], -1).reshape(*Y.shape[:-1], -1).to(torch.uint8)
+
+
+def _unpack12(P, n):
+    """inverse of _pack12 -> fp16 (..., n)"""
+    p = P.reshape(*P.shape[:-1], -1, 3).to(torch.int32)
+    a = p[..., 0] | ((p[..., 1] & 0xF) << 8)
+    b = (p[..., 1] >> 4) | (p[..., 2] << 4)
+    v = torch.stack([a, b], -1).reshape(*P.shape[:-1], -1)[..., :n]
+    h = ((v >> 11) << 15) | ((v & 0x7FF) << 4)
+    return torch.where(h >= 32768, h - 65536, h).to(torch.int16).view(torch.float16)
+
+
+def _decode(c, s):
+    """stored codes (int8 / fp8 / fp16 / packed 12-bit) times their per-column scale"""
+    return (_unpack12(c, s.shape[-1]) if c.dtype == torch.uint8 else c).float() * s
 
 
 def _store_pair(enc, U, V):
@@ -283,7 +315,7 @@ def _store_pair(enc, U, V):
 def _load_pair(t):
     """inverse of _store_pair (and a no-op on a plain fp32 (U, V))"""
     if len(t) == 4:
-        return t[0].float() * t[1], t[2].float() * t[3]
+        return _decode(t[0], t[1]), _decode(t[2], t[3])
     return t[0].float(), t[1].float()
 
 
@@ -1951,7 +1983,8 @@ def main():
     ap.add_argument("--ts_qfmt_aV", default="", help="--ts: storage format of the accumulator's basis V alone")
     ap.add_argument("--ts_store_m", default="", help="--ts: REAL storage of the short momentum (int8 | int8det | fp8 | "
                     "fp16 | fp16s | bf16), as opposed to the simulated --ts_qfmt_m")
-    ap.add_argument("--ts_store_a", default="", help="--ts: REAL storage of the accumulator (same formats)")
+    ap.add_argument("--ts_store_a", default="", help="--ts: REAL storage of the accumulator (same formats, and fp12s: "
+                    "fp16s rounded to 6 mantissa bits, two values in 3 bytes)")
     ap.add_argument("--ts_rank_kv", type=int, default=0, help="--ts: rank of both states for the attention k / v "
                     "projections (0: --lowrank / --ts_rank_s); with grouped-query attention these are narrow, so a full "
                     "rank there costs more than dense storage")
