@@ -232,6 +232,14 @@ def _qfmt(name):
     if name == "fp16": return lambda X: X.to(torch.float16).float()                   # 5 exp, 10 mantissa bits
     if name == "fp16s":                                       # fp16 with a per-column scale (column absmax -> 2^15)
         return lambda X: (X / (s := X.abs().amax(0, keepdim=True).clamp_min(1e-30) / 32768)).to(torch.float16).float() * s
+    if name == "int4":                                                                # per column, stochastic, 15 levels
+        return lambda X: (X / (s := X.abs().amax(0, keepdim=True).clamp_min(1e-30) / 7) + torch.rand_like(X)).floor().clamp_(-7, 7) * s
+    if name.startswith("fpm"):        # fpmK: floating point with K explicit mantissa bits (fp32 exponent range), nearest
+        k_ = int(name[3:])
+        def _fpm(X, k_=k_):
+            m_, e_ = torch.frexp(X)
+            return torch.ldexp(torch.round(m_ * 2 ** (k_ + 1)) / 2 ** (k_ + 1), e_)
+        return _fpm
     if name == "fp8":                                                                 # e4m3 with a per-column scale
         return lambda X: (X / (s := X.abs().amax(0, keepdim=True).clamp_min(1e-30) / 448)).to(torch.float8_e4m3fn).float() * s
     raise ValueError(name)
@@ -1832,7 +1840,7 @@ def main():
     ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64"],
                     help="--ts: subspace orthonormalisation by Householder QR or two-pass Cholesky-QR (faster)")
     ap.add_argument("--ts_qfmt", default="", help="--ts: storage format of the low-rank matrices: int8 | int8det | "
-                    "int8row | bf16 | fp16 | fp16s (per-column scale) | fp8 (simulated; --ts_int8 = int8)")
+                    "int8row | int4 | bf16 | fp16 | fp16s (per-column scale) | fp8 | fpmK (K mantissa bits) (simulated; --ts_int8 = int8)")
     ap.add_argument("--ts_qfmt_m", default="", help="--ts: storage format of the short momentum (direction) alone")
     ap.add_argument("--ts_qfmt_a", default="", help="--ts: storage format of the accumulator alone")
     ap.add_argument("--ts_qfmt_aV", default="", help="--ts: storage format of the accumulator's basis V alone")
