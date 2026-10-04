@@ -601,7 +601,27 @@ def ts_layer(l, g, state, c):
             X_ = X_ + c["sketch"] * X_.norm() / S_.norm().clamp_min(1e-30) * S_; del S_
         Vn = _orth(X_); del X_
         Ad = (U @ V.T + u) if diag else None                     # the accumulator before its rank-r projection
-        U = U @ (V.T @ Vn) + u @ Vn; V = Vn
+        uVn = u @ Vn
+        U = U @ (V.T @ Vn) + uVn; V = Vn
+        if c.get("rescale"):      # --ts_rescale: share of each step's energy the basis keeps (EMA over ~100 steps)
+            k_ = (uVn.norm() ** 2 / u.norm().clamp_min(1e-30) ** 2).clamp(0, 1)
+            kp = st.get(("kept", key))
+            st[("kept", key)] = k_ if kp is None else 0.99 * kp + 0.01 * k_
+        if c.get("refresh") and t % c["refresh"] == 0:   # --ts_refresh R: every R steps the weakest columns of the
+            # basis are replaced by the top directions of what this step's u has outside it (randomized range finder,
+            # one power iteration); the new columns start with this step's evidence along them
+            kr = max(1, int(round(V.shape[1] * c.get("refresh_frac", 0.125))))
+            gen = torch.Generator(device=u.device).manual_seed(5_000_000 + 2 * getattr(l, "_ts_idx", 0) + t)
+            Om = torch.randn(l.N, kr, device=u.device, generator=gen)
+            Y_ = u.T @ Om - V @ (uVn.T @ Om)                     # residual^T Om, residual = u - u V V^T
+            Z_ = u @ Y_ - uVn @ (V.T @ Y_)                       # residual Y
+            Y_ = u.T @ Z_ - V @ (uVn.T @ Z_)
+            Q_ = _orth(Y_ - V @ (V.T @ Y_)); del Y_, Z_, Om
+            idx = (U * U).sum(0).argsort()[:kr]                  # columns holding the least evidence
+            V = V.clone(); U = U.clone()
+            V[:, idx] = Q_; U[:, idx] = u @ Q_
+            del Q_
+        del uVn
         if c.get("resid"):
             st[("resid", key)] = Afull - U @ V.T; del Afull
         if diag:      # evidence dropped by the projection (U_new = Ad Vn) and share of this step's u that is kept
@@ -616,7 +636,10 @@ def ts_layer(l, g, state, c):
     A = U @ V.T
     w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
     d = A.sign()
-    fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
+    th = theta
+    if c.get("rescale") and ("kept", key) in st:   # --ts_rescale: compare A / s with theta, s = sqrt(share kept)
+        th = theta * st[("kept", key)].sqrt().clamp(0.25, 1.0)
+    fire = (A.abs() >= th) & ((w0.float() + d).abs() <= 1)
     if diag and c.get("shadow"):   # distance of the rank-r accumulator from the full-rank one
         _ts_rec(st, "a_vs_shadow", ((A - st[("shadow", key)]).norm() / st[("shadow", key)].norm().clamp_min(1e-30)).item())
     del A
@@ -626,7 +649,7 @@ def ts_layer(l, g, state, c):
     D = torch.where(fire, d, torch.zeros_like(d))
     nf = fire.sum()                           # a device tensor: no host sync per layer
     l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
-    U = U - c["spend"] * theta * (D @ V)
+    U = U - c["spend"] * th * (D @ V)
     if shadow_here:
         _ts_shadows_after(l, st, c, key, D, w0, theta, diag, (U + c["spend"] * theta * (D @ V)) @ V.T, t)
     if c.get("shadow"):
@@ -822,7 +845,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             tau_anneal=False, int8=False, fused=False, qfmt="", qwhich="all", qnoV=False, qdiag=False,
             qfmt_m="", qfmt_a="", qfmt_aV="", store_m="", store_a="", offload=False, diag=False, shadow=False,
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
-            shadow_layers=()):
+            shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -839,6 +862,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              tau_anneal=tau_anneal, int8=int8, qfmt=qfmt, qwhich=qwhich, qnoV=qnoV, qdiag=qdiag,
              qfmt_m=qfmt_m, qfmt_a=qfmt_a, qfmt_aV=qfmt_aV, store_m=store_m, store_a=store_a, offload=offload,
              diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid, shadows=shadows,
+             rescale=rescale, refresh=refresh, refresh_frac=refresh_frac,
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
     if not fused:
@@ -1969,6 +1993,12 @@ def main():
                     help="two timescales (ts_step): short low-rank momentum for the direction, long low-rank accumulator "
                          "of Adam-normalized steps, a trit moves when the accumulator crosses theta (no flip rate)")
     ap.add_argument("--ts_theta", type=float, default=16.0, help="--ts: firing threshold (latent half-bin / peak lr)")
+    ap.add_argument("--ts_rescale", action="store_true", help="--ts: fire where |A| >= theta * s and spend theta * s, "
+                    "s = sqrt(EMA of the share of each step's energy the rank-r basis keeps), clamped to [0.25, 1]: "
+                    "undoes the shrinking of the accumulator by its projection")
+    ap.add_argument("--ts_refresh", type=int, default=0, help="--ts: every R steps replace the weakest columns of the "
+                    "accumulator's basis by the top directions of the step's evidence outside the basis")
+    ap.add_argument("--ts_refresh_frac", type=float, default=0.125, help="--ts_refresh: share of the columns replaced")
     ap.add_argument("--ts_spend", type=float, default=1.0,
                     help="--ts: a move spends this x theta (1: to the new trit's centre, like master --m_snap; 2: stays at "
                          "the boundary it crossed, like master)")
@@ -2705,7 +2735,8 @@ def main():
                       qnoV=args.ts_qnoV, qdiag=False, qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
                       store_m=args.ts_store_m, store_a=args.ts_store_a, offload="async" if args.ts_offload_async else args.ts_offload,
                       diag=False, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
-                      sketch=args.ts_sketch, resid=args.ts_resid, shadows=TS_SHADOWS[0],
+                      sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale,
+                      refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
                       shadow_layers=TS_SHADOWS[1])
         for i_, m_ in enumerate([m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]):
@@ -2858,7 +2889,8 @@ def main():
                                   qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
                       store_m=args.ts_store_m, store_a=args.ts_store_a, offload="async" if args.ts_offload_async else args.ts_offload,
                       diag=bool(args.ts_diag) and step % args.ts_diag == 0, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
-                      sketch=args.ts_sketch, resid=args.ts_resid, shadows=TS_SHADOWS[0],
+                      sketch=args.ts_sketch, resid=args.ts_resid, rescale=args.ts_rescale,
+                      refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
                       shadow_layers=TS_SHADOWS[1])
             elif args.accum_flip:
