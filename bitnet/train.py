@@ -582,9 +582,19 @@ def ts_layer(l, g, state, c):
         Um = (1 - b1) * g @ Vm
     else:
         Um, Vm = _load_pair(_host_get(st, ("m", key), dev, off))
-        Vn = _orth(b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um)
+        oe_ = int(c.get("orth_every") or 1)
+        if c.get("orth_defer"):   # --ts_orth_defer: project on this basis now, orthonormalise at the end of the step
+            st.setdefault("_defer", []).append((st, ("m", key), b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um, "m"))
+            Vn = Vm
+        elif oe_ > 1 and t % oe_:  # --ts_orth_every k: the basis stays put between orthonormalisations
+            Vn = Vm
+        else:
+            Vn = _orth(b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um)
         Md = (b1 * Um @ Vm.T + (1 - b1) * g) if diag else None    # the momentum before its rank-r projection
-        Um = b1 * Um @ (Vm.T @ Vn) + (1 - b1) * g @ Vn; Vm = Vn
+        if Vn is Vm:
+            Um = b1 * Um + (1 - b1) * g @ Vm
+        else:
+            Um = b1 * Um @ (Vm.T @ Vn) + (1 - b1) * g @ Vn; Vm = Vn
         if diag:      # share of the momentum's energy the projection drops (Um_new = Md Vn, Vn orthonormal)
             x_ = 1 - (Um.norm() ** 2 / Md.norm().clamp_min(1e-30) ** 2).item(); del Md
             _ts_rec(st, "m_drop", x_); _ts_rec(st, "m_drop_" + _TS_TYPES[getattr(l, "_ts_idx", 0) % 7], x_)
@@ -614,14 +624,21 @@ def ts_layer(l, g, state, c):
             if R_ is not None:
                 u = u + R_ * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
             Afull = U @ V.T + u
-        X_ = V @ (U.T @ U) + u.T @ U
-        if c.get("sketch"):       # --ts_sketch RHO: a random sketch of this step's u joins the basis update, so new
-            S_ = u.T @ torch.randn(l.N, X_.shape[1], device=u.device)   # directions can enter (RHO of the norm)
-            X_ = X_ + c["sketch"] * X_.norm() / S_.norm().clamp_min(1e-30) * S_; del S_
-        Vn = _orth(X_); del X_
+        oe_ = int(c.get("orth_every") or 1)
+        if c.get("orth_defer"):
+            st.setdefault("_defer", []).append((state, key, V @ (U.T @ U) + u.T @ U, "a"))
+            Vn = V
+        elif oe_ > 1 and t % oe_:
+            Vn = V
+        else:
+            X_ = V @ (U.T @ U) + u.T @ U
+            if c.get("sketch"):       # --ts_sketch RHO: a random sketch of this step's u joins the basis update, so new
+                S_ = u.T @ torch.randn(l.N, X_.shape[1], device=u.device)   # directions can enter (RHO of the norm)
+                X_ = X_ + c["sketch"] * X_.norm() / S_.norm().clamp_min(1e-30) * S_; del S_
+            Vn = _orth(X_); del X_
         Ad = (U @ V.T + u) if diag else None                     # the accumulator before its rank-r projection
         uVn = u @ Vn
-        U = U @ (V.T @ Vn) + uVn; V = Vn
+        U = (U + uVn) if Vn is V else (U @ (V.T @ Vn) + uVn); V = Vn
         if c.get("rescale"):      # --ts_rescale: share of each step's energy the basis keeps (EMA over ~100 steps)
             k_ = (uVn.norm() ** 2 / u.norm().clamp_min(1e-30) ** 2).clamp(0, 1)
             kp = st.get(("kept", key))
@@ -897,6 +914,42 @@ def _ts_global_finish(state):
             gl[X_].zero_()
 
 
+def _orth_batched(X):
+    """orthonormal bases of a batch of tall matrices [B, K, r]: two-pass Cholesky-QR in fp64 with batched GEMMs,
+    Cholesky and triangular solves (a few kernel launches for the whole batch instead of several per matrix)"""
+    Q = X.double()
+    for _ in range(2):
+        G = Q.transpose(1, 2) @ Q
+        dg = G.diagonal(dim1=1, dim2=2)
+        dg.add_(dg.mean(-1, keepdim=True).clamp_min(1e-300) * 1e-12)
+        L = torch.linalg.cholesky_ex(G)[0]
+        Q = torch.linalg.solve_triangular(L, Q.transpose(1, 2), upper=False).transpose(1, 2)   # Q L^-T
+    return torch.nan_to_num(Q).to(X.dtype)
+
+
+@torch.no_grad()
+def _orth_defer_finish(state, c):
+    """--ts_orth_defer, once per step: orthonormalise every stored subspace-iteration product, batched by shape, and
+    rotate each layer's coefficients into its new basis"""
+    st = state.get("_ts", {})
+    items = st.pop("_defer", [])
+    if not items:
+        return
+    sm, sa = _store_codec(c.get("store_m", "")), _store_codec(c.get("store_a", ""))
+    groups = {}
+    for it in items:
+        groups.setdefault(tuple(it[2].shape), []).append(it)
+    for shp, its in groups.items():
+        for a0 in range(0, len(its), 32):
+            chunk = its[a0:a0 + 32]
+            Qb = _orth_batched(torch.stack([it[2] for it in chunk]))
+            for (d_, k_, _, kind), Q in zip(chunk, Qb):
+                U, V = _load_pair(d_[k_])
+                U = U @ (V.T @ Q)
+                enc = sm if kind == "m" else sa
+                d_[k_] = _store_pair(enc, U, Q) if enc else (U, Q)
+
+
 def _rank_sched(spec):
     """--ts_rank_sched "R0:R1" -> (R0, R1), or None"""
     if not spec:
@@ -1143,7 +1196,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
             shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125, table=0.0, exact_spend=False, tiles=1,
             rank_sched=None, progress=0.0, rsketch=0, rsketch_every=50, locate=0.0, spend_table=False,
-            global_=False, fuse=False):
+            global_=False, fuse=False, orth_every=1, orth_defer=False):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -1162,7 +1215,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid, shadows=shadows,
              rescale=rescale, refresh=refresh, refresh_frac=refresh_frac, table=table, exact_spend=exact_spend,
              tiles=tiles, rank_sched=rank_sched, progress=progress, rsketch=rsketch, rsketch_every=rsketch_every,
-             locate=locate, spend_table=spend_table, fuse=fuse, **{"global": global_},
+             locate=locate, spend_table=spend_table, fuse=fuse, orth_every=orth_every, orth_defer=orth_defer,
+             **{"global": global_},
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
     if not fused:
@@ -1173,6 +1227,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             del g
     if c.get("global") or c.get("fuse"):
         _ts_global_finish(state)
+    if c.get("orth_defer"):
+        _orth_defer_finish(state, c)
     nf, nt = st.pop("_nf", 0), st.pop("_nt", 0)
     info = {"ts_frac": float(nf) / max(nt, 1)}
     for k_, (tot, n_) in st.pop("_dg", {}).items():      # --ts_diag: means over layers this step
@@ -2323,11 +2379,15 @@ def main():
     ap.add_argument("--ts_fuse", action="store_true", help="--ts: matrices that read the same input share one input "
                     "basis per state: q / k / v of a block, and gate / up of a block (each keeps its own coefficients); "
                     "o and down as usual")
+    ap.add_argument("--ts_orth_every", type=int, default=1, help="--ts: orthonormalise the bases only every k steps "
+                    "(projection on the current basis in between)")
+    ap.add_argument("--ts_orth_defer", action="store_true", help="--ts: each layer projects on last step's basis; all "
+                    "orthonormalisations run once at the end of the step, batched by shape (state on the GPU only)")
     ap.add_argument("--ts_rank_sched", default="", help="--ts: R0:R1, both ranks move linearly from R0 to R1 over training")
     ap.add_argument("--ts_spend", type=float, default=1.0,
                     help="--ts: a move spends this x theta (1: to the new trit's centre, like master --m_snap; 2: stays at "
                          "the boundary it crossed, like master)")
-    ap.add_argument("--gemm", default="triton", choices=["triton", "cublas"],
+    ap.add_argument("--gemm", default="triton", choices=["triton", "cublas", "int8mm"],
                     help="ternary GEMMs: our Triton kernels, or cuBLAS bf16 on trits unpacked per call (faster on A100)")
     ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64"],
                     help="--ts: subspace orthonormalisation by Householder QR or two-pass Cholesky-QR (faster)")
@@ -2606,9 +2666,11 @@ def main():
     args = ap.parse_args()
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
-    if args.gemm == "cublas":
+    if args.ts_orth_defer and (args.ts_offload or args.ts_offload_async):
+        raise SystemExit("--ts_orth_defer needs the state on the GPU (no --ts_offload)")
+    if args.gemm in ("cublas", "int8mm"):
         from . import kernel as _kmod
-        _kmod.GEMM_BACKEND[0] = "cublas"
+        _kmod.GEMM_BACKEND[0] = args.gemm
     ORTH_CHOL[0] = args.ts_orth if args.ts_orth != "qr" else False
     TWO_STAGE[0] = args.two_stage
     TS_SHADOWS[0] = tuple(int(x) for x in args.ts_shadows.split(",")) if args.ts_shadows else ()
@@ -3072,6 +3134,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer,
                       progress=0.0,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
@@ -3233,6 +3296,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer,
                       progress=step / max(1, tc.max_steps),
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
