@@ -132,13 +132,22 @@ class Block(nn.Module):
     def _ffn(self, x):
         return self.ffn(self.ffn_norm(x))
 
+    def _block(self, x, freqs_cis):
+        x = x + self._attn(x, freqs_cis)
+        return x + self._ffn(x)
+
     def forward(self, x, freqs_cis, ckpt=False):
         # checkpoint attn and ffn separately: only one sublayer's dense weight +
         # gradient is materialized at a time during backward (much lower peak).
         # The norm goes INSIDE the checkpoint: it upcasts to fp32, and leaving it
         # outside retained two fp32 [B,T,d] tensors per sublayer (4.7 GiB at
         # 32k tokens/step, 12 layers) instead of recomputing them for free.
-        if ckpt:
+        if ckpt and getattr(self, "ckpt_block", False):
+            # --ckpt_block: one checkpoint per block (its input only): half the saved activations of the per-sublayer
+            # checkpoints, for a larger recompute (attention + MLP of one block at once); for the ternary kernels,
+            # which never build a dense weight
+            x = checkpoint(self._block, x, freqs_cis, use_reentrant=False)
+        elif ckpt:
             x = x + checkpoint(self._attn, x, freqs_cis, use_reentrant=False)
             x = x + checkpoint(self._ffn, x, use_reentrant=False)
         else:

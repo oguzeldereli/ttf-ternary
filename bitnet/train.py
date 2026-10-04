@@ -2361,6 +2361,8 @@ def main():
                     "stage 2 (F e.g. 0.4; 0: plain cosine)")
     ap.add_argument("--lean_tail", action="store_true", help="float tail in bf16 (embedding, adapter) / fp16 (gains, "
                     "scales) with LeanAdam: int8 first moment, factored second moment, stochastic-rounding updates")
+    ap.add_argument("--ckpt_block", action="store_true", help="checkpoint each block once (its input) instead of attention "
+                    "and MLP separately: half the saved activations (kernel mode; master builds dense weights per sublayer)")
     ap.add_argument("--mem_report", action="store_true", help="log the MiB of trits, float tail, its gradients and "
                     "optimizer state, TTF state on GPU / host, allocated and peak, at steps 10 / 50 / 100 / 1000")
     ap.add_argument("--ts_offload", action="store_true", help="--ts: keep the state in pinned host memory; each layer's "
@@ -2663,6 +2665,9 @@ def main():
     model.train()
     if args.ckpt_skip:
         model.ckpt_skip = args.ckpt_skip
+    if args.ckpt_block:
+        for b_ in model.layers:
+            b_.ckpt_block = True
     if args.ts_rank_types:
         rt = {k: int(v) for k, v in (x.split(":") for x in args.ts_rank_types.split(","))}
         lays_ = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
