@@ -1,0 +1,128 @@
+
+t500_layer0_q  (768, 768)  full-rank moves 30770 (5.22%)
+  rescale  energy kept 0.23 (s = 0.48) | s1.00: n538 P0.21 R0.00 | s0.80: n3164 P0.18 R0.02 | s0.60: n14416 P0.13 R0.06 | s0.50: n29267 P0.11 R0.11 | s0.40: n55547 P0.09 R0.17 | s0.30: n99003 P0.08 R0.26 | s0.25: n128812 P0.08 R0.32
+           on full-rank moves: sign agrees 0.66, |A_r64| / |A_full| median 0.17
+  table    full-rank moves inside the top 2% of |A_r64|: 0.01; inside the top 2% of |A_full|: 0.03; oracle table P0.71 R0.03
+  tiles    energy of A_full: best rank 64 0.43; 2 x 2 tiles of rank 32 0.40
+  spend    a low-rank spend removes 0.11 theta at a moved entry (exact: 1.00); elsewhere it removes 0.30 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.33 vs in the best rank-64 basis 0.43
+
+t500_layer35_q  (768, 768)  full-rank moves 20518 (3.48%)
+  rescale  energy kept 0.41 (s = 0.64) | s1.00: n2466 P0.21 R0.03 | s0.80: n10268 P0.18 R0.09 | s0.60: n33699 P0.14 R0.24 | s0.50: n55648 P0.13 R0.34 | s0.40: n86539 P0.11 R0.46 | s0.30: n128163 P0.09 R0.58 | s0.25: n153087 P0.09 R0.64
+           on full-rank moves: sign agrees 0.85, |A_r64| / |A_full| median 0.33
+  table    full-rank moves inside the top 2% of |A_r64|: 0.01; inside the top 2% of |A_full|: 0.00; oracle table P0.24 R0.03
+  tiles    energy of A_full: best rank 64 0.60; 2 x 2 tiles of rank 32 0.54
+  spend    a low-rank spend removes 0.11 theta at a moved entry (exact: 1.00); elsewhere it removes 0.31 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.51 vs in the best rank-64 basis 0.60
+
+t500_layer41_down  (768, 2048)  full-rank moves 70572 (4.49%)
+  rescale  energy kept 0.26 (s = 0.51) | s1.00: n1761 P0.20 R0.00 | s0.80: n10561 P0.18 R0.03 | s0.60: n49967 P0.15 R0.10 | s0.50: n97533 P0.13 R0.18 | s0.40: n176402 P0.11 R0.28 | s0.30: n297044 P0.10 R0.40 | s0.25: n374210 P0.09 R0.47
+           on full-rank moves: sign agrees 0.76, |A_r64| / |A_full| median 0.23
+  table    full-rank moves inside the top 2% of |A_r64|: 0.03; inside the top 2% of |A_full|: 0.04; oracle table P0.68 R0.04
+  tiles    energy of A_full: best rank 64 0.39; 2 x 2 tiles of rank 32 0.32
+  spend    a low-rank spend removes 0.05 theta at a moved entry (exact: 1.00); elsewhere it removes 0.22 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.27 vs in the best rank-64 basis 0.39
+
+t500_layer6_down  (768, 2048)  full-rank moves 49486 (3.15%)
+  rescale  energy kept 0.28 (s = 0.53) | s1.00: n1145 P0.13 R0.00 | s0.80: n7530 P0.14 R0.02 | s0.60: n39373 P0.12 R0.09 | s0.50: n81721 P0.10 R0.17 | s0.40: n157167 P0.09 R0.28 | s0.30: n277569 P0.07 R0.40 | s0.25: n357678 P0.07 R0.47
+           on full-rank moves: sign agrees 0.76, |A_r64| / |A_full| median 0.24
+  table    full-rank moves inside the top 2% of |A_r64|: 0.03; inside the top 2% of |A_full|: 0.06; oracle table P0.77 R0.07
+  tiles    energy of A_full: best rank 64 0.44; 2 x 2 tiles of rank 32 0.36
+  spend    a low-rank spend removes 0.05 theta at a moved entry (exact: 1.00); elsewhere it removes 0.22 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.30 vs in the best rank-64 basis 0.44
+
+t2000_layer0_q  (768, 768)  full-rank moves 36054 (6.11%)
+  rescale  energy kept 0.18 (s = 0.43) | s1.00: n1073 P0.18 R0.01 | s0.80: n4757 P0.16 R0.02 | s0.60: n18733 P0.13 R0.07 | s0.50: n34868 P0.12 R0.11 | s0.40: n62211 P0.10 R0.18 | s0.30: n104561 P0.09 R0.27 | s0.25: n132535 P0.09 R0.32
+           on full-rank moves: sign agrees 0.64, |A_r64| / |A_full| median 0.17
+  table    full-rank moves inside the top 2% of |A_r64|: 0.00; inside the top 2% of |A_full|: 0.00; oracle table P0.28 R0.01
+  tiles    energy of A_full: best rank 64 0.45; 2 x 2 tiles of rank 32 0.42
+  spend    a low-rank spend removes 0.10 theta at a moved entry (exact: 1.00); elsewhere it removes 0.29 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.33 vs in the best rank-64 basis 0.45
+
+t2000_layer35_q  (768, 768)  full-rank moves 22044 (3.74%)
+  rescale  energy kept 0.31 (s = 0.56) | s1.00: n6672 P0.12 R0.04 | s0.80: n18088 P0.11 R0.09 | s0.60: n43785 P0.09 R0.18 | s0.50: n64899 P0.08 R0.25 | s0.40: n93448 P0.08 R0.33 | s0.30: n130032 P0.07 R0.41 | s0.25: n151138 P0.07 R0.46
+           on full-rank moves: sign agrees 0.69, |A_r64| / |A_full| median 0.27
+  table    full-rank moves inside the top 2% of |A_r64|: 0.01; inside the top 2% of |A_full|: 0.00; oracle table P0.12 R0.04
+  tiles    energy of A_full: best rank 64 0.56; 2 x 2 tiles of rank 32 0.50
+  spend    a low-rank spend removes 0.10 theta at a moved entry (exact: 1.00); elsewhere it removes 0.29 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.41 vs in the best rank-64 basis 0.56
+
+t2000_layer41_down  (768, 2048)  full-rank moves 135745 (8.63%)
+  rescale  energy kept 0.18 (s = 0.42) | s1.00: n7689 P0.21 R0.01 | s0.80: n27475 P0.20 R0.04 | s0.60: n83759 P0.17 R0.11 | s0.50: n136168 P0.16 R0.16 | s0.40: n210217 P0.15 R0.23 | s0.30: n311295 P0.14 R0.32 | s0.25: n371800 P0.13 R0.37
+           on full-rank moves: sign agrees 0.62, |A_r64| / |A_full| median 0.21
+  table    full-rank moves inside the top 2% of |A_r64|: 0.02; inside the top 2% of |A_full|: 0.01; oracle table P0.30 R0.02
+  tiles    energy of A_full: best rank 64 0.30; 2 x 2 tiles of rank 32 0.26
+  spend    a low-rank spend removes 0.04 theta at a moved entry (exact: 1.00); elsewhere it removes 0.19 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.18 vs in the best rank-64 basis 0.30
+
+t2000_layer6_down  (768, 2048)  full-rank moves 112400 (7.15%)
+  rescale  energy kept 0.22 (s = 0.47) | s1.00: n10227 P0.15 R0.01 | s0.80: n33138 P0.13 R0.04 | s0.60: n94472 P0.12 R0.10 | s0.50: n150744 P0.11 R0.15 | s0.40: n232747 P0.10 R0.21 | s0.30: n347101 P0.10 R0.30 | s0.25: n417513 P0.09 R0.34
+           on full-rank moves: sign agrees 0.60, |A_r64| / |A_full| median 0.21
+  table    full-rank moves inside the top 2% of |A_r64|: 0.02; inside the top 2% of |A_full|: 0.02; oracle table P0.33 R0.04
+  tiles    energy of A_full: best rank 64 0.29; 2 x 2 tiles of rank 32 0.25
+  spend    a low-rank spend removes 0.04 theta at a moved entry (exact: 1.00); elsewhere it removes 0.19 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.12 vs in the best rank-64 basis 0.29
+
+t5000_layer0_q  (768, 768)  full-rank moves 18780 (3.18%)
+  rescale  energy kept 0.17 (s = 0.41) | s1.00: n277 P0.17 R0.00 | s0.80: n1884 P0.15 R0.01 | s0.60: n10005 P0.11 R0.06 | s0.50: n21640 P0.09 R0.10 | s0.40: n43702 P0.07 R0.17 | s0.30: n81127 P0.06 R0.26 | s0.25: n107326 P0.06 R0.32
+           on full-rank moves: sign agrees 0.68, |A_r64| / |A_full| median 0.16
+  table    full-rank moves inside the top 2% of |A_r64|: 0.02; inside the top 2% of |A_full|: 0.01; oracle table P0.51 R0.01
+  tiles    energy of A_full: best rank 64 0.47; 2 x 2 tiles of rank 32 0.44
+  spend    a low-rank spend removes 0.10 theta at a moved entry (exact: 1.00); elsewhere it removes 0.29 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.31 vs in the best rank-64 basis 0.47
+
+t5000_layer35_q  (768, 768)  full-rank moves 12995 (2.20%)
+  rescale  energy kept 0.27 (s = 0.52) | s1.00: n2195 P0.12 R0.02 | s0.80: n8260 P0.09 R0.06 | s0.60: n26523 P0.07 R0.15 | s0.50: n44394 P0.06 R0.22 | s0.40: n71076 P0.06 R0.30 | s0.30: n109156 P0.05 R0.41 | s0.25: n132665 P0.05 R0.46
+           on full-rank moves: sign agrees 0.73, |A_r64| / |A_full| median 0.24
+  table    full-rank moves inside the top 2% of |A_r64|: 0.02; inside the top 2% of |A_full|: 0.00; oracle table P0.12 R0.02
+  tiles    energy of A_full: best rank 64 0.54; 2 x 2 tiles of rank 32 0.49
+  spend    a low-rank spend removes 0.09 theta at a moved entry (exact: 1.00); elsewhere it removes 0.29 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.38 vs in the best rank-64 basis 0.54
+
+t5000_layer41_down  (768, 2048)  full-rank moves 100583 (6.39%)
+  rescale  energy kept 0.16 (s = 0.41) | s1.00: n2134 P0.22 R0.00 | s0.80: n11066 P0.19 R0.02 | s0.60: n47045 P0.16 R0.07 | s0.50: n87817 P0.14 R0.12 | s0.40: n155053 P0.13 R0.20 | s0.30: n256884 P0.12 R0.30 | s0.25: n323030 P0.11 R0.35
+           on full-rank moves: sign agrees 0.65, |A_r64| / |A_full| median 0.18
+  table    full-rank moves inside the top 2% of |A_r64|: 0.02; inside the top 2% of |A_full|: 0.02; oracle table P0.57 R0.02
+  tiles    energy of A_full: best rank 64 0.30; 2 x 2 tiles of rank 32 0.26
+  spend    a low-rank spend removes 0.04 theta at a moved entry (exact: 1.00); elsewhere it removes 0.20 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.18 vs in the best rank-64 basis 0.30
+
+t5000_layer6_down  (768, 2048)  full-rank moves 87027 (5.53%)
+  rescale  energy kept 0.20 (s = 0.45) | s1.00: n2749 P0.14 R0.00 | s0.80: n13676 P0.12 R0.02 | s0.60: n54686 P0.10 R0.06 | s0.50: n100720 P0.09 R0.11 | s0.40: n175681 P0.09 R0.17 | s0.30: n287643 P0.08 R0.26 | s0.25: n359847 P0.08 R0.31
+           on full-rank moves: sign agrees 0.61, |A_r64| / |A_full| median 0.18
+  table    full-rank moves inside the top 2% of |A_r64|: 0.02; inside the top 2% of |A_full|: 0.05; oracle table P0.67 R0.05
+  tiles    energy of A_full: best rank 64 0.28; 2 x 2 tiles of rank 32 0.24
+  spend    a low-rank spend removes 0.04 theta at a moved entry (exact: 1.00); elsewhere it removes 0.19 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.12 vs in the best rank-64 basis 0.28
+
+t9000_layer0_q  (768, 768)  full-rank moves 1559 (0.26%)
+  rescale  energy kept 0.32 (s = 0.57) | s1.00: n8 P0.25 R0.00 | s0.80: n238 P0.06 R0.01 | s0.60: n3298 P0.03 R0.06 | s0.50: n9542 P0.02 R0.12 | s0.40: n23800 P0.01 R0.19 | s0.30: n54317 P0.01 R0.31 | s0.25: n79554 P0.01 R0.38
+           on full-rank moves: sign agrees 0.85, |A_r64| / |A_full| median 0.17
+  table    full-rank moves inside the top 2% of |A_r64|: 0.08; inside the top 2% of |A_full|: 1.00; oracle table P1.00 R1.00
+  tiles    energy of A_full: best rank 64 0.59; 2 x 2 tiles of rank 32 0.56
+  spend    a low-rank spend removes 0.10 theta at a moved entry (exact: 1.00); elsewhere it removes 0.29 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.43 vs in the best rank-64 basis 0.59
+
+t9000_layer35_q  (768, 768)  full-rank moves 1403 (0.24%)
+  rescale  energy kept 0.33 (s = 0.58) | s1.00: n48 P0.02 R0.00 | s0.80: n719 P0.07 R0.04 | s0.60: n5942 P0.03 R0.13 | s0.50: n14143 P0.02 R0.21 | s0.40: n31303 P0.01 R0.32 | s0.30: n64718 P0.01 R0.43 | s0.25: n90047 P0.01 R0.49
+           on full-rank moves: sign agrees 0.86, |A_r64| / |A_full| median 0.23
+  table    full-rank moves inside the top 2% of |A_r64|: 0.12; inside the top 2% of |A_full|: 1.00; oracle table P0.97 R1.00
+  tiles    energy of A_full: best rank 64 0.56; 2 x 2 tiles of rank 32 0.51
+  spend    a low-rank spend removes 0.09 theta at a moved entry (exact: 1.00); elsewhere it removes 0.28 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.43 vs in the best rank-64 basis 0.56
+
+t9000_layer41_down  (768, 2048)  full-rank moves 12555 (0.80%)
+  rescale  energy kept 0.25 (s = 0.50) | s1.00: n29 P0.10 R0.00 | s0.80: n490 P0.10 R0.00 | s0.60: n6222 P0.09 R0.04 | s0.50: n19472 P0.06 R0.10 | s0.40: n55245 P0.04 R0.20 | s0.30: n137817 P0.03 R0.35 | s0.25: n206544 P0.03 R0.44
+           on full-rank moves: sign agrees 0.86, |A_r64| / |A_full| median 0.20
+  table    full-rank moves inside the top 2% of |A_r64|: 0.08; inside the top 2% of |A_full|: 0.76; oracle table P1.00 R0.76
+  tiles    energy of A_full: best rank 64 0.32; 2 x 2 tiles of rank 32 0.28
+  spend    a low-rank spend removes 0.04 theta at a moved entry (exact: 1.00); elsewhere it removes 0.20 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.25 vs in the best rank-64 basis 0.32
+
+t9000_layer6_down  (768, 2048)  full-rank moves 7613 (0.48%)
+  rescale  energy kept 0.24 (s = 0.49) | s1.00: n4 P0.00 R0.00 | s0.80: n129 P0.09 R0.00 | s0.60: n2921 P0.04 R0.02 | s0.50: n11210 P0.03 R0.05 | s0.40: n38227 P0.02 R0.11 | s0.30: n111764 P0.02 R0.23 | s0.25: n179267 P0.01 R0.31
+           on full-rank moves: sign agrees 0.79, |A_r64| / |A_full| median 0.16
+  table    full-rank moves inside the top 2% of |A_r64|: 0.07; inside the top 2% of |A_full|: 1.00; oracle table P1.00 R1.00
+  tiles    energy of A_full: best rank 64 0.34; 2 x 2 tiles of rank 32 0.28
+  spend    a low-rank spend removes 0.04 theta at a moved entry (exact: 1.00); elsewhere it removes 0.19 of ||theta D|| from entries that did not move
+  refresh  energy of A_full in A_r64's basis 0.19 vs in the best rank-64 basis 0.34
