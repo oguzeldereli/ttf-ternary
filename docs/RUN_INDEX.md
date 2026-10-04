@@ -27,6 +27,8 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `tsbare_rs512an05_s0` | TTF without float extras | 2.8266 (+0.075 vs bare master) |
 | `q*_s0`, `qfp16s_s0`, `qm8a16_seed2`, `qmf8a16_seed2` | storage formats | 8-bit direction + 16-bit accumulator free (seed 2 too); scaled fp16 2.7076 |
 | `ts512an05_lean_s0` | full lean recipe (fused, int8 / fp16 state, bf16 / fp16 tail, LeanAdam) | **2.7020** (fp32 2.7067) |
+| `ts{128,64}an05_{rescale,refresh}_s0` | low-rank mechanisms: rescaled threshold / basis refresh every 50 steps | rescale 2.8959 / 3.0056 (+0.012 / +0.013), refresh 2.8880 / 3.0007 (+0.004 / +0.008) vs 2.8837 / 2.9929 |
+| `ts64an05_sched128to64_s0` | ranks 128 -> 64 over training (peak 128, mean 96) | 2.9148 (-0.078 vs ranks 64, +0.031 vs ranks 128) |
 | `ts512an05_spend0_s0` (lamprey, 3 Oct) | TTF without spending after a move (`--ts_spend 0`) | 2.7748 (+0.068 vs spend theta 2.7067) |
 | `ts512an05_kv128_s0` / `ts512an05_sharedV_s0` | k / v at rank 128 / shared basis | +0.023 / +0.047 (fixed windows); k, v / down stop moving |
 | `ts{128,64}an05_*` fixes | sketch / residual / theta 8 / theta 11 / lr 3e-3 / ranks by input width | +0.17 / -0.03 / +0.14 / +0.05 / -0.02 / 0.00 vs the same-rank baseline (2.8837 / 2.9928) |
