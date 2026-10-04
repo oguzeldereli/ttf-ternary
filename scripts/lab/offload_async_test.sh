@@ -3,6 +3,8 @@
 #   offload_async_test.sh eq     110M, 40 steps each, the GPU run twice: the loss differences between the variants must be
 #                                no larger than between two identical GPU runs (the kernels are not bitwise deterministic)
 #   offload_async_test.sh time   1.3B micro-batch 1 x 2048 (the lean_mem.sh setting), 30 steps each: s/step and peak
+#   offload_async_test.sh resume 110M async: 21 steps with the final save, then --resume to 41 (the checkpoint holds the
+#                                host state; after the resume it must go back into page-locked buffers: same s/step)
 # Summary ~/ternary-sync/offload_async_MODE.txt
 S=/tmp/$USER/tern; source $S/env.sh || exit 1; cd $S/repo || exit 1
 M=${1:-eq}; O=checkpoints/offload_async; mkdir -p $O; R=$HOME/ternary-sync/offload_async_$M.txt
@@ -12,6 +14,13 @@ B="--mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_
    --ckpt_skip 0 --loss_chunk 256 --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp --ts --ts_theta 16 --ts_tau 1000
    --ts_anneal 0.5 --ts_fused --ts_store_m int8 --ts_store_a fp16 --lean_tail --mem_report --lowrank 512 --ts_rank_s 512"
 echo "$(date '+%F %T') start on $(hostname) $(nvidia-smi --query-gpu=name,memory.used --format=csv,noheader)" > $R
+if [ $M = resume ]; then
+  P="--preset small --batch_size 2 --ts_offload_async"; rm -rf $O/resume
+  python -m bitnet.train $(echo $B $P) --stop_after 21 --out_dir $O/resume > $O/resume_a.log 2>&1
+  python -m bitnet.train $(echo $B $P) --stop_after 41 --resume --out_dir $O/resume > $O/resume_b.log 2>&1
+  for x in a b; do echo "$x: $(grep -E '^step ' $O/resume_$x.log | head -1 | cut -c1-40) .. $(grep -E '^step ' $O/resume_$x.log | tail -1 | cut -c1-80) $(grep -m1 -E 'Traceback|Error' $O/resume_$x.log)" >> $R; done
+  echo "$(date '+%F %T') done" >> $R; exit
+fi
 if [ $M = eq ]; then P="--preset small --batch_size 2 --stop_after 41"; else P="--preset d2048_l24 --batch_size 1 --stop_after 31"; fi
 for v in gpu gpu2 sync async; do
   case $v in gpu|gpu2) F="";; sync) F="--ts_offload";; async) F="--ts_offload_async";; esac

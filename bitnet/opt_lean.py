@@ -31,6 +31,19 @@ class LeanAdam(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
 
+    def load_state_dict(self, state_dict):
+        """torch's Optimizer.load_state_dict casts the state to the parameter's dtype (bf16 / fp16 here): the int8 first
+        moment becomes bf16 (2x the memory), the row scales and factored second moment are rounded to bf16, and the fp16
+        gains' second moment (~1e-10) is flushed to zero (NaN on the first step after a resume). Put the saved state back
+        in its own dtypes."""
+        super().load_state_dict(state_dict)
+        params = [p for g in self.param_groups for p in g["params"]]
+        for i, st in state_dict["state"].items():
+            p = params[int(i)]
+            for k, v in st.items():
+                if torch.is_tensor(v) and k != "step":
+                    self.state[p][k] = v.to(device=p.device, copy=True)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = closure() if closure is not None else None

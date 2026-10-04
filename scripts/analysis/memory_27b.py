@@ -48,10 +48,18 @@ def state_gib(r, r_s, bm=1, ba=2, rs_type=None, bv=None):
     return (mom + (Nsum * ba + Ksum * (ba if bv is None else bv)) * r + nk * 4) / GiB
 
 
-host_base = M_HOST - state_gib(256, 256)  # host RSS besides the state (libraries, CUDA context, pinned staging)
+def pinned_pow2_gib(r, r_s, bm=1, ba=2):
+    """the same state as torch's pinned allocator stores it: every block rounded up to a power of two (measured on the
+    lab PCs: 100 x 9 MiB -> 1600 MiB); _PinnedPool in train.py stores it at its exact size"""
+    p2 = lambda b: 1 << (int(b) - 1).bit_length()
+    return L * sum(p2(b) for n, k in mats for b in (n * r_s * bm, r_s * 4, k * r_s * bm, r_s * 4, n * r * ba, r * 4,
+                                                    k * r * ba, r * 4, n * 4, k * 4)) / GiB
+
+
+host_base = M_HOST - pinned_pow2_gib(256, 256)  # host RSS besides the (power-of-two) pinned state: libraries, model copy
 print(f"\nbudget (16 GB card, micro-batch 1 x 2048, state on the host): packed {packed / GiB:.2f}, fp32 tail {fp32_tail:.2f}"
       f" (lean {lean_tail:.2f}), transient {transient:.2f}, host besides state {host_base:.2f} GiB")
-print("| ranks (acc / momentum) | state format | evidence for quality | state GiB | GPU peak GiB (fp32 / lean tail) | host GiB |")
+print("| ranks (acc / momentum) | state format | evidence for quality | state GiB | GPU peak GiB (fp32 / lean tail) | host GiB (torch pinned / exact pool) |")
 print("|---|---|---|---|---|---|")
 half = lambda r: dict(q=r // 4, k=r // 4, v=r // 4, o=r // 4, gate=3 * r // 4, up=3 * r // 4, down=3 * r // 4)
 for r, r_s, bm, ba, rst, fmt, ev, *bv in [
@@ -70,4 +78,5 @@ for r, r_s, bm, ba, rst, fmt, ev, *bv in [
     cp = 2 * st / L                                    # two layers' state copied in at a time
     gpu = packed / GiB + transient + cp - 2 * state_gib(256, 256) / L
     print(f"| {r} / {'by type' if rst else r_s} | {fmt} | {ev} | {st:.2f} | {gpu + fp32_tail:.1f} / {gpu + lean_tail:.1f} |"
+          f" {f'{pinned_pow2_gib(r, r_s, bm, ba) + host_base:.1f}' if (rst is None and not bv and ba in (1, 2)) else '-'} /"
           f" {st + host_base:.1f} |")

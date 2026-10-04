@@ -287,6 +287,40 @@ def _load_pair(t):
     return t[0].float(), t[1].float()
 
 
+class _PinnedPool:
+    """Page-locked host memory of exactly the requested size for the offloaded --ts state. torch's pinned allocator
+    rounds every block up to a power of two (measured on the lab PCs, torch 2.13: 100 x 9 MiB took 1600 MiB, one 900 MiB
+    block 1024 MiB), which at 27B ranks 1024 turns 21.3 GiB of state into 29.7 GiB. Here every tensor of at least
+    BIG bytes gets its own ordinary host buffer, padded so that a page-aligned slice of the rounded size fits inside it,
+    and that slice is page-locked with cudaHostRegister (so two registrations never share a page, and every tensor has its
+    own storage, as torch.save requires). Smaller tensors (scales, v's rows / columns) use torch's pinned allocator, where
+    the rounding costs little. Buffers are never freed: the state lives for the whole run."""
+    BIG = 1 << 20
+
+    def __init__(self):
+        self.keep, self.ptrs, self.reg = [], set(), 0
+
+    def empty(self, shape, dtype):
+        n = math.prod(shape) * dtype.itemsize
+        if n < self.BIG:
+            return torch.empty(shape, dtype=dtype, pin_memory=True)
+        m = (n + 4095) // 4096 * 4096
+        raw = torch.empty(m + 8192, dtype=torch.uint8)
+        a = (-raw.data_ptr()) % 4096
+        err = torch.cuda.cudart().cudaHostRegister(raw.data_ptr() + a, m, 0)
+        if int(err) != 0:
+            raise RuntimeError(f"cudaHostRegister failed ({err}) for {m} bytes")
+        t = raw[a:a + n].view(dtype).view(shape)
+        self.keep.append(raw); self.ptrs.add(t.data_ptr()); self.reg += m
+        return t
+
+    def owns(self, t):
+        return t.is_pinned() or t.data_ptr() in self.ptrs
+
+
+_PINNED = _PinnedPool()
+
+
 def _host_get(d, k, dev, off):
     """--ts_offload: a state tuple kept in pinned host memory, copied to the GPU for this layer's update (the copy is
     queued on the current stream, so it is ordered before the kernels that read it; no host sync)"""
@@ -306,11 +340,11 @@ def _host_put(d, k, v, off):
         return _OFFLOAD.put(d, k, v)
     old = d.get(k)
     if (old is not None and len(old) == len(v) and all(o.device.type == "cpu" and o.shape == x.shape and o.dtype == x.dtype
-                                                       for o, x in zip(old, v))):
+                                                       and _PINNED.owns(o) for o, x in zip(old, v))):
         for o, x in zip(old, v):
             o.copy_(x, non_blocking=True)
     else:
-        d[k] = tuple(torch.empty(x.shape, dtype=x.dtype, pin_memory=True).copy_(x, non_blocking=True) for x in v)
+        d[k] = tuple(_PINNED.empty(x.shape, x.dtype).copy_(x, non_blocking=True) for x in v)
 
 
 class _AsyncOffload:
@@ -367,11 +401,11 @@ class _AsyncOffload:
         old = d.get(k)
         with torch.cuda.stream(self.down):
             if (old is not None and len(old) == len(v) and all(o.device.type == "cpu" and o.shape == x.shape and
-                                                               o.dtype == x.dtype for o, x in zip(old, v))):
+                                                               o.dtype == x.dtype and _PINNED.owns(o) for o, x in zip(old, v))):
                 for o, x in zip(old, v):
                     o.copy_(x, non_blocking=True)
             else:
-                d[k] = tuple(torch.empty(x.shape, dtype=x.dtype, pin_memory=True).copy_(x, non_blocking=True) for x in v)
+                d[k] = tuple(_PINNED.empty(x.shape, x.dtype).copy_(x, non_blocking=True) for x in v)
             for x in v:
                 x.record_stream(self.down)
             self.done[tag] = self.down.record_event()
