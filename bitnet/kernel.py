@@ -490,7 +490,7 @@ def tern_gemm_i8(xq: torch.Tensor, xs: torch.Tensor, wpacked: torch.Tensor, K: i
     if GEMM_BACKEND[0] == "int8mm":
         # --gemm int8mm: int8 activation codes x int8 trits on the int8 tensor cores (cuBLASLt via torch._int_mm),
         # int32 accumulation: exact; the trits are unpacked per call to int8 (1 byte per weight, half of bf16)
-        w8 = unpack_rows(wpacked, K)
+        w8 = unpack_rows(wpacked, K).contiguous()     # unpack_rows returns a view with row stride 5 * ceil(K / 5)
         M_, N_ = xq.shape[0], w8.shape[0]
         if M_ > 16 and K % 8 == 0 and N_ % 8 == 0:
             y32 = torch._int_mm(xq.contiguous(), w8.t())
