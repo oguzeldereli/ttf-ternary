@@ -31,6 +31,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts64an05_sched128to64_s0` | ranks 128 -> 64 over training (peak 128, mean 96) | 2.9148 (-0.078 vs ranks 64, +0.031 vs ranks 128) |
 | `ts64an05_sched64to128_s0` | ranks 64 -> 128 | 2.9432 (-0.050 vs ranks 64, +0.059 vs ranks 128) |
 | `ts64an05_table_s0` / `_xspend_s0` / `_tiles2_s0` | exact table 2% / exact spend / 2 x 2 tiles of rank 32 | 2.9891 / 2.9915 / 3.0216 (-0.004 / -0.001 / +0.029 vs 2.9929) |
+| `ts128an05_xspend_s0` | exact spend at ranks 128 | **2.8727** (-0.011 vs 2.8837; ranks 64: -0.001) |
 | `big_ts512an05_seed2` | 340M TTF p 0.5, seed 2 | 2.5866 (training-time); fixed windows 2.5765 / 3.5250 (seed 1337 2.5774 / 3.5251) |
 | `mx_big_extras_lr1e3_s0` / `mx_big_extras_seed2` | 340M master + extras at lr 1e-3 / lr 1.5e-3 seed 2 | fixed windows 2.5837 / 3.5405 and 2.6009 / 3.5607: **TTF - master + extras lr 1e-3 -0.006 [-0.008, -0.005], FineWeb -0.015** |
 | `ts512an05_spend0_s0` (lamprey, 3 Oct) | TTF without spending after a move (`--ts_spend 0`) | 2.7748 (+0.068 vs spend theta 2.7067) |
