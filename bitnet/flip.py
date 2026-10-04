@@ -348,6 +348,13 @@ class _KernelTernFn(torch.autograd.Function):
             return gx.view(ctx.xshape).to(gy.dtype), None, None
 
         gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
+        if layer.capture and getattr(layer, "cap_accum", False) and getattr(layer, "ts_micro", False):
+            # --ts_micro: the TTF update sees every micro-batch's gradient (momentum and v step per micro-batch; the
+            # accumulator, firing and spend on the last one), so no dense gradient is kept across micro-batches
+            layer._ts_final = getattr(layer, "cap_final", True)
+            layer.on_grad(layer, gw.detach().float())
+            del gw
+            return gx.to(gy.dtype), None, None
         if layer.capture and getattr(layer, "cap_accum", False):
             # gradient accumulation with a captured gradient (--ts, grad_accum > 1): sum the micro-batches (each
             # loss is already divided by grad_accum); with --ts_fused the update runs on the last micro-batch only

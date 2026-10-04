@@ -542,6 +542,10 @@ def ts_layer(l, g, state, c):
     if c.get("global") or c.get("global_") or (c.get("fuse") and getattr(l, "_ts_idx", 0) % 7 in (0, 1, 2, 4, 5)):
         return _ts_global_layer(l, g, state, c)
     r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
+    M_ = int(c.get("micro") or 1)   # --ts_micro with --grad_accum M: momentum and v step once per micro-batch with
+    final_ = getattr(l, "_ts_final", True) if M_ > 1 else True   # beta^(1/M); the accumulator only on the last one
+    if M_ > 1:
+        b1, b2 = b1 ** (1.0 / M_), b2 ** (1.0 / M_)
     r = getattr(l, "_ts_rank", 0) or r                                                  # --ts_rank_kv: per-layer rank
     rk_sched = None
     if c.get("rank_sched"):   # --ts_rank_sched R0:R1: both ranks move linearly from R0 to R1 over training (multiples of 8)
@@ -568,6 +572,8 @@ def ts_layer(l, g, state, c):
         R, C = (1 - b2) * g2.mean(1), (1 - b2) * g2.mean(0)
     _host_put(st, ("v", key), (R, C), off)
     v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
+    if M_ > 1:      # a micro-batch gradient is noisier than the batch's: E[g_mb^2] ~ M E[g^2] when noise dominates
+        v = v / M_
     del g2
     rs = min(rk_sched or getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
     if ("m", key) not in st:
@@ -586,6 +592,8 @@ def ts_layer(l, g, state, c):
             Um, Vm = _resize_lowrank(Um, Vm, rs, g, 1 - b1, 7_000_000 + 2 * getattr(l, "_ts_idx", 0) + t)
     if c.get("qdiag"): _qdiag(st, key, "m", Um, Vm, t)
     _host_put(st, ("m", key), _store_pair(sm, Um, Vm) if sm else (qm(Um), qVm(Vm)), off)  # --ts_qfmt sim., --ts_store_m real
+    if not final_:
+        return
     u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
     shadow_here = c.get("shadows") and (not c.get("shadow_layers") or getattr(l, "_ts_idx", -1) in c["shadow_layers"])
     if shadow_here:           # --ts_shadows: the same gradients into shadow states of other ranks (and full rank)
@@ -2361,6 +2369,9 @@ def main():
                     "stage 2 (F e.g. 0.4; 0: plain cosine)")
     ap.add_argument("--lean_tail", action="store_true", help="float tail in bf16 (embedding, adapter) / fp16 (gains, "
                     "scales) with LeanAdam: int8 first moment, factored second moment, stochastic-rounding updates")
+    ap.add_argument("--ts_micro", action="store_true", help="--ts_fused with --grad_accum M: the TTF update sees each "
+                    "micro-batch's gradient (momentum and v step per micro-batch with beta^(1/M), v / M; accumulator, firing "
+                    "and spend once per step), so no dense gradient is kept between micro-batches: activations shrink M-fold")
     ap.add_argument("--ckpt_block", action="store_true", help="checkpoint each block once (its input) instead of attention "
                     "and MLP separately: half the saved activations (kernel mode; master builds dense weights per sublayer)")
     ap.add_argument("--mem_report", action="store_true", help="log the MiB of trits, float tail, its gradients and "
@@ -3068,6 +3079,7 @@ def main():
         for i_, m_ in enumerate([m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]):
             m_._ts_idx = i_
             m_.on_grad = lambda layer, g, _c=ts_cfg: ts_layer(layer, g, lr_state, _c)
+            m_.ts_micro = bool(args.ts_micro)
         print("--ts_fused: the update runs inside each layer's backward", flush=True)
     for step in range(start_step, end_step):
         ORTH_DBG[0] = ORTH_DEBUG and step % 10 == 0
@@ -3114,6 +3126,7 @@ def main():
         if ts_cfg is not None:
             ts_cfg["lr_ratio"] = (lr / tc.lr) ** args.ts_anneal
             ts_cfg["progress"] = step / max(1, tc.max_steps)
+            ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
         rate_now = args.rate
