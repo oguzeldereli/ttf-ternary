@@ -30,10 +30,9 @@ within 6e-5. FineWeb-Edu was never used for any choice.
 - **Master learning rate:** of 7.5e-4 / 1.5e-3 / 3e-3 / 6e-3, the 1.5e-3 used for master is the best.
 - **1.3B** (fixed windows, one seed each): TTF 2.5510 vs master 2.5706 (−0.020 [−0.021, −0.018]); FineWeb-Edu
   3.5009 vs 3.5489 (−0.048).
-- **340M** (fixed windows, one seed each, seed 2 running): TTF 2.5774 vs master + the same float extras 2.6061
-  (−0.029 [−0.030, −0.027]) and master 2.6461; FineWeb-Edu 3.5251 vs 3.5654 / 3.6167. With the older step scaling
-  (p = 1) TTF was level with master + extras. Master's learning rate was tuned at 110M; at 340M lr 1e-3 is better
-  mid-run (level with TTF at step 4000), and its final decides this comparison.
+- **340M** (fixed windows): TTF 2.5774 / 2.5765 (2 seeds) vs master + the same float extras at its better learning rate
+  (1e-3, one seed) 2.5837: −0.006 [−0.008, −0.005]; FineWeb-Edu −0.015. At lr 1.5e-3 master + extras is 2.6061 /
+  2.6009 (−0.027 for TTF). More seeds at lr 1e-3 for both methods are running.
 - **FineWeb-Edu, 600M tokens** (110M): TTF 3.0861 vs master 3.1508.
 - **Zero-shot at 110M:** LAMBADA 0.135 vs 0.123 for master + extras. The multiple-choice tasks are at chance at this
   scale.
