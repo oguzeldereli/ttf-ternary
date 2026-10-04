@@ -29,6 +29,9 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts512an05_lean_s0` | full lean recipe (fused, int8 / fp16 state, bf16 / fp16 tail, LeanAdam) | **2.7020** (fp32 2.7067) |
 | `ts{128,64}an05_{rescale,refresh}_s0` | low-rank mechanisms: rescaled threshold / basis refresh every 50 steps | rescale 2.8959 / 3.0056 (+0.012 / +0.013), refresh 2.8880 / 3.0007 (+0.004 / +0.008) vs 2.8837 / 2.9929 |
 | `ts64an05_sched128to64_s0` | ranks 128 -> 64 over training (peak 128, mean 96) | 2.9148 (-0.078 vs ranks 64, +0.031 vs ranks 128) |
+| `ts64an05_sched64to128_s0` | ranks 64 -> 128 | 2.9432 (-0.050 vs ranks 64, +0.059 vs ranks 128) |
+| `ts64an05_table_s0` / `_xspend_s0` / `_tiles2_s0` | exact table 2% / exact spend / 2 x 2 tiles of rank 32 | 2.9891 / 2.9915 / 3.0216 (-0.004 / -0.001 / +0.029 vs 2.9929) |
+| `big_ts512an05_seed2` | 340M TTF p 0.5, seed 2 | 2.5866 (training-time, seed-2 windows) |
 | `ts512an05_spend0_s0` (lamprey, 3 Oct) | TTF without spending after a move (`--ts_spend 0`) | 2.7748 (+0.068 vs spend theta 2.7067) |
 | `ts512an05_kv128_s0` / `ts512an05_sharedV_s0` | k / v at rank 128 / shared basis | +0.023 / +0.047 (fixed windows); k, v / down stop moving |
 | `ts{128,64}an05_*` fixes | sketch / residual / theta 8 / theta 11 / lr 3e-3 / ranks by input width | +0.17 / -0.03 / +0.14 / +0.05 / -0.02 / 0.00 vs the same-rank baseline (2.8837 / 2.9928) |
