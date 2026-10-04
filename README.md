@@ -42,11 +42,27 @@ within 6e-5. FineWeb-Edu was never used for any choice.
 - **Measured peaks of lean TTF training** (micro-batch 1–2 × 2048): 110M 0.38–0.63 GiB, 340M 0.68–1.35 GiB, 1.3B
   1.61–2.97 GiB (state on host / on GPU), ~10B 12.3 GiB, ~15B 17.0 GiB.
 - **27B-class model on one 16 GB GPU, measured.** The 26.5B-parameter preset `b27` (22.85B ternary weights) trains
-  with TTF on one RTX 4070 Ti Super. Settings: ranks 256, the update inside the backward pass, int8/fp16 state kept in
-  pinned host memory, full activation checkpointing. Result: 24.6 s per 2048-token step, 14.1 GiB PyTorch peak,
-  13.7 GiB host. Script: `scripts/lab/b27_smoke.sh`.
+  with TTF at micro-batch 1 × 2048 with the update inside the backward pass, the lean float tail, the state in exactly
+  sized page-locked host memory with asynchronous copies (`--ts_offload_async`) and full activation checkpointing
+  (`scripts/lab/b27_lean.sh`):
+
+  | ranks | state format | GPU peak (PyTorch) | host memory |
+  |---|---|---|---|
+  | 256 | int8 / fp16 | 11.1 GiB | 11.2 GiB |
+  | 512 | int8 / fp16 | 11.1 GiB | 17.0 GiB |
+  | 1024 | int8 / 12-bit | 11.6 GiB | 23.7 GiB |
+
+  Ranks 256 / 512 were measured on an RTX 4070 Ti Super (16 GB) with 30 GB RAM, ranks 1024 on a 3090 Ti with 125 GB RAM
+  (GPU memory is the same allocation on either card). With the state on the host the GPU peak barely depends on the
+  rank; host memory is the limit. A ~15B model (width 6144) peaks at 9.4 GiB on the 16 GB card.
+- **Host offload costs no time with `--ts_offload_async`** (copies on side streams, next layer prefetched): 1.3B at
+  micro-batch 1 2.80 s/step vs 2.79 with the state on the GPU. torch's pinned allocator rounds every buffer up to a
+  power of two (at 27B ranks 1024: 29.7 GiB for 21.3 GiB of state); the state is allocated exactly instead.
 - **State formats.** The momentum (direction) can be stored in 8 bits with a per-column scale (int8 or fp8) at no
-  cost. The accumulator needs a 16-bit float. int8 accumulators cost 0.01–0.02 in loss.
+  cost; 4 bits fails. The accumulator needs about 5 mantissa bits: 5 bits +0.002, 4 bits +0.05, 3 bits +0.15, int8
+  +0.01–0.02. A real 12-bit accumulator (`--ts_store_a fp12s`: per-column scale, sign, 5 exponent and 6 mantissa bits,
+  two values in 3 bytes) is level with 16 bits so far (quality run running). The momentum rank cannot be cut below the
+  accumulator rank (+0.05 for rank 256 or a per-type split under an accumulator of 512).
 - **Size.** Measured at 110M: int8 + fp16 cuts the state from 685 to 258 MiB with no change in loss. At 27B the
   state is 2 / 4 / 8 bits per weight at ranks 256 / 512 / 1024, against 128 bits for master weights + AdamW
   (`scripts/analysis/memory_27b.py`).
