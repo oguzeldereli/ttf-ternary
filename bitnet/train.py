@@ -425,7 +425,7 @@ def ts_layer(l, g, state, c):
     _host_put(st, ("v", key), (R, C), off)
     v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
     del g2
-    rs = min(getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
+    rs = min(getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
     if ("m", key) not in st:
         gen = torch.Generator(device=g.device).manual_seed(4_000_000 + 2 * getattr(l, "_ts_idx", 0))
         Vm = _orth(g.T @ torch.randn(l.N, rs, device=g.device, generator=gen))
@@ -1861,6 +1861,8 @@ def main():
                     "accumulator's basis update with this share of its norm (lets new directions in at low rank)")
     ap.add_argument("--ts_resid", action="store_true", help="--ts: feed what the accumulator's projection discarded back "
                     "into the next step (dense N x K per layer: an upper-bound test, not sublinear)")
+    ap.add_argument("--ts_rank_s_types", default="", help="--ts: per-layer-type rank of the short momentum only, e.g. "
+                    "q:128,k:128,v:128,o:128,gate:384,up:384,down:384 (the momentum is lower-rank than the accumulator)")
     ap.add_argument("--ts_rank_types", default="", help="--ts: per-layer-type ranks, e.g. q:64,k:64,v:96,o:64,gate:160,"
                     "up:160,down:128 (both states; types not listed use --lowrank / --ts_rank_s)")
     ap.add_argument("--ts_shared_v", action="store_true", help="--ts: the short momentum and the accumulator share one "
@@ -2181,6 +2183,13 @@ def main():
             if _TS_TYPES[i % 7] in rt:
                 m._ts_rank = rt[_TS_TYPES[i % 7]]
         print(f"--ts_rank_types: {rt}", flush=True)
+    if args.ts_rank_s_types:
+        rt = {k: int(v) for k, v in (x.split(":") for x in args.ts_rank_s_types.split(","))}
+        lays_ = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
+        for i, m in enumerate(lays_):
+            if _TS_TYPES[i % 7] in rt:
+                m._ts_rank_s = rt[_TS_TYPES[i % 7]]
+        print(f"--ts_rank_s_types: {rt}", flush=True)
     if args.ts_rank_kv:
         from .model import Attention
         for a in model.modules():
