@@ -150,8 +150,10 @@ docs/            see below
 - **Late-training slope.** With steps × ρ^0.5 (p = 0.5) the 340M lead holds to the end (with p = 1 master + extras
   caught up). At 1.3B (p = 0.5) the lead shrank to −0.008 and widened again to −0.020 at the end.
 - **Rank vs width.** Ranks 512 match or beat master up to 1.3B (rank / width 0.25). Low rank fails in the accumulator,
-  whose energy is spread over many directions (the top 64 hold ~50%); that share stays flat from width 768 to 2048,
-  which supports a fixed rank. A width sweep up to 15B and 1x / 2x / 4x compute runs at ranks 64 / 128 are running.
+  whose energy is spread over many directions. At batch 16 the share that ranks 512 captures falls with width (0.96 /
+  0.91 / 0.77 at 110M / 340M / 1.3B), while energy capture overstates the need (1.3B ranks 512 still beats master). A
+  width sweep at batch 2 (up to 15B) cannot settle it: at that batch the gradient is mostly noise and a lower rank
+  filters it. The deciding run is 1.3B at ranks 256 (running).
 - **Wall-clock.** On an A100 at 1.3B, a TTF step is about 5 s against 4.5 s for master. The QR timing is being
   re-measured.
 - Token budgets are small (300M–600M), and the 340M and 1.3B comparisons have one seed each.
