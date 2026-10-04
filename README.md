@@ -28,15 +28,18 @@ within 6e-5. FineWeb-Edu was never used for any choice.
   paired block bootstrap over windows. On FineWeb it is −0.038. Seed spread is 0.002–0.0035, so the gap is more than
   10× the seed noise.
 - **Master learning rate:** of 7.5e-4 / 1.5e-3 / 3e-3 / 6e-3, the 1.5e-3 used for master is the best.
-- **Other scales and data** (training-time evaluation, one seed):
-  - FineWeb-Edu, 600M tokens: TTF 3.0861 vs master 3.1508.
-  - 340M: TTF 2.6268 vs master 2.6626.
-  - 1.3B: in progress, −0.011 vs master at step 8000 of 9155.
+- **1.3B** (fixed windows, one seed each): TTF 2.5510 vs master 2.5706 (−0.020 [−0.021, −0.018]); FineWeb-Edu
+  3.5009 vs 3.5489 (−0.048).
+- **340M** (training-time evaluation, one seed): TTF 2.6268, master 2.6626, master + the same float extras 2.6222. TTF
+  led master + extras by 0.075 at step 5000; master + extras caught up in the last ~1500 steps.
+- **FineWeb-Edu, 600M tokens** (110M): TTF 3.0861 vs master 3.1508.
 - **Zero-shot at 110M:** LAMBADA 0.135 vs 0.123 for master + extras. The multiple-choice tasks are at chance at this
   scale.
 
 ## Memory
 
+- **Measured peaks of lean TTF training** (micro-batch 1–2 × 2048): 110M 0.38–0.63 GiB, 340M 0.68–1.35 GiB, 1.3B
+  1.61–2.97 GiB (state on host / on GPU), ~10B 12.3 GiB, ~15B 17.0 GiB.
 - **27B-class model on one 16 GB GPU, measured.** The 26.5B-parameter preset `b27` (22.85B ternary weights) trains
   with TTF on one RTX 4070 Ti Super. Settings: ranks 256, the update inside the backward pass, int8/fp16 state kept in
   pinned host memory, full activation checkpointing. Result: 24.6 s per 2048-token step, 14.1 GiB PyTorch peak,
@@ -143,11 +146,11 @@ docs/            see below
 
 ## Open questions
 
-- **Late-training lead at larger scale.** TTF's lead over master shrinks late in training at 1.3B and at 340M with
-  low rank; at 110M and on FineWeb-Edu it holds or grows. The levers being tested are the step annealing p and the
-  leak.
-- **Rank vs width.** Ranks 512 match or beat master up to 1.3B (rank / width 0.25). Whether the rank needed stays
-  fixed as width grows, which is what makes the state small, is not settled yet. Ranks 128 and 256 trail at 340M.
+- **Late-training slope.** At 340M master + extras catches TTF in the last ~1500 steps; at 1.3B the lead shrank to
+  −0.008 and widened again to −0.020 at the end. The levers being tested are the step annealing p and the leak.
+- **Rank vs width.** Ranks 512 match or beat master up to 1.3B (rank / width 0.25). Low rank fails in the accumulator,
+  whose energy is spread over many directions (the top 64 hold ~50%); that share stays flat from width 768 to 2048,
+  which supports a fixed rank. A width sweep up to 15B and 1x / 2x / 4x compute runs at ranks 64 / 128 are running.
 - **Wall-clock.** On an A100 at 1.3B, a TTF step is about 5 s against 4.5 s for master. The QR timing is being
   re-measured.
 - Token budgets are small (300M–600M), and the largest finished comparison is 340M with one seed.

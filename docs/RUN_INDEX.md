@@ -13,6 +13,25 @@ Training-time
 val numbers of different seeds use different windows and differ by up to 0.06 for that reason alone (RUNS.md
 "3 Oct 04:45").
 
+
+## 3-4 Oct: scale, checks, memory, low rank (details in RUNS.md "3 Oct night" onwards)
+
+| run(s) | what | result |
+|---|---|---|
+| `x1b_ts512_la1000an05` vs `x1b_master_lr75` (Myriad) | 1.3B, fixed windows | **TTF 2.5510 vs master 2.5706 (-0.020 [-0.021, -0.018]); FineWeb 3.5009 vs 3.5489 (-0.048)**; LAMBADA 0.155 vs 0.138 |
+| `mx_big_extras_s0` (harlequin) | 340M master + the same float extras | **2.6222** (TTF ranks 512 2.6268; TTF led by 0.075 at 5000) |
+| `mx_lr075_s0` / `mx_lr3e3_s0` / `mx_lr6e3_s0` | master lr sweep | 2.7785 / 2.8136 / diverged (lr 1.5e-3 2.7513 is best) |
+| `mx_2stage_s0` / `mx_2stage_lr3e3_s0` | master with a BitNet-style two-stage schedule | 2.7577 / 2.8153 (no gain) |
+| `bop_g1e3_t02/t05/t15_s0` | ternary Bop baseline (one timescale) | 3.0885 / 3.9898 / 3.2451 (rerun 3.2407) |
+| `tsbare_rs512an05_s0` | TTF without float extras | 2.8266 (+0.075 vs bare master) |
+| `q*_s0`, `qfp16s_s0`, `qm8a16_seed2`, `qmf8a16_seed2` | storage formats | 8-bit direction + 16-bit accumulator free (seed 2 too); scaled fp16 2.7076 |
+| `ts512an05_lean_s0` | full lean recipe (fused, int8 / fp16 state, bf16 / fp16 tail, LeanAdam) | **2.7020** (fp32 2.7067) |
+| `ts512an05_kv128_s0` / `ts512an05_sharedV_s0` | k / v at rank 128 / shared basis | +0.023 / +0.047 (fixed windows); k, v / down stop moving |
+| `ts{128,64}an05_*` fixes | sketch / residual / theta 8 / theta 11 / lr 3e-3 / ranks by input width | +0.17 / -0.03 / +0.14 / +0.05 / -0.02 / 0.00 vs the same-rank baseline (2.8837 / 2.9928) |
+| `fwc_*` (running) | ranks 512 / 128 / 64 at 1x / 2x / 4x compute, FineWeb-Edu | capacity or direction? |
+| `w{110m,340m,1b,10b,15b}_r{64,256,512}` (running) | width sweep, batch 2, 1000 steps, shadows | top-64 energy share 0.57 / 0.54 / 0.53 at width 768 / 1024 / 2048 |
+| `lean_mem.sh`, `b27_smoke.sh` | measured memory | 110M 0.38-0.63 GiB, 340M 0.68-1.35, 1.3B 1.61-2.97, 10B 12.3, 15B 17.0, 26.5B 14.1 (ranks 256) |
+
 ## Best so far (110M, 300M tokens, from scratch, final validation loss / perplexity)
 
 | run | what | val loss | ppl |

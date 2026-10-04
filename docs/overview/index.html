@@ -129,41 +129,38 @@ ul.plain{margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4
 <div class="wrap">
 
 <header style="display:flex;flex-direction:column;gap:10px">
-  <span class="eyebrow">ternary-LLM · 110M model · wiki32k · updated 1 Oct 2026, 10:50</span>
+  <span class="eyebrow">ternary-LLM · 110M–15B · wiki32k / FineWeb-Edu · updated 4 Oct 2026, 01:45</span>
   <h1>Ternary Training Map</h1>
   <p class="lede">Training a model whose weights are only <span class="trits">{−1, 0, +1}</span> with no full-precision copy of them (optimizer state at most sublinear in parameter count). What we tried, what it showed, what is running, what we have not tried and what is still open.</p>
 </header>
 
 <section>
-  <span class="eyebrow">Validation loss at 300M tokens (lower is better; perplexity = e^loss)</span>
+  <span class="eyebrow">Final evaluation on fixed windows (same windows for every model; FineWeb-Edu never used for any choice)</span>
   <div class="score">
-    <div class="best"><span class="v">2.670</span><span class="l"><b>ours, two-timescale threshold flips (TTF / --ts), full rank</b>, leak scaled with the lr (2 seeds 2.6746 / 2.6645; ppl 14.4)</span></div>
-    <div class="ref"><span class="v">2.683</span><span class="l">full precision fp32 + AdamW (ppl 14.6)</span></div>
-    <div class="best"><span class="v">2.702</span><span class="l"><b>ours, TTF ranks 512</b>, steps × (lr ratio)^0.5 (2 seeds 2.7067 / 2.6978; ppl 14.9): <b>−0.028 vs the fair master</b></span></div>
-    <div class="ref"><span class="v">2.730</span><span class="l"><b>fair reference</b>: master weights + the same float extras as our runs (scales, additive rank-16 adapter, head temperature; 2 seeds 2.7321 / 2.7279)</span></div>
-    <div class="ref"><span class="v">2.751</span><span class="l">master weights: ternary forward, fp32 latent copy + AdamW (ppl 15.7)</span></div>
-    <div><span class="v">2.783</span><span class="l">ours, TTF ranks 256, steps × ratio^0.5 (128: 2.909, 64: 3.018 with the older annealing)</span></div>
-    <div><span class="v">2.793</span><span class="l">old rule, full-rank momentum: dry friction + spend (2 seeds 2.7998 / 2.7864)</span></div>
-    <div><span class="v">2.815</span><span class="l">old rule, rank 512: dry friction + spend (2 seeds 2.8215 / 2.8093)</span></div>
-    <div><span class="v">2.867</span><span class="l">old rule, rank 256 (2 seeds 2.8699 / 2.8639)</span></div>
-    <div><span class="v">2.9875</span><span class="l">gate + Adam step + sharp, short memory (decay 0.97): the base of 29–30 Sep</span></div>
-    <div><span class="v">2.9925</span><span class="l">look-ahead + sharp (3 passes per step)</span></div>
-    <div><span class="v">3.131</span><span class="l">rank-256 momentum + row/column scales</span></div>
+    <div class="best"><span class="v">2.689</span><span class="l"><b>110M, TTF ranks 512</b> (3 seeds 2.6903 / 2.6868 / 2.6893; FineWeb 3.645)</span></div>
+    <div class="ref"><span class="v">2.717</span><span class="l">110M, master weights + the same float extras (2 seeds; FineWeb 3.683): TTF <b>−0.028 [−0.029, −0.027]</b>, FineWeb −0.038</span></div>
+    <div class="ref"><span class="v">2.736</span><span class="l">110M, master weights (3 seeds; FineWeb 3.707): TTF −0.047 / FineWeb −0.062; seed spread 0.002–0.0035</span></div>
+    <div><span class="v">2.797</span><span class="l">110M, our earlier flip rule (FineWeb 3.755)</span></div>
+    <div class="best"><span class="v">2.551</span><span class="l"><b>1.3B, TTF ranks 512</b> (FineWeb 3.501; LAMBADA 0.155)</span></div>
+    <div class="ref"><span class="v">2.571</span><span class="l">1.3B, master weights (FineWeb 3.549; LAMBADA 0.138): TTF <b>−0.020 [−0.021, −0.018]</b>, FineWeb −0.048</span></div>
+    <div><span class="v">2.627</span><span class="l">340M, TTF ranks 512 (training-time eval); 340M master 2.663; <b>340M master + extras 2.622</b> (ends 0.005 ahead after trailing by 0.075 at step 5000)</span></div>
   </div>
-  <p><b>2 Oct:</b> master trained with one ingredient removed showed what it needs: a short momentum (beta1 0.997 instead of 0.9: +0.49), an integrator with a ~1000-step memory (300 steps: +0.097; master without its leftover offset after a crossing lands exactly on our old rule, +0.071) and immediate firing (trits that follow the latent at a rate: +0.77); rank and factored normalization do not matter (+0.02 / 0.00). The rule rebuilt that way (<b>two-timescale threshold flips, TTF</b>: short low-rank momentum → Adam step → long low-rank accumulator → flip when it crosses a threshold) beats master even when master gets our float extras. <b>340M</b>: TTF ranks 512 <b>2.6268</b> vs 340M master 2.6626 (−0.036) and our old rule 2.7246. <b>1.3B</b> (Myriad): master 2.5868; TTF at step 1500 is +0.011 behind it, where the old rule was +0.93 at step 1000 (still running). In bits per byte (3.58 bytes per token): 110M master 1.108, TTF 512 1.088, 340M TTF 1.058. Open: int8 storage of the TTF state costs ~0.03 (ablation running), the rank needed at large width, and the late flattening of the curves (steps annealed with the lr: milder annealing keeps master's late slope). Memory: at 27B, ranks 1024 in int8 is ~0.94 bytes per parameter for weights + optimizer state (master 16). Every formula: <code>docs/FORMULAS.md</code>.</p>
+  <p><b>What TTF is</b>: a short low-rank momentum (β 0.9) → Adam-normalised step → a long low-rank accumulator (leak ~1000 steps) → a ternary weight moves one level when its accumulated evidence crosses θ = 16, and the move is spent from the accumulator. Built from an ablation of master-weight training (2 Oct). <b>Checked 3 Oct</b>: rebuilt models reproduce their logged losses to &lt;6e-5; no val article in train; 69 kernel tests pass; master's lr 1.5e-3 is the best of four; master is the BitNet b1.58 recipe (a two-stage schedule did not improve it); a ternary Bop baseline is 0.38 behind; storage formats: 8-bit direction + 16-bit accumulator free (both seeds); the lean recipe (int8 / fp16 state, bf16 / fp16 float tail, update inside the backward) <b>2.7020 vs 2.7067</b>. Objections and evidence: <code>docs/THREATS.md</code>.</p>
+  <p><b>Memory, measured</b> (micro-batch 1–2 × 2048, lean): 110M 0.38–0.63 GiB, 340M 0.68–1.35, 1.3B 1.61–2.97 (state on host / on GPU), <b>10B 12.3 GiB</b> (16 GB card), <b>15B 17.0 GiB</b> (24 GB card), the 26.5B preset 14.1 GiB at ranks 256 on a 16 GB card (24.6 s/step). Master + AdamW: 16 bytes per parameter before activations.</p>
 </section>
 
 <section>
-  <span class="eyebrow">Right now</span>
+  <span class="eyebrow">Right now (4 Oct, 01:45)</span>
   <h2>What is running where</h2>
   <div class="tbl"><table>
     <tr><th>machine</th><th>run</th><th>what</th><th>expected</th></tr>
-    <tr><td>10 lab121 PCs</td><td class="mono">q8all, q8m, q8a, q8noV, q8det, q8row, qbf16, qfp16, qfp8, qdiag_fp32</td><td>why int8 storage of the TTF state costs ~0.03: which matrix, which rounding, which format (bf16 / fp16 / fp8), and diagnostics of the stored numbers (crest factor, sub-resolution updates, dynamic range)</td><td class="num">~23:45</td></tr>
-    <tr><td>Myriad</td><td class="mono">x1b_ts512_la1000an05</td><td>1.3B, TTF ranks 512 (on master's curve at step 1500)</td><td class="num">Sat ~14:45</td></tr>
-    <tr><td>Myriad</td><td class="mono">x1b_dryspend_r512_lr75</td><td>1.3B, old rule (+0.19 vs 1.3B master at 6000)</td><td class="num">Sat ~01:20</td></tr>
-    <tr><td>Myriad</td><td class="mono">prof1b_master / old / ts</td><td>why 1.3B steps are slow on the A100s: time and memory per phase, top kernels</td><td class="num">queued</td></tr>
+    <tr><td>7 lab121 PCs</td><td class="mono">fwc_r512_1x, fwc_r128_{1,2,4}x, fwc_r64_{1,2,4}x</td><td>capacity or direction: do ranks 128 / 64 with 2× / 4× compute reach ranks 512 at 1× (FineWeb-Edu, 110M)?</td><td class="num">05:15 / 10:00 / Sun 19:30</td></tr>
+    <tr><td>lab121 + 2 × 3090</td><td class="mono">w10b_r64/256/512, w15b_r64/256/512 (+ 110M / 340M / 1.3B done)</td><td>width sweep for the sublinearity claim: does a fixed rank suffice as width grows? (1000 steps, shadow states at ranks 64 / 256 / 1024 / full)</td><td class="num">03:00–13:30</td></tr>
+    <tr><td>Myriad</td><td class="mono">x340_shadows, x1b_shadows</td><td>the same shadow comparison at batch 16 on every layer (1.3B on an 80 GB A100)</td><td class="num">04:10 / 05:50</td></tr>
+    <tr><td>3 lab121 PCs</td><td class="mono">qm8af5 / af4 / af3, qm4a16</td><td>precision ladder: accumulator with 5 / 4 / 3 mantissa bits; int4 direction</td><td class="num">06:00–08:15</td></tr>
+    <tr><td>tope / quillback</td><td class="mono">big_ts512an05, big_ts512la1000an05</td><td>340M late-training levers (steps × ratio^0.5, + scaled leak)</td><td class="num">02:45</td></tr>
   </table></div>
-  <p class="meh" style="font-size:13px">Kept current in <code>docs/QUEUE.md</code>. No look-ahead in new runs unless there is a new reason.</p>
+  <p class="meh" style="font-size:13px">Kept current in <code>docs/QUEUE.md</code>; overnight plan in <code>docs/OVERNIGHT_PLAN_OCT4.md</code>.</p>
 </section>
 
 <section>
@@ -240,6 +237,21 @@ ul.plain{margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4
       <div class="node">Short momentum rank matters (128 → 512: 2.856 → 2.733); ranks 256: 2.78, 128: 2.909; the lead fades in the cosine tail unless the annealing is milder (√ ratio: master's late slope)</div><div class="down">↓</div>
       <div class="node good"><b>Fair check</b>: master + our float extras 2.730 (2 seeds); TTF 512 2.702 (2 seeds), full rank 2.670 (2 seeds). 340M TTF 2.6268 vs master 2.6626</div><div class="down">↓</div>
       <div class="node lead">int8 storage of the TTF state costs ~0.03: likely the accumulator's tiny per-step changes (~1/1000) under the int8 step; testing formats</div>
+    </div></div>
+    <div class="thread"><h3>8 · Evaluation, scale, memory (3 Oct)</h3><div class="chain">
+      <div class="node">Fixed-window evaluation: training-time seed comparisons were biased by up to 0.065 (windows drawn per seed)</div><div class="down">↓</div>
+      <div class="node good"><b>110M</b> TTF −0.028 vs master + extras (3 / 2 seeds, CI ±0.001), −0.038 on FineWeb; <b>1.3B</b> TTF −0.020 vs master, −0.048 on FineWeb</div><div class="down">↓</div>
+      <div class="node good">Storage: 8-bit direction + 16-bit accumulator free (fp16 needs a per-column scale: underflow); real int8 / fp16 state and host offload; lean float tail free (2.7020)</div><div class="down">↓</div>
+      <div class="node good">26.5B preset trains on one 16 GB GPU; 10B 12.3 GiB, 15B 17.0 GiB peak</div><div class="down">↓</div>
+      <div class="node lead">340M: master + extras catches TTF in the last 1500 steps (2.622 vs 2.627): the late-training slope at width</div>
+    </div></div>
+    <div class="thread"><h3>9 · Why low rank falls behind (3–4 Oct)</h3><div class="chain">
+      <div class="node bad">k / v at rank 128 +0.023; shared basis +0.047: those layers (k, v / down) stop moving</div><div class="down">↓</div>
+      <div class="node">Low rank under-moves: flips per weight 3.0 / 1.5 / 0.8 at ranks 512 / 128 / 64; down keeps only 21–29% of each step (2048-wide input)</div><div class="down">↓</div>
+      <div class="node lead">Shadow states: the full-rank accumulator is not low-rank (top 64 directions hold ~50% of its energy); the momentum is fine at rank 64 (cosine 0.87)</div><div class="down">↓</div>
+      <div class="node bad">Fixes: sketch +0.15, lower θ +0.05 to +0.14, per-type ranks 0, lr 3e-3 −0.02, dense residual feedback −0.03</div><div class="down">↓</div>
+      <div class="node lead">Ranks 256 / 128 behave like ranks 512 slowed down (1.14× / 1.4× the steps); ranks 64 drifts; its moves are as good, just fewer → testing 2× / 4× compute</div><div class="down">↓</div>
+      <div class="node lead">Width sweep: top-64 energy share 0.57 / 0.54 / 0.53 at width 768 / 1024 / 2048 (flat, not 1 / width): supports a fixed rank; 10B / 15B running</div>
     </div></div>
   </div></div>
 </section>
@@ -381,28 +393,25 @@ ul.plain{margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4
       <span class="eyebrow">Not tried yet</span>
       <h2>Proposed, not run</h2>
       <ul>
-        <li><span class="tag t-run">running</span>Rank sweep 32 / 64 / 128 at 110M and 64 / 128 at 340M (can the recipe fit 27B in 12–16 GB?); 340M recipe vs master (4090); decay 0.995 + spend + rank 512</li>
-        <li><span class="tag t-lead">next</span>A second seed of the best run (seed runs on hold)</li>
-        <li><span class="tag t-lead">next</span>Goldbug, 8–10 Oct (2 × RTX PRO 6000): the recipe vs master at ~1B parameters on ~2B tokens (FineWeb), plus a 27B memory and speed test</li>
-        <li><span class="tag t-lead">next</span>Trainer for 27B: update each layer during the backward pass, fold micro-batches into the momentum, flip from U, V without materialising M, bf16 momentum</li>
-        <li>Dry friction + spend + rank 1024; friction between 1/33 and 0.05; a friction schedule for longer runs</li>
-        <li>Master-to-our-rule branch test: does our rule forget master's rare pairs or only fail to learn them? (needs a master-to-ternary converter)</li>
-        <li>Protect formed circuits (induction heads); an output bias for unigram frequencies</li>
-        <li><span class="tag t-bad">dropped</span>Look-ahead; asymmetric gravity; speed references; online selector; undo; dither; slow gate</li>
+        <li><span class="tag t-lead">next</span>Overlap the host-offload copies with compute (side stream, prefetch the next layer): offload costs +2% at batch 16 but +33–70% at micro-batch 1</li>
+        <li><span class="tag t-lead">next</span>15B on a 16 GB card: update the largest layers in row blocks (several 0.4 GB N × K temporaries) and micro-batch 1</li>
+        <li><span class="tag t-lead">next</span>340M late slope: seeds of TTF and master + extras; levers beyond p (the ratio^0.5 runs end 02:45)</li>
+        <li><span class="tag t-lead">next</span>Goldbug, 8–10 Oct (2 × RTX PRO 6000): TTF vs master + extras at 1.3B on FineWeb-Edu</li>
+        <li>Real packed storage of a smaller accumulator if the precision ladder finds one (12-bit or less)</li>
+        <li><span class="tag t-bad">dropped</span>Shared basis; ranks by input width; random sketch in the basis; lower θ at low rank; Cholesky-QR in fp32</li>
       </ul>
     </div>
     <div class="list">
       <span class="eyebrow">Open questions</span>
       <h2>What we still can't explain</h2>
       <ul>
-        <li><span class="tag t-bad">open</span>The last 0.07: pairs seen 10–999 times are still +0.10–0.12 behind master; is it memory, rank, or per-weight precision?</li>
-        <li><span class="tag t-bad">open</span>Does the rank needed grow with model width (340M runs), and does the recipe hold at 1B?</li>
-        <li><span class="tag t-bad">open</span>Why dry friction starts slowly (+0.14 at 33M vs decay 0.995) although its memory at step 1000 is already ~220 steps</li>
-        <li><span class="tag t-bad">open</span>Why the copy gain varies so much between runs of similar loss (+1.6 to +5.9)</li>
-        <li><span class="tag t-bad">open</span>Why 41-step swing tests don't predict training</li>
-        <li><span class="tag t-good">found</span>The gap to master was rare-pair statistics, and the cause the momentum's short memory; lengthening it halves that gap and brings induction heads</li>
-        <li><span class="tag t-good">found</span>The swing is made by our flips; the gate removes it; the Adam step moves flips out of steep rows</li>
-        <li><span class="tag t-good">settled</span>Look-ahead is not needed; rank 256 is not the limit at a short memory; dry friction ≈ the best fixed decay</li>
+        <li><span class="tag t-bad">open</span>Does the rank needed stay fixed as width grows (10B / 15B / Myriad shadow runs)? The sublinearity headline depends on it</li>
+        <li><span class="tag t-bad">open</span>Late-training slope at 340M (master + extras catches up in the last 1500 steps); at 1.3B the lead shrank to −0.008 and widened again to −0.020</li>
+        <li><span class="tag t-bad">open</span>Ranks 64: slowed down (more compute fixes it) or heading somewhere else? (2× / 4× runs)</li>
+        <li><span class="tag t-bad">open</span>A100 step time: TTF 6.6 s (fp64 Cholesky-QR) / 8.2 s (Householder) vs master 4.5 s at 1.3B</li>
+        <li><span class="tag t-good">found</span>What master needs: a short momentum, a ~1000-step integrator, immediate moves; TTF rebuilt from that beats master at 110M and 1.3B</li>
+        <li><span class="tag t-good">found</span>Low rank fails in the accumulator (energy spread over many directions), not in the momentum</li>
+        <li><span class="tag t-good">settled</span>8-bit direction + 16-bit accumulator free; lean float tail free; fp32 Cholesky-QR locks subspaces at zero (Householder / fp64 fine)</li>
       </ul>
     </div>
   </div>
@@ -412,6 +421,9 @@ ul.plain{margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4
   <span class="eyebrow">The figures worth looking at</span>
   <h2>Figures</h2>
   <div class="figs">
+    <figure><img src="../figures/oct3_scale_eval.png" alt="Scale and evaluation"><figcaption><b>3 Oct, scale and evaluation</b>: 1.3B and 340M curves, 110M fixed-window results relative to master, TTF minus master by size.</figcaption></figure>
+    <figure><img src="../figures/oct3_lowrank.png" alt="Low rank"><figcaption><b>3 Oct, low rank</b>: the fixes against the same-rank baseline, shadow states vs full rank, which layer types stop moving.</figcaption></figure>
+    <figure><img src="../figures/oct3_memory.png" alt="Memory"><figcaption><b>3 Oct, memory</b>: lean TTF measured at 110M / 340M / 1.3B against master + AdamW.</figcaption></figure>
     <figure><img src="../figures/best_runs.png" alt="Best runs"><figcaption><b>best runs</b>: the best run at each step of progress with fp32 and master (dashed); right: 100M–300M with final loss and perplexity.</figcaption></figure>
     <figure><img src="../figures/sweeps.png" alt="Sweeps"><figcaption><b>the recipe's knobs</b>: decay (as memory), dry friction strength, rank. Memory has an optimum at ~200–400 steps; rank helps once the memory is long.</figcaption></figure>
     <figure><img src="../figures/gaps.png" alt="Gaps to master"><figcaption><b>where the gap is</b>: by how often the word pair occurs in training, by context position (first buckets small and noisy), and the copy (induction) gain.</figcaption></figure>
