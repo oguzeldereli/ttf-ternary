@@ -35,6 +35,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts64an05_rsketch16_s0` / `_spendtab_s0` / `_sched512to64_s0` | residual-sketch refresh / spend only in a table / ranks 512 -> 64 | 3.0808 / 3.0009 / **2.7777** (+0.088 / +0.008 / -0.215 vs 2.9929; 512 -> 64 peaks at the ranks-512 state) |
 | `big_ts512an05_seed2` | 340M TTF p 0.5, seed 2 | 2.5866 (training-time); fixed windows 2.5765 / 3.5250 (seed 1337 2.5774 / 3.5251) |
 | `mx_big_extras_lr1e3_s0` / `mx_big_extras_seed2` | 340M master + extras at lr 1e-3 / lr 1.5e-3 seed 2 | fixed windows 2.5837 / 3.5405 and 2.6009 / 3.5607: **TTF - master + extras lr 1e-3 -0.006 [-0.008, -0.005], FineWeb -0.015** |
+| `big_ts512an05_lr1e3_{s0,seed2}`, `mx_big_extras_lr1e3_seed2` | 340M at lr 1e-3: TTF / master + extras seed 2 | fixed windows TTF 2.6133 / 2.6180 (worse than at 1.5e-3), master + extras 2.5919 / 3.5510; **each at its better lr, 2 seeds each: TTF - master + extras -0.0108 [-0.0120, -0.0097], FineWeb -0.0207** |
 | `ts512an05_spend0_s0` (lamprey, 3 Oct) | TTF without spending after a move (`--ts_spend 0`) | 2.7748 (+0.068 vs spend theta 2.7067) |
 | `ts512an05_kv128_s0` / `ts512an05_sharedV_s0` | k / v at rank 128 / shared basis | +0.023 / +0.047 (fixed windows); k, v / down stop moving |
 | `ts{128,64}an05_*` fixes | sketch / residual / theta 8 / theta 11 / lr 3e-3 / ranks by input width | +0.17 / -0.03 / +0.14 / +0.05 / -0.02 / 0.00 vs the same-rank baseline (2.8837 / 2.9928) |
