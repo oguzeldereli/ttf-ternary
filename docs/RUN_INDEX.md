@@ -32,6 +32,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts64an05_sched64to128_s0` | ranks 64 -> 128 | 2.9432 (-0.050 vs ranks 64, +0.059 vs ranks 128) |
 | `ts64an05_table_s0` / `_xspend_s0` / `_tiles2_s0` | exact table 2% / exact spend / 2 x 2 tiles of rank 32 | 2.9891 / 2.9915 / 3.0216 (-0.004 / -0.001 / +0.029 vs 2.9929) |
 | `ts128an05_xspend_s0` | exact spend at ranks 128 | **2.8727** (-0.011 vs 2.8837; ranks 64: -0.001) |
+| `ts128an05_xspend_seed2` | exact spend at ranks 128, seed 2 | 2.8534 (seed-2 training windows; fixed-window comparison pending) |
 | `ts64an05_rsketch16_s0` / `_spendtab_s0` / `_sched512to64_s0` | residual-sketch refresh / spend only in a table / ranks 512 -> 64 | 3.0808 / 3.0009 / **2.7777** (+0.088 / +0.008 / -0.215 vs 2.9929; 512 -> 64 peaks at the ranks-512 state) |
 | `ts512an05_global_s0` / `ts512an05_fuse_s0` / `ts128an05_fuse_s0` | one basis for the whole model (64% state) / q-k-v and gate-up share an input basis (84%) | 2.7505 / 2.7200 / 2.9172 (+0.044 / +0.013 vs 2.7067, +0.034 vs 2.8837); vs per-layer at the same memory -0.011 / -0.011 / -0.001 |
 | `big_ts512an05_seed2` | 340M TTF p 0.5, seed 2 | 2.5866 (training-time); fixed windows 2.5765 / 3.5250 (seed 1337 2.5774 / 3.5251) |

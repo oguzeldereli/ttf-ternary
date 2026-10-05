@@ -570,7 +570,7 @@ def ts_layer(l, g, state, c):
     if M_ > 1:    # --ts_micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
         # row / column means of (sum_i g_i)^2 = the micro-batches' own squares + 2 <g_i, sum of earlier g_i'>, the
         # cross terms through a k-dim random sketch of the running sum (unbiased; k (N + K) floats, held within the step)
-        Sr, Sc = _micro_sketch(l, dev)
+        Sr, Sc = _micro_sketch(l, dev, (t - 1) // M_)
         PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (0, 0, 0, 0, 0, 0)
         gS, Sg = g @ Sr, Sc @ g
         d1, d0 = g2.mean(1), g2.mean(0)
@@ -822,10 +822,11 @@ def ts_layer(l, g, state, c):
 MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "64"))]   # sketch size (TERN_MICRO_K: tests only)
 
 
-def _micro_sketch(l, dev):
-    """--ts_micro: a layer's fixed random maps (K x k, k x N; E[S S^T] = I) for the cross terms of the batch's v"""
+def _micro_sketch(l, dev, step):
+    """--ts_micro: a layer's random maps (K x k, k x N; E[S S^T] = I) for the cross terms of the batch's v; fixed within
+    a step, new every step, so their errors are independent across steps and v's EMA averages them out"""
     k = MICRO_SKETCH[0]
-    gen = torch.Generator(device=dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0))
+    gen = torch.Generator(device=dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * step)
     return (torch.randn(l.K, k, device=dev, generator=gen) / k ** 0.5,
             torch.randn(k, l.N, device=dev, generator=gen) / k ** 0.5)
 
