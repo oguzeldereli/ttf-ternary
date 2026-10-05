@@ -37,7 +37,9 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts64an05_gate_s0` / `_sgate1_s0` / `_sgate2_s0` | ranks 64 + `--lr_gate` / per-weight sign counter K 1 / K 2 (`--ts_sgate`) | 2.9942 / 2.9937 / 2.9950 (+0.001 / +0.001 / +0.002 vs 2.9929: neutral) |
 | `ts512an05_fast_s0` | 110M ranks 512 + `--ts_fused --ts_orth_defer --ts_orth_every 4 --gemm int8mm` | 2.7721 (+0.065 vs 2.7067: the speed modes cost quality) |
 | `x1b_mx_extras_lr75` (Myriad 49713) | 1.3B master + the same float extras, lr 7.5e-4 | fixed windows **2.4980** (TTF ranks 512 2.5510: **TTF +0.053 [+0.051, +0.055]**); FineWeb 3.4584 (TTF +0.043); LAMBADA 0.143 (TTF 0.155) |
-| `ts512an05_nomom_s0` | no short momentum, ranks 512 | **2.6878** (-0.019 vs 2.7067, half the state) |
+| `ts512an05_nomom_s0` / `_seed2` | no short momentum, ranks 512 | fixed windows **2.6707 / 2.6693** (-0.019 [-0.020, -0.018] vs TTF ranks 512, 3 seeds; **-0.047 vs master + extras**; FineWeb -0.026 / -0.064); half the state |
+| `ts512an05_fused_s0` / `_oe4_s0` / `_defer_s0` | speed ablation | 2.7082 / 2.7642 / 2.7619 (fused free; every 4 +0.058; deferred +0.055) |
+| `x1b_master_lr50` | 1.3B plain master lr 5e-4 | fixed windows **2.4986** (TTF ranks 512 +0.052) |
 | `ts64an05_nomom_s0` / `ts128an05_nomom_s0` | no short momentum, ranks 64 / 128 | **2.9724 / 2.8575** (-0.021 vs 2.9929 / -0.026 vs 2.8837; ranks 128 without momentum -0.135 vs ranks 64 at the same memory) |
 | `x1b_ts256_la1000an05` (Myriad 49129) | 1.3B ranks 256 | fixed windows **2.6167** (vs ranks 512 2.5510 +0.066 [+0.064, +0.067], master 2.5706 +0.046 [+0.044, +0.048]); FineWeb 3.5739 (+0.073 / +0.025); LAMBADA 0.137 (0.155 / 0.138) |
 | `ts128an05_xspend_seed2` | exact spend at ranks 128, seed 2 | 2.8534 (seed-2 training windows; fixed-window comparison pending) |

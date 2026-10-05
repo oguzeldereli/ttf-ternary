@@ -34,6 +34,9 @@ within 6e-5. FineWeb-Edu was never used for any choice.
   (**+0.053 [+0.051, +0.055]**), FineWeb-Edu 3.5009 vs 3.4584 (+0.043); LAMBADA 0.155 vs 0.143; master ahead at every
   evaluation from step 3000. TTF's lead over the fair reference shrinks with
   scale (−0.028 / −0.011 / +0.053 at 110M / 340M / 1.3B), as the rank / width ratio of ranks 512 falls (0.67 / 0.5 / 0.25).
+- **TTF without the short momentum** (`--ts_nomom`, half the state): 110M fixed windows, ranks 512 (2 seeds) 2.6707 /
+  2.6693: −0.019 [−0.020, −0.018] vs TTF with momentum and **−0.047 vs master + the same extras** (FineWeb −0.064); −0.020
+  / −0.027 at ranks 64 / 128; ranks 128 without momentum beats ranks 64 with it (the same state) by 0.136.
 - **340M** (fixed windows, each method at its better learning rate, 2 seeds each): TTF 2.5774 / 2.5765 vs master +
   the same float extras (lr 1e-3) 2.5837 / 2.5919: −0.011 [−0.012, −0.010]; FineWeb-Edu −0.021. Master's seeds differ by
   0.008, so the Wikipedia margin is about one to two seed spreads.
