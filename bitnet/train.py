@@ -572,8 +572,6 @@ def ts_layer(l, g, state, c):
         R, C = (1 - b2) * g2.mean(1), (1 - b2) * g2.mean(0)
     _host_put(st, ("v", key), (R, C), off)
     v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
-    if M_ > 1:      # a micro-batch gradient is noisier than the batch's: E[g_mb^2] ~ M E[g^2] when noise dominates
-        v = v / M_
     del g2
     rs = min(rk_sched or getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
     if ("m", key) not in st:
@@ -605,7 +603,13 @@ def ts_layer(l, g, state, c):
     _host_put(st, ("m", key), _store_pair(sm, Um, Vm) if sm else (qm(Um), qVm(Vm)), off)  # --ts_qfmt sim., --ts_store_m real
     if not final_:
         return
-    u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
+    if M_ > 1:      # --ts_micro: v holds micro-batch squares; the batch gradient's square is ~ v / M where noise
+        # dominates and ~ m^2 where signal dominates, so v_eff = v / M + (1 - 1/M) m_hat^2 (|u| <= ~1 as in Adam)
+        mh_ = (Um @ Vm.T) / (1 - b1 ** t)
+        u = -mh_ / ((v / M_ + (1 - 1 / M_) * mh_ * mh_).sqrt() + 1e-8) * lr_ratio
+        del mh_
+    else:
+        u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
     shadow_here = c.get("shadows") and (not c.get("shadow_layers") or getattr(l, "_ts_idx", -1) in c["shadow_layers"])
     if shadow_here:           # --ts_shadows: the same gradients into shadow states of other ranks (and full rank)
         _ts_shadows_step(l, g, v, st, c, t, lr_ratio, key)
