@@ -1,11 +1,20 @@
 # 110M proxy sweep at the 1.3B rank / width (ranks 192 of width 768 = 0.25, like ranks 512 at 1.3B), no momentum, fused update,
 # int8 forward. 110M ranks 256 / 128 reproduce the 1.3B curve shape vs master + extras (docs/figures/proxy_shape.png).
 # Reference: master + extras 110M (mx_extras_s0 / _seed2, 2.7166 fixed). Base run first.
+# + the schedule arms at ranks 512 (110M ranks 512 reproduces 1.3B ranks 512's curve shape incl. the late recovery)
 sw192_base
 sw192_th1020 --ts_theta_sched 10:20
 sw192_th1218 --ts_theta_sched 12:18
 sw192_tauanneal --ts_tau_anneal
 sw192_p1 --ts_anneal 1.0
+sw512_base --lowrank 512 --ts_rank_s 512
+sw512_th1020 --lowrank 512 --ts_rank_s 512 --ts_theta_sched 10:20
+sw512_th1218 --lowrank 512 --ts_rank_s 512 --ts_theta_sched 12:18
+sw512_tauanneal --lowrank 512 --ts_rank_s 512 --ts_tau_anneal
+sw512_p1 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0
+sw512_p025 --lowrank 512 --ts_rank_s 512 --ts_anneal 0.25
+sw512_p075 --lowrank 512 --ts_rank_s 512 --ts_anneal 0.75
+sw512_tau2000 --lowrank 512 --ts_rank_s 512 --ts_tau 2000
 sw192_lr1e3 --lr 1e-3 --min_lr 1e-4
 sw192_lr2e3 --lr 2e-3 --min_lr 2e-4
 sw192_lr3e3 --lr 3e-3 --min_lr 3e-4
