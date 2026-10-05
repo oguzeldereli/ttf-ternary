@@ -2489,6 +2489,8 @@ def main():
                     "(projection on the current basis in between)")
     ap.add_argument("--ts_orth_defer", action="store_true", help="--ts: each layer projects on last step's basis; all "
                     "orthonormalisations run once at the end of the step, batched by shape (state on the GPU only)")
+    ap.add_argument("--mem_cap_gib", type=float, default=0.0, help="cap PyTorch's memory on the GPU at this many GiB "
+                    "(memory-matched comparisons; 0: no cap)")
     ap.add_argument("--init_density", type=float, default=0.0, help="kernel mode: initial share of nonzero trits "
                     "(0: rounded normal, ~69%%)")
     ap.add_argument("--ts_nomom", action="store_true", help="--ts: no short momentum; the accumulator takes the "
@@ -2818,6 +2820,11 @@ def main():
 
     BitTransformer.loss_chunk = args.loss_chunk
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.mem_cap_gib and device == "cuda":   # --mem_cap_gib G: PyTorch may use at most G GiB of this GPU (a 96 GB card
+        # standing in for a 24 GB one in memory-matched comparisons; allocations beyond it raise out-of-memory)
+        tot_ = torch.cuda.get_device_properties(0).total_memory / 2**30
+        torch.cuda.set_per_process_memory_fraction(min(1.0, args.mem_cap_gib / tot_))
+        print(f"--mem_cap_gib: PyTorch capped at {args.mem_cap_gib:.1f} of {tot_:.1f} GiB", flush=True)
     torch.manual_seed(tc.seed)
     print(mc.report())
     use_beta = args.mode in ("kernel", "evidence") and not args.no_beta

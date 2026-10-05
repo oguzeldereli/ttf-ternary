@@ -111,6 +111,9 @@ PRESETS = {
                        n_kv_heads=8, hidden_dim=13824, max_seq_len=2048),
     "b15": ModelConfig(vocab_size=32000, dim=6144, n_layers=38, n_heads=48,
                        n_kv_heads=8, hidden_dim=16384, max_seq_len=2048),
+    # ~2.9B (5 Oct, memory-matched goldbug arm): width 3072, the b27 head layout (GQA, 8 KV heads of 128)
+    "b3": ModelConfig(vocab_size=32000, dim=3072, n_layers=28, n_heads=24,
+                      n_kv_heads=8, hidden_dim=8192, max_seq_len=2048),
     # ~40B target. NOT trainable on one 12GiB card (weights alone ~8GiB ternary +
     # activations). Needs multi-GPU / big-RAM offload. Architecture is identical.
     "b40": ModelConfig(vocab_size=128000, dim=6144, n_layers=80, n_heads=48,
