@@ -819,7 +819,7 @@ def ts_layer(l, g, state, c):
         l._record_flips(before, l.wpacked)
 
 
-MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "32"))]   # sketch size (TERN_MICRO_K: tests only)
+MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "64"))]   # sketch size (TERN_MICRO_K: tests only)
 
 
 def _micro_sketch(l, dev):
