@@ -36,7 +36,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts64an05_init10_s0` / `_init02_s0` / `_decay1e4_s0` / `_decay3e4_s0` | ranks 64 + sparse trit init (`--init_density` 0.1 / 0.02) / trit decay (`--ts_decay` 1e-4 / 3e-4) | 3.0452 / 3.0953 / 3.0282 / 3.0780 (+0.052 / +0.102 / +0.035 / +0.085 vs 2.9929) |
 | `ts64an05_gate_s0` / `_sgate1_s0` / `_sgate2_s0` | ranks 64 + `--lr_gate` / per-weight sign counter K 1 / K 2 (`--ts_sgate`) | 2.9942 / 2.9937 / 2.9950 (+0.001 / +0.001 / +0.002 vs 2.9929: neutral) |
 | `ts512an05_fast_s0` | 110M ranks 512 + `--ts_fused --ts_orth_defer --ts_orth_every 4 --gemm int8mm` | 2.7721 (+0.065 vs 2.7067: the speed modes cost quality) |
-| `x1b_ts256_la1000an05` (Myriad 49129) | 1.3B ranks 256 | 2.6334 training-time (ranks 512 2.5673, master lr 7.5e-4 2.5868); fixed windows pending |
+| `x1b_ts256_la1000an05` (Myriad 49129) | 1.3B ranks 256 | fixed windows **2.6167** (vs ranks 512 2.5510 +0.066 [+0.064, +0.067], master 2.5706 +0.046 [+0.044, +0.048]); FineWeb 3.5739 (+0.073 / +0.025); LAMBADA 0.137 (0.155 / 0.138) |
 | `ts128an05_xspend_seed2` | exact spend at ranks 128, seed 2 | 2.8534 (seed-2 training windows; fixed-window comparison pending) |
 | `ts64an05_rsketch16_s0` / `_spendtab_s0` / `_sched512to64_s0` | residual-sketch refresh / spend only in a table / ranks 512 -> 64 | 3.0808 / 3.0009 / **2.7777** (+0.088 / +0.008 / -0.215 vs 2.9929; 512 -> 64 peaks at the ranks-512 state) |
 | `ts512an05_global_s0` / `ts512an05_fuse_s0` / `ts128an05_fuse_s0` | one basis for the whole model (64% state) / q-k-v and gate-up share an input basis (84%) | 2.7505 / 2.7200 / 2.9172 (+0.044 / +0.013 vs 2.7067, +0.034 vs 2.8837); vs per-layer at the same memory -0.011 / -0.011 / -0.001 |

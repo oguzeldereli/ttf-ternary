@@ -170,8 +170,9 @@ docs/            see below
   whose energy is spread over many directions. At batch 16 the share that ranks 512 captures falls with width (0.96 /
   0.91 / 0.77 at 110M / 340M / 1.3B), while energy capture overstates the need (1.3B ranks 512 still beats master). A
   width sweep at batch 2 (up to 15B) cannot settle it: at that batch the gradient is mostly noise and a lower rank
-  filters it. 1.3B at ranks 256 (training-time windows): 2.6334 vs ranks 512 2.5673 (+0.066, the same penalty as at
-  110M +0.076 and 340M +0.066) and master 2.5868 (+0.047): at 1.3B ranks 256 falls behind master (fixed windows pending).
+  filters it. 1.3B at ranks 256 (fixed windows): 2.6167 vs ranks 512 2.5510 (**+0.066 [+0.064, +0.067]**, the same
+  penalty as at 110M +0.076 and 340M +0.066) and master 2.5706 (+0.046 [+0.044, +0.048]; FineWeb-Edu +0.025): at 1.3B
+  ranks 256 falls behind master.
 - **Wall-clock.** A100 40 GB, 1.3B, batch 16 x 2048: TTF 7.05 s per step against 4.45 s for master. Updating the
   bases every 4 steps with a deferred batched orthonormalisation gets to 6.4-6.7 s but costs +0.065 at 110M over a full
   run, so it is not in the recipe. Matrix products touching trits are 1.96 s of the TTF step; the 2.6 s of non-matmul work
