@@ -36,7 +36,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts64an05_init10_s0` / `_init02_s0` / `_decay1e4_s0` / `_decay3e4_s0` | ranks 64 + sparse trit init (`--init_density` 0.1 / 0.02) / trit decay (`--ts_decay` 1e-4 / 3e-4) | 3.0452 / 3.0953 / 3.0282 / 3.0780 (+0.052 / +0.102 / +0.035 / +0.085 vs 2.9929) |
 | `ts64an05_gate_s0` / `_sgate1_s0` / `_sgate2_s0` | ranks 64 + `--lr_gate` / per-weight sign counter K 1 / K 2 (`--ts_sgate`) | 2.9942 / 2.9937 / 2.9950 (+0.001 / +0.001 / +0.002 vs 2.9929: neutral) |
 | `ts512an05_fast_s0` | 110M ranks 512 + `--ts_fused --ts_orth_defer --ts_orth_every 4 --gemm int8mm` | 2.7721 (+0.065 vs 2.7067: the speed modes cost quality) |
-| `x1b_mx_extras_lr75` (Myriad 49713) | 1.3B master + the same float extras, lr 7.5e-4 | **2.5142** training-time (TTF ranks 512 2.5673: TTF +0.053; master ahead from 3000 on); fixed windows pending (51688) |
+| `x1b_mx_extras_lr75` (Myriad 49713) | 1.3B master + the same float extras, lr 7.5e-4 | fixed windows **2.4980** (TTF ranks 512 2.5510: **TTF +0.053 [+0.051, +0.055]**); FineWeb 3.4584 (TTF +0.043); LAMBADA 0.143 (TTF 0.155) |
 | `ts512an05_nomom_s0` | no short momentum, ranks 512 | **2.6878** (-0.019 vs 2.7067, half the state) |
 | `ts64an05_nomom_s0` / `ts128an05_nomom_s0` | no short momentum, ranks 64 / 128 | **2.9724 / 2.8575** (-0.021 vs 2.9929 / -0.026 vs 2.8837; ranks 128 without momentum -0.135 vs ranks 64 at the same memory) |
 | `x1b_ts256_la1000an05` (Myriad 49129) | 1.3B ranks 256 | fixed windows **2.6167** (vs ranks 512 2.5510 +0.066 [+0.064, +0.067], master 2.5706 +0.046 [+0.044, +0.048]); FineWeb 3.5739 (+0.073 / +0.025); LAMBADA 0.137 (0.155 / 0.138) |

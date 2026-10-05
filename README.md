@@ -30,8 +30,9 @@ within 6e-5. FineWeb-Edu was never used for any choice.
 - **Master learning rate:** of 7.5e-4 / 1.5e-3 / 3e-3 / 6e-3, the 1.5e-3 used for master is the best.
 - **1.3B** (fixed windows, one seed each): TTF 2.5510 vs master 2.5706 (−0.020 [−0.021, −0.018]); FineWeb-Edu
   3.5009 vs 3.5489 (−0.048).
-  **Against master with the same float extras, TTF is behind at 1.3B**: 2.5673 vs 2.5142 (+0.053, training-time windows,
-  master ahead at every evaluation from step 3000; fixed windows pending). TTF's lead over the fair reference shrinks with
+  **Against master with the same float extras, TTF (ranks 512) is behind at 1.3B**: fixed windows 2.5510 vs 2.4980
+  (**+0.053 [+0.051, +0.055]**), FineWeb-Edu 3.5009 vs 3.4584 (+0.043); LAMBADA 0.155 vs 0.143; master ahead at every
+  evaluation from step 3000. TTF's lead over the fair reference shrinks with
   scale (−0.028 / −0.011 / +0.053 at 110M / 340M / 1.3B), as the rank / width ratio of ranks 512 falls (0.67 / 0.5 / 0.25).
 - **340M** (fixed windows, each method at its better learning rate, 2 seeds each): TTF 2.5774 / 2.5765 vs master +
   the same float extras (lr 1e-3) 2.5837 / 2.5919: −0.011 [−0.012, −0.010]; FineWeb-Edu −0.021. Master's seeds differ by
