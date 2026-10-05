@@ -606,8 +606,11 @@ def ts_layer(l, g, state, c):
     if M_ > 1:      # --ts_micro: v holds micro-batch squares; the batch gradient's square is ~ v / M where noise
         # dominates and ~ m^2 where signal dominates, so v_eff = v / M + (1 - 1/M) m_hat^2 (|u| <= ~1 as in Adam)
         mh_ = (Um @ Vm.T) / (1 - b1 ** t)
-        u = -mh_ / ((v / M_ + (1 - 1 / M_) * mh_ * mh_).sqrt() + 1e-8) * lr_ratio
-        del mh_
+        m2_ = mh_ * mh_            # factored like v (row x column means), as the batch's v would be
+        Rm_, Cm_ = m2_.mean(1), m2_.mean(0); del m2_
+        vsig_ = Rm_[:, None] * Cm_[None, :] / Rm_.mean().clamp_min(1e-30)
+        u = -mh_ / ((v / M_ + (1 - 1 / M_) * vsig_).sqrt() + 1e-8) * lr_ratio
+        del mh_, vsig_
     else:
         u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
     shadow_here = c.get("shadows") and (not c.get("shadow_layers") or getattr(l, "_ts_idx", -1) in c["shadow_layers"])
