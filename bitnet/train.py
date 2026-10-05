@@ -2749,6 +2749,7 @@ def main():
     ap.add_argument("--out_dir", default=None)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--warmup", type=int, default=None)
+    ap.add_argument("--weight_decay", type=float, default=None, help="weight decay of the float tail's embedding / adapter group (default 0.1)")
     ap.add_argument("--min_lr", type=float, default=None,
                     help="cosine floor (default: lr/10)")
     ap.add_argument("--eval_interval", type=int, default=None)
@@ -2811,6 +2812,7 @@ def main():
     if args.out_dir: tc.out_dir = args.out_dir
     if args.lr: tc.lr = args.lr
     if args.warmup is not None: tc.warmup_steps = args.warmup
+    if args.weight_decay is not None: tc.weight_decay = args.weight_decay   # float tail (embedding) decoupled weight decay
     tc.min_lr = args.min_lr if args.min_lr is not None else tc.lr / 10
     if args.eval_interval: tc.eval_interval = args.eval_interval
     if args.eval_iters: tc.eval_iters = args.eval_iters

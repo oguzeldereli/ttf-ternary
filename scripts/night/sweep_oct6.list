@@ -1,0 +1,23 @@
+# 110M sweep around the best recipe (ranks 512, no momentum; ts512an05_nomom_s0: 2.6878 training-time, 2.6707 fixed)
+sw_lr1e3 --lr 1e-3 --min_lr 1e-4
+sw_lr2e3 --lr 2e-3 --min_lr 2e-4
+sw_lr3e3 --lr 3e-3 --min_lr 3e-4
+sw_spend050 --ts_spend 0.5
+sw_spend075 --ts_spend 0.75
+sw_spend125 --ts_spend 1.25
+sw_spend150 --ts_spend 1.5
+sw_b2_090 --ts_b2 0.9
+sw_b2_099 --ts_b2 0.99
+sw_wd0 --weight_decay 0.0
+sw_wd03 --weight_decay 0.3
+sw_warm100 --warmup 100
+sw_warm1000 --warmup 1000
+sw_bs8 --batch_size 8 --steps 18310 --warmup 610 --ts_tau 2000
+sw_bs32 --batch_size 32 --steps 4578 --warmup 153 --ts_tau 500
+sw_theta12 --ts_theta 12
+sw_theta20 --ts_theta 20
+sw_tau2000 --ts_tau 2000
+sw_p025 --ts_anneal 0.25
+sw_p075 --ts_anneal 0.75
+sw_b2_0999 --ts_b2 0.999
+sw_wd003 --weight_decay 0.03
