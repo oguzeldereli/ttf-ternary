@@ -719,6 +719,13 @@ def ts_layer(l, g, state, c):
     del A
     if c["gate"]:
         fire &= (d == -g.sign())
+    if c.get("sgate"):    # --ts_sgate K: a per-weight counter of the gradient's sign (saturating at +-2, ~3 bits per
+        # weight); a weight moves only where the counter agrees with the move by at least K
+        sc_ = st.get(("sc", key))
+        stp_ = (-g).sign().to(torch.int8)
+        sc_ = stp_ if sc_ is None else (sc_ + stp_).clamp_(-2, 2)
+        st[("sc", key)] = sc_
+        fire &= (sc_ * d.to(torch.int8)) >= int(c["sgate"])
     before = l.wpacked.clone() if l.track else None
     D = torch.where(fire, d, torch.zeros_like(d))
     nf = fire.sum()                           # a device tensor: no host sync per layer
@@ -1201,7 +1208,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
             shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125, table=0.0, exact_spend=False, tiles=1,
             rank_sched=None, progress=0.0, rsketch=0, rsketch_every=50, locate=0.0, spend_table=False,
-            global_=False, fuse=False, orth_every=1, orth_defer=False):
+            global_=False, fuse=False, orth_every=1, orth_defer=False, sgate=0):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -1220,7 +1227,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              diag=diag, shadow=shadow, shared_v=shared_v, sketch=sketch, resid=resid, shadows=shadows,
              rescale=rescale, refresh=refresh, refresh_frac=refresh_frac, table=table, exact_spend=exact_spend,
              tiles=tiles, rank_sched=rank_sched, progress=progress, rsketch=rsketch, rsketch_every=rsketch_every,
-             locate=locate, spend_table=spend_table, fuse=fuse, orth_every=orth_every, orth_defer=orth_defer,
+             locate=locate, spend_table=spend_table, fuse=fuse, orth_every=orth_every, orth_defer=orth_defer, sgate=sgate,
              **{"global": global_},
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
@@ -2388,6 +2395,8 @@ def main():
                     "(projection on the current basis in between)")
     ap.add_argument("--ts_orth_defer", action="store_true", help="--ts: each layer projects on last step's basis; all "
                     "orthonormalisations run once at the end of the step, batched by shape (state on the GPU only)")
+    ap.add_argument("--ts_sgate", type=int, default=0, help="--ts: per-weight saturating counter (+-2) of the gradient's "
+                    "sign; a weight moves only where counter x move >= K")
     ap.add_argument("--ts_rank_sched", default="", help="--ts: R0:R1, both ranks move linearly from R0 to R1 over training")
     ap.add_argument("--ts_spend", type=float, default=1.0,
                     help="--ts: a move spends this x theta (1: to the new trit's centre, like master --m_snap; 2: stays at "
@@ -3139,7 +3148,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
-                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate,
                       progress=0.0,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
@@ -3301,7 +3310,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
-                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate,
                       progress=step / max(1, tc.max_steps),
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
