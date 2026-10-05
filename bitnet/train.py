@@ -546,6 +546,9 @@ def ts_layer(l, g, state, c):
     if c.get("global") or c.get("global_") or (c.get("fuse") and getattr(l, "_ts_idx", 0) % 7 in (0, 1, 2, 4, 5)):
         return _ts_global_layer(l, g, state, c)
     r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
+    if c.get("theta_sched"):   # --ts_theta_sched T0:T1: the threshold moves linearly from T0 to T1 over training
+        th0_, th1_ = c["theta_sched"]
+        theta = th0_ + (th1_ - th0_) * min(max(c.get("progress", 0.0), 0.0), 1.0)
     M_ = int(c.get("micro") or 1)   # --ts_micro with --grad_accum M: momentum and v step once per micro-batch with
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True   # beta^(1/M); the accumulator only on the last one
     b1o, b2o = b1, b2
@@ -1301,7 +1304,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
             shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125, table=0.0, exact_spend=False, tiles=1,
             rank_sched=None, progress=0.0, rsketch=0, rsketch_every=50, locate=0.0, spend_table=False,
-            global_=False, fuse=False, orth_every=1, orth_defer=False, sgate=0, decay=0.0, nomom=False):
+            global_=False, fuse=False, orth_every=1, orth_defer=False, sgate=0, decay=0.0, nomom=False,
+            theta_sched=None):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -1321,7 +1325,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              rescale=rescale, refresh=refresh, refresh_frac=refresh_frac, table=table, exact_spend=exact_spend,
              tiles=tiles, rank_sched=rank_sched, progress=progress, rsketch=rsketch, rsketch_every=rsketch_every,
              locate=locate, spend_table=spend_table, fuse=fuse, orth_every=orth_every, orth_defer=orth_defer, sgate=sgate,
-             decay=decay, nomom=nomom,
+             decay=decay, nomom=nomom, theta_sched=theta_sched,
              **{"global": global_},
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
@@ -2493,6 +2497,7 @@ def main():
                     "(memory-matched comparisons; 0: no cap)")
     ap.add_argument("--init_density", type=float, default=0.0, help="kernel mode: initial share of nonzero trits "
                     "(0: rounded normal, ~69%%)")
+    ap.add_argument("--ts_theta_sched", default="", help="--ts: T0:T1, the threshold moves linearly from T0 to T1 over training")
     ap.add_argument("--ts_nomom", action="store_true", help="--ts: no short momentum; the accumulator takes the "
                     "full-rank g / sqrt(v) each step (the momentum's state freed)")
     ap.add_argument("--ts_decay", type=float, default=0.0, help="--ts: trit decay, a nonzero trit with |A| < theta / 2 "
@@ -3268,7 +3273,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
-                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay, nomom=args.ts_nomom,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay, nomom=args.ts_nomom, theta_sched=(tuple(float(x) for x in args.ts_theta_sched.split(":")) if args.ts_theta_sched else None),
                       progress=0.0,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
@@ -3430,7 +3435,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
-                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay, nomom=args.ts_nomom,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay, nomom=args.ts_nomom, theta_sched=(tuple(float(x) for x in args.ts_theta_sched.split(":")) if args.ts_theta_sched else None),
                       progress=step / max(1, tc.max_steps),
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
