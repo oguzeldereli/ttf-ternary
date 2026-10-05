@@ -32,6 +32,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts64an05_sched64to128_s0` | ranks 64 -> 128 | 2.9432 (-0.050 vs ranks 64, +0.059 vs ranks 128) |
 | `ts64an05_table_s0` / `_xspend_s0` / `_tiles2_s0` | exact table 2% / exact spend / 2 x 2 tiles of rank 32 | 2.9891 / 2.9915 / 3.0216 (-0.004 / -0.001 / +0.029 vs 2.9929) |
 | `ts128an05_xspend_s0` | exact spend at ranks 128 | **2.8727** (-0.011 vs 2.8837; ranks 64: -0.001) |
+| `ts64an05_init10_s0` / `_init02_s0` / `_decay1e4_s0` / `_decay3e4_s0` | ranks 64 + sparse trit init (`--init_density` 0.1 / 0.02) / trit decay (`--ts_decay` 1e-4 / 3e-4) | 3.0452 / 3.0953 / 3.0282 / 3.0780 (+0.052 / +0.102 / +0.035 / +0.085 vs 2.9929) |
 | `ts64an05_gate_s0` / `_sgate1_s0` / `_sgate2_s0` | ranks 64 + `--lr_gate` / per-weight sign counter K 1 / K 2 (`--ts_sgate`) | 2.9942 / 2.9937 / 2.9950 (+0.001 / +0.001 / +0.002 vs 2.9929: neutral) |
 | `ts512an05_fast_s0` | 110M ranks 512 + `--ts_fused --ts_orth_defer --ts_orth_every 4 --gemm int8mm` | 2.7721 (+0.065 vs 2.7067: the speed modes cost quality) |
 | `x1b_ts256_la1000an05` (Myriad 49129) | 1.3B ranks 256 | 2.6334 training-time (ranks 512 2.5673, master lr 7.5e-4 2.5868); fixed windows pending |
