@@ -544,6 +544,7 @@ def ts_layer(l, g, state, c):
     r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
     M_ = int(c.get("micro") or 1)   # --ts_micro with --grad_accum M: momentum and v step once per micro-batch with
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True   # beta^(1/M); the accumulator only on the last one
+    b1o, b2o = b1, b2
     if M_ > 1:
         b1, b2 = b1 ** (1.0 / M_), b2 ** (1.0 / M_)
     r = getattr(l, "_ts_rank", 0) or r                                                  # --ts_rank_kv: per-layer rank
@@ -580,6 +581,11 @@ def ts_layer(l, g, state, c):
         Um = (1 - b1) * g @ Vm
     else:
         Um, Vm = _load_pair(_host_get(st, ("m", key), dev, off))
+        if M_ > 1:    # --ts_micro: row / column means of g * m_prev, unbiased for the signal's square (the noise of this
+            # micro-batch is independent of the momentum's), EMA'd like v (see the step u below)
+            x_ = g * ((Um @ Vm.T) / (1 - b1 ** (t - 1)))
+            XR, XC = st.get(("vx", key), (torch.zeros(l.N, device=dev), torch.zeros(l.K, device=dev)))
+            st[("vx", key)] = (b2 * XR + (1 - b2) * x_.mean(1), b2 * XC + (1 - b2) * x_.mean(0)); del x_
         oe_ = int(c.get("orth_every") or 1)
         if c.get("orth_defer") and not (oe_ > 1 and t % oe_):   # --ts_orth_defer: project now, orthonormalise at the
             # end of the step (with --ts_orth_every k only on every k-th step)
@@ -601,18 +607,25 @@ def ts_layer(l, g, state, c):
             Um, Vm = _resize_lowrank(Um, Vm, rs, g, 1 - b1, 7_000_000 + 2 * getattr(l, "_ts_idx", 0) + t)
     if c.get("qdiag"): _qdiag(st, key, "m", Um, Vm, t)
     _host_put(st, ("m", key), _store_pair(sm, Um, Vm) if sm else (qm(Um), qVm(Vm)), off)  # --ts_qfmt sim., --ts_store_m real
+    dbg_ = MICRO_DBG[0] if M_ > 1 else ""
+    if dbg_:
+        gs_ = st.get(("dbg_gsum", key)); st[("dbg_gsum", key)] = g.clone() if gs_ is None else gs_.add_(g)
     if not final_:
         return
-    if M_ > 1:      # --ts_micro: v holds micro-batch squares; the batch gradient's square is ~ v / M where noise
-        # dominates and ~ m^2 where signal dominates, so v_eff = v / M + (1 - 1/M) m_hat^2 (|u| <= ~1 as in Adam)
-        mh_ = (Um @ Vm.T) / (1 - b1 ** t)
-        m2_ = mh_ * mh_            # factored like v (row x column means), as the batch's v would be
-        Rm_, Cm_ = m2_.mean(1), m2_.mean(0); del m2_
-        vsig_ = Rm_[:, None] * Cm_[None, :] / Rm_.mean().clamp_min(1e-30)
-        u = -mh_ / ((v / M_ + (1 - 1 / M_) * vsig_).sqrt() + 1e-8) * lr_ratio
-        del mh_, vsig_
+    if M_ > 1:      # --ts_micro: with g_i = (s + n_i) / M the batch gradient's E[g^2] = M E[g_i^2] + M (M - 1) s^2 / M^2;
+        # E[g_i^2] is v, s^2 / M^2 the EMA of g_i * m_prev (vx), and the micro momentum is ~ s / M, so the batch's step
+        # is m_hat / sqrt(v / M + (1 - 1/M) vx), both in row / column means (linear, so factored as the batch's v is)
+        Rv_, Cv_ = R / (1 - b2 ** t), C / (1 - b2 ** t)
+        XR, XC = st.get(("vx", key), (torch.zeros_like(R), torch.zeros_like(C)))
+        cx_ = max(1 - b2 ** (t - 1), 1e-30)
+        Re_ = Rv_ / M_ + (1 - 1 / M_) * (XR / cx_).clamp_min(0); Ce_ = Cv_ / M_ + (1 - 1 / M_) * (XC / cx_).clamp_min(0)
+        veff_ = Re_[:, None] * Ce_[None, :] / Re_.mean().clamp_min(1e-30)
+        u = -(Um @ Vm.T) / (1 - b1 ** t) / (veff_.sqrt() + 1e-8) * lr_ratio
+        del veff_
     else:
         u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
+    if dbg_:
+        u = _micro_dbg_u(l, st, key, t, M_, b1, b1o, b2o, Um, Vm, v, u, lr_ratio, dbg_)
     shadow_here = c.get("shadows") and (not c.get("shadow_layers") or getattr(l, "_ts_idx", -1) in c["shadow_layers"])
     if shadow_here:           # --ts_shadows: the same gradients into shadow states of other ranks (and full rank)
         _ts_shadows_step(l, g, v, st, c, t, lr_ratio, key)
@@ -717,6 +730,10 @@ def ts_layer(l, g, state, c):
     if c.get("rescale") and ("kept", key) in st:   # --ts_rescale: compare A / s with theta, s = sqrt(share kept)
         th = theta * st[("kept", key)].sqrt().clamp(0.25, 1.0)
     fire = (A.abs() >= th) & ((w0.float() + d).abs() <= 1)
+    dec = None
+    if c.get("decay"):    # --ts_decay P: trit decay, the ternary analogue of weight decay: a nonzero trit whose evidence
+        # is weak (|A| < theta / 2) moves to 0 with probability P x lr_ratio per step (not spent: no evidence moved it)
+        dec = (w0 != 0) & (A.abs() < 0.5 * th) & (torch.rand(A.shape, device=A.device) < c["decay"] * lr_ratio)
     if diag and c.get("shadow"):   # distance of the rank-r accumulator from the full-rank one
         _ts_rec(st, "a_vs_shadow", ((A - st[("shadow", key)]).norm() / st[("shadow", key)].norm().clamp_min(1e-30)).item())
     del A
@@ -732,7 +749,11 @@ def ts_layer(l, g, state, c):
     before = l.wpacked.clone() if l.track else None
     D = torch.where(fire, d, torch.zeros_like(d))
     nf = fire.sum()                           # a device tensor: no host sync per layer
-    l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
+    if dec is not None:
+        nf = nf + dec.sum()
+        l.wpacked.copy_(pack_rows(torch.where(dec, torch.zeros_like(w0), (w0.float() + D).to(torch.int8)))); del dec
+    else:
+        l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
     if tabmode != "spendtab":
         U = U - c["spend"] * th * (D @ V)
     if use_tab or rsk:
@@ -785,6 +806,45 @@ def ts_layer(l, g, state, c):
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
     if before is not None:
         l._record_flips(before, l.wpacked)
+
+
+MICRO_DBG = [os.environ.get("TERN_MICRO_DBG", "")]   # diagnostic of --ts_micro (see _micro_dbg_u)
+
+
+def _micro_dbg_u(l, st, key, t, M_, b1, b1o, b2o, Um, Vm, v, u, lr_ratio, dbg):
+    """TERN_MICRO_DBG=v|m|both|log with --ts_micro (diagnostic, keeps a dense gradient sum): the step's u with the second
+    moment (v), the momentum (m) or both taken from the batch gradient as the dense path would compute them; "both"
+    must reproduce the dense path; "log" keeps the micro u and only measures it against the batch path's. Logs
+    cos(u, micro u) and the norm ratio."""
+    G = st.pop(("dbg_gsum", key)); tb = t // M_
+    if dbg in ("v", "both", "log"):
+        g2 = G * G
+        R, C = st.get(("dbg_v", key), (torch.zeros(l.N, device=G.device), torch.zeros(l.K, device=G.device)))
+        R = b2o * R + (1 - b2o) * g2.mean(1); C = b2o * C + (1 - b2o) * g2.mean(0); del g2
+        st[("dbg_v", key)] = (R, C)
+        vd = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2o ** tb)
+    if dbg in ("m", "both", "log"):
+        if ("dbg_m", key) not in st:
+            gen = torch.Generator(device=G.device).manual_seed(4_000_000 + 2 * getattr(l, "_ts_idx", 0))
+            Vd = _orth(G.T @ torch.randn(l.N, Vm.shape[1], device=G.device, generator=gen)); Ud = (1 - b1o) * G @ Vd
+        else:
+            Ud, Vd = st[("dbg_m", key)]
+            Vn = _orth(b1o * Vd @ (Ud.T @ Ud) + (1 - b1o) * G.T @ Ud)
+            Ud = b1o * Ud @ (Vd.T @ Vn) + (1 - b1o) * G @ Vn; Vd = Vn
+        st[("dbg_m", key)] = (Ud, Vd)
+        mhd = (Ud @ Vd.T) / (1 - b1o ** tb)
+    del G
+    if dbg in ("both", "log"):
+        un = -mhd / (vd.sqrt() + 1e-8) * lr_ratio
+    elif dbg == "v":
+        un = -M_ * (Um @ Vm.T) / (1 - b1 ** t) / (vd.sqrt() + 1e-8) * lr_ratio
+    else:
+        m2_ = (mhd / M_) ** 2; Rm_, Cm_ = m2_.mean(1), m2_.mean(0); del m2_
+        vs_ = Rm_[:, None] * Cm_[None, :] / Rm_.mean().clamp_min(1e-30)
+        un = -(mhd / M_) / ((v / M_ + (1 - 1 / M_) * vs_).sqrt() + 1e-8) * lr_ratio
+    _ts_rec(st, "dbg_cos", ((un * u).sum() / (un.norm() * u.norm()).clamp_min(1e-30)).item())
+    _ts_rec(st, "dbg_ratio", (u.norm() / un.norm().clamp_min(1e-30)).item())
+    return u if dbg == "log" else un
 
 
 def _rsk_maps(l, k, dev):
@@ -1211,7 +1271,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
             shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125, table=0.0, exact_spend=False, tiles=1,
             rank_sched=None, progress=0.0, rsketch=0, rsketch_every=50, locate=0.0, spend_table=False,
-            global_=False, fuse=False, orth_every=1, orth_defer=False, sgate=0):
+            global_=False, fuse=False, orth_every=1, orth_defer=False, sgate=0, decay=0.0):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -1231,6 +1291,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              rescale=rescale, refresh=refresh, refresh_frac=refresh_frac, table=table, exact_spend=exact_spend,
              tiles=tiles, rank_sched=rank_sched, progress=progress, rsketch=rsketch, rsketch_every=rsketch_every,
              locate=locate, spend_table=spend_table, fuse=fuse, orth_every=orth_every, orth_defer=orth_defer, sgate=sgate,
+             decay=decay,
              **{"global": global_},
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
@@ -2398,6 +2459,10 @@ def main():
                     "(projection on the current basis in between)")
     ap.add_argument("--ts_orth_defer", action="store_true", help="--ts: each layer projects on last step's basis; all "
                     "orthonormalisations run once at the end of the step, batched by shape (state on the GPU only)")
+    ap.add_argument("--init_density", type=float, default=0.0, help="kernel mode: initial share of nonzero trits "
+                    "(0: rounded normal, ~69%%)")
+    ap.add_argument("--ts_decay", type=float, default=0.0, help="--ts: trit decay, a nonzero trit with |A| < theta / 2 "
+                    "moves to 0 with probability P x lr_ratio per step")
     ap.add_argument("--ts_sgate", type=int, default=0, help="--ts: per-weight saturating counter (+-2) of the gradient's "
                     "sign; a weight moves only where counter x move >= K")
     ap.add_argument("--ts_rank_sched", default="", help="--ts: R0:R1, both ranks move linearly from R0 to R1 over training")
@@ -2753,6 +2818,15 @@ def main():
         model = BitTransformer(mc, grad_checkpoint=tc.grad_checkpoint)
     model = model.to(device)
     model.train()
+    if args.init_density:   # --init_density D: start from trits with only D of them nonzero (signs of the largest of a
+        # normal draw) instead of the ~69% of the rounded normal, so weights the update never reaches stay zero, not noise
+        from .kernel import pack_rows as _pack_rows
+        thr_ = torch.special.ndtri(torch.tensor(1 - args.init_density / 2, dtype=torch.float64)).item()
+        for m_ in model.modules():
+            if isinstance(m_, KernelTernaryLinear):
+                w_ = torch.randn(m_.N, m_.K, device=device)
+                q_ = (torch.sign(w_) * (w_.abs() >= thr_)).to(torch.int8); del w_
+                m_.wpacked.copy_(_pack_rows(q_)); del q_
     if args.ckpt_skip:
         model.ckpt_skip = args.ckpt_skip
     if args.ckpt_block:
@@ -3151,7 +3225,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
-                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay,
                       progress=0.0,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
@@ -3313,7 +3387,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
-                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay,
                       progress=step / max(1, tc.max_steps),
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
