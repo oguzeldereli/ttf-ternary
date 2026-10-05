@@ -602,45 +602,50 @@ def ts_layer(l, g, state, c):
         _host_put(st, ("v", key), (R, C), off)
         v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
     del g2
-    rs = min(rk_sched or getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
-    if ("m", key) not in st:
-        gen = torch.Generator(device=g.device).manual_seed(4_000_000 + 2 * getattr(l, "_ts_idx", 0))
-        Vm = _orth(g.T @ torch.randn(l.N, rs, device=g.device, generator=gen))
-        Um = (1 - b1) * g @ Vm
+    if c.get("nomom"):   # --ts_nomom: no short momentum: the accumulator integrates the full-rank Adam-normalised
+        # gradient (its long-run sum is the momentum's anyway) and its own rank-r projection filters the noise; frees the
+        # momentum's r_s (N + K) floats per layer
+        u = -g / (v.sqrt() + 1e-8) * lr_ratio
     else:
-        Um, Vm = _load_pair(_host_get(st, ("m", key), dev, off))
-        oe_ = int(c.get("orth_every") or 1)
-        if c.get("orth_defer") and not (oe_ > 1 and t % oe_):   # --ts_orth_defer: project now, orthonormalise at the
-            # end of the step (with --ts_orth_every k only on every k-th step)
-            st.setdefault("_defer", []).append((st, ("m", key), b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um, "m"))
-            Vn = Vm
-        elif oe_ > 1 and t % oe_:  # --ts_orth_every k: the basis stays put between orthonormalisations
-            Vn = Vm
+        rs = min(rk_sched or getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
+        if ("m", key) not in st:
+            gen = torch.Generator(device=g.device).manual_seed(4_000_000 + 2 * getattr(l, "_ts_idx", 0))
+            Vm = _orth(g.T @ torch.randn(l.N, rs, device=g.device, generator=gen))
+            Um = (1 - b1) * g @ Vm
         else:
-            Vn = _orth(b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um)
-        Md = (b1 * Um @ Vm.T + (1 - b1) * g) if diag else None    # the momentum before its rank-r projection
-        if Vn is Vm:
-            Um = b1 * Um + (1 - b1) * g @ Vm
+            Um, Vm = _load_pair(_host_get(st, ("m", key), dev, off))
+            oe_ = int(c.get("orth_every") or 1)
+            if c.get("orth_defer") and not (oe_ > 1 and t % oe_):   # --ts_orth_defer: project now, orthonormalise at the
+                # end of the step (with --ts_orth_every k only on every k-th step)
+                st.setdefault("_defer", []).append((st, ("m", key), b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um, "m"))
+                Vn = Vm
+            elif oe_ > 1 and t % oe_:  # --ts_orth_every k: the basis stays put between orthonormalisations
+                Vn = Vm
+            else:
+                Vn = _orth(b1 * Vm @ (Um.T @ Um) + (1 - b1) * g.T @ Um)
+            Md = (b1 * Um @ Vm.T + (1 - b1) * g) if diag else None    # the momentum before its rank-r projection
+            if Vn is Vm:
+                Um = b1 * Um + (1 - b1) * g @ Vm
+            else:
+                Um = b1 * Um @ (Vm.T @ Vn) + (1 - b1) * g @ Vn; Vm = Vn
+            if diag:      # share of the momentum's energy the projection drops (Um_new = Md Vn, Vn orthonormal)
+                x_ = 1 - (Um.norm() ** 2 / Md.norm().clamp_min(1e-30) ** 2).item(); del Md
+                _ts_rec(st, "m_drop", x_); _ts_rec(st, "m_drop_" + _TS_TYPES[getattr(l, "_ts_idx", 0) % 7], x_)
+            if Vm.shape[1] != rs:     # --ts_rank_sched: grow / shrink the momentum to this step's rank
+                Um, Vm = _resize_lowrank(Um, Vm, rs, g, 1 - b1, 7_000_000 + 2 * getattr(l, "_ts_idx", 0) + t)
+        if c.get("qdiag"): _qdiag(st, key, "m", Um, Vm, t)
+        _host_put(st, ("m", key), _store_pair(sm, Um, Vm) if sm else (qm(Um), qVm(Vm)), off)  # --ts_qfmt sim., --ts_store_m real
+        dbg_ = MICRO_DBG[0] if M_ > 1 else ""
+        if dbg_:
+            gs_ = st.get(("dbg_gsum", key)); st[("dbg_gsum", key)] = g.clone() if gs_ is None else gs_.add_(g)
+        if not final_:
+            return
+        if M_ > 1:      # --ts_micro: the micro-batch momentum is ~ the batch's / M (each g_i carries the loss / M)
+            u = -M_ * (Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
         else:
-            Um = b1 * Um @ (Vm.T @ Vn) + (1 - b1) * g @ Vn; Vm = Vn
-        if diag:      # share of the momentum's energy the projection drops (Um_new = Md Vn, Vn orthonormal)
-            x_ = 1 - (Um.norm() ** 2 / Md.norm().clamp_min(1e-30) ** 2).item(); del Md
-            _ts_rec(st, "m_drop", x_); _ts_rec(st, "m_drop_" + _TS_TYPES[getattr(l, "_ts_idx", 0) % 7], x_)
-        if Vm.shape[1] != rs:     # --ts_rank_sched: grow / shrink the momentum to this step's rank
-            Um, Vm = _resize_lowrank(Um, Vm, rs, g, 1 - b1, 7_000_000 + 2 * getattr(l, "_ts_idx", 0) + t)
-    if c.get("qdiag"): _qdiag(st, key, "m", Um, Vm, t)
-    _host_put(st, ("m", key), _store_pair(sm, Um, Vm) if sm else (qm(Um), qVm(Vm)), off)  # --ts_qfmt sim., --ts_store_m real
-    dbg_ = MICRO_DBG[0] if M_ > 1 else ""
-    if dbg_:
-        gs_ = st.get(("dbg_gsum", key)); st[("dbg_gsum", key)] = g.clone() if gs_ is None else gs_.add_(g)
-    if not final_:
-        return
-    if M_ > 1:      # --ts_micro: the micro-batch momentum is ~ the batch's / M (each g_i carries the loss / M)
-        u = -M_ * (Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
-    else:
-        u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
-    if dbg_:
-        u = _micro_dbg_u(l, st, key, t, M_, b1, b1o, b2o, Um, Vm, v, u, lr_ratio, dbg_)
+            u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
+        if dbg_:
+            u = _micro_dbg_u(l, st, key, t, M_, b1, b1o, b2o, Um, Vm, v, u, lr_ratio, dbg_)
     shadow_here = c.get("shadows") and (not c.get("shadow_layers") or getattr(l, "_ts_idx", -1) in c["shadow_layers"])
     if shadow_here:           # --ts_shadows: the same gradients into shadow states of other ranks (and full rank)
         _ts_shadows_step(l, g, v, st, c, t, lr_ratio, key)
@@ -1296,7 +1301,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
             shared_v=False, sketch=0.0, resid=False, shadows=(), dump_dir="", dump_steps=(), dump_layers=(),
             shadow_layers=(), rescale=False, refresh=0, refresh_frac=0.125, table=0.0, exact_spend=False, tiles=1,
             rank_sched=None, progress=0.0, rsketch=0, rsketch_every=50, locate=0.0, spend_table=False,
-            global_=False, fuse=False, orth_every=1, orth_defer=False, sgate=0, decay=0.0):
+            global_=False, fuse=False, orth_every=1, orth_defer=False, sgate=0, decay=0.0, nomom=False):
     """--ts: master's two timescales with sublinear state (the mechanism the 1 Oct master branches point to).
     Per layer:
       v      factored row x column EMA of g^2 (decay b2), v_ij ~ R_i C_j / mean(R)          (N + K floats)
@@ -1316,7 +1321,7 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              rescale=rescale, refresh=refresh, refresh_frac=refresh_frac, table=table, exact_spend=exact_spend,
              tiles=tiles, rank_sched=rank_sched, progress=progress, rsketch=rsketch, rsketch_every=rsketch_every,
              locate=locate, spend_table=spend_table, fuse=fuse, orth_every=orth_every, orth_defer=orth_defer, sgate=sgate,
-             decay=decay,
+             decay=decay, nomom=nomom,
              **{"global": global_},
              dump_dir=dump_dir, dump_steps=dump_steps, dump_layers=dump_layers, shadow_layers=shadow_layers)
     st = state.setdefault("_ts", {})
@@ -2486,6 +2491,8 @@ def main():
                     "orthonormalisations run once at the end of the step, batched by shape (state on the GPU only)")
     ap.add_argument("--init_density", type=float, default=0.0, help="kernel mode: initial share of nonzero trits "
                     "(0: rounded normal, ~69%%)")
+    ap.add_argument("--ts_nomom", action="store_true", help="--ts: no short momentum; the accumulator takes the "
+                    "full-rank g / sqrt(v) each step (the momentum's state freed)")
     ap.add_argument("--ts_decay", type=float, default=0.0, help="--ts: trit decay, a nonzero trit with |A| < theta / 2 "
                     "moves to 0 with probability P x lr_ratio per step")
     ap.add_argument("--ts_sgate", type=int, default=0, help="--ts: per-weight saturating counter (+-2) of the gradient's "
@@ -2773,6 +2780,8 @@ def main():
     args = ap.parse_args()
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
+    if args.ts_nomom and (args.ts_micro or args.ts_global or args.ts_fuse or args.ts_shared_v):
+        raise SystemExit("--ts_nomom works with the per-layer path only (no --ts_micro / --ts_global / --ts_fuse / --ts_shared_v)")
     if args.ts_orth_defer and (args.ts_offload or args.ts_offload_async):
         raise SystemExit("--ts_orth_defer needs the state on the GPU (no --ts_offload)")
     if args.gemm in ("cublas", "int8mm"):
@@ -3250,7 +3259,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
-                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay, nomom=args.ts_nomom,
                       progress=0.0,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
@@ -3412,7 +3421,7 @@ def main():
                       exact_spend=args.ts_exact_spend, tiles=args.ts_tiles, rank_sched=_rank_sched(args.ts_rank_sched),
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
-                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay,
+                      orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay, nomom=args.ts_nomom,
                       progress=step / max(1, tc.max_steps),
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
