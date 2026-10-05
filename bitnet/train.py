@@ -567,12 +567,36 @@ def ts_layer(l, g, state, c):
     off, dev = c.get("offload", False), g.device                                       # --ts_offload: state on the host
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
     g2 = g * g
-    if ("v", key) in st:
-        R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * g2.mean(1); C = b2 * C + (1 - b2) * g2.mean(0)
+    if M_ > 1:    # --ts_micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
+        # row / column means of (sum_i g_i)^2 = the micro-batches' own squares + 2 <g_i, sum of earlier g_i'>, the
+        # cross terms through a k-dim random sketch of the running sum (unbiased; k (N + K) floats, held within the step)
+        Sr, Sc = _micro_sketch(l, dev)
+        PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (0, 0, 0, 0, 0, 0)
+        gS, Sg = g @ Sr, Sc @ g
+        d1, d0 = g2.mean(1), g2.mean(0)
+        rs = rs + d1 + (2.0 / l.K) * (gS * PS).sum(1) if torch.is_tensor(PS) else d1
+        cs = cs + d0 + (2.0 / l.N) * (Sg * SP).sum(0) if torch.is_tensor(SP) else d0
+        ds, es = ds + d1, es + d0
+        PS, SP = PS + gS, SP + Sg
+        del gS, Sg, d1, d0
+        if final_:
+            rs, cs = torch.maximum(rs, ds / M_), torch.maximum(cs, es / M_)   # sketch noise: never below pure noise
+            if ("v", key) in st:
+                R, C = _host_get(st, ("v", key), dev, off); R = b2o * R + (1 - b2o) * rs; C = b2o * C + (1 - b2o) * cs
+            else:
+                R, C = (1 - b2o) * rs, (1 - b2o) * cs
+            _host_put(st, ("v", key), (R, C), off)
+            v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2o ** (t // M_))
+        else:
+            st[("mx", key)] = (PS, SP, rs, cs, ds, es); v = None
+        del PS, SP
     else:
-        R, C = (1 - b2) * g2.mean(1), (1 - b2) * g2.mean(0)
-    _host_put(st, ("v", key), (R, C), off)
-    v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
+        if ("v", key) in st:
+            R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * g2.mean(1); C = b2 * C + (1 - b2) * g2.mean(0)
+        else:
+            R, C = (1 - b2) * g2.mean(1), (1 - b2) * g2.mean(0)
+        _host_put(st, ("v", key), (R, C), off)
+        v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
     del g2
     rs = min(rk_sched or getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
     if ("m", key) not in st:
@@ -581,11 +605,6 @@ def ts_layer(l, g, state, c):
         Um = (1 - b1) * g @ Vm
     else:
         Um, Vm = _load_pair(_host_get(st, ("m", key), dev, off))
-        if M_ > 1:    # --ts_micro: row / column means of g * m_prev, unbiased for the signal's square (the noise of this
-            # micro-batch is independent of the momentum's), EMA'd like v (see the step u below)
-            x_ = g * ((Um @ Vm.T) / (1 - b1 ** (t - 1)))
-            XR, XC = st.get(("vx", key), (torch.zeros(l.N, device=dev), torch.zeros(l.K, device=dev)))
-            st[("vx", key)] = (b2 * XR + (1 - b2) * x_.mean(1), b2 * XC + (1 - b2) * x_.mean(0)); del x_
         oe_ = int(c.get("orth_every") or 1)
         if c.get("orth_defer") and not (oe_ > 1 and t % oe_):   # --ts_orth_defer: project now, orthonormalise at the
             # end of the step (with --ts_orth_every k only on every k-th step)
@@ -612,16 +631,8 @@ def ts_layer(l, g, state, c):
         gs_ = st.get(("dbg_gsum", key)); st[("dbg_gsum", key)] = g.clone() if gs_ is None else gs_.add_(g)
     if not final_:
         return
-    if M_ > 1:      # --ts_micro: with g_i = (s + n_i) / M the batch gradient's E[g^2] = M E[g_i^2] + M (M - 1) s^2 / M^2;
-        # E[g_i^2] is v, s^2 / M^2 the EMA of g_i * m_prev (vx), and the micro momentum is ~ s / M, so the batch's step
-        # is m_hat / sqrt(v / M + (1 - 1/M) vx), both in row / column means (linear, so factored as the batch's v is)
-        Rv_, Cv_ = R / (1 - b2 ** t), C / (1 - b2 ** t)
-        XR, XC = st.get(("vx", key), (torch.zeros_like(R), torch.zeros_like(C)))
-        cx_ = max(1 - b2 ** (t - 1), 1e-30)
-        Re_ = Rv_ / M_ + (1 - 1 / M_) * (XR / cx_).clamp_min(0); Ce_ = Cv_ / M_ + (1 - 1 / M_) * (XC / cx_).clamp_min(0)
-        veff_ = Re_[:, None] * Ce_[None, :] / Re_.mean().clamp_min(1e-30)
-        u = -(Um @ Vm.T) / (1 - b1 ** t) / (veff_.sqrt() + 1e-8) * lr_ratio
-        del veff_
+    if M_ > 1:      # --ts_micro: the micro-batch momentum is ~ the batch's / M (each g_i carries the loss / M)
+        u = -M_ * (Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
     else:
         u = -(Um @ Vm.T) / (1 - b1 ** t) / (v.sqrt() + 1e-8) * lr_ratio
     if dbg_:
@@ -808,6 +819,17 @@ def ts_layer(l, g, state, c):
         l._record_flips(before, l.wpacked)
 
 
+MICRO_SKETCH = [32]
+
+
+def _micro_sketch(l, dev):
+    """--ts_micro: a layer's fixed random maps (K x k, k x N; E[S S^T] = I) for the cross terms of the batch's v"""
+    k = MICRO_SKETCH[0]
+    gen = torch.Generator(device=dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0))
+    return (torch.randn(l.K, k, device=dev, generator=gen) / k ** 0.5,
+            torch.randn(k, l.N, device=dev, generator=gen) / k ** 0.5)
+
+
 MICRO_DBG = [os.environ.get("TERN_MICRO_DBG", "")]   # diagnostic of --ts_micro (see _micro_dbg_u)
 
 
@@ -839,9 +861,7 @@ def _micro_dbg_u(l, st, key, t, M_, b1, b1o, b2o, Um, Vm, v, u, lr_ratio, dbg):
     elif dbg == "v":
         un = -M_ * (Um @ Vm.T) / (1 - b1 ** t) / (vd.sqrt() + 1e-8) * lr_ratio
     else:
-        m2_ = (mhd / M_) ** 2; Rm_, Cm_ = m2_.mean(1), m2_.mean(0); del m2_
-        vs_ = Rm_[:, None] * Cm_[None, :] / Rm_.mean().clamp_min(1e-30)
-        un = -(mhd / M_) / ((v / M_ + (1 - 1 / M_) * vs_).sqrt() + 1e-8) * lr_ratio
+        un = -mhd / (v.sqrt() + 1e-8) * lr_ratio
     _ts_rec(st, "dbg_cos", ((un * u).sum() / (un.norm() * u.norm()).clamp_min(1e-30)).item())
     _ts_rec(st, "dbg_ratio", (u.norm() / un.norm().clamp_min(1e-30)).item())
     return u if dbg == "log" else un
