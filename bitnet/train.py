@@ -2754,6 +2754,8 @@ def main():
     ap.add_argument("--out_dir", default=None)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--warmup", type=int, default=None)
+    ap.add_argument("--extend_to", type=int, default=0, help="train until this step: after --steps the schedule's lr stays "
+                    "at --min_lr (continuing a finished run from its checkpoint with --resume)")
     ap.add_argument("--weight_decay", type=float, default=None, help="weight decay of the float tail's embedding / adapter group (default 0.1)")
     ap.add_argument("--min_lr", type=float, default=None,
                     help="cosine floor (default: lr/10)")
@@ -3242,7 +3244,8 @@ def main():
                 m.enable_reversal_tracking()
     t0 = time.time()
     last_save = time.time()
-    end_step = tc.max_steps if args.stop_after is None else min(tc.max_steps, args.stop_after)
+    last_ = max(tc.max_steps, args.extend_to or 0)   # --extend_to N: keep training past the schedule (lr held at min_lr)
+    end_step = last_ if args.stop_after is None else min(last_, args.stop_after)
     probe_steps = parse_schedule(args.probe)
     ramp_t = time.time()
     prof = None
