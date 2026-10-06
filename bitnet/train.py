@@ -67,7 +67,15 @@ def two_stage_mid(tc: TrainConfig):
 def _ts_scale(args, step, tc, lr):
     """the TTF step scale a: --ts_step_sched HOLD:END gives TTF its own schedule (1 until step HOLD, then a cosine to END
     at the last step, independent of the float tail's lr); otherwise (lr ratio)^p with --ts_anneal / --ts_anneal_sched
-    and the --ts_anneal_floor after warmup"""
+    and the --ts_anneal_floor after warmup; --ts_step_tanh CENTER:WIDTH:END: a falling tanh step, 1 after warmup to END at the
+    last step (slow start, fast fall around CENTER, flat tail)"""
+    if getattr(args, "ts_step_tanh", ""):
+        c_, w_, end = (float(x) for x in args.ts_step_tanh.split(":"))
+        if step < tc.warmup_steps:
+            return (step + 1) / tc.warmup_steps
+        s_ = lambda x: 0.5 * (1.0 - math.tanh((x - c_) / w_))
+        s0, s1 = s_(tc.warmup_steps), s_(tc.max_steps)
+        return end + (1.0 - end) * (s_(min(step, tc.max_steps)) - s1) / (s0 - s1)
     if args.ts_step_sched:
         hold, end = (float(x) for x in args.ts_step_sched.split(":"))
         if step < tc.warmup_steps:
@@ -83,6 +91,14 @@ def _anneal_p(args, step, tc):
     """--ts_anneal_sched P0:P1[:START]: the exponent p of the step scale (lr ratio)^p is P0 until fraction START of training
     (default 0), then moves linearly to P1 at the end (e.g. 1:0.25:0.6: like master's lr mid-training, slower decay late);
     otherwise --ts_anneal"""
+    if getattr(args, "ts_anneal_pts", ""):   # --ts_anneal_pts "S0:P0,S1:P1,...": p piecewise linear in the step
+        pts = sorted((float(a), float(b)) for a, b in (x.split(":") for x in args.ts_anneal_pts.split(",")))
+        if step <= pts[0][0]:
+            return pts[0][1]
+        for (s0, p0), (s1, p1) in zip(pts, pts[1:]):
+            if step <= s1:
+                return p0 + (p1 - p0) * (step - s0) / max(1e-9, s1 - s0)
+        return pts[-1][1]
     if not args.ts_anneal_sched:
         return args.ts_anneal
     v = [float(x) for x in args.ts_anneal_sched.split(":")]
@@ -2524,8 +2540,12 @@ def main():
                     "(memory-matched comparisons; 0: no cap)")
     ap.add_argument("--init_density", type=float, default=0.0, help="kernel mode: initial share of nonzero trits "
                     "(0: rounded normal, ~69%%)")
+    ap.add_argument("--ts_step_tanh", default="", help="--ts: CENTER:WIDTH:END, TTF's own step scale as a falling tanh: 1 after "
+                    "warmup, fastest fall at step CENTER (width WIDTH steps), END at the last step (overrides --ts_anneal*)")
     ap.add_argument("--ts_step_sched", default="", help="--ts: HOLD:END, TTF's own step scale: 1 until step HOLD, then a cosine "
                     "to END at the last step (independent of the float tail's lr; overrides --ts_anneal*)")
+    ap.add_argument("--ts_anneal_pts", default="", help="--ts: 'S0:P0,S1:P1,...', the step-scale exponent p piecewise linear in "
+                    "the step (overrides --ts_anneal / --ts_anneal_sched)")
     ap.add_argument("--ts_anneal_sched", default="", help="--ts: P0:P1[:START], the step-scale exponent p moves from P0 to P1 "
                     "linearly after fraction START of training (default: --ts_anneal throughout)")
     ap.add_argument("--ts_anneal_floor", type=float, default=0.0, help="--ts: the step scale (lr ratio)^p never falls below "
