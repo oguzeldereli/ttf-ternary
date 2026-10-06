@@ -2,10 +2,17 @@
 # int8 forward. 110M ranks 256 / 128 reproduce the 1.3B curve shape vs master + extras (docs/figures/proxy_shape.png).
 # Reference: master + extras 110M (mx_extras_s0 / _seed2, 2.7166 fixed). Base run first.
 # + the schedule arms at ranks 512 (110M ranks 512 reproduces 1.3B ranks 512's curve shape incl. the late recovery)
+# + 03:55: p 1 follow-ups (seed 2, + tau 2000, ranks 128 / 64)
 sw512_p15 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.5
 sw512_p2 --lowrank 512 --ts_rank_s 512 --ts_anneal 2.0
 sw192_p15 --ts_anneal 1.5
 sw192_p2 --ts_anneal 2.0
+sw512_p1_seed2 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --seed 2
+sw512_p1_tau2000 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_tau 2000
+sw128_base --lowrank 128 --ts_rank_s 128
+sw128_p1 --lowrank 128 --ts_rank_s 128 --ts_anneal 1.0
+sw64_base --lowrank 64 --ts_rank_s 64
+sw64_p1 --lowrank 64 --ts_rank_s 64 --ts_anneal 1.0
 big_ts512an05_nomom_s0 --preset d1024_l24
 sw192_base
 sw192_th1020 --ts_theta_sched 10:20
