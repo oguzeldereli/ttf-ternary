@@ -7,6 +7,7 @@
 # + 06:50: larger late steps (p 0.5 + floor 0.4 / 0.5; p 0.75 + floor 0.3): the end dominates the final
 # + 10:25: p 1 + floor 0.5 (floor 0.3 still leaves late steps below the base's)
 # + 10:45 : the exponent p decays over training (1 mid-training -> lower late)
+# + 11:00 : TTF's own step schedule: hold 1 until step 4000, then cosine to 0.32 / 0.5
 sw512_p1_f03 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.3
 sw512_p1_f02 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.2
 sw192_p1_f03 --ts_anneal 1.0 --ts_anneal_floor 0.3
@@ -41,6 +42,9 @@ sw512_ps1to05 --lowrank 512 --ts_rank_s 512 --ts_anneal_sched 1:0.5
 sw512_ps1to025 --lowrank 512 --ts_rank_s 512 --ts_anneal_sched 1:0.25
 sw192_ps1to05_s05 --ts_anneal_sched 1:0.5:0.5
 sw192_ps1to025_s06 --ts_anneal_sched 1:0.25:0.6
+sw512_ss4000_032 --lowrank 512 --ts_rank_s 512 --ts_step_sched 4000:0.32
+sw512_ss4000_05 --lowrank 512 --ts_rank_s 512 --ts_step_sched 4000:0.5
+sw192_ss4000_032 --ts_step_sched 4000:0.32
 sw512_p1_f05 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.5
 sw192_p1_f05 --ts_anneal 1.0 --ts_anneal_floor 0.5
 sw512_p05_f05 --lowrank 512 --ts_rank_s 512 --ts_anneal_floor 0.5
