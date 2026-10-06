@@ -34,6 +34,9 @@ within 6e-5. FineWeb-Edu was never used for any choice.
   (**+0.053 [+0.051, +0.055]**), FineWeb-Edu 3.5009 vs 3.4584 (+0.043); LAMBADA 0.155 vs 0.143; master ahead at every
   evaluation from step 3000. TTF's lead over the fair reference shrinks with
   scale (−0.028 / −0.011 / +0.053 at 110M / 340M / 1.3B), as the rank / width ratio of ranks 512 falls (0.67 / 0.5 / 0.25).
+  **Without the short momentum (6 Oct) the 1.3B gap mostly closes:** ranks 512 fixed windows 2.5012 / 3.4415 (vs master
+  + extras lr 7.5e-4 2.4980 / 3.4584: +0.003 / −0.017); against master + extras at its better lr 5e-4 (training-time
+  2.4949) ranks 512 is +0.022 and **ranks 1024 is level (−0.004 at step 9000)**; finals and fixed windows pending.
 - **TTF without the short momentum** (`--ts_nomom`, half the state): 110M fixed windows, ranks 512 (2 seeds) 2.6707 /
   2.6693: −0.019 [−0.020, −0.018] vs TTF with momentum and **−0.047 vs master + the same extras** (FineWeb −0.064); −0.020
   / −0.027 at ranks 64 / 128; ranks 128 without momentum beats ranks 64 with it (the same state) by 0.136.

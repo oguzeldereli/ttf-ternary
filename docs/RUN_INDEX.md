@@ -14,6 +14,19 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 "3 Oct 04:45").
 
 
+## 5-6 Oct: no momentum at scale, step schedules (details in RUNS.md "6 Oct")
+
+| run(s) | what | result |
+|---|---|---|
+| `x1b_nomom512_lr15` (Myriad) | 1.3B, no momentum, ranks 512, lr 1.5e-3 | **fixed windows 2.5012 / 3.4415** (training-time 2.5169); master + extras lr 7.5e-4 2.4980 (+0.003), lr 5e-4 fixed pending (training-time +0.022) |
+| `x1b_nomom1024_lr15` (Myriad) | 1.3B, no momentum, ranks 1024 | **2.4956 at 9000, -0.004 vs master + extras lr 5e-4** (training-time); final pending |
+| `x1b_mx_extras_lr50` (Myriad) | 1.3B master + extras at lr 5e-4 | **2.4949** training-time (lr 7.5e-4: 2.5142); fixed windows pending |
+| `x1b_ts512_hold` / `x1b_mx_extras_lr75_hold` | 1.3B continued at the final lr | gap 0.054 -> 0.036 over 2600 steps (running) |
+| `x1b_nm512_b2k_*` | 1.3B branches from 2000: p 1 / theta 10 -> 20 / constant leak / p 1 + floor 0.3 | +0.025 / +0.025 / +0.046 / +0.007 vs best master (running) |
+| `big_ts512an05_nomom_s0` | 340M no momentum | 2.5861 training-time (fixed windows pending) |
+| `sw512_*` / `sw192_*` (lab) | 110M step-schedule sweep (p, floors, p schedules, piecewise p, theta / tau schedules) | **nothing beats the base (p 0.5)**; mid-training gains are lost late; fixed windows: base 2.6720 (r512), 2.7748 (r192) |
+| `x10b_ts512` (Myriad) | 10B, ranks 512, 98M tokens | 2.9911 training-time |
+
 ## 3-4 Oct: scale, checks, memory, low rank (details in RUNS.md "3 Oct night" onwards)
 
 | run(s) | what | result |
