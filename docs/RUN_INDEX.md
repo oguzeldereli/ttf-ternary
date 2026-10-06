@@ -37,6 +37,8 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `ts64an05_gate_s0` / `_sgate1_s0` / `_sgate2_s0` | ranks 64 + `--lr_gate` / per-weight sign counter K 1 / K 2 (`--ts_sgate`) | 2.9942 / 2.9937 / 2.9950 (+0.001 / +0.001 / +0.002 vs 2.9929: neutral) |
 | `ts512an05_fast_s0` | 110M ranks 512 + `--ts_fused --ts_orth_defer --ts_orth_every 4 --gemm int8mm` | 2.7721 (+0.065 vs 2.7067: the speed modes cost quality) |
 | `x1b_mx_extras_lr75` (Myriad 49713) | 1.3B master + the same float extras, lr 7.5e-4 | fixed windows **2.4980** (TTF ranks 512 2.5510: **TTF +0.053 [+0.051, +0.055]**); FineWeb 3.4584 (TTF +0.043); LAMBADA 0.143 (TTF 0.155) |
+| `sw512_base` / `_p075` / `_tau2000` / `_tauanneal` / `_th1218` / `_p1` / `_th1020` / `_p025` | 110M sweep, ranks 512 no momentum | 2.6896 / 2.6940 / 2.6980 / 2.7011 / 2.7067 / 2.7147 / 2.7258 / 2.7658 (training-time; base best) |
+| `x10b_ts512` (Myriad 49814) | ~10B, ranks 512, batch 16, 3000 steps (98M tokens) | 2.9911 training-time |
 | `sw192_base` / `_p1` / `_th1020` / `_th1218` / `_tauanneal` | 110M proxy sweep, ranks 192 no momentum (fused, int8 forward) | 2.7940 / 2.8312 / 2.8176 / 2.8014 / 2.7965 (training-time) |
 | `ts512an05_nomom_s0` / `_seed2` | no short momentum, ranks 512 | fixed windows **2.6707 / 2.6693** (-0.019 [-0.020, -0.018] vs TTF ranks 512, 3 seeds; **-0.047 vs master + extras**; FineWeb -0.026 / -0.064); half the state |
 | `ts512an05_fused_s0` / `_oe4_s0` / `_defer_s0` | speed ablation | 2.7082 / 2.7642 / 2.7619 (fused free; every 4 +0.058; deferred +0.055) |
