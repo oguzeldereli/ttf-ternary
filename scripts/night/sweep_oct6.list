@@ -5,6 +5,7 @@
 # + 03:55: p 1 follow-ups (seed 2, + tau 2000, ranks 128 / 64)
 # + 04:50: p 1 with a floor on the step scale (keeps the late recovery)
 # + 06:50: larger late steps (p 0.5 + floor 0.4 / 0.5; p 0.75 + floor 0.3): the end dominates the final
+# + 10:25: p 1 + floor 0.5 (floor 0.3 still leaves late steps below the base's)
 sw512_p1_f03 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.3
 sw512_p1_f02 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.2
 sw192_p1_f03 --ts_anneal 1.0 --ts_anneal_floor 0.3
@@ -33,6 +34,8 @@ sw512_p025 --lowrank 512 --ts_rank_s 512 --ts_anneal 0.25
 sw512_p075 --lowrank 512 --ts_rank_s 512 --ts_anneal 0.75
 sw512_tau2000 --lowrank 512 --ts_rank_s 512 --ts_tau 2000
 sw512_p05_f04 --lowrank 512 --ts_rank_s 512 --ts_anneal_floor 0.4
+sw512_p1_f05 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.5
+sw192_p1_f05 --ts_anneal 1.0 --ts_anneal_floor 0.5
 sw512_p05_f05 --lowrank 512 --ts_rank_s 512 --ts_anneal_floor 0.5
 sw512_p075_f03 --lowrank 512 --ts_rank_s 512 --ts_anneal 0.75 --ts_anneal_floor 0.3
 sw192_p05_f04 --ts_anneal_floor 0.4
