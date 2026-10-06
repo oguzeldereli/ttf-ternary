@@ -1,6 +1,6 @@
 """110M piecewise-p arms (--ts_anneal_pts, 6 Oct): the step scale each arm uses, and each arm minus the base (p 0.5) and
 minus master + the same extras at each evaluation step (training-time windows).
-    python scripts/plots/plot_pp.py CURVE_DIR      (RUN.jsonl files: sw512_pp_A..F, sw192_pp_*, sw{512,192}_base)
+    python scripts/plots/plot_pp.py CURVE_DIR      (RUN.jsonl files: sw512_pp_A..F, sw192_pp_*, sw{512,192}_base, sw{512,192}_p1)
 Writes docs/figures/pp_oct6.png."""
 import json, math, os, sys
 import matplotlib
@@ -68,6 +68,10 @@ def panel(a, base, ref, title, ylim):
             continue
         fin = " final" if max(v) == T else f" @ {s[-1]}"
         a.plot(s, [v[x] - ref[x] for x in s], "-", color=c, lw=1.4, label=f"{k} ({v[s[-1]] - ref[s[-1]]:+.3f}{fin})")
+    v = get(base + "_p1")
+    s = sorted(x for x in v if x in ref and x >= 500)
+    if s:
+        a.plot(s, [v[x] - ref[x] for x in s], "k:", lw=1.8, label=f"p 1 = master's lr ratio ({v[s[-1]] - ref[s[-1]]:+.3f} final)")
     if ref is not b:
         s = sorted(x for x in b if x in ref and x >= 500)
         a.plot(s, [b[x] - ref[x] for x in s], "k-", lw=2.4, label=f"base p 0.5 ({b[s[-1]] - ref[s[-1]]:+.3f} final)")
