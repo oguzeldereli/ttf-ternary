@@ -2497,6 +2497,8 @@ def main():
                     "(memory-matched comparisons; 0: no cap)")
     ap.add_argument("--init_density", type=float, default=0.0, help="kernel mode: initial share of nonzero trits "
                     "(0: rounded normal, ~69%%)")
+    ap.add_argument("--ts_anneal_floor", type=float, default=0.0, help="--ts: the step scale (lr ratio)^p never falls below "
+                    "this (e.g. p 1 mid-training like master's lr, then constant late)")
     ap.add_argument("--ts_theta_sched", default="", help="--ts: T0:T1, the threshold moves linearly from T0 to T1 over training")
     ap.add_argument("--ts_nomom", action="store_true", help="--ts: no short momentum; the accumulator takes the "
                     "full-rank g / sqrt(v) each step (the momentum's state freed)")
@@ -3329,7 +3331,7 @@ def main():
             reset_lockout(model)
         lr = lr_at(step, tc)
         if ts_cfg is not None:
-            ts_cfg["lr_ratio"] = (lr / tc.lr) ** args.ts_anneal
+            ts_cfg["lr_ratio"] = max((lr / tc.lr) ** args.ts_anneal, args.ts_anneal_floor if step >= tc.warmup_steps else 0.0)   # --ts_anneal_floor F
             ts_cfg["progress"] = step / max(1, tc.max_steps)
             ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
@@ -3426,7 +3428,7 @@ def main():
                 rs_info = bop_step(model, lr_state, args.bop_gamma, args.bop_tau, args.ts_b2, norm=not args.bop_raw,
                                    bias_correct=args.bop_bc)
             elif args.ts:
-                rs_info = ts_step(model, lr_state, args.lowrank, step, (lr / tc.lr) ** args.ts_anneal, args.ts_theta, args.ts_tau,
+                rs_info = ts_step(model, lr_state, args.lowrank, step, max((lr / tc.lr) ** args.ts_anneal, args.ts_anneal_floor if step >= tc.warmup_steps else 0.0), args.ts_theta, args.ts_tau,
                                   args.ts_rank_s, args.ts_b1, args.ts_b2, gate=args.lr_gate, spend=args.ts_spend,
                                   tau_anneal=args.ts_tau_anneal, int8=args.ts_int8, fused=args.ts_fused,
                                   qfmt=args.ts_qfmt, qwhich=args.ts_qwhich, qnoV=args.ts_qnoV,

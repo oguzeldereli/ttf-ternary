@@ -3,6 +3,11 @@
 # Reference: master + extras 110M (mx_extras_s0 / _seed2, 2.7166 fixed). Base run first.
 # + the schedule arms at ranks 512 (110M ranks 512 reproduces 1.3B ranks 512's curve shape incl. the late recovery)
 # + 03:55: p 1 follow-ups (seed 2, + tau 2000, ranks 128 / 64)
+# + 04:50: p 1 with a floor on the step scale (keeps the late recovery)
+sw512_p1_f03 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.3
+sw512_p1_f02 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.2
+sw192_p1_f03 --ts_anneal 1.0 --ts_anneal_floor 0.3
+sw192_p1_f02 --ts_anneal 1.0 --ts_anneal_floor 0.2
 sw512_p15 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.5
 sw512_p2 --lowrank 512 --ts_rank_s 512 --ts_anneal 2.0
 sw192_p15 --ts_anneal 1.5
