@@ -23,6 +23,9 @@ RUNS = [  # name, label, colour, style
     ("x1b_ts512_lr15", "TTF ranks 512, momentum, lr 1.5e-3", "C1", "-"),
     ("x1b_nomom512_lr15", "TTF ranks 512, no momentum, lr 1.5e-3", "C0", "-"),
     ("x1b_nomom1024_lr15", "TTF ranks 1024, no momentum, lr 1.5e-3", "C2", "-"),
+    ("x1b_nm512_b2k_p1", "  branch at 2000: steps x lr ratio^1 (p 1)", "C0", "--"),
+    ("x1b_nm512_b2k_leakc", "  branch at 2000: constant leak", "C9", "--"),
+    ("x1b_nm512_b2k_th1020", "  branch at 2000: threshold 10 -> 20", "C8", "--"),
 ]
 ref = V["x1b_mx_extras_lr75"]
 fig, ax = plt.subplots(1, 2, figsize=(14, 5.2))
