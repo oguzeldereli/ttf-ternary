@@ -545,6 +545,8 @@ def _orth(X):
         return torch.linalg.householder_product(a_, tau_)
     if ORTH_CHOL[0] == "scholqr3":   # shifted Cholesky-QR3 in fp32: no host sync, no fp64 (Gram products in full fp32)
         return _orth_scholqr3(X)
+    if ORTH_CHOL[0] == "ns":         # Newton-Schulz conditioning (Muon's quintic, matrix products only) + Cholesky-QR2
+        return _orth_ns(X)
     if not ORTH_CHOL[0]:
         Q = torch.linalg.qr(X)[0]
         if ORTH_DBG[0]:
@@ -586,6 +588,29 @@ def _orth_scholqr3(X):
             L = torch.linalg.cholesky_ex(G)[0]
             Q = torch.linalg.solve_triangular(L, Q.T, upper=False).T   # Q L^-T
         return torch.nan_to_num(Q)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf_
+
+
+def _orth_ns(X, iters=5):
+    """orthonormal basis of the columns of X (K x r) from matrix products only: five Newton-Schulz iterations with the
+    quintic coefficients of the Muon optimizer (Jordan et al. 2024) bring the singular values of X / ||X||_F to ~[0.7, 1.2]
+    (same span), then two Cholesky-QR passes in fp32 make the basis exactly orthonormal (its Gram matrix is now well
+    conditioned, so fp32 suffices; a tiny shift guards the Cholesky). No QR routine, no host sync, no fp64."""
+    tf_ = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        a_, b_, c_ = 3.4445, -4.7750, 2.0315
+        Y = X / X.norm().clamp_min(1e-30)
+        for _ in range(iters):
+            A = Y.T @ Y
+            Y = a_ * Y + Y @ (b_ * A + c_ * (A @ A))
+        for _ in range(2):
+            G = Y.T @ Y
+            G.diagonal().add_(1e-7 * G.diagonal().sum() + 1e-30)
+            L = torch.linalg.cholesky_ex(G)[0]
+            Y = torch.linalg.solve_triangular(L, Y.T, upper=False).T
+        return torch.nan_to_num(Y)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = tf_
 
@@ -2675,7 +2700,7 @@ def main():
                     help="ternary GEMMs: our Triton kernels, or cuBLAS bf16 on trits unpacked per call (faster on A100)")
     ap.add_argument("--ts_orth_shift", type=float, default=0.0, help="--ts_orth scholqr3: Gram shift D * tr(X^T X) "
                     "(0: the worst-case bound 11 (K r + r (r + 1)) u ||X||^2, too large when r is a large share of K)")
-    ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64", "scholqr3", "geqrf"],
+    ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64", "scholqr3", "geqrf", "ns"],
                     help="--ts: subspace orthonormalisation by Householder QR or two-pass Cholesky-QR (faster)")
     ap.add_argument("--ts_qfmt", default="", help="--ts: storage format of the low-rank matrices: int8 | int8det | "
                     "int8row | int4 | bf16 | fp16 | fp16s (per-column scale) | fp8 | fpmK (K mantissa bits) (simulated; --ts_int8 = int8)")
