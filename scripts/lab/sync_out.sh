@@ -9,6 +9,9 @@ mkdir -p "$S/.synced" "$H/runs" "$H/outbox"
 while true; do
   # logs and metrics only: checkpoints (~0.5-1.3 GB each) stay on this PC's local disk, since shipping them through
   # the home folder filled the 10 GB quota; the laptop copies the ones it needs directly from here
-  rsync -a --exclude '*.pt' --exclude '*.part' --exclude '*.tmp' --exclude 'metrics.jsonl' "$R/" "$H/runs/"
+  # also never: profiler traces (~0.5 GB each) and rsync's partial copies of checkpoints (.ckpt.pt.XXXXXX): both filled
+  # the quota on 7 Oct
+  rsync -a --exclude '*.pt' --exclude '.*.pt.*' --exclude '*.part' --exclude '*.tmp' --exclude 'metrics.jsonl' \
+    --exclude 'profile_trace.json' --exclude '*.trace.json' "$R/" "$H/runs/"
   sleep 60
 done
