@@ -1,13 +1,13 @@
 #!/bin/bash -l
 # Myriad: step-time test of large models (1.3B, b3 2.9B), TTF and master, at 16 / 32 / 64 sequences of 2048 tokens per
-# step. Each configuration runs ~150 s (warm-up + steady steps); the time per step is read from the step log
-# (cumulative seconds, steps 20 -> last). Results in logs/speed_big/summary.txt.
+# step. Each configuration runs ~330 s (warm-up + steady steps); the time per step is read from the step log
+# (cumulative seconds, steps 10 -> last). Results in logs/speed_big/summary.txt.
 #   qsub scripts/myriad/speed_big.sh
 #$ -N speed_big
-#$ -l h_rt=0:50:00
+#$ -l h_rt=1:20:00
 #$ -l mem=12G
 #$ -l gpu=1
-#$ -ac allow=LUV
+#$ -ac allow=UV
 #$ -pe smp 4
 #$ -l tmpfs=20G
 #$ -wd /home/zcabogu/Scratch/ternary-LLM
@@ -27,8 +27,8 @@ M="--mode master --master_dtype fp32 --lr 5e-4 --min_lr 5e-5"
 F="--ts_fast --ts_orth scholqr3"
 one() {  # NAME PRESET BATCH FLAGS...
   n=$1; p=$2; b=$3; shift 3
-  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; timeout 170 python -m bitnet.train --preset $p --batch_size $b $(echo $C) $* --out_dir $TMPDIR/sp_$n" > $O/$n.log 2>&1
-  r=$(grep -E '^step' $O/$n.log | awk '{x=$(NF-3); sub("s","",x); if ($2>=20) {if (!s0) {s0=$2; t0=x}; s1=$2; t1=x}} END {if (s1>s0) printf "%.2f s/step (%d steps measured), %.0f tokens/s", (t1-t0)/(s1-s0), s1-s0, '$b'*2048*(s1-s0)/(t1-t0); else print "no steady steps"}')
+  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; timeout 330 python -m bitnet.train --preset $p --batch_size $b $(echo $C) $* --out_dir $TMPDIR/sp_$n" > $O/$n.log 2>&1
+  r=$(grep -E '^step' $O/$n.log | awk '{x=$(NF-3); sub("s","",x); if ($2>=10) {if (!s0) {s0=$2; t0=x}; s1=$2; t1=x}} END {if (s1>s0) printf "%.2f s/step (%d steps measured), %.0f tokens/s", (t1-t0)/(s1-s0), s1-s0, '$b'*2048*(s1-s0)/(t1-t0); else print "no steady steps"}')
   pk=$(grep -E '^step' $O/$n.log | tail -1 | grep -o 'peakVRAM [0-9.]*GiB')
   oom=$(grep -c -i "out of memory" $O/$n.log)
   echo "$n  preset $p  batch $b  $r  $pk  ${oom:+oom=$oom}" >> $O/summary.txt
