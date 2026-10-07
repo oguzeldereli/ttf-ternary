@@ -540,6 +540,9 @@ def _orth(X):
     """orthonormal basis of the columns of X (tall, K x r): two-pass Cholesky-QR (GEMMs plus an r x r Cholesky in
     fp64, no host sync) instead of a Householder QR, which was 1.6 s per 1.3B step. Only the span matters to --ts
     (A = U V^T does not depend on the basis chosen)."""
+    if ORTH_CHOL[0] == "geqrf":      # the same Householder QR as torch.linalg.qr (geqrf + orgqr), called directly
+        a_, tau_ = torch.geqrf(X)
+        return torch.linalg.householder_product(a_, tau_)
     if ORTH_CHOL[0] == "scholqr3":   # shifted Cholesky-QR3 in fp32: no host sync, no fp64 (Gram products in full fp32)
         return _orth_scholqr3(X)
     if not ORTH_CHOL[0]:
@@ -2668,7 +2671,7 @@ def main():
                          "the boundary it crossed, like master)")
     ap.add_argument("--gemm", default="triton", choices=["triton", "cublas", "int8mm"],
                     help="ternary GEMMs: our Triton kernels, or cuBLAS bf16 on trits unpacked per call (faster on A100)")
-    ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64", "scholqr3"],
+    ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64", "scholqr3", "geqrf"],
                     help="--ts: subspace orthonormalisation by Householder QR or two-pass Cholesky-QR (faster)")
     ap.add_argument("--ts_qfmt", default="", help="--ts: storage format of the low-rank matrices: int8 | int8det | "
                     "int8row | int4 | bf16 | fp16 | fp16s (per-column scale) | fp8 | fpmK (K mantissa bits) (simulated; --ts_int8 = int8)")
