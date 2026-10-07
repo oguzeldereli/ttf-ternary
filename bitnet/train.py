@@ -540,6 +540,8 @@ def _orth(X):
     """orthonormal basis of the columns of X (tall, K x r): two-pass Cholesky-QR (GEMMs plus an r x r Cholesky in
     fp64, no host sync) instead of a Householder QR, which was 1.6 s per 1.3B step. Only the span matters to --ts
     (A = U V^T does not depend on the basis chosen)."""
+    if ORTH_CHOL[0] == "scholqr3":   # shifted Cholesky-QR3 in fp32: no host sync, no fp64 (Gram products in full fp32)
+        return _orth_scholqr3(X)
     if not ORTH_CHOL[0]:
         Q = torch.linalg.qr(X)[0]
         if ORTH_DBG[0]:
@@ -563,6 +565,27 @@ def _orth(X):
     return Q
 
 
+def _orth_scholqr3(X):
+    """orthonormal basis of the columns of X (K x r) by shifted Cholesky-QR3: X^T X + s I = R^T R with a shift s that
+    keeps the fp32 Gram matrix positive definite (s = 11 (K r + r (r + 1)) u ||X||_F^2, u the fp32 unit roundoff), then
+    two plain Cholesky-QR passes restore orthogonality. All in fp32, Cholesky without an info check: no host sync."""
+    tf_ = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False          # the Gram products need full fp32
+    try:
+        K_, r_ = X.shape
+        Q = X
+        for k_ in range(3):
+            G = Q.T @ Q
+            if k_ == 0:
+                s_ = 11.0 * (K_ * r_ + r_ * (r_ + 1)) * 2.0 ** -24 * G.diagonal().sum()
+                G.diagonal().add_(s_ + 1e-30)
+            L = torch.linalg.cholesky_ex(G)[0]
+            Q = torch.linalg.solve_triangular(L, Q.T, upper=False).T   # Q L^-T
+        return torch.nan_to_num(Q)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf_
+
+
 def _orth_stats(X, Q):
     """TERN_ORTHDBG=1 (one step in 10): compare Q with Householder on the same input; count all-zero inputs / outputs"""
     Qh = torch.linalg.qr(X)[0]
@@ -579,11 +602,93 @@ ORTH_DBG = [False]                # on for one step in 10 when TERN_ORTHDBG=1
 ORTH_STATS = []                   # (max |Q^T Q - I|, span error vs Householder, condition number of the input) per call
 
 
+_POW3 = {}
+
+
+def _ts_layer_fast(l, g, state, c):
+    """--ts_fast: the default --ts --ts_nomom update (same mathematics as ts_layer with no optional mechanism) with fewer
+    full-size passes: the row / column means of g^2 by norms (no g^2 array); v never formed (u from its row and column
+    factors in place); the moves taken from the legal candidates only (one nonzero, one host sync per layer), so the
+    trits change in place in their packed bytes (no repack of the whole matrix) and the spend D V is a sparse row update
+    over the moves (no dense N x K x r product)"""
+    from .kernel import unpack_rows
+    r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
+    if c.get("theta_sched"):
+        th0_, th1_ = c["theta_sched"]
+        theta = th0_ + (th1_ - th0_) * min(max(c.get("progress", 0.0), 0.0), 1.0)
+    st = state.setdefault("_ts", {})
+    off, dev = c.get("offload", False), g.device
+    key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
+    rm = torch.linalg.vector_norm(g, dim=1).square_().div_(l.K)          # row means of g^2
+    cm = torch.linalg.vector_norm(g, dim=0).square_().div_(l.N)          # column means of g^2
+    if ("v", key) in st:
+        R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * rm; C = b2 * C + (1 - b2) * cm
+    else:
+        R, C = (1 - b2) * rm, (1 - b2) * cm
+    _host_put(st, ("v", key), (R, C), off)
+    del rm, cm
+    a_ = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** t)).sqrt_()         # sqrt(v_ij) = a_i * b_j
+    u = torch.outer(a_, C.sqrt()).add_(1e-8)
+    torch.div(g, u, out=u).mul_(-lr_ratio)                                # u = -g / (sqrt(v) + eps) * lr_ratio
+    ra = min(r, l.N, l.K)
+    lk = 1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau
+    if key not in state:
+        gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
+        V = _orth(u.T @ torch.randn(l.N, ra, device=g.device, generator=gen))
+        U = u @ V
+    else:
+        U, V = _load_pair(_host_get(state, key, dev, off))
+        U = U * lk
+        Vn = _orth(V @ (U.T @ U) + u.T @ U)
+        uVn = u @ Vn
+        U = U @ (V.T @ Vn) + uVn; V = Vn
+        del uVn
+    del u
+    A = U @ V.T
+    w0 = unpack_rows(l.wpacked, l.K)                                       # int8 {-1, 0, 1}
+    pos, neg = A >= theta, A <= -theta
+    del A
+    legal = (pos & (w0 < 1)) | (neg & (w0 > -1))                           # fires and stays within {-1, 0, 1}
+    del w0
+    D = (legal & pos).to(torch.int8) - (legal & neg).to(torch.int8)        # the moves, dense (no host sync)
+    nf = legal.sum()
+    del pos, neg, legal
+    before = l.wpacked.clone() if l.track else None
+    p3 = _POW3.get(dev)
+    if p3 is None:
+        p3 = _POW3[dev] = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int16, device=dev)
+    K5 = l.wpacked.shape[1]
+    Dp = torch.nn.functional.pad(D, (0, K5 * 5 - l.K)).view(l.N, K5, 5).to(torch.int16)
+    l.wpacked.copy_((l.wpacked.to(torch.int16) + (Dp * p3).sum(2)).to(torch.uint8))   # digit k of a byte: 3^k
+    del Dp
+    U.sub_((c["spend"] * theta) * (D.to(U.dtype) @ V))                     # spend: U -= spend theta D V
+    del D
+    _host_put(state, key, (U, V), off)
+    st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
+    if before is not None:
+        l._record_flips(before, l.wpacked)
+
+
+_TS_FAST_OFF = ("shared_v", "global", "global_", "fuse", "qfmt", "qfmt_m", "qfmt_a", "qfmt_aV", "int8",
+                "store_m", "store_a", "shadows", "shadow", "resid", "sketch", "rescale", "refresh",
+                "rank_sched", "locate", "table", "spend_table", "exact_spend", "rsketch", "decay", "gate", "sgate",
+                "orth_defer", "diag", "qdiag")
+
+
 def ts_layer(l, g, state, c):
     """one layer of --ts (see ts_step): g is this layer's gradient (fp32); c holds the settings and lr_ratio.
     Called from ts_step after the backward, or from the layer's backward itself (--ts_fused), right after its input
     gradient is computed, so only one layer's fp32 gradient exists at a time."""
     from .kernel import unpack_rows, pack_rows
+    if (c.get("fast") and c.get("nomom") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
+            and int(c.get("tiles") or 1) == 1 and not getattr(l, "_ts_rank", 0)
+            and not any(c.get(k_) for k_ in _TS_FAST_OFF)):
+        if not _POW3:
+            print("--ts_fast: the fast update path is active", flush=True)
+        return _ts_layer_fast(l, g, state, c)
+    if c.get("fast") and not _POW3.get("warned"):
+        _POW3["warned"] = True
+        print("--ts_fast: an optional mechanism is on, using the general update path", flush=True)
     if c.get("shared_v"):
         return ts_layer_shared(l, g, state, c)
     if c.get("global") or c.get("global_") or (c.get("fuse") and getattr(l, "_ts_idx", 0) % 7 in (0, 1, 2, 4, 5)):
@@ -2563,7 +2668,7 @@ def main():
                          "the boundary it crossed, like master)")
     ap.add_argument("--gemm", default="triton", choices=["triton", "cublas", "int8mm"],
                     help="ternary GEMMs: our Triton kernels, or cuBLAS bf16 on trits unpacked per call (faster on A100)")
-    ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64"],
+    ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64", "scholqr3"],
                     help="--ts: subspace orthonormalisation by Householder QR or two-pass Cholesky-QR (faster)")
     ap.add_argument("--ts_qfmt", default="", help="--ts: storage format of the low-rank matrices: int8 | int8det | "
                     "int8row | int4 | bf16 | fp16 | fp16s (per-column scale) | fp8 | fpmK (K mantissa bits) (simulated; --ts_int8 = int8)")
@@ -2622,6 +2727,9 @@ def main():
                          "change / int8 step and log2 dynamic range (qd_* in metrics.jsonl)")
     ap.add_argument("--ts_int8", action="store_true",
                     help="--ts: both low-rank matrices (short momentum and accumulator) kept on an int8 grid (per column)")
+    ap.add_argument("--ts_fast", action="store_true", help="--ts_fused --ts_nomom: the same update with fewer full-size "
+                    "passes (v never formed, moves from the legal candidates only, trits changed in their packed bytes, the "
+                    "spend as a sparse row update); falls back to the general path when an optional mechanism is on")
     ap.add_argument("--ts_fused", action="store_true",
                     help="--ts: each layer's update runs inside the backward, right after the layer's input gradient, so "
                          "the fp32 gradient of only one layer exists at a time (saves N*K*4 bytes over all layers)")
@@ -2841,6 +2949,8 @@ def main():
     ap.add_argument("--temp_check", type=int, default=4,
                     help="check GPU temp every N steps")
     args = ap.parse_args()
+    if os.environ.get("TERN_SYNCDBG"):   # report every host sync (location in the warning)
+        torch.cuda.set_sync_debug_mode(1)
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
     if args.ts_nomom and (args.ts_micro or args.ts_global or args.ts_fuse or args.ts_shared_v):
@@ -3330,7 +3440,7 @@ def main():
                       rsketch=args.ts_rsketch, rsketch_every=args.ts_rsketch_every, locate=args.ts_locate,
                       spend_table=args.ts_spend_table, global_=args.ts_global, fuse=args.ts_fuse,
                       orth_every=args.ts_orth_every, orth_defer=args.ts_orth_defer, sgate=args.ts_sgate, decay=args.ts_decay, nomom=args.ts_nomom, theta_sched=(tuple(float(x) for x in args.ts_theta_sched.split(":")) if args.ts_theta_sched else None),
-                      progress=0.0,
+                      progress=0.0, fast=args.ts_fast,
                       refresh=args.ts_refresh, refresh_frac=args.ts_refresh_frac, shadows=TS_SHADOWS[0],
                       dump_dir=TS_DUMP[0], dump_steps=TS_DUMP[1], dump_layers=TS_DUMP[2],
                       shadow_layers=TS_SHADOWS[1])
