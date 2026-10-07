@@ -579,8 +579,9 @@ def _orth_scholqr3(X):
         Q = X
         for k_ in range(3):
             G = Q.T @ Q
-            if k_ == 0:
-                s_ = 11.0 * (K_ * r_ + r_ * (r_ + 1)) * 2.0 ** -24 * G.diagonal().sum()
+            if k_ == 0:     # --ts_orth_shift D: s = D tr(G) (the rounding error actually covered); 0: the worst-case bound
+                tr_ = G.diagonal().sum()
+                s_ = ORTH_SHIFT[0] * tr_ if ORTH_SHIFT[0] > 0 else 11.0 * (K_ * r_ + r_ * (r_ + 1)) * 2.0 ** -24 * tr_
                 G.diagonal().add_(s_ + 1e-30)
             L = torch.linalg.cholesky_ex(G)[0]
             Q = torch.linalg.solve_triangular(L, Q.T, upper=False).T   # Q L^-T
@@ -600,6 +601,7 @@ def _orth_stats(X, Q):
                        float(X.abs().max().item() == 0), float(Q.abs().max().item() == 0)))
 
 
+ORTH_SHIFT = [0.0]               # --ts_orth_shift: relative shift of the shifted Cholesky-QR3
 ORTH_CHOL = [False]               # False (Householder) | "chol" | "chol_cs" | "chol64" (--ts_orth)
 ORTH_DBG = [False]                # on for one step in 10 when TERN_ORTHDBG=1
 ORTH_STATS = []                   # (max |Q^T Q - I|, span error vs Householder, condition number of the input) per call
@@ -2671,6 +2673,8 @@ def main():
                          "the boundary it crossed, like master)")
     ap.add_argument("--gemm", default="triton", choices=["triton", "cublas", "int8mm"],
                     help="ternary GEMMs: our Triton kernels, or cuBLAS bf16 on trits unpacked per call (faster on A100)")
+    ap.add_argument("--ts_orth_shift", type=float, default=0.0, help="--ts_orth scholqr3: Gram shift D * tr(X^T X) "
+                    "(0: the worst-case bound 11 (K r + r (r + 1)) u ||X||^2, too large when r is a large share of K)")
     ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64", "scholqr3", "geqrf"],
                     help="--ts: subspace orthonormalisation by Householder QR or two-pass Cholesky-QR (faster)")
     ap.add_argument("--ts_qfmt", default="", help="--ts: storage format of the low-rank matrices: int8 | int8det | "
@@ -2964,6 +2968,7 @@ def main():
         from . import kernel as _kmod
         _kmod.GEMM_BACKEND[0] = args.gemm
     ORTH_CHOL[0] = args.ts_orth if args.ts_orth != "qr" else False
+    ORTH_SHIFT[0] = args.ts_orth_shift
     TWO_STAGE[0] = args.two_stage
     TS_SHADOWS[0] = tuple(int(x) for x in args.ts_shadows.split(",")) if args.ts_shadows else ()
     TS_SHADOWS[1] = tuple(int(x) for x in args.ts_shadow_layers.split(",")) if args.ts_shadow_layers else ()
