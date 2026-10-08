@@ -44,6 +44,7 @@ class MasterTernaryLinear(nn.Module):
         self.T = None                  # --m_lag: the trits the forward uses, changed toward round(W / gamma) stochastically
         self.row_scale = self.col_scale = None   # --rc_scale in master mode (the float extras our runs carry)
         self.mag_A = None                        # --lowrank_mag add:R in master mode
+        self.lora_B = None                       # --m_lora R: low-rank latent (W = W0 + B A^T, W0 frozen)
 
     def enable_rc_scale(self):
         dev = self.weight.device
@@ -57,6 +58,22 @@ class MasterTernaryLinear(nn.Module):
         self.mag_A = nn.Parameter(torch.zeros(self.N, r, device=dev))
         self.mag_B = nn.Parameter(torch.randn(self.K, r, device=dev) * (1.0 / self.K) ** 0.5)
         return [self.mag_A, self.mag_B]
+
+    def enable_lora(self, r):
+        """--m_lora R: the low-rank Adam STE baseline. The latent is W0 + B A^T with W0 the frozen random init (it
+        can be regenerated from the seed, so it costs no memory) and only B (N x r, starts at 0) and A (K x r,
+        N(0, 1/r): a B step of ~lr per entry moves the latent by ~lr, as master's) trained, through the same
+        absmean ternary STE. No master weights; the latent's change is rank r for the whole run."""
+        dev = self.weight.device
+        self.weight.requires_grad_(False)
+        self.lora_B = nn.Parameter(torch.zeros(self.N, r, device=dev))
+        self.lora_A = nn.Parameter(torch.randn(self.K, r, device=dev) * (1.0 / r) ** 0.5)
+        return [self.lora_B, self.lora_A]
+
+    def latent(self):
+        if self.lora_B is None:
+            return self.weight
+        return self.weight + self.lora_B @ self.lora_A.T
 
     def _extras(self, x, y_fn):
         if self.col_scale is not None:
@@ -79,11 +96,11 @@ class MasterTernaryLinear(nn.Module):
             w = self.weight
             gamma = self.gamma_fixed if self.gamma_fixed is not None else w.detach().abs().mean().clamp_min(1e-5)
             return F.linear(_act_quant_ste(x, self.act_bits), w + (self.T.to(w.dtype) * gamma - w).detach())
-        return F.linear(_act_quant_ste(x, self.act_bits), _ternary_ste(self.weight, self.gamma_fixed))
+        return F.linear(_act_quant_ste(x, self.act_bits), _ternary_ste(self.latent(), self.gamma_fixed))
 
     @torch.no_grad()
     def ternary_weight(self):
-        w = self.weight.float()
+        w = self.latent().float()
         if self.T is not None:
             return self.T.clone(), (self.gamma_fixed if self.gamma_fixed is not None else w.abs().mean().clamp_min(1e-5))
         gamma = self.gamma_fixed if self.gamma_fixed is not None else w.abs().mean().clamp_min(1e-5)
@@ -102,8 +119,9 @@ def build_master_transformer(c: ModelConfig, grad_checkpoint: bool = True,
 
 def split_params(model):
     """(latent master weights, embedding/head, norm gains) — for AdamW groups."""
-    master = [m.weight for m in model.modules() if isinstance(m, MasterTernaryLinear)]
-    ids = {id(p) for p in master}
+    lays = [m for m in model.modules() if isinstance(m, MasterTernaryLinear)]
+    master = [p for m in lays for p in ((m.lora_B, m.lora_A) if m.lora_B is not None else (m.weight,))]
+    ids = {id(p) for p in master} | {id(m.weight) for m in lays}
     emb, norms = [], []
     for n, p in model.named_parameters():
         if id(p) in ids:

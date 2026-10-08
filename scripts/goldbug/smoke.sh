@@ -24,11 +24,23 @@ for g in triton cublas int8mm; do
   CUDA_VISIBLE_DEVICES=0 TERN_TIME=1 python -m bitnet.train $(echo $C) $G --out_dir $O/path_$g > $O/path_$g.log 2>&1
   echo "path $g: $(grep -E '^step' $O/path_$g.log | tail -1 | cut -c1-60) $(grep -E 'time step' $O/path_$g.log | tail -1 | grep -oE 'forward\+backward [0-9.]+s') $(grep -m1 -E 'Error|error:' $O/path_$g.log | cut -c1-120)" >> $R
 done
-while read -r g n flags; do
-  [ -z "$g" ] || [ "${g:0:1}" = "#" ] && continue
-  CUDA_VISIBLE_DEVICES=$g TERN_TIME=1 python -m bitnet.train $flags --stop_after 41 --eval_interval 1000000 \
+# throughput, laid out as start.sh runs the arms: every arm whose GPU field has no "+" at the same time (two arms on one
+# GPU share it, as in the real run), then the chained "GPU+" arms. Wall s/step = (time at step 40 - at step 20) / 20.
+tp() {   # tp GPU NAME FLAGS...
+  local g=$1 n=$2; shift 2
+  CUDA_VISIBLE_DEVICES=$g TERN_TIME=1 python -m bitnet.train "$@" --stop_after 41 --eval_interval 1000000 \
     --save_secs 100000000 --out_dir $O/tp_$n > $O/tp_$n.log 2>&1
-  t=$(grep -E 'time step' $O/tp_$n.log | tail -10 | grep -oE 'forward\+backward [0-9.]+' | awk '{s+=$2} END {print s/NR}')
-  echo "arm $n (GPU $g): ~$t s per step fwd+bwd, $(grep -E '^step' $O/tp_$n.log | tail -1 | grep -oE 'peakVRAM [0-9.]+GiB') $(grep -m1 -E 'Error|out of memory' $O/tp_$n.log | cut -c1-120)" >> $R
-done < $A
+  local t w
+  t=$(grep -E 'time step' $O/tp_$n.log | tail -10 | grep -oE 'forward\+backward [0-9.]+' | awk '{s+=$2} END {if (NR) print s/NR}')
+  w=$(grep -E '^step +(20|40) ' $O/tp_$n.log | grep -oE '[0-9.]+s \|' | tr -d 's|' | paste -sd' ' | awk '{if (NF==2) printf "%.2f", ($2-$1)/20}')
+  echo "arm $n (GPU $g): wall ~$w s/step, fwd+bwd ~$t s, $(grep -E '^step' $O/tp_$n.log | tail -1 | grep -oE 'peakVRAM [0-9.]+GiB') $(grep -m1 -E 'Error|out of memory' $O/tp_$n.log | cut -c1-120)" >> $R
+}
+for phase in first chained; do
+  while read -r g n flags; do
+    [ -z "$g" ] || [ "${g:0:1}" = "#" ] && continue
+    if [ "${g: -1}" = "+" ]; then [ $phase = chained ] || continue; else [ $phase = first ] || continue; fi
+    tp ${g%+} $n $flags &
+  done < $A
+  wait
+done
 echo "$(date '+%F %T') done" >> $R; cat $R

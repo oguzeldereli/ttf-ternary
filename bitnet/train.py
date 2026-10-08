@@ -2622,6 +2622,8 @@ def main():
                     help="master: second moment factored (row x column, our rule's normalization) instead of per weight")
     ap.add_argument("--m_gate", action="store_true",
                     help="master: latent update only where this batch's gradient agrees in sign with m (our gate)")
+    ap.add_argument("--m_lora", type=int, default=0,
+                    help="master: low-rank Adam STE baseline: latent = frozen random init + rank-R B A^T, only B, A trained")
     ap.add_argument("--m_rank", type=int, default=0, help="master: first moment kept at rank R (like our momentum)")
     ap.add_argument("--m_beta1", type=float, default=0.0, help="master: Adam beta1 for the latent weights (default 0.9)")
     ap.add_argument("--m_beta2", type=float, default=0.0, help="master: Adam beta2 for the latent weights (default 0.95)")
@@ -3114,6 +3116,10 @@ def main():
             print(f"row/column scales (master): {nrc / 1e3:.1f}k floats", flush=True)
         else:
             print(f"row/column scales: {enable_rc_scales(model) / 1e3:.1f}k floats", flush=True)
+    if args.m_lora:
+        assert args.mode == "master", "--m_lora needs --mode master"
+        nl_ = sum(p.numel() for m_ in model.modules() if isinstance(m_, MasterTernaryLinear) for p in m_.enable_lora(args.m_lora))
+        print(f"low-rank latent (--m_lora {args.m_lora}): {nl_ / 1e6:.2f}M trained floats, init latent frozen", flush=True)
     if args.compile:
         from .model import enable_compile
         enable_compile()
