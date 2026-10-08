@@ -1,0 +1,10 @@
+# goldbug arms, batch 16 x 2048 (32k tokens per step), prepared 8 Oct 05:25. "GPU NAME flags" (one per GPU).
+# TTF = the flags of x1b_nomom1024_lr15 (1.3B ranks 1024 no momentum: fixed windows 2.4742 / 3.4153, -0.0054 / -0.019 vs
+#   master + extras lr 5e-4) + speed options that each passed a 110M quality check (vs base 2.6896): --ts_fused --gemm
+#   int8mm (neutral), --tf32 (2.6901), --ts_orth scholqr3 --ts_orth_shift 1e-5 (2.6882). (The three together are untested
+#   in one run; scholqr3 turns TF32 off for its own Gram products.)
+# master = the flags of x1b_mx_extras_lr50 (master + the same float extras, lr 5e-4).
+# Both: FineWeb-Edu, same steps / warmup / schedule. --steps 30000 is a placeholder: set it for both arms from the smoke
+#   throughput test so the slower (TTF) arm finishes its cosine schedule in the booking.
+0 gb_ttf_nomom1024 --preset d2048_l24 --mode kernel --data data/fwedu32k_train.bin --val data/fwedu32k_val.bin --seq_len 2048 --batch_size 16 --grad_accum 1 --steps 30000 --warmup 1000 --rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_warmup 30 --g_ref 3.0 --int8 --dw_mode dense --track_flips --tail_fp32 --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 500 --eval_iters 30 --save_secs 3600 --snap_every 0 --lookahead 0 --lowrank 1024 --ckpt_skip 2 --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp --ts --ts_nomom --ts_theta 16 --ts_tau 1000 --ts_tau_anneal --ts_anneal 0.5 --ts_fused --gemm int8mm --tf32 --ts_orth scholqr3 --ts_orth_shift 1e-5
+1 gb_master_extras --preset d2048_l24 --mode master --master_dtype fp32 --data data/fwedu32k_train.bin --val data/fwedu32k_val.bin --seq_len 2048 --batch_size 16 --grad_accum 1 --steps 30000 --warmup 1000 --lr 5e-4 --min_lr 5e-5 --eval_interval 500 --eval_iters 30 --save_secs 3600 --snap_every 0 --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp
