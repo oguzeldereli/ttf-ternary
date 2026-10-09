@@ -57,6 +57,12 @@ def load_model(path, device, mag_kind="add"):
                     m.enable_rc_scale()
         else:
             enable_rc_scales(model)
+    loras = [k for k in sd if k.endswith("lora_B")]       # --m_lora R: low-rank latent baseline
+    if loras:
+        r = sd[loras[0]].shape[1]
+        for m in model.modules():
+            if isinstance(m, MasterTernaryLinear):
+                m.enable_lora(r)
     mags = [k for k in sd if k.endswith("mag_A")]
     if mags:
         r = sd[mags[0]].shape[1]
