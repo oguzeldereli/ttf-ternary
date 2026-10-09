@@ -10,7 +10,12 @@ micro-batch gradients u_b at the frozen checkpoint (the kernel path's own dL/dW,
   - rank capture: the share of the signal inside a rank-r subspace, (i) the top-r SVD subspace of one third of the
     gradients, measured on the other two (<P G2, P G3> / <G2, G3>, so neither the noise nor the fitted subspace's own
     noise counts), (ii) the checkpoint's accumulator subspace span(U) x span(V).
-    python scripts/analysis/grad_snr.py CKPT --data data/fwedu32k_train.bin [--n 96] [--micro 4] [--batch 16]
+A frozen checkpoint gives the instantaneous mean gradient, not whether it persists over the ~tau steps the accumulator
+integrates: --save_mu FILE keeps each layer's mean (bf16) and debiased signal energy, and --persist FILE_A FILE_B
+compares two such files (checkpoints ~1000 steps apart): cos = <mu_a, mu_b> / sqrt(sig_a sig_b) (independent batches,
+so the cross product carries no noise; the energies are debiased), the share of the drift that keeps its direction.
+    python scripts/analysis/grad_snr.py CKPT --data data/fwedu32k_train.bin [--n 96] [--micro 4] [--batch 16] [--save_mu F]
+    python scripts/analysis/grad_snr.py --persist A.pt B.pt
 """
 import argparse, json, os, sys, time
 import numpy as np
@@ -21,12 +26,25 @@ from scripts.eval.final_eval import load_model                      # noqa: E402
 from bitnet.flip import KernelTernaryLinear                         # noqa: E402
 
 ap = argparse.ArgumentParser()
-ap.add_argument("ckpt"); ap.add_argument("--data", required=True)
+ap.add_argument("ckpt", nargs="?"); ap.add_argument("--data")
+ap.add_argument("--save_mu", default=""); ap.add_argument("--persist", nargs=2, default=None)
 ap.add_argument("--n", type=int, default=96, help="micro-batch gradients (a multiple of 3)")
 ap.add_argument("--micro", type=int, default=4); ap.add_argument("--batch", type=int, default=16)
 ap.add_argument("--seq", type=int, default=2048); ap.add_argument("--no_svd", action="store_true")
 a = ap.parse_args()
 dev = "cuda"
+if a.persist:
+    A_, B_ = (torch.load(f, map_location="cpu", weights_only=False) for f in a.persist)
+    print(f"persistence of the mean gradient: {a.persist[0]} (step {A_['step']}) vs {a.persist[1]} (step {B_['step']})")
+    cs = []
+    for i, (ma, mb) in enumerate(zip(A_["mu"], B_["mu"])):
+        c = (ma.float() * mb.float()).sum().item() / max(A_["sig"][i] * B_["sig"][i], 1e-30) ** 0.5
+        cs.append(c)
+    nl = len(cs) // 7; six = np.array_split(np.arange(nl), 6)
+    print("cos by depth sixth: " + " ".join(f"{np.mean([cs[7 * l + j] for l in t for j in range(7)]):.3f}" for t in six))
+    for j, t in enumerate(["q", "k", "v", "o", "gate", "up", "down"]):
+        print(f"  {t:5s} " + " ".join(f"{np.mean([cs[7 * l + j] for l in tt]):.3f}" for tt in six))
+    sys.exit()
 t0 = time.time()
 model, ck = load_model(a.ckpt, dev)
 cfg = ck.get("args") or {}
@@ -94,7 +112,7 @@ k_noise = a.batch / a.micro            # micro-batch noise variance / training-b
 p_ = 0.5; theta = 16.0; tau = 1000.0
 bar = theta * rho / (tau * rho ** p_) if rho else None
 print(f"\nrho {rho}, fire bar theta / (tau_eff a) = {bar} (theta 16, tau 1000 annealed, p 0.5)")
-rows = []
+rows = []; MU, SIG = [], []
 for i, m in enumerate(layers):
     if vfac[i] is None:                # normalise by the empirical factored second moment at the training batch
         e = EMP[i] / n; R = e.mean(1); C = e.mean(0)
@@ -120,9 +138,13 @@ for i, m in enumerate(layers):
         del Uq, Vh, Pu, Pv, Qu, Qv
     rows.append(dict(i=i, name=names[i], N=m.N, K=m.K, snr=sig / max(noise, 1e-30), drift=(max(sig, 0) / NK) ** 0.5,
                      noise_rms=(noise / NK) ** 0.5, cross=cross, cap_svd=cap_svd, cap_acc=cap_acc, r=r))
+    if a.save_mu:
+        MU.append(mu.to(torch.bfloat16).cpu()); SIG.append(sig)
     S[i] = None; SQ[i] = None; del tot, mu, var, G
     torch.cuda.empty_cache()
 
+if a.save_mu:
+    torch.save({"step": step, "mu": MU, "sig": SIG, "names": names}, a.save_mu); MU = None
 TYPES = ["q", "k", "v", "o", "gate", "up", "down"]
 nl = len(rows) // 7
 six = np.array_split(np.arange(nl), 6)
