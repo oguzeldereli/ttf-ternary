@@ -34,8 +34,8 @@ BYTES_PER_TOKEN_FW = 4.003
 
 
 def load_model(path, device, mag_kind="add"):
-    ck = torch.load(path, map_location="cpu", weights_only=False)
-    mc, mode, sd = ck["cfg"], ck["mode"], ck["model"]
+    ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)   # mmap: a 35 GB master checkpoint
+    mc, mode, sd = ck["cfg"], ck["mode"], ck["model"]                         # need not fit in host memory
     if mode == "kernel":
         model = build_kernel_transformer(mc, grad_checkpoint=False, rate=0.0, beta=ck.get("beta", False),
                                          int8=ck.get("int8", False), dw_mode=ck.get("dw_mode", "int8"),
