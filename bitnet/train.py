@@ -2775,6 +2775,9 @@ def main():
                     "(dg_m_drop, dg_a_drop, dg_u_kept) and, with --ts_shadow, the full-rank accumulator's moves")
     ap.add_argument("--ts_shadow", action="store_true", help="--ts: keep a full-rank accumulator fed the same steps and "
                     "spent by the same moves (diagnostic: dense N x K per layer)")
+    ap.add_argument("--movediag", default="", help="EVERY[:NB]: every EVERY steps, measure what this step's trit moves "
+                    "are worth: count, first-order gain on a true gradient from NB probe batches, direction precision, "
+                    "realized loss change on NB other probe batches, undo share (bitnet/movediag.py)")
     ap.add_argument("--lr_wsd", type=int, default=0, help="warmup-stable-decay: the peak lr until step D (this), then a "
                     "cosine to --min_lr at the last step (0 = off); branch a decay off any stable-phase checkpoint")
     ap.add_argument("--lr_rewarm", default="", help="S:W, continue a decayed run: from step S a linear warmup over W steps "
@@ -3541,6 +3544,12 @@ def main():
             m_.on_grad = lambda layer, g, _c=ts_cfg: ts_layer(layer, g, lr_state, _c)
             m_.ts_micro = bool(args.ts_micro)
         print("--ts_fused: the update runs inside each layer's backward", flush=True)
+    movediag = None
+    if args.movediag:
+        from .movediag import MoveDiag
+        md_e, md_nb = (args.movediag.split(":") + ["8"])[:2]
+        movediag = MoveDiag(model, train_data, tc, device, args.mode, int(md_e), int(md_nb))
+        print(f"--movediag: every {md_e} steps, {md_nb} + {md_nb} probe batches, {len(movediag.layers)} layers", flush=True)
     for step in range(start_step, end_step):
         ORTH_DBG[0] = ORTH_DEBUG and step % 10 == 0
         if args.profile and step == start_step + 20:         # after autotune / warm-up
@@ -3622,6 +3631,8 @@ def main():
 
         # gradient accumulation: BitLinear hooks apply lr*g/accum each micro-step
         # (SGD is linear, so summing micro-steps approximates one averaged step).
+        if movediag is not None and movediag.on(step):
+            movediag.pre(step)
         STATE.updates_enabled = True
         STATE.grad_scale = tc.grad_accum
         tail_opt.zero_grad(set_to_none=True)
@@ -3734,6 +3745,13 @@ def main():
             rs_info["rate_mult"] = ar_state["mult"]; rs_info["cos_ema"] = ar_state["ema"]
         torch.nn.utils.clip_grad_norm_(tail, tc.grad_clip)
         tail_opt.step()
+        if movediag is not None and movediag.active:
+            md_ = movediag.post(step)
+            log_metrics({"step": step, **md_})
+            print(f"movediag {step}: moves {md_['md_moves']} pred/move {md_['md_pred_per_move']:.3e} precision "
+                  f"{md_['md_precision']:.3f} |g| ratio {md_['md_g_ratio']:.2f} realized/move "
+                  f"{md_['md_realized_per_move']:.3e} survive {md_['md_survive']:.2f} trits {md_['md_realized']:+.2e} "
+                  f"float {md_['md_float']:+.2e} undo {md_['md_undo_frac']:.3f}", flush=True)
         if TIME:
             torch.cuda.synchronize(); _t2 = time.time()
             print(f"time step {step}: forward+backward {_t1 - _t0:.3f}s, update (momentum step / AdamW) {_t2 - _t1:.3f}s"
