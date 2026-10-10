@@ -56,6 +56,8 @@ def get_batch(data, bs, seq_len, device, gen=None):
 
 
 TWO_STAGE = [0.0]
+LR_WSD = [0]                      # --lr_wsd D: warmup, constant peak lr until step D, then a cosine to min_lr at the end
+LR_REWARM = [0, 0]                # --lr_rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
 TS_SHADOWS = [(), ()]             # --ts_shadows: ranks of the shadow states (0 = full rank); --ts_shadow_layers
 TS_DUMP = ["", (), ()]            # --ts_dump_steps / --ts_dump_layers: directory, steps, layer indices   # --two_stage F: BitNet-b1.58-style two-stage schedule (0: plain cosine)
 
@@ -130,6 +132,19 @@ def lr_at(step, tc: TrainConfig):
         return tc.min_lr + 0.5 * (p2 - tc.min_lr) * (1 + math.cos(math.pi * r))
     if step > tc.max_steps:
         return tc.min_lr
+    if LR_REWARM[1] and step >= LR_REWARM[0]:
+        # continued training of a decayed checkpoint: re-warm from min_lr to the peak, then a fresh cosine to the end
+        s0, w = LR_REWARM
+        if step < s0 + w:
+            return tc.min_lr + (tc.lr - tc.min_lr) * (step - s0 + 1) / w
+        r = (step - s0 - w) / max(1, tc.max_steps - s0 - w)
+        return tc.min_lr + 0.5 * (tc.lr - tc.min_lr) * (1 + math.cos(math.pi * r))
+    if LR_WSD[0]:
+        # warmup-stable-decay: the peak lr until step D, then a cosine down to min_lr at the last step
+        if step < LR_WSD[0]:
+            return tc.lr
+        r = (step - LR_WSD[0]) / max(1, tc.max_steps - LR_WSD[0])
+        return tc.min_lr + 0.5 * (tc.lr - tc.min_lr) * (1 + math.cos(math.pi * r))
     r = (step - tc.warmup_steps) / max(1, tc.max_steps - tc.warmup_steps)
     return tc.min_lr + 0.5 * (tc.lr - tc.min_lr) * (1 + math.cos(math.pi * r))
 
@@ -2760,6 +2775,10 @@ def main():
                     "(dg_m_drop, dg_a_drop, dg_u_kept) and, with --ts_shadow, the full-rank accumulator's moves")
     ap.add_argument("--ts_shadow", action="store_true", help="--ts: keep a full-rank accumulator fed the same steps and "
                     "spent by the same moves (diagnostic: dense N x K per layer)")
+    ap.add_argument("--lr_wsd", type=int, default=0, help="warmup-stable-decay: the peak lr until step D (this), then a "
+                    "cosine to --min_lr at the last step (0 = off); branch a decay off any stable-phase checkpoint")
+    ap.add_argument("--lr_rewarm", default="", help="S:W, continue a decayed run: from step S a linear warmup over W steps "
+                    "from --min_lr back to the peak, then a cosine to --min_lr at the last step")
     ap.add_argument("--two_stage", type=float, default=0.0, help="BitNet-b1.58-style schedule: stage 1 cosine from the "
                     "peak to half of it, at the midpoint restart at F x peak and cosine to min_lr; weight decay 0 in "
                     "stage 2 (F e.g. 0.4; 0: plain cosine)")
@@ -3028,6 +3047,9 @@ def main():
               + (" x lr_ratio" if TS_TUNNEL[1] else "") + " per step"
               + ("; a tunnelled move spends |A|, not theta" if TS_TUNNEL[2] else ""), flush=True)
     TWO_STAGE[0] = args.two_stage
+    LR_WSD[0] = args.lr_wsd
+    if args.lr_rewarm:
+        LR_REWARM[:] = [int(x) for x in args.lr_rewarm.split(":")]
     TS_SHADOWS[0] = tuple(int(x) for x in args.ts_shadows.split(",")) if args.ts_shadows else ()
     TS_SHADOWS[1] = tuple(int(x) for x in args.ts_shadow_layers.split(",")) if args.ts_shadow_layers else ()
     if args.ts_dump_steps:
