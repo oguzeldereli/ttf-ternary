@@ -89,6 +89,11 @@ def _ts_scale(args, step, tc, lr):
     return max((lr / tc.lr) ** _anneal_p(args, step, tc), args.ts_anneal_floor if step >= tc.warmup_steps else 0.0)
 
 
+def _tern_lays(model):
+    from .tern_emb import tern_emb_layers
+    return tern_emb_layers(model)
+
+
 def _theta_at(sched, prog):
     """--ts_theta_sched T0:T1[:START]: T0 until fraction START of training (default 0), then linear to T1 at the end"""
     th0_, th1_, st_ = (tuple(sched) + (0.0,))[:3]
@@ -1296,6 +1301,50 @@ def _resize_lowrank(U, V, r_new, X, coef, seed):
     Y = X.T @ Z - V @ (XV.T @ Z)
     Q = _orth(Y - V @ (V.T @ Y))
     return torch.cat([U, coef * (X @ Q)], 1), torch.cat([V, Q], 1)
+
+
+def ts_rank_adapt(model, state, r0):
+    """--ts_rank_adapt EVERY[:START]: per-layer ranks of the accumulator under a fixed total budget
+    B = sum_l min(r0, N_l, K_l) (N_l + K_l) floats. A direction is worth its floats by its energy per float, s_i^2 / (N + K)
+    (s_i the singular values of U V^T = those of U, V orthonormal); one global threshold lambda keeps the directions above
+    it, and a layer whose every direction is above it (rank-bound) grows by a quarter; lambda is set so the total fits B.
+    Ranks move by at most +-25% per call (multiples of 8, >= 32); the layers resize in their next update
+    (_resize_lowrank: shrink by SVD, grow along this step's u). Returns the mean rank per layer type."""
+    lays = [l for l in model.modules() if isinstance(l, KernelTernaryLinear) and id(l) in state]
+    if not lays:
+        return {}
+    cost = [l.N + l.K for l in lays]
+    B = sum(min(r0, l.N, l.K) * c_ for l, c_ in zip(lays, cost))
+    vals = []
+    for l, c_ in zip(lays, cost):
+        U, _ = _load_pair(state[id(l)])
+        vals.append((torch.linalg.svdvals(U.float()).square() / c_).cpu())
+
+    def alloc(lam):
+        rs = []
+        for l, s2 in zip(lays, vals):
+            cur = len(s2); n = int((s2 >= lam).sum())
+            if n == cur:
+                n = cur + max(8, cur // 4)
+            n = min(max(n, max(32, int(cur * 0.75))), int(cur * 1.25) + 8, l.N, l.K)
+            rs.append(max(8, n // 8 * 8))
+        return rs
+
+    tot = lambda rs: sum(r * c_ for r, c_ in zip(rs, cost))
+    allv = torch.cat(vals)
+    lo, hi = max(float(allv.min()), 1e-30), float(allv.max()) * 2 + 1e-30
+    for _ in range(50):
+        mid = (lo * hi) ** 0.5
+        if tot(alloc(mid)) > B:
+            lo = mid
+        else:
+            hi = mid
+    for l, r in zip(lays, alloc(hi)):
+        l._ts_rank = r
+    by = {}
+    for l in lays:
+        by.setdefault(_TS_TYPES[getattr(l, "_ts_idx", 0) % 7], []).append(l._ts_rank)
+    return {k: sum(v) / len(v) for k, v in by.items()}
 
 
 def _ts_tiled_rest(l, u, state, st, c, key, ra):
@@ -2751,6 +2800,9 @@ def main():
                     "fp16 | fp16s | bf16), as opposed to the simulated --ts_qfmt_m")
     ap.add_argument("--ts_store_a", default="", help="--ts: REAL storage of the accumulator (same formats, and fp12s: "
                     "fp16s rounded to 6 mantissa bits, two values in 3 bytes)")
+    ap.add_argument("--ts_rank_adapt", default="", help="--ts: EVERY[:START]: every EVERY steps from START (default "
+                    "500), reallocate the accumulator's rank across layers under the fixed budget of --lowrank "
+                    "(ts_rank_adapt)")
     ap.add_argument("--ts_rank_kv", type=int, default=0, help="--ts: rank of both states for the attention k / v "
                     "projections (0: --lowrank / --ts_rank_s); with grouped-query attention these are narrow, so a full "
                     "rank there costs more than dense storage")
@@ -2775,6 +2827,9 @@ def main():
                     "(dg_m_drop, dg_a_drop, dg_u_kept) and, with --ts_shadow, the full-rank accumulator's moves")
     ap.add_argument("--ts_shadow", action="store_true", help="--ts: keep a full-rank accumulator fed the same steps and "
                     "spent by the same moves (diagnostic: dense N x K per layer)")
+    ap.add_argument("--tern_emb", default="", help="tied | untied: ternary token embedding (and output head) with "
+                    "per-row / per-column float scales; kernel mode trains its trits with TTF after the backward, master "
+                    "mode keeps a float latent (STE) (bitnet/tern_emb.py)")
     ap.add_argument("--movediag", default="", help="EVERY[:NB[:WIN]]: every EVERY steps, measure what this step's trit moves "
                     "are worth: count, first-order gain on a true gradient from NB probe batches, direction precision, "
                     "realized loss change on NB other probe batches, undo share (bitnet/movediag.py)")
@@ -3122,6 +3177,12 @@ def main():
         model = BitTransformer(mc, grad_checkpoint=tc.grad_checkpoint)
     model = model.to(device)
     model.train()
+    if args.tern_emb:
+        from .tern_emb import enable_tern_emb
+        n_te = enable_tern_emb(model, args.tern_emb, "master" if args.mode == "master" else "kernel")
+        assert args.mode == "master" or (args.ts and args.ts_fused and tc.grad_accum == 1), \
+            "--tern_emb in kernel mode: --ts --ts_fused, grad_accum 1"
+        print(f"--tern_emb {args.tern_emb}: {n_te / 1e6:.1f}M ternary embedding weights (+ row / column scales)", flush=True)
     if args.init_density:   # --init_density D: start from trits with only D of them nonzero (signs of the largest of a
         # normal draw) instead of the ~69% of the rounded normal, so weights the update never reaches stay zero, not noise
         from .kernel import pack_rows as _pack_rows
@@ -3368,7 +3429,13 @@ def main():
                     # --ts: the rest of the per-layer state (update count, factored v, short momentum), module order
                     "ts_state": [{k[0]: st_[k] for k in (("t", id(m)), ("v", id(m)), ("m", id(m))) if k in st_}
                                  for m in model.modules() if isinstance(m, KernelTernaryLinear)]
-                                if (st_ := lr_state.get("_ts")) else None}, tmp)
+                                if (st_ := lr_state.get("_ts")) else None,
+                    "ts_ranks": [getattr(m, "_ts_rank", 0) for m in model.modules()
+                                 if isinstance(m, KernelTernaryLinear)] if args.ts_rank_adapt else None,
+                    # --tern_emb: the ternary embedding matrices' TTF state (U V, update count, factored v)
+                    "tern_emb_state": [(lr_state.get(id(m)), {k[0]: lr_state.get("_ts", {})[k] for k in
+                                        (("t", id(m)), ("v", id(m))) if k in lr_state.get("_ts", {})})
+                                       for m in _tern_lays(model)] if args.tern_emb and lr_state else None}, tmp)
         os.replace(tmp, ckpt_path)
 
     la_off = tuple(int(x) for x in args.lookahead_off.split(":")) if args.lookahead_off else (0, 0)
@@ -3447,6 +3514,18 @@ def main():
                 if uv is not None:
                     lr_state[id(m)] = tuple(t.to(device) for t in uv)
             print(f"resumed low-rank momentum for {len(lr_state)} layers", flush=True)
+        if blob.get("ts_ranks"):
+            for m, r_ in zip([m for m in model.modules() if isinstance(m, KernelTernaryLinear)], blob["ts_ranks"]):
+                m._ts_rank = r_
+            print(f"resumed --ts_rank_adapt ranks", flush=True)
+        if blob.get("tern_emb_state"):
+            st_ = lr_state.setdefault("_ts", {})
+            for m, (uv, d_) in zip(_tern_lays(model), blob["tern_emb_state"]):
+                if uv is not None:
+                    lr_state[id(m)] = tuple(t.to(device) for t in uv)
+                for k_, v_ in d_.items():
+                    st_[(k_, id(m))] = tuple(x.to(device) for x in v_) if isinstance(v_, tuple) else v_
+            print(f"resumed --tern_emb TTF state for {len(blob['tern_emb_state'])} matrices", flush=True)
         if blob.get("ts_state"):
             lays = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
             st_ = lr_state.setdefault("_ts", {})
@@ -3653,6 +3732,9 @@ def main():
             with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
                 _, loss = model(x, y)
             (loss / tc.grad_accum).backward()  # triggers BitLinear fused updates
+            if args.tern_emb and args.mode != "master":   # the ternary embedding's TTF update (both of its gradients)
+                from .tern_emb import tern_emb_step
+                tern_emb_step(model, lr_state, ts_cfg, ts_layer)
             last_loss = loss.item()
         if args.mode in ("kernel", "evidence") and tc.grad_accum > 1:
             flip_accumulated(model)
@@ -3746,6 +3828,12 @@ def main():
             rs_info["rate_mult"] = ar_state["mult"]; rs_info["cos_ema"] = ar_state["ema"]
         torch.nn.utils.clip_grad_norm_(tail, tc.grad_clip)
         tail_opt.step()
+        if args.ts_rank_adapt and lr_state:
+            ra_e, ra_s = (args.ts_rank_adapt.split(":") + ["500"])[:2]
+            if step >= int(ra_s) and step % int(ra_e) == 0:
+                ra_ = ts_rank_adapt(model, lr_state, args.lowrank)
+                log_metrics({"step": step, **{f"rank_{k}": v for k, v in ra_.items()}})
+                print(f"rank_adapt {step}: " + " ".join(f"{k} {v:.0f}" for k, v in ra_.items()), flush=True)
         if movediag is not None and movediag.active:
             md_ = movediag.post(step)
             log_metrics({"step": step, **md_})

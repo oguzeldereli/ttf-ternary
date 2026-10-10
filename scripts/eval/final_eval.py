@@ -46,6 +46,10 @@ def load_model(path, device, mag_kind="add"):
     else:
         raise SystemExit(f"mode {mode} not supported")
     model = model.to(device)
+    if "tok_emb.wpacked" in sd or "tok_emb.latent" in sd:     # --tern_emb
+        from bitnet.tern_emb import enable_tern_emb
+        enable_tern_emb(model, "untied" if ("lm_head.wpacked" in sd or "lm_head.latent" in sd) else "tied",
+                        "master" if mode == "master" else "kernel")
     if any(k.endswith("qk_logscale") for k in sd):
         for a in model.modules():
             if isinstance(a, Attention):
