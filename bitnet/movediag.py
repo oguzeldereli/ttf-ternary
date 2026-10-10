@@ -14,13 +14,16 @@ per move; the float part, L0 - Lmix; survive = realized / pred (curvature and in
 of moves that undo a move of the same weight within the last 1000 steps (and their share of pred); moves leaving 0 vs
 moves towards 0. An "undo" is a move against the weight's net change since the diag step ~1000 steps earlier (trit
 snapshots of earlier diag steps, kept on the host).
+Windowed value (the one-step realized change is noisy, and a move's value can show only after the floats adapt to it):
+the trits of that ~1000-step-old snapshot put back in with today's float tail, md_win_realized = L(old trits) - L1,
+over md_win_net net changed entries (md_win_per_net) and md_win_age steps.
 """
 from __future__ import annotations
 import collections
 import torch
 
 from .flip import KernelTernaryLinear
-from .kernel import unpack_rows
+from .kernel import pack_rows, unpack_rows
 from .master import MasterTernaryLinear
 from .bitlinear import STATE
 
@@ -112,6 +115,8 @@ class MoveDiag:
         if not self.active:
             return None
         self.active = False
+        while len(self.hist) > 1 and step - self.hist[1][0] >= self.undo_window:
+            self.hist.popleft()
         was = STATE.updates_enabled
         STATE.updates_enabled = False
         T1 = self._trits()
@@ -131,12 +136,27 @@ class MoveDiag:
             for m, p in zip(self.layers, P1):
                 m.wpacked.copy_(p)
             del P1
+        old = self.hist[0] if self.hist and step - self.hist[0][0] >= self.undo_window // 2 else None
+        Lwin = None; win_net = 0
+        if old is not None:                       # the trits of ~undo_window steps ago, today's float tail
+            if self.mode == "master":
+                for m, t in zip(self.layers, old[1]):
+                    m.T = t.to(self.device)
+                Lwin = self._loss(self.lb)
+                for m in self.layers:
+                    m.T = None
+            else:
+                P1 = [m.wpacked.clone() for m in self.layers]
+                for m, t in zip(self.layers, old[1]):
+                    m.wpacked.copy_(pack_rows(t.to(self.device)))
+                Lwin = self._loss(self.lb)
+                for m, p in zip(self.layers, P1):
+                    m.wpacked.copy_(p)
+                del P1
+            win_net = sum(int((t1 != t.to(self.device)).sum().item()) for t1, t in zip(T1, old[1]))
         STATE.updates_enabled = was
         n = 0; pred = 0.0; down = 0; gm_moved = 0.0; gm_all = 0.0; nall = 0
         undo_n = 0; undo_pred = 0.0; leave0 = 0; to0 = 0
-        while len(self.hist) > 1 and step - self.hist[1][0] >= self.undo_window:
-            self.hist.popleft()
-        old = self.hist[0] if self.hist and step - self.hist[0][0] >= self.undo_window // 2 else None
         for i, (t0, t1, g) in enumerate(zip(self.T0, T1, self.G)):
             d = (t1.to(torch.int16) - t0.to(torch.int16)).to(torch.int8)
             mv = d != 0
@@ -161,6 +181,9 @@ class MoveDiag:
                    md_total=self.L0 - L1, md_survive=(Lmix - L1) / pred if pred else float("nan"),
                    md_undo_frac=undo_n / max(n, 1) if old is not None else float("nan"),
                    md_undo_pred_share=undo_pred / pred if (pred and old is not None) else float("nan"),
-                   md_leave0_frac=leave0 / max(n, 1), md_to0_frac=to0 / max(n, 1), md_L0=self.L0)
+                   md_leave0_frac=leave0 / max(n, 1), md_to0_frac=to0 / max(n, 1), md_L0=self.L0,
+                   md_win_realized=(Lwin - L1) if Lwin is not None else float("nan"),
+                   md_win_net=win_net, md_win_per_net=(Lwin - L1) / max(win_net, 1) if Lwin is not None else float("nan"),
+                   md_win_age=step - old[0] if old is not None else 0)
         self.T0 = self.G = self.P0 = None
         return rec

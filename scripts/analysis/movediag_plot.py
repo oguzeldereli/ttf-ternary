@@ -39,10 +39,14 @@ panels = [("md_move_frac", "moves per step (share of weights)", True),
           ("md_survive", "survive: realized / first-order (curvature, interactions)", False),
           ("md_undo_frac", "share of moves undoing the net change of the last ~1000 steps", False),
           ("md_realized", "realized trit gain per step (nats, probe loss)", False),
-          ("md_float", "float-tail gain per step (nats)", False)]
-fig, axs = plt.subplots(4, 2, figsize=(14, 17)); axs = axs.ravel()
+          ("md_float", "float-tail gain per step (nats)", False),
+          ("md_win_realized", "value of the last ~1000 steps' trit moves (old trits back in, today's floats; nats)", False),
+          ("md_win_per_net", "same, per net changed entry (nats)", False)]
+fig, axs = plt.subplots(5, 2, figsize=(14, 21)); axs = axs.ravel()
 for ax, (k, title, logy) in zip(axs, panels):
     for name, r in R.items():
+        if k not in r:
+            continue
         y = r[k]
         if k == "md_survive":            # a ratio of two noisy numbers: smooth numerator and denominator separately
             y = smooth(r["md_realized"], a.window) / smooth(r["md_pred"], a.window)
@@ -54,7 +58,7 @@ for ax, (k, title, logy) in zip(axs, panels):
         ax.set_yscale("log")
     if k in ("md_precision",):
         ax.axhline(0.5, color="gray", lw=0.8)
-    if k in ("md_realized", "md_float"):
+    if k in ("md_realized", "md_float", "md_win_realized", "md_win_per_net"):
         ax.axhline(0, color="gray", lw=0.8)
     ax.legend(fontsize=8)
 fig.suptitle(f"what one step's trit moves are worth (110M; smoothed over {a.window} diag steps)", fontsize=12)
@@ -68,4 +72,6 @@ for name, r in R.items():
                   f"  precision {np.nanmean(r['md_precision'][m]):.3f}  |g| ratio {np.nanmean(r['md_g_ratio'][m]):.2f}"
                   f"  survive {np.nansum(r['md_realized'][m]) / np.nansum(r['md_pred'][m]):.2f}"
                   f"  realized/step {np.nanmean(r['md_realized'][m]):+.2e}  float/step {np.nanmean(r['md_float'][m]):+.2e}"
-                  f"  undo {np.nanmean(r['md_undo_frac'][m]):.3f}")
+                  f"  undo {np.nanmean(r['md_undo_frac'][m]):.3f}"
+                  + (f"  window {np.nanmean(r['md_win_realized'][m]):+.2e} over {np.nanmean(r['md_win_net'][m]):.0f} net"
+                     if 'md_win_realized' in r else ""))
