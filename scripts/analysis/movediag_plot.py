@@ -64,6 +64,23 @@ for ax, (k, title, logy) in zip(axs, panels):
     ax.legend(fontsize=8)
 fig.suptitle(f"what one step's trit moves are worth (110M; smoothed over {a.window} diag steps)", fontsize=12)
 plt.tight_layout(rect=(0, 0, 1, 0.98)); plt.savefig(a.out, dpi=110); print(a.out)
+# the decomposition the late-gain question needs: window value per step = gross moves per step x value per gross move
+# (value per gross move = the window's realized gain / (moves per step x window length)); net / gross = how much of the
+# moving survives as net change
+print("\nwindow decomposition (per phase): value/step = moves/step x value/move")
+for name, r in R.items():
+    if "md_win_realized" not in r:
+        continue
+    s = r["step"]
+    for lo, hi in ((1000, 3000), (3000, 5000), (5000, 7000), (7000, 9200)):
+        m = (s >= lo) & (s < hi) & np.isfinite(r["md_win_realized"]) & (r["md_win_age"] > 0)
+        if not m.any():
+            continue
+        vps = np.nanmean(r["md_win_realized"][m] / r["md_win_age"][m])
+        mps = np.nanmean(r["md_moves"][m])
+        net = np.nanmean(r["md_win_net"][m] / (r["md_moves"][m] * r["md_win_age"][m]))
+        print(f"{name:8s} {lo}-{hi}: value/step {vps:+.2e}  moves/step {mps:9.0f}  value/move {vps / max(mps, 1):+.2e}"
+              f"  net/gross {net:.2f}  precision {np.nanmean(r['md_precision'][m]):.3f}  |g| ratio {np.nanmean(r['md_g_ratio'][m]):.2f}")
 for name, r in R.items():
     s = r["step"]
     for lo, hi in ((1000, 3000), (3000, 5000), (5000, 7000), (7000, 9200)):
