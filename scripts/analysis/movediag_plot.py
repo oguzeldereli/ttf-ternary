@@ -16,7 +16,8 @@ a = ap.parse_args()
 
 def load(d):
     rows = [json.loads(l) for l in open(os.path.join(d, "metrics.jsonl")) if '"movediag"' in l]
-    return {k: np.array([r.get(k, np.nan) for r in rows], float) for k in rows[0]} if rows else None
+    keys = {k for r in rows for k in r if k != "movediag"}      # runs resumed with newer fields: union of keys
+    return {k: np.array([r.get(k, np.nan) for r in rows], float) for k in keys} if rows else None
 
 
 def smooth(y, w):
