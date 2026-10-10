@@ -662,7 +662,7 @@ def _ts_layer_fast(l, g, state, c):
     u = torch.outer(a_, C.sqrt()).add_(1e-8)
     torch.div(g, u, out=u).mul_(-lr_ratio)                                # u = -g / (sqrt(v) + eps) * lr_ratio
     ra = min(r, l.N, l.K)
-    lk = 1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau
+    lk = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau
     if key not in state:
         gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
         V = _orth(u.T @ torch.randn(l.N, ra, device=g.device, generator=gen))
@@ -841,11 +841,11 @@ def ts_layer(l, g, state, c):
         U = u @ V
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
-        U = U * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)   # --ts_tau_anneal: memory in distance, not steps
+        U = U * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)   # --ts_tau_anneal: memory in distance, not steps
         if c.get("resid"):        # --ts_resid: what the last projection discarded comes back with this step (dense)
             R_ = st.get(("resid", key))
             if R_ is not None:
-                u = u + R_ * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
+                u = u + R_ * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)
             Afull = U @ V.T + u
         oe_ = int(c.get("orth_every") or 1)
         if c.get("orth_defer") and not (oe_ > 1 and t % oe_):
@@ -891,9 +891,9 @@ def ts_layer(l, g, state, c):
             _ts_rec(st, "u_kept", x_); _ts_rec(st, "u_kept_" + _TS_TYPES[getattr(l, "_ts_idx", 0) % 7], x_)
     if c.get("shadow"):   # --ts_shadow: a full-rank accumulator fed the same steps and spent by the same moves
         S = st.get(("shadow", key))
-        S = u.clone() if S is None else S.mul_(1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau).add_(u)
+        S = u.clone() if S is None else S.mul_(1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau).add_(u)
         st[("shadow", key)] = S
-    lk = 1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau
+    lk = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau
     tabmode = ("locate" if (c.get("locate") or 0) > 0 else "table" if (c.get("table") or 0) > 0 else
                "spendtab" if c.get("spend_table") else "xspend" if c.get("exact_spend") else "")
     use_tab, rsk = bool(tabmode), int(c.get("rsketch") or 0)
@@ -1166,7 +1166,7 @@ def _ts_global_layer(l, g, state, c):
     U = st.get(("gU", key))
     if U is None:
         U = torch.zeros(G.shape[0], r, device=g.device)
-    U = U * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
+    U = U * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)
     gl["Xa"] += V @ (U.T @ U) + u.T @ U
     U = U + u @ V
     del u
@@ -1289,7 +1289,7 @@ def _ts_tiled_rest(l, u, state, st, c, key, ra):
         U = ub @ V
     else:
         U, V = state[key]
-        U = U * (1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau)
+        U = U * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)
         Vn = torch.linalg.qr(V @ (U.transpose(1, 2) @ U) + ub.transpose(1, 2) @ U)[0]
         U = U @ (V.transpose(1, 2) @ Vn) + ub @ Vn; V = Vn
     del ub, u
@@ -1317,7 +1317,7 @@ def _ts_shadows_step(l, g, v, st, c, t, lr_ratio, key):
     """--ts_shadows R1,R2,...: for each rank (0 = full rank) a shadow short momentum and accumulator, fed this layer's
     gradient with the same v and schedule as the run; spent later by the run's actual moves (_ts_shadows_after)"""
     b1, tau = c["b1"], c["tau"]
-    decay = 1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau
+    decay = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau
     sq = v.sqrt() + 1e-8
     sh = st.setdefault(("shd", key), {})
     for rr in c["shadows"]:
@@ -1423,7 +1423,7 @@ def ts_layer_shared(l, g, state, c):
         R, C = (1 - b2) * g2.mean(1), (1 - b2) * g2.mean(0)
     st[("v", key)] = (R, C); del g2
     sq = (R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)).sqrt_().add_(1e-8)
-    decay = 1 - (lr_ratio if c["tau_anneal"] else 1.0) / tau
+    decay = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau
     if key not in state:
         M = (1 - b1) * g; Ao = None
         gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
@@ -2785,6 +2785,8 @@ def main():
     ap.add_argument("--bop_tau", type=float, default=0.016, help="--bop: threshold on |m_hat / sqrt(v)| (or |m| with --bop_raw)")
     ap.add_argument("--bop_raw", action="store_true", help="--bop: threshold the raw m (original Bop), no normalisation")
     ap.add_argument("--bop_bc", action="store_true", help="--bop: bias-correct m (off in Bop)")
+    ap.add_argument("--ts_tau_anneal_pow", type=float, default=1.0, help="--ts_tau_anneal: the leak per step is "
+                    "a^Q / tau (Q = this; a = the step scale), so the memory grows as a^-Q")
     ap.add_argument("--ts_tau_anneal", action="store_true",
                     help="--ts: the leak shrinks with the accumulator's steps (decay 1 - ratio / tau): memory counted in "
                          "distance travelled, so the accumulator's level does not sink below theta as the lr decays")
@@ -3483,7 +3485,7 @@ def main():
     if args.ts and args.ts_fused:         # --ts_fused: each layer's update inside its backward (ts_layer)
         ts_cfg = dict(r=args.lowrank, lr_ratio=1.0, theta=args.ts_theta, tau=args.ts_tau, rank_s=args.ts_rank_s,
                       b1=args.ts_b1, b2=args.ts_b2, gate=args.lr_gate, spend=args.ts_spend,
-                      tau_anneal=args.ts_tau_anneal, int8=args.ts_int8, qfmt=args.ts_qfmt, qwhich=args.ts_qwhich,
+                      tau_anneal=(args.ts_tau_anneal_pow if args.ts_tau_anneal else False), int8=args.ts_int8, qfmt=args.ts_qfmt, qwhich=args.ts_qwhich,
                       qnoV=args.ts_qnoV, qdiag=False, qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,
                       store_m=args.ts_store_m, store_a=args.ts_store_a, offload="async" if args.ts_offload_async else args.ts_offload,
                       diag=False, shadow=args.ts_shadow, shared_v=args.ts_shared_v,
@@ -3643,7 +3645,7 @@ def main():
             elif args.ts:
                 rs_info = ts_step(model, lr_state, args.lowrank, step, _ts_scale(args, step, tc, lr), args.ts_theta, args.ts_tau,
                                   args.ts_rank_s, args.ts_b1, args.ts_b2, gate=args.lr_gate, spend=args.ts_spend,
-                                  tau_anneal=args.ts_tau_anneal, int8=args.ts_int8, fused=args.ts_fused,
+                                  tau_anneal=(args.ts_tau_anneal_pow if args.ts_tau_anneal else False), int8=args.ts_int8, fused=args.ts_fused,
                                   qfmt=args.ts_qfmt, qwhich=args.ts_qwhich, qnoV=args.ts_qnoV,
                                   qdiag=bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1),
                                   qfmt_m=args.ts_qfmt_m, qfmt_a=args.ts_qfmt_a, qfmt_aV=args.ts_qfmt_aV,

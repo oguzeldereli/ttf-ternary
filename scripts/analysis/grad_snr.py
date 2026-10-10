@@ -109,9 +109,12 @@ for b in range(3 * n3):
 
 n = 3 * n3
 k_noise = a.batch / a.micro            # micro-batch noise variance / training-batch noise variance
-p_ = 0.5; theta = 16.0; tau = 1000.0
-bar = theta * rho / (tau * rho ** p_) if rho else None
-print(f"\nrho {rho}, fire bar theta / (tau_eff a) = {bar} (theta 16, tau 1000 annealed, p 0.5)")
+cg = cfg if isinstance(cfg, dict) else vars(cfg)
+p_, theta, tau = float(cg.get("ts_anneal", 0.5)), float(cg.get("ts_theta", 16.0)), float(cg.get("ts_tau", 1000.0))
+tan = bool(cg.get("ts_tau_anneal", False))
+# the leak per step is a / tau with --ts_tau_anneal (a = rho^p), 1 / tau otherwise: bar theta / (tau_eff a)
+bar = (theta / tau if tan else theta / (tau * rho ** p_)) if rho else None
+print(f"\nrho {rho}, fire bar theta / (tau_eff a) = {bar} (theta {theta}, tau {tau}{' annealed' if tan else ''}, p {p_})")
 rows = []; MU, SIG = [], []
 for i, m in enumerate(layers):
     if vfac[i] is None:                # normalise by the empirical factored second moment at the training batch
