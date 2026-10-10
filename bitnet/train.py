@@ -627,7 +627,7 @@ def _orth_stats(X, Q):
 
 
 ORTH_SHIFT = [0.0]               # --ts_orth_shift: relative shift of the shifted Cholesky-QR3
-TS_TUNNEL = [0.0, False]         # --ts_tunnel KAPPA[:rate]: sub-threshold moves through the barrier
+TS_TUNNEL = [0.0, False, False]  # --ts_tunnel KAPPA[:rate][:zero]: sub-threshold moves through the barrier
 ORTH_CHOL = [False]               # False (Householder) | "chol" | "chol_cs" | "chol64" (--ts_orth)
 ORTH_DBG = [False]                # on for one step in 10 when TERN_ORTHDBG=1
 ORTH_STATS = []                   # (max |Q^T Q - I|, span error vs Householder, condition number of the input) per call
@@ -932,11 +932,16 @@ def ts_layer(l, g, state, c):
     if c.get("rescale") and ("kept", key) in st:   # --ts_rescale: compare A / s with theta, s = sqrt(share kept)
         th = theta * st[("kept", key)].sqrt().clamp(0.25, 1.0)
     fire = (A.abs() >= th) & ((w0.float() + d).abs() <= 1)
+    tun_short = None
     if TS_TUNNEL[0] > 0:  # --ts_tunnel: below the barrier a legal move tunnels with probability exp(-kappa (1 - |A| / theta))
         pt_ = torch.exp(-TS_TUNNEL[0] * (1.0 - A.abs() / th))
         if TS_TUNNEL[1]:
             pt_ = pt_ * lr_ratio
-        fire = fire | ((torch.rand_like(pt_) < pt_) & ((w0.float() + d).abs() <= 1) & (A != 0)); del pt_
+        tun_ = (torch.rand_like(pt_) < pt_) & ((w0.float() + d).abs() <= 1) & (A != 0) & ~fire; del pt_
+        if TS_TUNNEL[2]:  # ':zero': a tunnelled move spends |A| (A -> 0), not theta (no reversed evidence left behind)
+            assert not use_tab, "--ts_tunnel :zero with the table modes"
+            tun_short = torch.where(tun_, th - A.abs(), torch.zeros_like(A))
+        fire = fire | tun_; del tun_
     dec = None
     if c.get("decay"):    # --ts_decay P: trit decay, the ternary analogue of weight decay: a nonzero trit whose evidence
         # is weak (|A| < theta / 2) moves to 0 with probability P x lr_ratio per step (not spent: no evidence moved it)
@@ -961,7 +966,9 @@ def ts_layer(l, g, state, c):
         l.wpacked.copy_(pack_rows(torch.where(dec, torch.zeros_like(w0), (w0.float() + D).to(torch.int8)))); del dec
     else:
         l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
-    if tabmode != "spendtab":
+    if tun_short is not None:
+        U = U - c["spend"] * ((th * D - D * tun_short) @ V); del tun_short
+    elif tabmode != "spendtab":
         U = U - c["spend"] * th * (D @ V)
     if use_tab or rsk:
         Er = None if tabmode == "spendtab" and not rsk else c["spend"] * th * (D - (D @ V) @ V.T)   # unprojected spend
@@ -2708,7 +2715,8 @@ def main():
                     help="ternary GEMMs: our Triton kernels, or cuBLAS bf16 on trits unpacked per call (faster on A100)")
     ap.add_argument("--ts_tunnel", default="", help="--ts: KAPPA[:rate]. The threshold becomes a barrier: |A| >= theta "
                     "moves as before; a legal entry below it moves with probability exp(-KAPPA (1 - |A| / theta)) per step "
-                    "(':rate': times lr_ratio, the attempt rate following the step scale); spent theta either way")
+                    "(':rate': times lr_ratio, the attempt rate following the step scale); spent theta either way (':zero': a "
+                    "tunnelled move spends |A|, leaving A = 0)")
     ap.add_argument("--ts_orth_shift", type=float, default=0.0, help="--ts_orth scholqr3: Gram shift D * tr(X^T X) "
                     "(0: the worst-case bound 11 (K r + r (r + 1)) u ||X||^2, too large when r is a large share of K)")
     ap.add_argument("--ts_orth", default="qr", choices=["qr", "chol", "chol_cs", "chol64", "scholqr3", "geqrf", "ns"],
@@ -3008,9 +3016,11 @@ def main():
     ORTH_CHOL[0] = args.ts_orth if args.ts_orth != "qr" else False
     ORTH_SHIFT[0] = args.ts_orth_shift
     if args.ts_tunnel:
-        TS_TUNNEL[0] = float(args.ts_tunnel.split(":")[0]); TS_TUNNEL[1] = args.ts_tunnel.endswith(":rate")
+        tp_ = args.ts_tunnel.split(":")
+        TS_TUNNEL[0] = float(tp_[0]); TS_TUNNEL[1] = "rate" in tp_[1:]; TS_TUNNEL[2] = "zero" in tp_[1:]
         print(f"--ts_tunnel: below theta a legal move fires with probability exp(-{TS_TUNNEL[0]} (1 - |A| / theta))"
-              + (" x lr_ratio" if TS_TUNNEL[1] else "") + " per step", flush=True)
+              + (" x lr_ratio" if TS_TUNNEL[1] else "") + " per step"
+              + ("; a tunnelled move spends |A|, not theta" if TS_TUNNEL[2] else ""), flush=True)
     TWO_STAGE[0] = args.two_stage
     TS_SHADOWS[0] = tuple(int(x) for x in args.ts_shadows.split(",")) if args.ts_shadows else ()
     TS_SHADOWS[1] = tuple(int(x) for x in args.ts_shadow_layers.split(",")) if args.ts_shadow_layers else ()
