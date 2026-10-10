@@ -87,6 +87,13 @@ def _ts_scale(args, step, tc, lr):
     return max((lr / tc.lr) ** _anneal_p(args, step, tc), args.ts_anneal_floor if step >= tc.warmup_steps else 0.0)
 
 
+def _theta_at(sched, prog):
+    """--ts_theta_sched T0:T1[:START]: T0 until fraction START of training (default 0), then linear to T1 at the end"""
+    th0_, th1_, st_ = (tuple(sched) + (0.0,))[:3]
+    prog = min(max(prog, 0.0), 1.0)
+    return th0_ if prog <= st_ else th0_ + (th1_ - th0_) * (prog - st_) / max(1e-9, 1.0 - st_)
+
+
 def _anneal_p(args, step, tc):
     """--ts_anneal_sched P0:P1[:START]: the exponent p of the step scale (lr ratio)^p is P0 until fraction START of training
     (default 0), then moves linearly to P1 at the end (e.g. 1:0.25:0.6: like master's lr mid-training, slower decay late);
@@ -645,8 +652,7 @@ def _ts_layer_fast(l, g, state, c):
     from .kernel import unpack_rows
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
     if c.get("theta_sched"):
-        th0_, th1_ = c["theta_sched"]
-        theta = th0_ + (th1_ - th0_) * min(max(c.get("progress", 0.0), 0.0), 1.0)
+        theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
     st = state.setdefault("_ts", {})
     off, dev = c.get("offload", False), g.device
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
@@ -725,9 +731,8 @@ def ts_layer(l, g, state, c):
     if c.get("global") or c.get("global_") or (c.get("fuse") and getattr(l, "_ts_idx", 0) % 7 in (0, 1, 2, 4, 5)):
         return _ts_global_layer(l, g, state, c)
     r, lr_ratio, theta, tau, b1, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b1"], c["b2"]
-    if c.get("theta_sched"):   # --ts_theta_sched T0:T1: the threshold moves linearly from T0 to T1 over training
-        th0_, th1_ = c["theta_sched"]
-        theta = th0_ + (th1_ - th0_) * min(max(c.get("progress", 0.0), 0.0), 1.0)
+    if c.get("theta_sched"):   # --ts_theta_sched T0:T1[:START]: the threshold moves linearly from T0 to T1
+        theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
     M_ = int(c.get("micro") or 1)   # --ts_micro with --grad_accum M: momentum and v step once per micro-batch with
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True   # beta^(1/M); the accumulator only on the last one
     b1o, b2o = b1, b2
@@ -2700,7 +2705,8 @@ def main():
                     "linearly after fraction START of training (default: --ts_anneal throughout)")
     ap.add_argument("--ts_anneal_floor", type=float, default=0.0, help="--ts: the step scale (lr ratio)^p never falls below "
                     "this (e.g. p 1 mid-training like master's lr, then constant late)")
-    ap.add_argument("--ts_theta_sched", default="", help="--ts: T0:T1, the threshold moves linearly from T0 to T1 over training")
+    ap.add_argument("--ts_theta_sched", default="", help="--ts: T0:T1[:START], the threshold is T0 until fraction START of training (default 0), then moves "
+                    "linearly to T1 at the end")
     ap.add_argument("--ts_nomom", action="store_true", help="--ts: no short momentum; the accumulator takes the "
                     "full-rank g / sqrt(v) each step (the momentum's state freed)")
     ap.add_argument("--ts_decay", type=float, default=0.0, help="--ts: trit decay, a nonzero trit with |A| < theta / 2 "
