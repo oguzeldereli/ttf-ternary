@@ -77,9 +77,12 @@ for name, r in R.items():
         if not m.any():
             continue
         vps = np.nanmean(r["md_win_realized"][m] / r["md_win_age"][m])
-        mps = np.nanmean(r["md_moves"][m])
-        net = np.nanmean(r["md_win_net"][m] / (r["md_moves"][m] * r["md_win_age"][m]))
-        print(f"{name:8s} {lo}-{hi}: value/step {vps:+.2e}  moves/step {mps:9.0f}  value/move {vps / max(mps, 1):+.2e}"
+        # the window's gross moves: the mean sampled moves per step over (step - age, step], times age
+        gw = np.array([np.nanmean(r["md_moves"][(s > s_ - a_) & (s <= s_)]) * a_
+                       for s_, a_ in zip(s[m], r["md_win_age"][m])])
+        mps = np.nanmean(gw / r["md_win_age"][m])
+        net = np.nanmean(r["md_win_net"][m] / gw)
+        print(f"{name:8s} {lo}-{hi}: value/step {vps:+.2e}  moves/step {mps:9.0f}  value/move {np.nanmean(r["md_win_realized"][m] / gw):+.2e}"
               f"  net/gross {net:.2f}  precision {np.nanmean(r['md_precision'][m]):.3f}  |g| ratio {np.nanmean(r['md_g_ratio'][m]):.2f}")
 for name, r in R.items():
     s = r["step"]
