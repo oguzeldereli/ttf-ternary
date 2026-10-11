@@ -16,3 +16,7 @@ __pycache__/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
+
+# paper build output
+docs/paper/build/
+docs/paper/ttf_paper.pdf
