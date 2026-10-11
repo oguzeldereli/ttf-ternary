@@ -42,8 +42,8 @@ def cost(p, th, form, g=None):
     w, r, D = p["w"] / 768, p["r"] / 768, p["D"] / 9155
     if form == "power":
         c, b = th[0], th[1]
+        e = th[-1] if multiD else 0.0      # e is the last shared parameter, whether g is fitted or fixed
         g = th[2] if g is None else g
-        e = th[3] if multiD else 0.0
         return c * w ** (g * b) * (r ** -b - w ** -b) * D ** e
     c, k = th[0], th[1]
     e = th[2] if multiD else 0.0
