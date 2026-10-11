@@ -797,6 +797,18 @@ def ts_layer(l, g, state, c):
     st = state.setdefault("_ts", {})
     off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device  # --ts_offload(_keep)
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
+    mic_nm = M_ > 1 and c.get("nomom")
+    if mic_nm:    # --ts_micro --ts_nomom: the accumulator takes every micro-batch's u, normalised by the v of the steps
+        # before (this step's v needs all of its micro-batches); on the first step there is none, so each micro-batch
+        # uses its own g^2 x M^2 (each g_i carries the loss / M). Firing and the spend once per step, on the last one
+        ts_ = (t - 1) // M_
+        if ("v", key) in st and ts_ > 0:
+            R0, C0 = _host_get(st, ("v", key), dev, off)
+            sq_prev = (R0[:, None] * C0[None, :] / R0.mean().clamp_min(1e-30) / (1 - b2o ** ts_)).sqrt_(); del R0, C0
+        else:
+            r0, c0 = torch.linalg.vector_norm(g, dim=1).square_().mul_(M_ * M_ / l.K), \
+                torch.linalg.vector_norm(g, dim=0).square_().mul_(M_ * M_ / l.N)
+            sq_prev = (r0[:, None] * c0[None, :] / r0.mean().clamp_min(1e-30)).sqrt_(); del r0, c0
     g2 = g * g
     if M_ > 1:    # --ts_micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
         # row / column means of (sum_i g_i)^2 = the micro-batches' own squares + 2 <g_i, sum of earlier g_i'>, the
@@ -832,7 +844,9 @@ def ts_layer(l, g, state, c):
     if c.get("nomom"):   # --ts_nomom: no short momentum: the accumulator integrates the full-rank Adam-normalised
         # gradient (its long-run sum is the momentum's anyway) and its own rank-r projection filters the noise; frees the
         # momentum's r_s (N + K) floats per layer
-        u = -g / (v.sqrt() + 1e-8) * lr_ratio
+        u = -g / ((sq_prev if mic_nm else v.sqrt()) + 1e-8) * lr_ratio
+        if mic_nm:
+            del sq_prev
     else:
         rs = min(rk_sched or getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
         if ("m", key) not in st:
@@ -886,7 +900,8 @@ def ts_layer(l, g, state, c):
         U = u @ V
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
-        U = U * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)   # --ts_tau_anneal: memory in distance, not steps
+        if not mic_nm or (t - 1) % M_ == 0:   # --ts_micro --ts_nomom: the leak once per step, on the first micro-batch
+            U = U * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)   # --ts_tau_anneal: memory in distance, not steps
         if c.get("resid"):        # --ts_resid: what the last projection discarded comes back with this step (dense)
             R_ = st.get(("resid", key))
             if R_ is not None:
@@ -934,6 +949,9 @@ def ts_layer(l, g, state, c):
             _ts_rec(st, "a_drop", 1 - (U.norm() ** 2 / Ad.norm().clamp_min(1e-30) ** 2).item())
             x_ = ((u @ Vn).norm() ** 2 / u.norm().clamp_min(1e-30) ** 2).item(); del Ad
             _ts_rec(st, "u_kept", x_); _ts_rec(st, "u_kept_" + _TS_TYPES[getattr(l, "_ts_idx", 0) % 7], x_)
+    if mic_nm and not final_:   # --ts_micro --ts_nomom: not the last micro-batch: keep the accumulator, no firing
+        _host_put(state, key, _store_pair(sa, U, V) if sa else (qa(U), qV(V)), off)
+        return
     if c.get("shadow"):   # --ts_shadow: a full-rank accumulator fed the same steps and spent by the same moves
         S = st.get(("shadow", key))
         S = u.clone() if S is None else S.mul_(1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau).add_(u)
@@ -3131,8 +3149,8 @@ def main():
         torch.cuda.set_sync_debug_mode(1)
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
-    if args.ts_nomom and (args.ts_micro or args.ts_global or args.ts_fuse or args.ts_shared_v):
-        raise SystemExit("--ts_nomom works with the per-layer path only (no --ts_micro / --ts_global / --ts_fuse / --ts_shared_v)")
+    if args.ts_nomom and (args.ts_global or args.ts_fuse or args.ts_shared_v):
+        raise SystemExit("--ts_nomom works with the per-layer path only (no --ts_global / --ts_fuse / --ts_shared_v)")
     if args.ts_orth_defer and (args.ts_offload or args.ts_offload_async):
         raise SystemExit("--ts_orth_defer needs the state on the GPU (no --ts_offload)")
     if args.gemm in ("cublas", "int8mm"):
