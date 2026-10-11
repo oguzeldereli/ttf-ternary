@@ -2777,6 +2777,15 @@ def main():
                     "orthonormalisations run once at the end of the step, batched by shape (state on the GPU only)")
     ap.add_argument("--mem_cap_gib", type=float, default=0.0, help="cap PyTorch's memory on the GPU at this many GiB "
                     "(memory-matched comparisons; 0: no cap)")
+    ap.add_argument("--init_hf", default="", help="start from a pretrained Llama checkpoint in Hugging Face format (a "
+                    "directory with config.json and safetensors); the model shape comes from its config (--preset is ignored). "
+                    "See bitnet/hf_init.py")
+    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "zero"],
+                    help="--init_hf, kernel mode: how the weights become trits and scales (bitnet/hf_init.py)")
+    ap.add_argument("--init_acc", type=float, default=0.0, help="--init_hf with --ts: the accumulator starts at KAPPA "
+                    "x each weight's position inside its bin (2 theta (x - T)), at the run's rank (0: starts empty)")
+    ap.add_argument("--init_acc_clip", type=float, default=0.5, help="--init_acc: cap on |x - T| (0: no cap, the "
+                    "outward excess of large weights is kept)")
     ap.add_argument("--init_density", type=float, default=0.0, help="kernel mode: initial share of nonzero trits "
                     "(0: rounded normal, ~69%%)")
     ap.add_argument("--ts_step_tanh", default="", help="--ts: CENTER:WIDTH:END, TTF's own step scale as a falling tanh: 1 after "
@@ -3151,6 +3160,9 @@ def main():
     TIME = os.environ.get("TERN_TIME") == "1"   # time the forward/backward vs the momentum step (synchronizes)
 
     mc: ModelConfig = PRESETS[args.preset]
+    if args.init_hf:
+        from .hf_init import model_config_from_hf
+        mc = model_config_from_hf(args.init_hf)
     tc = TrainConfig()
     if args.seed is not None: tc.seed = args.seed
     if args.data: tc.data_path = args.data
@@ -3270,6 +3282,15 @@ def main():
             print(f"row/column scales (master): {nrc / 1e3:.1f}k floats", flush=True)
         else:
             print(f"row/column scales: {enable_rc_scales(model) / 1e3:.1f}k floats", flush=True)
+    _acc_init = {}
+    if args.init_hf:
+        from .hf_init import init_from_hf
+        assert args.mode in ("kernel", "master", "fp32"), "--init_hf: kernel, master or fp32 mode"
+        assert not (args.init_acc and (args.ts_offload or args.ts_offload_async or args.ts_tiles > 1)), \
+            "--init_acc: state on the GPU, no tiles"
+        _acc_init = init_from_hf(model, args.init_hf, args.mode, args.init_hf_method, rc=args.rc_scale,
+                                 acc=args.init_acc if args.ts else 0.0, theta=args.ts_theta, rank=args.lowrank, clip=args.init_acc_clip,
+                                 log=lambda m_: print(m_, flush=True))
     if args.m_lora:
         assert args.mode == "master", "--m_lora needs --mode master"
         nl_ = sum(p.numel() for m_ in model.modules() if isinstance(m_, MasterTernaryLinear) for p in m_.enable_lora(args.m_lora))
@@ -3410,6 +3431,8 @@ def main():
     # separate stream for cross-batch look-ahead, so the training batch order is unchanged
     la_gen = torch.Generator().manual_seed(tc.seed + 4242)
     lr_state = {}
+    for m_, uv_ in _acc_init.items():       # --init_acc: the accumulator's starting point (a resume replaces it)
+        lr_state[id(m_)] = uv_
     la_extra = ((lambda: get_batch(train_data, tc.batch_size, tc.seq_len, device, la_gen))
                 if args.lookahead_xbatch else None)
     rs_state = {"mult": 1.0}
