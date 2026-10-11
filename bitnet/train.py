@@ -393,6 +393,12 @@ def _load_pair(t):
     return t[0].float(), t[1].float()
 
 
+def _ts_on_host(args, i, n):
+    """--ts_offload / --ts_offload_async with --ts_offload_keep F: layer i of n (module order) keeps its state in host
+    memory unless it is among the first round(F n)"""
+    return bool(args.ts_offload or args.ts_offload_async) and i >= round(args.ts_offload_keep * n)
+
+
 class _PinnedPool:
     """Page-locked host memory of exactly the requested size for the offloaded --ts state. torch's pinned allocator
     rounds every block up to a power of two (measured on the lab PCs, torch 2.13: 100 x 9 MiB took 1600 MiB, one 900 MiB
@@ -674,7 +680,7 @@ def _ts_layer_fast(l, g, state, c):
     if c.get("theta_sched"):
         theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
     st = state.setdefault("_ts", {})
-    off, dev = c.get("offload", False), g.device
+    off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device   # --ts_offload_keep
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
     rm = torch.linalg.vector_norm(g, dim=1).square_().div_(l.K)          # row means of g^2
     cm = torch.linalg.vector_norm(g, dim=0).square_().div_(l.N)          # column means of g^2
@@ -775,7 +781,7 @@ def ts_layer(l, g, state, c):
     if c.get("qfmt_aV"): qV = _qfmt(c["qfmt_aV"]) or ident                             # --ts_qfmt_aV: accumulator's V
     sm, sa = _store_codec(c.get("store_m", "")), _store_codec(c.get("store_a", ""))    # --ts_store_*: real storage
     st = state.setdefault("_ts", {})
-    off, dev = c.get("offload", False), g.device                                       # --ts_offload: state on the host
+    off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device  # --ts_offload(_keep)
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
     g2 = g * g
     if M_ > 1:    # --ts_micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
@@ -2847,12 +2853,20 @@ def main():
                     "and spend once per step), so no dense gradient is kept between micro-batches: activations shrink M-fold")
     ap.add_argument("--ckpt_block", action="store_true", help="checkpoint each block once (its input) instead of attention "
                     "and MLP separately: half the saved activations (kernel mode; master builds dense weights per sublayer)")
+    ap.add_argument("--no_final_save", action="store_true", help="no checkpoint at the end of the run (memory and "
+                    "speed probes of large models)")
+    ap.add_argument("--mem_snapshot", default="", help="PATH:STEP: record every CUDA allocation (with its Python stack) "
+                    "from the start and dump the history to PATH (a pickle) at logged step STEP; scripts/analysis/mem_snapshot.py "
+                    "attributes the peak")
     ap.add_argument("--mem_report", action="store_true", help="log the MiB of trits, float tail, its gradients and "
                     "optimizer state, TTF state on GPU / host, allocated and peak, at steps 10 / 50 / 100 / 1000")
     ap.add_argument("--ts_offload", action="store_true", help="--ts: keep the state in pinned host memory; each layer's "
                     "state is copied to the GPU for its update and back (same stream: ordered, no host sync)")
     ap.add_argument("--ts_offload_async", action="store_true", help="--ts_offload with the copies on side streams: the "
                     "next layer's state is prefetched while this layer updates, write-backs overlap with compute")
+    ap.add_argument("--ts_offload_keep", type=float, default=0.0, help="--ts_offload(_async): the state of the first "
+                    "share of the ternary layers (module order) stays on the GPU, the rest in host memory (fill a GPU's "
+                    "spare memory with state; 0 = all on the host)")
     ap.add_argument("--ts_qwhich", default="all", choices=["all", "m", "a"],
                     help="--ts_qfmt applies to both matrices / the short momentum only / the accumulator only")
     ap.add_argument("--ts_qnoV", action="store_true", help="--ts_qfmt: keep the orthonormal bases V in fp32")
@@ -3143,6 +3157,8 @@ def main():
         tot_ = torch.cuda.get_device_properties(0).total_memory / 2**30
         torch.cuda.set_per_process_memory_fraction(min(1.0, args.mem_cap_gib / tot_))
         print(f"--mem_cap_gib: PyTorch capped at {args.mem_cap_gib:.1f} of {tot_:.1f} GiB", flush=True)
+    if args.mem_snapshot and device == "cuda":   # --mem_snapshot PATH:STEP: every allocation with its Python stack
+        torch.cuda.memory._record_memory_history(enabled="all", stacks="python", max_entries=2_000_000)
     torch.manual_seed(tc.seed)
     print(mc.report())
     use_beta = args.mode in ("kernel", "evidence") and not args.no_beta
@@ -3508,11 +3524,13 @@ def main():
         if args.lookahead_xbatch:
             for _ in range(sum(la_on(i) for i in range(start_step)) * args.lookahead):
                 torch.randint(len(train_data) - tc.seq_len - 1, (tc.batch_size,), generator=la_gen)
+        _lays = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
+        _sdev = {id(m): ("cpu" if _ts_on_host(args, i, len(_lays)) else device) for i, m in enumerate(_lays)}
         if blob.get("lowrank"):
-            lays = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
+            lays = _lays
             for m, uv in zip(lays, blob["lowrank"]):
                 if uv is not None:
-                    lr_state[id(m)] = tuple(t.to(device) for t in uv)
+                    lr_state[id(m)] = tuple(t.to(_sdev[id(m)]) for t in uv)
             print(f"resumed low-rank momentum for {len(lr_state)} layers", flush=True)
         if blob.get("ts_ranks"):
             for m, r_ in zip([m for m in model.modules() if isinstance(m, KernelTernaryLinear)], blob["ts_ranks"]):
@@ -3531,7 +3549,7 @@ def main():
             st_ = lr_state.setdefault("_ts", {})
             for m, d_ in zip(lays, blob["ts_state"]):
                 for k_, v_ in d_.items():
-                    st_[(k_, id(m))] = tuple(x.to(device) for x in v_) if isinstance(v_, tuple) else v_
+                    st_[(k_, id(m))] = tuple(x.to(_sdev[id(m)]) for x in v_) if isinstance(v_, tuple) else v_
             print(f"resumed --ts state (short momentum, v, step counts) for {len(lays)} layers", flush=True)
         tmask = blob.get("touched") or {}
         nres = 0
@@ -3602,6 +3620,13 @@ def main():
     ttrack = TritTracker(model) if (args.mode == "master" and args.track_flips) else None
     _snap_state = {}                      # --m_snap: each master layer's trits after the last step
     ts_cfg = None
+    if args.ts:                           # --ts_offload(_keep): which layers' state lives in host memory
+        _lays = [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]
+        for i_, m_ in enumerate(_lays):
+            m_._ts_host = _ts_on_host(args, i_, len(_lays))
+        if args.ts_offload_keep and (args.ts_offload or args.ts_offload_async):
+            print(f"--ts_offload_keep: state of {sum(not m_._ts_host for m_ in _lays)} of {len(_lays)} layers on the GPU",
+                  flush=True)
     if args.ts and args.ts_fused:         # --ts_fused: each layer's update inside its backward (ts_layer)
         ts_cfg = dict(r=args.lowrank, lr_ratio=1.0, theta=args.ts_theta, tau=args.ts_tau, rank_s=args.ts_rank_s,
                       b1=args.ts_b1, b2=args.ts_b2, gate=args.lr_gate, spend=args.ts_spend,
@@ -3927,6 +3952,10 @@ def main():
                   f"| {dt:6.1f}s | peakVRAM {mem:.2f}GiB", flush=True)
             if args.ts and step in (10, 1000):
                 print(f"  --ts state: {_ts_state_bytes(lr_state) / 2**20:.1f} MiB stored", flush=True)
+            if args.mem_snapshot and device == "cuda" and step == int(args.mem_snapshot.rsplit(":", 1)[1]):
+                torch.cuda.memory._dump_snapshot(args.mem_snapshot.rsplit(":", 1)[0])    # scripts/analysis/mem_snapshot.py
+                torch.cuda.memory._record_memory_history(enabled=None)
+                print(f"--mem_snapshot: allocation history to step {step} in {args.mem_snapshot.rsplit(':', 1)[0]}", flush=True)
             if args.mem_report and step in (10, 50, 100, 1000):
                 mr = mem_report(model, tail_opt, lr_state)
                 log_metrics({"step": step, **mr})
@@ -3956,7 +3985,8 @@ def main():
 
     if mwin is not None and mwin.rec is not None:
         mwin.rec.flush()
-    save_ckpt(end_step - 1)
+    if not args.no_final_save:
+        save_ckpt(end_step - 1)
     vl = evaluate(model, val_data, tc, device)
     log_metrics({"step": end_step, "val_loss": vl, "val_ppl": math.exp(vl),
                  "final": True})

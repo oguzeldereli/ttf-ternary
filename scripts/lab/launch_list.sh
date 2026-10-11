@@ -5,7 +5,7 @@ set -u
 cd "$(dirname "$0")/../.."
 K=oguzelde@knuckles.cs.ucl.ac.uk
 python -c "import ast; ast.parse(open('bitnet/train.py').read()); print('trainer syntax ok')" || exit 1
-rsync -az --exclude checkpoints --exclude data --exclude __pycache__ ./ $K:ternary-LLM/ && echo "code synced"
+rsync -az --exclude checkpoints --exclude data --exclude __pycache__ --exclude private ./ $K:ternary-LLM/ && echo "code synced"
 ssh -o BatchMode=yes $K "mkdir -p ternary-sync/inbox/bench_nola ternary-sync/inbox/master4000"
 rsync -a checkpoints/nola_lab/ckpt_4000.pt $K:ternary-sync/inbox/bench_nola/
 python -c "
