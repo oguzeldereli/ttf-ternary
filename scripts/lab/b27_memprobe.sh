@@ -2,11 +2,11 @@
 # 26.5B (b27) memory probe with the current recipe (no momentum, 12-bit accumulator, update inside the backward, lean
 # float tail, micro-batch 1 x 2048, every layer checkpointed): 11 steps with --mem_report and --mem_snapshot at step
 # 10 (every CUDA allocation with its Python stack; scripts/analysis/mem_snapshot.py attributes the peak).
-#   WHERE=host|gpu|split KEEP=0.7 RANK=1024 CAP=0 bash scripts/lab/b27_memprobe.sh   (from the repo root, env sourced)
+#   WHERE=host|gpu|split KEEP=0.7 RANK=1024 CAP=0 INPLACE=1 bash scripts/lab/b27_memprobe.sh   (from the repo root, env sourced)
 # On the lab PCs a guard stops the run if free host memory drops under 2 GB.
-r=${RANK:-1024}; W=${WHERE:-host}; O=checkpoints/b27_memprobe; mkdir -p $O; n=r${r}_${W}${KEEP:+_k$KEEP}
+r=${RANK:-1024}; W=${WHERE:-host}; O=checkpoints/b27_memprobe; mkdir -p $O; n=r${r}_${W}${KEEP:+_k$KEEP}${INPLACE:+_inpl}${CAP:+_cap$CAP}
 OFF=""; [ $W = host ] && OFF="--ts_offload_async"; [ $W = split ] && OFF="--ts_offload_async --ts_offload_keep ${KEEP:-0.7}"
-CAPF=""; [ "${CAP:-0}" != 0 ] && CAPF="--mem_cap_gib $CAP"
+CAPF=""; [ "${CAP:-0}" != 0 ] && CAPF="--mem_cap_gib $CAP"; [ -n "${INPLACE:-}" ] && CAPF="$CAPF --ts_state_inplace"
 nvidia-smi --query-gpu=memory.used --format=csv,noheader -l 1 > $O/smi_$n.csv &
 SMI=$!
 python -m bitnet.train --preset b27 --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 \

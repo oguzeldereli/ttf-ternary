@@ -442,10 +442,21 @@ def _host_get(d, k, dev, off):
     return tuple(x.to(dev, non_blocking=True) for x in v) if off else v
 
 
+_STATE_INPLACE = [False]   # --ts_state_inplace
+
+
 def _host_put(d, k, v, off):
     """--ts_offload: write a state tuple back to its pinned host buffers (reused across steps; the device-to-host copy
     is queued on the same stream after this step's kernels and before next step's host-to-device copy)"""
     if not off:
+        old = d.get(k)
+        if (_STATE_INPLACE[0] and old is not None and len(old) == len(v)
+                and all(torch.is_tensor(o) and torch.is_tensor(x) and o.device == x.device and o.shape == x.shape
+                        and o.dtype == x.dtype for o, x in zip(old, v))):
+            for o, x in zip(old, v):          # --ts_state_inplace: the state keeps its buffers (no per-step reallocation)
+                if o.data_ptr() != x.data_ptr():
+                    o.copy_(x)
+            return
         d[k] = v
         return
     if off == "async":
@@ -2853,6 +2864,9 @@ def main():
                     "and spend once per step), so no dense gradient is kept between micro-batches: activations shrink M-fold")
     ap.add_argument("--ckpt_block", action="store_true", help="checkpoint each block once (its input) instead of attention "
                     "and MLP separately: half the saved activations (kernel mode; master builds dense weights per sublayer)")
+    ap.add_argument("--ts_state_inplace", action="store_true", help="--ts with the state on the GPU: write each layer's "
+                    "new state into its existing buffers instead of replacing them, so 10+ GiB of state is not reallocated "
+                    "every step among the backward's temporaries (fragmentation at 27B)")
     ap.add_argument("--no_final_save", action="store_true", help="no checkpoint at the end of the run (memory and "
                     "speed probes of large models)")
     ap.add_argument("--mem_snapshot", default="", help="PATH:STEP: record every CUDA allocation (with its Python stack) "
@@ -3157,6 +3171,7 @@ def main():
         tot_ = torch.cuda.get_device_properties(0).total_memory / 2**30
         torch.cuda.set_per_process_memory_fraction(min(1.0, args.mem_cap_gib / tot_))
         print(f"--mem_cap_gib: PyTorch capped at {args.mem_cap_gib:.1f} of {tot_:.1f} GiB", flush=True)
+    _STATE_INPLACE[0] = bool(args.ts_state_inplace)
     if args.mem_snapshot and device == "cuda":   # --mem_snapshot PATH:STEP: every allocation with its Python stack
         torch.cuda.memory._record_memory_history(enabled="all", stacks="python", max_entries=2_000_000)
     torch.manual_seed(tc.seed)
