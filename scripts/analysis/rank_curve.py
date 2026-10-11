@@ -43,7 +43,7 @@ def fit(xs, ys):
 
 fig, axs = plt.subplots(1, 2, figsize=(13, 5))
 for s in SHAPES:
-    P = [p for p in pts if p[0] == s]
+    P = sorted((p for p in pts if p[0] == s), key=lambda p: p[2])
     if not P:
         continue
     x = [p[2] for p in P]; y = [p[4] for p in P]; q = [p[3] for p in P]
@@ -55,7 +55,7 @@ for s in SHAPES:
         a2, b2, be2, rms2 = fit(q, y)
         print(f"{s:5s}: gap = {a:+.4f} {b:+.4f} log2(floats/weight); per doubling {b:+.4f}; break-even "
               f"{be:.2f} floats/weight (rms {rms:.4f}) | vs rank/width: per doubling {b2:+.4f}, break-even {be2:.2f}")
-for k, (i, lab) in enumerate(((2, "floats per weight (fp32 accumulator + factored v)"), (3, "rank / width"))):
+for k, (i, lab) in enumerate(((2, "numbers of state per ternary weight"), (3, "rank / width"))):
     xs = [p[i] for p in pts if p[0] != "110M"]; ys = [p[4] for p in pts if p[0] != "110M"]
     if len(xs) >= 2:
         a, b, be, rms = fit(xs, ys)
