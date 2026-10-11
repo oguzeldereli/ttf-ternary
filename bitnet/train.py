@@ -801,14 +801,17 @@ def ts_layer(l, g, state, c):
     if mic_nm:    # --ts_micro --ts_nomom: the accumulator takes every micro-batch's u, normalised by the v of the steps
         # before (this step's v needs all of its micro-batches); on the first step there is none, so each micro-batch
         # uses its own g^2 x M^2 (each g_i carries the loss / M). Firing and the spend once per step, on the last one
+        # As Adam's v includes the current gradient (which bounds a step at 1 / sqrt(1 - beta2) per weight), this
+        # micro-batch's own square (x M^2, the batch's scale) joins with weight 1 - beta2; without it a gradient spike
+        # passes into the accumulator whole (110M: a 6% flip burst at step ~55, 5.64 vs 4.42 at 600 steps)
         ts_ = (t - 1) // M_
+        r0, c0 = torch.linalg.vector_norm(g, dim=1).square_().mul_(M_ * M_ / l.K), \
+            torch.linalg.vector_norm(g, dim=0).square_().mul_(M_ * M_ / l.N)
         if ("v", key) in st and ts_ > 0:
             R0, C0 = _host_get(st, ("v", key), dev, off)
-            sq_prev = (R0[:, None] * C0[None, :] / R0.mean().clamp_min(1e-30) / (1 - b2o ** ts_)).sqrt_(); del R0, C0
-        else:
-            r0, c0 = torch.linalg.vector_norm(g, dim=1).square_().mul_(M_ * M_ / l.K), \
-                torch.linalg.vector_norm(g, dim=0).square_().mul_(M_ * M_ / l.N)
-            sq_prev = (r0[:, None] * c0[None, :] / r0.mean().clamp_min(1e-30)).sqrt_(); del r0, c0
+            bc_ = 1 - b2o ** ts_
+            r0 = b2o * R0 / bc_ + (1 - b2o) * r0; c0 = b2o * C0 / bc_ + (1 - b2o) * c0; del R0, C0
+        sq_prev = (r0[:, None] * c0[None, :] / r0.mean().clamp_min(1e-30)).sqrt_(); del r0, c0
     g2 = g * g
     if M_ > 1:    # --ts_micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
         # row / column means of (sum_i g_i)^2 = the micro-batches' own squares + 2 <g_i, sum of earlier g_i'>, the
@@ -894,13 +897,34 @@ def ts_layer(l, g, state, c):
     ra = min(r, l.N, l.K)
     if c.get("tiles", 1) > 1:     # --ts_tiles T: the accumulator as T x T tiles, each of rank ra / T (same memory)
         return _ts_tiled_rest(l, u, state, st, c, key, ra)
-    if key not in state:
+    if mic_nm and key in state and MICRO_BASIS[0] != "rot":   # --ts_micro --ts_nomom: the basis stays fixed within the step (every micro-batch's u
+        # is projected on it: U += u_i V), and turns once, on the last micro-batch; turning it per micro-batch lets each
+        # micro-batch's noisier u rotate the evidence away (110M r512: 5.64 vs 4.42 at 600 steps). The turn uses
+        # X = V (U^T U) + S, S = sum_i u_i^T U ('sum', TERN_MICRO_BASIS=sum: K x r held per layer within the step) or
+        # S = M u_M^T U (the last micro-batch only, scaled; no memory beyond the state; the default)
+        U, V = _load_pair(_host_get(state, key, dev, off))
+        first_ = (t - 1) % M_ == 0
+        if first_:
+            U = U * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)
+        if MICRO_BASIS[0] == "sum":
+            S_ = st.pop(("mS", key), None)
+            S_ = u.T @ U if (S_ is None or first_) else S_ + u.T @ U
+            if not final_:
+                st[("mS", key)] = S_
+        elif final_:
+            S_ = M_ * (u.T @ U)
+        if final_:
+            Vn = _orth(V @ (U.T @ U) + S_); del S_
+            U = (U + u @ V) @ (V.T @ Vn); V = Vn
+        else:
+            U = U + u @ V
+    elif key not in state:
         gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
         V = _orth(u.T @ torch.randn(l.N, ra, device=g.device, generator=gen))
         U = u @ V
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
-        if not mic_nm or (t - 1) % M_ == 0:   # --ts_micro --ts_nomom: the leak once per step, on the first micro-batch
+        if not (mic_nm and (t - 1) % M_):   # (TERN_MICRO_BASIS=rot: the basis turns per micro-batch; leak once per step)
             U = U * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)   # --ts_tau_anneal: memory in distance, not steps
         if c.get("resid"):        # --ts_resid: what the last projection discarded comes back with this step (dense)
             R_ = st.get(("resid", key))
@@ -1097,6 +1121,7 @@ def _micro_sketch(l, dev, step):
             torch.randn(k, l.N, device=dev, generator=gen) / k ** 0.5)
 
 
+MICRO_BASIS = [os.environ.get("TERN_MICRO_BASIS", "last")]   # --ts_micro --ts_nomom: last | sum | rot (see ts_layer)
 MICRO_DBG = [os.environ.get("TERN_MICRO_DBG", "")]   # diagnostic of --ts_micro (see _micro_dbg_u)
 
 
@@ -2895,6 +2920,8 @@ def main():
                     "stage 2 (F e.g. 0.4; 0: plain cosine)")
     ap.add_argument("--lean_tail", action="store_true", help="float tail in bf16 (embedding, adapter) / fp16 (gains, "
                     "scales) with LeanAdam: int8 first moment, factored second moment, stochastic-rounding updates")
+    ap.add_argument("--ts_micro_basis", default="", choices=["", "last", "sum", "rot"], help="--ts_micro --ts_nomom: how "
+                    "the accumulator's basis turns (default last; see ts_layer)")
     ap.add_argument("--ts_micro", action="store_true", help="--ts_fused with --grad_accum M: the TTF update sees each "
                     "micro-batch's gradient (momentum and v step per micro-batch with beta^(1/M), v / M; accumulator, firing "
                     "and spend once per step), so no dense gradient is kept between micro-batches: activations shrink M-fold")
@@ -3212,6 +3239,8 @@ def main():
         torch.cuda.set_per_process_memory_fraction(min(1.0, args.mem_cap_gib / tot_))
         print(f"--mem_cap_gib: PyTorch capped at {args.mem_cap_gib:.1f} of {tot_:.1f} GiB", flush=True)
     _STATE_INPLACE[0] = bool(args.ts_state_inplace)
+    if args.ts_micro_basis:
+        MICRO_BASIS[0] = args.ts_micro_basis
     if args.mem_snapshot and device == "cuda":   # --mem_snapshot PATH:STEP: every allocation with its Python stack
         torch.cuda.memory._record_memory_history(enabled="all", stacks="python", max_entries=2_000_000)
     torch.manual_seed(tc.seed)
