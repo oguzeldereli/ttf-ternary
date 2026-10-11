@@ -92,8 +92,10 @@ class AdamX(torch.optim.Optimizer):
 
 
 @torch.no_grad()
-def latent_ops(layers, state, clamp=0.0, leak=0.0, snap=False, lag=0.0, step=0):
-    """after an optimizer step: clamp / leak / snap the latent master weights (see the module docstring)"""
+def latent_ops(layers, state, clamp=0.0, leak=0.0, snap=False, lag=0.0, step=0, opt=None):
+    """after an optimizer step: clamp / leak / snap the latent master weights (see the module docstring); with opt
+    (--m_snap_mreset) a snapped weight's first moment is zeroed too (AdamW exp_avg / AdamX m), so no carried momentum
+    pushes it on from the new centre"""
     for i, l in enumerate(layers):
         w = l.weight
         gam = l.gamma_fixed if getattr(l, "gamma_fixed", None) is not None else w.abs().mean().clamp_min(1e-5)
@@ -107,6 +109,11 @@ def latent_ops(layers, state, clamp=0.0, leak=0.0, snap=False, lag=0.0, step=0):
             if prev is not None:
                 ch = t != prev
                 w.copy_(torch.where(ch, t * gam, w))
+                if opt is not None:
+                    st_ = opt.state.get(w, {})
+                    for k_ in ("exp_avg", "m"):
+                        if k_ in st_:
+                            st_[k_].masked_fill_(ch, 0.0)
             state[i] = t.to(torch.int8)
         if lag:
             # --m_lag q: the forward's trits T follow round(W / gamma) only stochastically: each weight whose latent says

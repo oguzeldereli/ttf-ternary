@@ -2751,6 +2751,10 @@ def main():
     ap.add_argument("--m_leak", type=float, default=0.0,
                     help="master: latent's offset from its trit centre decays with a time constant of TAU steps")
     ap.add_argument("--m_snap", action="store_true", help="master: a latent whose trit changed is set to the new centre")
+    ap.add_argument("--m_snap_mreset", action="store_true", help="master --m_snap: also zero the snapped weights' first "
+                    "moment (tests whether the snap hurts Adam master through carried momentum)")
+    ap.add_argument("--m_clip_tail", action="store_true", help="master: the global gradient-norm clip over the float "
+                    "tail only, latents excluded (as in TTF, whose ternary gradients are not clipped)")
     ap.add_argument("--m_lag", type=float, default=0.0,
                     help="master: the trits follow the latent only with probability Q per step (rate-limited firing)")
     ap.add_argument("--m_gfix", type=int, default=0, help="master: freeze each matrix's absmean scale at step S")
@@ -3325,6 +3329,7 @@ def main():
         xid = {id(p) for n, p in model.named_parameters() if n.endswith(("row_scale", "col_scale", "qk_logscale"))}
         norms = norms + [p for p in emb if id(p) in xid]; emb = [p for p in emb if id(p) not in xid]
         tail = master + emb + norms
+        _lat_ids = {id(p_) for p_ in master}   # --m_clip_tail: the clip without the latents
         if args.m_factv or args.m_rank or args.m_beta1 or args.m_gate or args.m_beta2:
             from .master_opt import AdamX
             tail_opt = AdamX(
@@ -3913,7 +3918,7 @@ def main():
             ar_state["mult"] = min(max(ar_state["mult"] * math.exp(args.adapt_rate_gain * (ar_state["ema"] - args.adapt_rate_target)),
                                        1 / 16), 2.0)
             rs_info["rate_mult"] = ar_state["mult"]; rs_info["cos_ema"] = ar_state["ema"]
-        torch.nn.utils.clip_grad_norm_(tail, tc.grad_clip)
+        torch.nn.utils.clip_grad_norm_([p_ for p_ in tail if id(p_) not in _lat_ids] if args.m_clip_tail and args.mode == "master" else tail, tc.grad_clip)
         tail_opt.step()
         if args.ts_rank_adapt and lr_state:
             ra_e, ra_s = (args.ts_rank_adapt.split(":") + ["500"])[:2]
@@ -3942,7 +3947,8 @@ def main():
             mlays = [m_ for m_ in model.modules() if isinstance(m_, MasterTernaryLinear)]
             if args.m_gfix and step == args.m_gfix or (args.m_gfix and step > args.m_gfix and mlays[0].gamma_fixed is None):
                 for m_ in mlays: m_.gamma_fixed = m_.weight.detach().abs().mean().clamp_min(1e-5)
-            latent_ops(mlays, _snap_state, args.m_clamp, args.m_leak, args.m_snap, args.m_lag, step)
+            latent_ops(mlays, _snap_state, args.m_clamp, args.m_leak, args.m_snap, args.m_lag, step,
+                       opt=tail_opt if args.m_snap_mreset else None)
         if args.master_bits and args.mode == "master":
             # --master_bits K: master degraded toward us: after every step each latent weight is stored on a
             # (2^K - 1)-level uniform grid over [-2 gamma, 2 gamma] (gamma = the matrix's absmean), with stochastic
