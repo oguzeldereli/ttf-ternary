@@ -53,9 +53,17 @@ for ax, (k, title, logy) in zip(axs, panels):
             y = smooth(r["md_realized"], a.window) / smooth(r["md_pred"], a.window)
         else:
             y = smooth(y, a.window)
-        ax.plot(r["step"], np.abs(y) if logy else y, label=name, lw=1.6)
+        x = r["step"]
+        if k.startswith("md_win"):       # the window needs ~1000 steps of history; its first values are the init
+            keep = x >= 2000
+            x, y = x[keep], y[keep]
+        ax.plot(x, np.abs(y) if logy else y, label=name, lw=1.6)
     ax.set_title(title, fontsize=10); ax.set_xlabel("step"); ax.grid(alpha=0.3)
     if logy:
+        ax.set_yscale("log")
+    if k == "md_survive":
+        ax.set_ylim(-3, 3)
+    if k.startswith("md_win"):
         ax.set_yscale("log")
     if k in ("md_precision",):
         ax.axhline(0.5, color="gray", lw=0.8)
