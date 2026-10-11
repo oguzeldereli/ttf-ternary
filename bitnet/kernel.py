@@ -40,18 +40,19 @@ def _w_bf16(wpacked, K):
 
 
 def pack_rows(w: torch.Tensor) -> torch.Tensor:
-    """int8 {-1,0,1} [N,K] -> uint8 [N, ceil(K/5)] base-3, per row along K."""
+    """int8 {-1,0,1} [N,K] -> uint8 [N, ceil(K/5)] base-3, per row along K (digit j has weight 3^j). Horner in uint8
+    (at most 242): one [N, K] uint8 temporary instead of int16 products and an int64 sum (0.76 GiB at 13824 x 5120)."""
     N, K = w.shape
     K5 = (K + 4) // 5
     pad = K5 * 5 - K
-    x = (w.to(torch.int16) + 1)                       # {0,1,2}
+    x = (w.to(torch.int8) + 1).view(torch.uint8)      # {0,1,2}
     if pad:
         x = torch.cat([x, x.new_zeros(N, pad)], dim=1)
     x = x.view(N, K5, 5)
-    wts = _P3_DEV.get(w.device)
-    if wts is None:                                   # cached: a per-call host copy syncs
-        wts = _P3_DEV[w.device] = torch.tensor(_P3, dtype=torch.int16, device=w.device)
-    return (x * wts).sum(2).to(torch.uint8)           # [N, K5]
+    out = x[:, :, 4].clone()
+    for j in (3, 2, 1, 0):
+        out.mul_(3).add_(x[:, :, j])
+    return out                                        # [N, K5]
 
 
 def unpack_rows(packed: torch.Tensor, K: int) -> torch.Tensor:

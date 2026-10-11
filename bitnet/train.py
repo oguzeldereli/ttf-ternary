@@ -1005,9 +1005,9 @@ def ts_layer(l, g, state, c):
     nf = fire.sum()                           # a device tensor: no host sync per layer
     if dec is not None:
         nf = nf + dec.sum()
-        l.wpacked.copy_(pack_rows(torch.where(dec, torch.zeros_like(w0), (w0.float() + D).to(torch.int8)))); del dec
+        l.wpacked.copy_(pack_rows(torch.where(dec, torch.zeros_like(w0), w0 + D.to(torch.int8)))); del dec
     else:
-        l.wpacked.copy_(pack_rows((w0.float() + D).to(torch.int8)))
+        l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))   # int8 add: exact, no [N, K] fp32 temporary
     if tun_short is not None:
         U = U - c["spend"] * ((th * D - D * tun_short) @ V); del tun_short
     elif tabmode != "spendtab":
