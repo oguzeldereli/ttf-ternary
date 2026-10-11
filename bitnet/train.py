@@ -56,6 +56,7 @@ def get_batch(data, bs, seq_len, device, gen=None):
 
 
 TWO_STAGE = [0.0]
+LR_LINEAR = [False]               # --lr_linear: linear decay after warmup instead of the cosine
 LR_WSD = [0]                      # --lr_wsd D: warmup, constant peak lr until step D, then a cosine to min_lr at the end
 LR_REWARM = [0, 0]                # --lr_rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
 TS_SHADOWS = [(), ()]             # --ts_shadows: ranks of the shadow states (0 = full rank); --ts_shadow_layers
@@ -151,6 +152,8 @@ def lr_at(step, tc: TrainConfig):
         r = (step - LR_WSD[0]) / max(1, tc.max_steps - LR_WSD[0])
         return tc.min_lr + 0.5 * (tc.lr - tc.min_lr) * (1 + math.cos(math.pi * r))
     r = (step - tc.warmup_steps) / max(1, tc.max_steps - tc.warmup_steps)
+    if LR_LINEAR[0]:              # --lr_linear: a straight line from the peak to min_lr (to zero with --min_lr 0)
+        return tc.min_lr + (tc.lr - tc.min_lr) * (1.0 - r)
     return tc.min_lr + 0.5 * (tc.lr - tc.min_lr) * (1 + math.cos(math.pi * r))
 
 
@@ -2850,6 +2853,8 @@ def main():
     ap.add_argument("--movediag", default="", help="EVERY[:NB[:WIN]]: every EVERY steps, measure what this step's trit moves "
                     "are worth: count, first-order gain on a true gradient from NB probe batches, direction precision, "
                     "realized loss change on NB other probe batches, undo share (bitnet/movediag.py)")
+    ap.add_argument("--lr_linear", action="store_true", help="after warmup, a linear decay from the peak lr to --min_lr "
+                    "instead of the cosine (TTF's step scale follows it through the lr ratio)")
     ap.add_argument("--lr_wsd", type=int, default=0, help="warmup-stable-decay: the peak lr until step D (this), then a "
                     "cosine to --min_lr at the last step (0 = off); branch a decay off any stable-phase checkpoint")
     ap.add_argument("--lr_rewarm", default="", help="S:W, continue a decayed run: from step S a linear warmup over W steps "
@@ -3134,6 +3139,7 @@ def main():
               + ("; a tunnelled move spends |A|, not theta" if TS_TUNNEL[2] else ""), flush=True)
     TWO_STAGE[0] = args.two_stage
     LR_WSD[0] = args.lr_wsd
+    LR_LINEAR[0] = args.lr_linear
     if args.lr_rewarm:
         LR_REWARM[:] = [int(x) for x in args.lr_rewarm.split(":")]
     TS_SHADOWS[0] = tuple(int(x) for x in args.ts_shadows.split(",")) if args.ts_shadows else ()
