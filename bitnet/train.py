@@ -2780,7 +2780,7 @@ def main():
     ap.add_argument("--init_hf", default="", help="start from a pretrained Llama checkpoint in Hugging Face format (a "
                     "directory with config.json and safetensors); the model shape comes from its config (--preset is ignored). "
                     "See bitnet/hf_init.py")
-    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "zero"],
+    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "zero", "scratch"],
                     help="--init_hf, kernel mode: how the weights become trits and scales (bitnet/hf_init.py)")
     ap.add_argument("--init_acc", type=float, default=0.0, help="--init_hf with --ts: the accumulator starts at KAPPA "
                     "x each weight's position inside its bin (2 theta (x - T)), at the run's rank (0: starts empty)")

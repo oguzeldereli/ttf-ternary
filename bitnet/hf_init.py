@@ -7,6 +7,7 @@ The float parts (token embedding, output head, RMSNorm gains) are copied. Each l
             absmean  T = round(clip(W / mean|W|)) per tensor, the output scale mean|W| (BitNet b1.58)
             row      a per-row scale a_i chosen from a grid to minimise |W_i - a_i T_i| (least-squares magnitude)
             als      W ~ a_i c_j T_ij, row and column scales by alternating least squares (needs --rc_scale)
+            scratch  nothing loaded, only the shape (the from-scratch baseline for the same model)
             zero     every trit 0; the weight goes into the accumulator only (needs --ts and --init_acc), so the first
                      update's firing does the rounding
           the scales go into row_scale / col_scale (with --rc_scale) over the layer's beta = 1 / sqrt(K rho);
@@ -48,13 +49,37 @@ def load_hf_tensors(path):
     files = sorted(f for f in os.listdir(path) if f.endswith(".safetensors"))
     sd = {}
     if files:
-        from safetensors.torch import load_file
+        try:
+            from safetensors.torch import load_file
+        except ImportError:
+            load_file = _read_safetensors
         for f in files:
             sd.update(load_file(os.path.join(path, f)))
     else:
         for f in sorted(f for f in os.listdir(path) if f.startswith("pytorch_model") and f.endswith(".bin")):
             sd.update(torch.load(os.path.join(path, f), map_location="cpu", weights_only=True))
     return {k: v.float() for k, v in sd.items()}
+
+
+_ST_DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64,
+              "I32": torch.int32, "U8": torch.uint8, "I8": torch.int8, "BOOL": torch.bool}
+
+
+def _read_safetensors(fn):
+    """safetensors without the package (Myriad's image lacks it): 8-byte little-endian header size, a JSON header
+    {name: {dtype, shape, data_offsets}}, then the raw little-endian data"""
+    with open(fn, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        hdr = json.loads(f.read(n))
+        buf = bytearray(f.read())
+    out = {}
+    for k, v in hdr.items():
+        if k == "__metadata__":
+            continue
+        dt = _ST_DTYPES[v["dtype"]]; a, b = v["data_offsets"]
+        out[k] = torch.frombuffer(buf, dtype=dt, count=(b - a) // torch.empty((), dtype=dt).element_size(),
+                                  offset=a).reshape(v["shape"]).clone()
+    return out
 
 
 def _unpermute(w, n_heads):
@@ -114,6 +139,9 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
     from .flip import KernelTernaryLinear
     from .kernel import pack_rows, trit_beta
     from .master import MasterTernaryLinear
+    if method == "scratch":       # the checkpoint's shape only, random init (the baseline for the same model)
+        log(f"--init_hf {path}: scratch (shape only, weights not loaded)")
+        return {}
     sd = load_hf_tensors(path)
     c_ = model.c
     dev = next(model.parameters()).device
