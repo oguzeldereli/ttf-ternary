@@ -196,6 +196,20 @@ class BitTransformer(nn.Module):
         return F.cross_entropy(F.linear(h, w).float(), tgt, ignore_index=-1,
                                reduction="sum")
 
+    # --distill: the teacher's log-probabilities for this batch ([tokens, vocab]), set by the trainer around one
+    # forward / backward; the loss becomes (1 - kd_w) CE + kd_w KL(teacher || student), per token
+    kd_logp = None
+    kd_w = 1.0
+
+    @staticmethod
+    def _loss_chunk_kd(h, w, tgt, tlp, a):
+        z = F.linear(h, w).float()
+        lp = F.log_softmax(z, -1)
+        kl = F.kl_div(lp, tlp.float(), log_target=True, reduction="sum")
+        if a >= 1.0:
+            return kl
+        return (1 - a) * F.nll_loss(lp, tgt, ignore_index=-1, reduction="sum") + a * kl
+
     def forward(self, idx, targets=None):
         h = self.tok_emb(idx)
         if torch.is_autocast_enabled(h.device.type):
@@ -218,8 +232,14 @@ class BitTransformer(nn.Module):
         tf = targets.reshape(-1)
         n = self.loss_chunk
         total = hf.new_zeros((), dtype=torch.float32)
+        kd = self.kd_logp
         for i in range(0, hf.shape[0], n):
             hc, tc = hf[i:i + n], tf[i:i + n]
+            if kd is not None:
+                tl = kd[i:i + n]
+                total = total + (checkpoint(self._loss_chunk_kd, hc, w, tc, tl, self.kd_w, use_reentrant=False)
+                                 if ckpt else self._loss_chunk_kd(hc, w, tc, tl, self.kd_w))
+                continue
             total = total + (checkpoint(self._loss_chunk, hc, w, tc, use_reentrant=False)
                              if ckpt else self._loss_chunk(hc, w, tc))
         return None, total / (tf != -1).sum().clamp_min(1)

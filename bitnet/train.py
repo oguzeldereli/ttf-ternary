@@ -2861,6 +2861,9 @@ def main():
                     "See bitnet/hf_init.py")
     ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "gptq", "zero", "scratch"],
                     help="--init_hf, kernel mode: how the weights become trits and scales (bitnet/hf_init.py)")
+    ap.add_argument("--distill", default="", help="a full-precision teacher (Hugging Face Llama dir): the loss is "
+                    "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
+    ap.add_argument("--distill_w", type=float, default=1.0, help="--distill: weight of the KL term (1: KL only)")
     ap.add_argument("--init_calib", type=int, default=64, help="--init_hf_method gptq: calibration windows "
                     "(of --seq_len tokens) for the input second moments")
     ap.add_argument("--init_acc", type=float, default=0.0, help="--init_hf with --ts: the accumulator starts at KAPPA "
@@ -3391,6 +3394,18 @@ def main():
         _acc_init = init_from_hf(model, args.init_hf, args.mode, args.init_hf_method, rc=args.rc_scale, hess=_hess,
                                  acc=args.init_acc if args.ts else 0.0, theta=args.ts_theta, rank=args.lowrank, clip=args.init_acc_clip,
                                  log=lambda m_: print(m_, flush=True))
+    _teacher = None
+    if args.distill:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels
+        from .hf_init import model_config_from_hf as _mch, init_from_hf as _ifh
+        from .model import BitTransformer as _BT
+        _teacher = _BT(_mch(args.distill, max_seq_len=tc.seq_len), grad_checkpoint=False,
+                       make_linear=lambda i_, o_: nn.Linear(i_, o_, bias=False)).to(device)
+        _ifh(_teacher, args.distill, "fp32", log=lambda *_: None)
+        _teacher = _teacher.to(torch.bfloat16).eval()
+        for p_ in _teacher.parameters():
+            p_.requires_grad_(False)
+        model.kd_w = args.distill_w
+        print(f"--distill {args.distill}: teacher in bf16, loss (1 - {args.distill_w}) CE + {args.distill_w} KL", flush=True)
     if args.m_lora:
         assert args.mode == "master", "--m_lora needs --mode master"
         nl_ = sum(p.numel() for m_ in model.modules() if isinstance(m_, MasterTernaryLinear) for p in m_.enable_lora(args.m_lora))
@@ -3901,9 +3916,14 @@ def main():
                     if isinstance(l_, KernelTernaryLinear):
                         l_.cap_accum = True; l_.cap_final = micro == tc.grad_accum - 1
             x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
+            if _teacher is not None:   # --distill: the full-precision model's next-token distribution for this batch
+                with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
+                    tz_, _ = _teacher(x)
+                model.kd_logp = F.log_softmax(tz_.float(), -1).to(torch.bfloat16).reshape(-1, tz_.shape[-1]); del tz_
             with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
                 _, loss = model(x, y)
             (loss / tc.grad_accum).backward()  # triggers BitLinear fused updates
+            model.kd_logp = None
             if args.tern_emb and args.mode != "master":   # the ternary embedding's TTF update (both of its gradients)
                 from .tern_emb import tern_emb_step
                 tern_emb_step(model, lr_state, ts_cfg, ts_layer)
