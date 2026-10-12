@@ -180,8 +180,9 @@ def load_qwen(m, path, swapped, method="als", rc=True, hess=None, log=print):
         else:
             raise SystemExit("Qwen conversion needs --rc_scale")
         del W
-    log(f"--init_hf {path}: {method}, {len(errs)} ternary linears, relative weight error mean "
-        f"{sum(errs) / len(errs):.4f} (max {max(errs):.4f})")
+    if errs:
+        log(f"--init_hf {path}: {method}, {len(errs)} ternary linears, relative weight error mean "
+            f"{sum(errs) / len(errs):.4f} (max {max(errs):.4f})")
     if oerrs:
         e0, e1 = zip(*oerrs)
         log(f"  output-space error mean {sum(e1) / len(e1):.4f} (ALS rounding {sum(e0) / len(e0):.4f})")
