@@ -140,11 +140,12 @@ def lr_at(step, tc: TrainConfig):
         return tc.min_lr
     if LR_REWARM[1] and step >= LR_REWARM[0]:
         # continued training of a decayed checkpoint: re-warm from min_lr to the peak, then a fresh cosine to the end
-        s0, w = LR_REWARM
+        s0, w = LR_REWARM[:2]
+        pk = tc.lr * (LR_REWARM[2] if len(LR_REWARM) > 2 else 1.0)   # S:W:F re-warms to F x the peak (TTF's step too)
         if step < s0 + w:
-            return tc.min_lr + (tc.lr - tc.min_lr) * (step - s0 + 1) / w
+            return tc.min_lr + (pk - tc.min_lr) * (step - s0 + 1) / w
         r = (step - s0 - w) / max(1, tc.max_steps - s0 - w)
-        return tc.min_lr + 0.5 * (tc.lr - tc.min_lr) * (1 + math.cos(math.pi * r))
+        return tc.min_lr + 0.5 * (pk - tc.min_lr) * (1 + math.cos(math.pi * r))
     if LR_WSD[0]:
         # warmup-stable-decay: the peak lr until step D, then a cosine down to min_lr at the last step
         if step < LR_WSD[0]:
@@ -3271,7 +3272,8 @@ def main():
     LR_WSD[0] = args.lr_wsd
     LR_LINEAR[0] = args.lr_linear
     if args.lr_rewarm:
-        LR_REWARM[:] = [int(x) for x in args.lr_rewarm.split(":")]
+        _rw = args.lr_rewarm.split(":")
+        LR_REWARM[:] = [int(_rw[0]), int(_rw[1])] + ([float(_rw[2])] if len(_rw) > 2 else [])
     TS_SHADOWS[0] = tuple(int(x) for x in args.ts_shadows.split(",")) if args.ts_shadows else ()
     TS_SHADOWS[1] = tuple(int(x) for x in args.ts_shadow_layers.split(",")) if args.ts_shadow_layers else ()
     if args.ts_dump_steps:
