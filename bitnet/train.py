@@ -757,7 +757,7 @@ def ts_layer(l, g, state, c):
     Called from ts_step after the backward, or from the layer's backward itself (--ts_fused), right after its input
     gradient is computed, so only one layer's fp32 gradient exists at a time."""
     from .kernel import unpack_rows, pack_rows
-    if (c.get("fast") and c.get("nomom") and not c.get("start") and not c.get("vdiag") and not c.get("uclip") and not c.get("move_cap") and not c.get("vbar") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
+    if (c.get("fast") and c.get("nomom") and not c.get("start") and not c.get("vdiag") and not c.get("uclip") and not c.get("urms") and not c.get("move_cap") and not c.get("vbar") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
             and int(c.get("tiles") or 1) == 1 and not getattr(l, "_ts_rank", 0)
             and not any(c.get(k_) for k_ in _TS_FAST_OFF) and not TS_TUNNEL[0]):
         if not _POW3:
@@ -859,6 +859,10 @@ def ts_layer(l, g, state, c):
             _ts_rec(st, "u_gt4", float((ua_ > 4).float().mean())); del ua_
         if c.get("uclip"):    # --ts_uclip C: no entry's step exceeds C (in units of the lr ratio): a gradient spike
             u = u.clamp(-c["uclip"] * lr_ratio, c["uclip"] * lr_ratio)   # against a lagging v cannot fire a layer
+        if c.get("urms"):     # --ts_urms D: the layer's step has rms <= D (units of the lr ratio), as Adafactor's update
+            r_ = float(u.pow(2).mean().sqrt()) / max(lr_ratio, 1e-12) / c["urms"]   # clipping: a step whose g^2 runs
+            if r_ > 1.0:                                                            # ahead of v keeps its direction,
+                u = u / r_                                                          # not its size
         if c.get("start") and c.get("step", 0) < c["start"]:   # --ts_start S: the trits stay frozen (no evidence kept,
             del u, v                                             # nothing fires) until step S; v keeps learning
             return
@@ -2886,6 +2890,8 @@ def main():
                     "linearly to T1 at the end")
     ap.add_argument("--ts_start", type=int, default=0, help="--ts: the trits stay frozen until step S (no evidence is kept "
                     "and nothing fires; the floats and the second moment train): calibrate a converted model first")
+    ap.add_argument("--ts_urms", type=float, default=0.0, help="--ts: scale each layer's step u down so its rms is at most D "
+                    "(units of the lr ratio; Adafactor's update clipping): a gradient spike against a lagging v fires no burst")
     ap.add_argument("--ts_uclip", type=float, default=0.0, help="--ts: clip each entry of the step u at C (units of the lr "
                     "ratio): a gradient spike against a lagging second moment cannot fire a whole layer")
     ap.add_argument("--ts_move_cap", type=float, default=0.0, help="--ts: at most a share F of a layer's weights move in one "
@@ -3861,7 +3867,7 @@ def main():
             ts_cfg["lr_ratio"] = _ts_scale(args, step, tc, lr)   # --ts_anneal_floor F
             ts_cfg["progress"] = step / max(1, tc.max_steps)
             ts_cfg["step"] = step; ts_cfg["start"] = args.ts_start; ts_cfg["vdiag"] = args.ts_vdiag
-            ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar
+            ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar; ts_cfg["urms"] = args.ts_urms
             ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
