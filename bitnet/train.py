@@ -757,7 +757,7 @@ def ts_layer(l, g, state, c):
     Called from ts_step after the backward, or from the layer's backward itself (--ts_fused), right after its input
     gradient is computed, so only one layer's fp32 gradient exists at a time."""
     from .kernel import unpack_rows, pack_rows
-    if (c.get("fast") and c.get("nomom") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
+    if (c.get("fast") and c.get("nomom") and not c.get("start") and not c.get("vdiag") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
             and int(c.get("tiles") or 1) == 1 and not getattr(l, "_ts_rank", 0)
             and not any(c.get(k_) for k_ in _TS_FAST_OFF) and not TS_TUNNEL[0]):
         if not _POW3:
@@ -843,6 +843,8 @@ def ts_layer(l, g, state, c):
             R, C = (1 - b2) * g2.mean(1), (1 - b2) * g2.mean(0)
         _host_put(st, ("v", key), (R, C), off)
         v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
+    if c.get("vdiag") and v is not None:   # --ts_vdiag: this step's g^2 against the second moment it is divided by
+        sp_ = float(g2.mean() / v.mean().clamp_min(1e-30)); _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
     del g2
     if c.get("nomom"):   # --ts_nomom: no short momentum: the accumulator integrates the full-rank Adam-normalised
         # gradient (its long-run sum is the momentum's anyway) and its own rank-r projection filters the noise; frees the
@@ -850,6 +852,14 @@ def ts_layer(l, g, state, c):
         u = -g / ((sq_prev if mic_nm else v.sqrt()) + 1e-8) * lr_ratio
         if mic_nm:
             del sq_prev
+        if c.get("vdiag"):    # |u| / lr_ratio: rms, and the largest entry (a spike the leaky sum turns into a burst)
+            ua_ = u.abs() / max(lr_ratio, 1e-12)
+            _ts_rec(st, "u_rms", float(ua_.pow(2).mean().sqrt())); m_ = float(ua_.max())
+            _ts_rec(st, "u_max", m_); _ts_recmax(st, "u_max", m_)
+            _ts_rec(st, "u_gt4", float((ua_ > 4).float().mean())); del ua_
+        if c.get("start") and c.get("step", 0) < c["start"]:   # --ts_start S: the trits stay frozen (no evidence kept,
+            del u, v                                             # nothing fires) until step S; v keeps learning
+            return
     else:
         rs = min(rk_sched or getattr(l, "_ts_rank_s", 0) or getattr(l, "_ts_rank", 0) or c["rank_s"], l.N, l.K)
         if ("m", key) not in st:
@@ -1541,6 +1551,10 @@ def _ts_rec(st, name, x):
     d = st.setdefault("_dg", {}); n = d.setdefault(name, [0.0, 0]); n[0] += x; n[1] += 1
 
 
+def _ts_recmax(st, name, x):
+    d = st.setdefault("_dgmax", {}); d[name] = max(d.get(name, -float("inf")), x)
+
+
 @torch.no_grad()
 def ts_layer_shared(l, g, state, c):
     """--ts_shared_v: the short momentum and the accumulator share ONE orthonormal basis V (K x r): stored Um (N x r),
@@ -1666,6 +1680,8 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
     info = {"ts_frac": float(nf) / max(nt, 1)}
     for k_, (tot, n_) in st.pop("_dg", {}).items():      # --ts_diag: means over layers this step
         info["dg_" + k_] = tot / max(n_, 1)
+    for k_, x_ in st.pop("_dgmax", {}).items():           # --ts_vdiag: maxima over layers this step
+        info["dgmax_" + k_] = x_
     for w, rec in st.pop("_qd", {}).items():
         n = max(rec["n"], 1)
         info.update({f"qd_{w}_{k}": rec[k] / n for k in ("crest", "sub", "rel", "range")})
@@ -2849,6 +2865,10 @@ def main():
                     "this (e.g. p 1 mid-training like master's lr, then constant late)")
     ap.add_argument("--ts_theta_sched", default="", help="--ts: T0:T1[:START], the threshold is T0 until fraction START of training (default 0), then moves "
                     "linearly to T1 at the end")
+    ap.add_argument("--ts_start", type=int, default=0, help="--ts: the trits stay frozen until step S (no evidence is kept "
+                    "and nothing fires; the floats and the second moment train): calibrate a converted model first")
+    ap.add_argument("--ts_vdiag", action="store_true", help="--ts: log per step the gradient's size against the second "
+                    "moment it is divided by (g^2 / v, mean and max over layers) and the |u| tail")
     ap.add_argument("--ts_nomom", action="store_true", help="--ts: no short momentum; the accumulator takes the "
                     "full-rank g / sqrt(v) each step (the momentum's state freed)")
     ap.add_argument("--ts_decay", type=float, default=0.0, help="--ts: trit decay, a nonzero trit with |A| < theta / 2 "
@@ -3803,6 +3823,7 @@ def main():
         if ts_cfg is not None:
             ts_cfg["lr_ratio"] = _ts_scale(args, step, tc, lr)   # --ts_anneal_floor F
             ts_cfg["progress"] = step / max(1, tc.max_steps)
+            ts_cfg["step"] = step; ts_cfg["start"] = args.ts_start; ts_cfg["vdiag"] = args.ts_vdiag
             ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
