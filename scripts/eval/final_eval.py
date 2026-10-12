@@ -46,6 +46,9 @@ def load_model(path, device, mag_kind="add"):
     else:
         raise SystemExit(f"mode {mode} not supported")
     model = model.to(device)
+    if any(k.endswith(".bpacked") for k in sd):              # --ts_boost
+        from bitnet.flip import enable_boost
+        enable_boost(model)
     if "tok_emb.table.wpacked" in sd:                         # --tern_emb tied_wide:M
         from bitnet.tern_emb import enable_tern_emb
         M_ = sd["tok_emb.table.col_scale"].numel() // sd["tok_emb.proj.row_scale"].numel()

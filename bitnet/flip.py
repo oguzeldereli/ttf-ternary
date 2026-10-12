@@ -287,6 +287,41 @@ class _TernNoFlipFn(torch.autograd.Function):
         return gu, None, None
 
 
+class _TernBoostFn(torch.autograd.Function):
+    """--ts_boost: beta(T) * Q8(x) @ B^T with the layer's packed boost plane B, input gradient only (TTF moves B itself)"""
+    @staticmethod
+    def forward(ctx, x, bpacked, layer):
+        beta = trit_beta(layer.wpacked, layer.K) if layer.use_beta else None     # the main trits' beta
+        xq, xs = act_quant_i8(x.reshape(-1, layer.K), layer.act_bits)
+        y = tern_gemm_i8(xq, xs, bpacked, layer.K, beta if beta is not None else 1.0)
+        ctx.save_for_backward(bpacked); ctx.layer = layer; ctx.beta = beta; ctx.xshape = x.shape
+        return y.view(*x.shape[:-1], layer.N).to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, gy):
+        (bpacked,) = ctx.saved_tensors
+        layer = ctx.layer
+        w = unpack_rows(bpacked, layer.K).to(gy.dtype)
+        g = gy.reshape(-1, layer.N)
+        if ctx.beta is not None:
+            g = g * ctx.beta.to(g.dtype)
+        return (g @ w).view(ctx.xshape), None, None
+
+
+def enable_boost(model, s0=0.5):
+    """--ts_boost S: every ternary layer gets a second, initially empty, ternary plane B and a learnable float scale s
+    (init S): W = T + s B. TTF writes B when a trit at +-1 still has evidence past the threshold in its own direction, and
+    clears it first when evidence comes back (see ts_layer). 0.2 bytes per weight (packed), one more ternary GEMM."""
+    n = 0
+    for m in model.modules():
+        if isinstance(m, KernelTernaryLinear):
+            m.register_buffer("bpacked", torch.zeros_like(m.wpacked) + pack_rows(torch.zeros(1, m.K, dtype=torch.int8,
+                              device=m.wpacked.device)))
+            m.boost_s = nn.Parameter(torch.tensor(float(s0), device=m.wpacked.device))
+            n += 1
+    return n
+
+
 class _KernelTernFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, wpacked, layer):
@@ -641,6 +676,8 @@ class KernelTernaryLinear(nn.Module):
         if self.col_scale is not None:
             x = x * self.col_scale.to(x.dtype)
         y = _KernelTernFn.apply(x, self.wpacked, self)
+        if getattr(self, "bpacked", None) is not None:      # --ts_boost: W = T + s B
+            y = y + self.boost_s.to(y.dtype) * _TernBoostFn.apply(x, self.bpacked, self)
         if getattr(self, "mag_A", None) is not None:
             A, B = self.mag_A.to(y.dtype), self.mag_B.to(x.dtype)
             if self.mag_kind == "add":

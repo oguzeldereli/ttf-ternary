@@ -758,7 +758,7 @@ def ts_layer(l, g, state, c):
     Called from ts_step after the backward, or from the layer's backward itself (--ts_fused), right after its input
     gradient is computed, so only one layer's fp32 gradient exists at a time."""
     from .kernel import unpack_rows, pack_rows
-    if (c.get("fast") and c.get("nomom") and not c.get("start") and not c.get("vdiag") and not c.get("uclip") and not c.get("urms") and not c.get("theta_noise") and not c.get("move_cap") and not c.get("vbar") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
+    if (c.get("fast") and c.get("nomom") and not c.get("start") and not c.get("vdiag") and not c.get("uclip") and not c.get("urms") and not c.get("theta_noise") and not c.get("boost") and not c.get("move_cap") and not c.get("vbar") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
             and int(c.get("tiles") or 1) == 1 and not getattr(l, "_ts_rank", 0)
             and not any(c.get(k_) for k_ in _TS_FAST_OFF) and not TS_TUNNEL[0]):
         if not _POW3:
@@ -1061,6 +1061,14 @@ def ts_layer(l, g, state, c):
             float(c["vbar"])).clamp(0.25, 4.0)
         del R_, C_, sR, sC
     fire = (A.abs() >= th) & ((w0.float() + d).abs() <= 1)
+    bst = None
+    if getattr(l, "bpacked", None) is not None:   # --ts_boost: evidence past the threshold at a trit already at +-1 (a
+        b0 = unpack_rows(l.bpacked, l.K).to(torch.int8)     # blocked move) sets the boost plane; evidence back clears it
+        over = (A.abs() >= th) & ((w0.float() + d).abs() > 1)                   # before the trit itself moves
+        bset = over & (b0 == 0)
+        bclr = fire & (b0 != 0) & (d.to(torch.int8) == -b0)
+        fire = fire & ~bclr
+        bst = (b0, bset, bclr); del over
     if c.get("move_cap"):   # --ts_move_cap F: at most a share F of the layer's weights move in one step (the largest |A| / bar)
         kmax = max(1, int(c["move_cap"] * fire.numel()))
         if int(fire.sum()) > kmax:
@@ -1102,6 +1110,14 @@ def ts_layer(l, g, state, c):
         l.wpacked.copy_(pack_rows(torch.where(dec, torch.zeros_like(w0), w0 + D.to(torch.int8)))); del dec
     else:
         l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))   # int8 add: exact, no [N, K] fp32 temporary
+    if bst is not None:   # --ts_boost: write the boost plane; its moves spend theta like the trits' own
+        b0, bset, bclr = bst
+        di = d.to(torch.int8)
+        l.bpacked.copy_(pack_rows(torch.where(bclr, torch.zeros_like(b0), torch.where(bset, di, b0))))
+        D = D + torch.where(bset | bclr, d, torch.zeros_like(d))
+        nb_ = (bset | bclr).sum(); nf = nf + nb_
+        _ts_rec(st, "boost_frac", float((torch.where(bclr, torch.zeros_like(b0), torch.where(bset, di, b0)) != 0).float().mean()))
+        del bst, b0, bset, bclr, di
     if tun_short is not None:
         U = U - c["spend"] * ((th * D - D * tun_short) @ V); del tun_short
     elif tabmode != "spendtab":
@@ -2915,6 +2931,9 @@ def main():
                     "linearly to T1 at the end")
     ap.add_argument("--ts_start", type=int, default=0, help="--ts: the trits stay frozen until step S (no evidence is kept "
                     "and nothing fires; the floats and the second moment train): calibrate a converted model first")
+    ap.add_argument("--ts_boost", type=float, default=0.0, help="--ts: S > 0 adds a boost plane per ternary layer, W = T + s B with s "
+                    "learnable (init S): a trit at +-1 whose evidence passes theta again in its direction sets B, evidence back "
+                    "clears B before the trit moves (bitnet/flip.py enable_boost)")
     ap.add_argument("--ts_theta_noise", type=float, default=0.0, help="--ts: per layer, the fire bar is K x a ~100-step average of "
                     "the accumulator's rms (never below --ts_theta): a threshold set by the layer's own evidence spread")
     ap.add_argument("--ts_urms", type=float, default=0.0, help="--ts: scale each layer's step u down so its rms is at most D "
@@ -3390,6 +3409,9 @@ def main():
     else:
         model = BitTransformer(mc, grad_checkpoint=tc.grad_checkpoint)
     model = model.to(device)
+    if args.ts_boost and args.mode == "kernel":
+        from .flip import enable_boost
+        print(f"--ts_boost {args.ts_boost}: boost planes on {enable_boost(model, args.ts_boost)} ternary layers", flush=True)
     if args.moe:      # --moe E:K[:H]: every feed-forward becomes a mixture of E ternary experts, top-K routing
         from .model import enable_moe
         _mk = (lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, rate=args.rate, beta=use_beta, int8=args.int8,
@@ -3955,7 +3977,7 @@ def main():
             ts_cfg["lr_ratio"] = _ts_scale(args, step, tc, lr)   # --ts_anneal_floor F
             ts_cfg["progress"] = step / max(1, tc.max_steps)
             ts_cfg["step"] = step; ts_cfg["start"] = args.ts_start; ts_cfg["vdiag"] = args.ts_vdiag
-            ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar; ts_cfg["urms"] = args.ts_urms; ts_cfg["theta_noise"] = args.ts_theta_noise; ts_cfg["resid_sparse"] = args.ts_resid_sparse; ts_cfg["resid_steps"] = args.ts_resid_steps
+            ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar; ts_cfg["urms"] = args.ts_urms; ts_cfg["theta_noise"] = args.ts_theta_noise; ts_cfg["boost"] = args.ts_boost; ts_cfg["resid_sparse"] = args.ts_resid_sparse; ts_cfg["resid_steps"] = args.ts_resid_steps
             ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
