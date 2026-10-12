@@ -31,6 +31,7 @@ ap.add_argument("--fracs", default="1e-5,1e-4,1e-3"); ap.add_argument("--nval", 
 ap.add_argument("--locate", type=float, default=0.0, help="random legal moves at this fraction: (i) one layer at a time "
                 "(held-out change per layer), (ii) all layers with the input channels of the largest second moment "
                 "excluded (top 0.1 / 1 / 5%%), (iii) only those channels")
+ap.add_argument("--blocks", default="", help="keep only these decoder blocks (all 7 linears each), e.g. 0,1,2,3,10,21")
 ap.add_argument("--bydepth", default="", help="FRAC: per measured layer, its TTF-chosen moves applied alone (loss change "
                 "per move), with the layer's gradient consistency (per-entry SNR mean^2 / var) and evidence size")
 ap.add_argument("--bytype", default="", help="FRAC: also apply each rule's moves one matrix type at a time at FRAC")
@@ -41,6 +42,9 @@ model, ck = load_model(a.ckpt, dev)
 layers = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
 names = [n for n, m in model.named_modules() if isinstance(m, KernelTernaryLinear)]
 KEEP = [i % a.every == 0 for i in range(len(layers))]
+if a.blocks:
+    _bl = {int(x) for x in a.blocks.split(",")}
+    KEEP = [int(n.split(".")[1]) in _bl for n in names]
 for i, m in enumerate(layers):
     m.capture = True; m.capture_h = KEEP[i]
 for p in model.parameters():
