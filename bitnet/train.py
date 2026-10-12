@@ -757,7 +757,7 @@ def ts_layer(l, g, state, c):
     Called from ts_step after the backward, or from the layer's backward itself (--ts_fused), right after its input
     gradient is computed, so only one layer's fp32 gradient exists at a time."""
     from .kernel import unpack_rows, pack_rows
-    if (c.get("fast") and c.get("nomom") and not c.get("start") and not c.get("vdiag") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
+    if (c.get("fast") and c.get("nomom") and not c.get("start") and not c.get("vdiag") and not c.get("uclip") and not c.get("move_cap") and not c.get("vbar") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
             and int(c.get("tiles") or 1) == 1 and not getattr(l, "_ts_rank", 0)
             and not any(c.get(k_) for k_ in _TS_FAST_OFF) and not TS_TUNNEL[0]):
         if not _POW3:
@@ -857,6 +857,8 @@ def ts_layer(l, g, state, c):
             _ts_rec(st, "u_rms", float(ua_.pow(2).mean().sqrt())); m_ = float(ua_.max())
             _ts_rec(st, "u_max", m_); _ts_recmax(st, "u_max", m_)
             _ts_rec(st, "u_gt4", float((ua_ > 4).float().mean())); del ua_
+        if c.get("uclip"):    # --ts_uclip C: no entry's step exceeds C (in units of the lr ratio): a gradient spike
+            u = u.clamp(-c["uclip"] * lr_ratio, c["uclip"] * lr_ratio)   # against a lagging v cannot fire a layer
         if c.get("start") and c.get("step", 0) < c["start"]:   # --ts_start S: the trits stay frozen (no evidence kept,
             del u, v                                             # nothing fires) until step S; v keeps learning
             return
@@ -1028,7 +1030,21 @@ def ts_layer(l, g, state, c):
     th = theta
     if c.get("rescale") and ("kept", key) in st:   # --ts_rescale: compare A / s with theta, s = sqrt(share kept)
         th = theta * st[("kept", key)].sqrt().clamp(0.25, 1.0)
+    if c.get("vbar"):   # --ts_vbar K: the fire bar scales with the entry's gradient size, theta (sqrt v / mean sqrt v)^K:
+        # a move must beat its cost (h / 2, with v as the curvature proxy), not only clear a fixed bar
+        R_, C_ = _host_get(st, ("v", key), dev, off)
+        sR, sC = R_.clamp_min(0).sqrt(), C_.clamp_min(0).sqrt()
+        th = th * ((sR / sR.mean().clamp_min(1e-30))[:, None] * (sC / sC.mean().clamp_min(1e-30))[None, :]).pow(
+            float(c["vbar"])).clamp(0.25, 4.0)
+        del R_, C_, sR, sC
     fire = (A.abs() >= th) & ((w0.float() + d).abs() <= 1)
+    if c.get("move_cap"):   # --ts_move_cap F: at most a share F of the layer's weights move in one step (the largest |A| / bar)
+        kmax = max(1, int(c["move_cap"] * fire.numel()))
+        if int(fire.sum()) > kmax:
+            sc_ = torch.where(fire, A.abs() / th, torch.zeros_like(A)).view(-1)
+            idx = sc_.topk(kmax, sorted=False).indices
+            fire = torch.zeros_like(fire).view(-1); fire[idx] = True; fire = fire.view(A.shape); del sc_, idx
+            _ts_rec(st, "capped", 1.0)
     tun_short = None
     if TS_TUNNEL[0] > 0:  # --ts_tunnel: below the barrier a legal move tunnels with probability exp(-kappa (1 - |A| / theta))
         pt_ = torch.exp(-TS_TUNNEL[0] * (1.0 - A.abs() / th))
@@ -1066,7 +1082,7 @@ def ts_layer(l, g, state, c):
     if tun_short is not None:
         U = U - c["spend"] * ((th * D - D * tun_short) @ V); del tun_short
     elif tabmode != "spendtab":
-        U = U - c["spend"] * th * (D @ V)
+        U = U - c["spend"] * (((th * D) @ V) if torch.is_tensor(th) and th.dim() == 2 else th * (D @ V))
     if use_tab or rsk:
         Er = None if tabmode == "spendtab" and not rsk else c["spend"] * th * (D - (D @ V) @ V.T)   # unprojected spend
     if rsk:
@@ -2867,6 +2883,12 @@ def main():
                     "linearly to T1 at the end")
     ap.add_argument("--ts_start", type=int, default=0, help="--ts: the trits stay frozen until step S (no evidence is kept "
                     "and nothing fires; the floats and the second moment train): calibrate a converted model first")
+    ap.add_argument("--ts_uclip", type=float, default=0.0, help="--ts: clip each entry of the step u at C (units of the lr "
+                    "ratio): a gradient spike against a lagging second moment cannot fire a whole layer")
+    ap.add_argument("--ts_move_cap", type=float, default=0.0, help="--ts: at most a share F of a layer's weights move in one "
+                    "step (those with the largest |A| / bar)")
+    ap.add_argument("--ts_vbar", type=float, default=0.0, help="--ts: the fire bar is theta (sqrt v / mean sqrt v)^K per "
+                    "entry (clamped to 1/4 .. 4 theta): a move must beat its curvature cost, v the proxy")
     ap.add_argument("--ts_vdiag", action="store_true", help="--ts: log per step the gradient's size against the second "
                     "moment it is divided by (g^2 / v, mean and max over layers) and the |u| tail")
     ap.add_argument("--ts_nomom", action="store_true", help="--ts: no short momentum; the accumulator takes the "
@@ -3824,6 +3846,7 @@ def main():
             ts_cfg["lr_ratio"] = _ts_scale(args, step, tc, lr)   # --ts_anneal_floor F
             ts_cfg["progress"] = step / max(1, tc.max_steps)
             ts_cfg["step"] = step; ts_cfg["start"] = args.ts_start; ts_cfg["vdiag"] = args.ts_vdiag
+            ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar
             ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
