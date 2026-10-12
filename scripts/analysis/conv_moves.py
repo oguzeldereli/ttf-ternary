@@ -28,6 +28,10 @@ ap.add_argument("--val", default="data/wiki32k_val.bin")
 ap.add_argument("--n", type=int, default=48); ap.add_argument("--micro", type=int, default=2)
 ap.add_argument("--seq", type=int, default=2048); ap.add_argument("--every", type=int, default=2)
 ap.add_argument("--fracs", default="1e-5,1e-4,1e-3"); ap.add_argument("--nval", type=int, default=32)
+ap.add_argument("--locate", type=float, default=0.0, help="random legal moves at this fraction: (i) one layer at a time "
+                "(held-out change per layer), (ii) all layers with the input channels of the largest second moment "
+                "excluded (top 0.1 / 1 / 5%%), (iii) only those channels")
+ap.add_argument("--bytype", default="", help="FRAC: also apply each rule's moves one matrix type at a time at FRAC")
 a = ap.parse_args()
 dev = "cuda"
 t0 = time.time()
@@ -65,6 +69,13 @@ for i in range(len(layers)):
 for m in layers:
     m.capture = False; m.capture_h = False
 model.eval()
+ts = ck.get("ts_state") or []
+VF = {}                      # TTF's own normaliser: the run's factored second moment R_i C_j / mean R
+for i in range(len(layers)):
+    if KEEP[i] and i < len(ts) and ts[i] and "v" in ts[i]:
+        R, C = (x.to(dev).float() for x in ts[i]["v"])
+        VF[i] = (R[:, None] * C[None, :] / R.mean().clamp_min(1e-30)).sqrt_().view(-1)
+print(f"factored v from the checkpoint for {len(VF)} of {sum(KEEP)} measured layers")
 
 TYPES = ["wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"]
 typ = lambda n: next(t for t in TYPES if n.endswith(t))
@@ -101,15 +112,21 @@ def apply(sel):
     return L - base
 
 
-for f in [float(x) for x in a.fracs.split(",")]:
-    row = []
-    for rule in ("evidence", "newton", "random"):
-        sel, pred = {}, 0.0
-        for i in T0:
+RULES = ("ttf", "evidence", "newton", "random") if VF else ("evidence", "newton", "random")
+
+
+def choose(rule, f, only=None):
+    sel, pred = {}, 0.0
+    for i in T0:
+        if only is not None and typ(names[i]) != only:
+            continue
+        if True:
             g, h = G[i].view(-1), Hd[i].view(-1)
             d = -torch.sign(g); legal = (T0[i].view(-1).float() + d).abs() <= 1
             k = max(1, int(f * g.numel()))
-            if rule == "evidence":
+            if rule == "ttf":            # what TTF's accumulator fires first: |g| / sqrt(factored v)
+                sc = g.abs() / VF[i].clamp_min(1e-30)
+            elif rule == "evidence":
                 sc = g.abs() / h.clamp_min(1e-30).sqrt()
             elif rule == "newton":
                 sc = g.abs() - 0.5 * h
@@ -121,7 +138,52 @@ for f in [float(x) for x in a.fracs.split(",")]:
                 idx = idx[sc[idx] > 0]
             sel[i] = (idx, d[idx].to(torch.int8))
             pred += float((-g[idx].abs() + 0.5 * h[idx]).sum())
+    return sel, pred
+
+
+for f in [float(x) for x in a.fracs.split(",")]:
+    row = []
+    for rule in RULES:
+        sel, pred = choose(rule, f)
         n_m = sum(len(v[0]) for v in sel.values())
         row.append(f"{rule} {apply(sel):+.4f} (pred {pred:+.4f}, {n_m} moves)")
     print(f"  fraction {f:g}: " + " | ".join(row), flush=True)
+if a.bytype:
+    f = float(a.bytype)
+    print(f"\nby matrix type at fraction {f:g} (only that type's moves applied)")
+    for t in TYPES:
+        row = []
+        for rule in RULES:
+            sel, pred = choose(rule, f, only=t)
+            row.append(f"{rule} {apply(sel):+.4f}")
+        print(f"  {t:7s} " + " | ".join(row), flush=True)
+if a.locate:
+    f = a.locate
+    gen = torch.Generator(device=dev).manual_seed(5)
+
+    def rnd_sel(i, colmask=None):
+        g = G[i].view(-1); d = -torch.sign(g)
+        legal = (T0[i].view(-1).float() + d).abs() <= 1
+        if colmask is not None:
+            legal &= colmask[None, :].expand(layers[i].N, -1).reshape(-1)
+        k = max(1, int(f * g.numel()))
+        sc = torch.where(legal, torch.rand(g.shape, device=dev, generator=gen), torch.full_like(g, -1.0))
+        idx = sc.topk(k).indices
+        return idx, d[idx].to(torch.int8)
+    print(f"\nlocate: random legal moves, fraction {f:g} of each layer")
+    per = []
+    for i in T0:
+        dl = apply({i: rnd_sel(i)})
+        per.append((dl, names[i]))
+    per.sort(reverse=True)
+    print("  worst layers: " + ", ".join(f"{n} {d:+.4f}" for d, n in per[:10]))
+    print(f"  sum over layers {sum(d for d, _ in per):+.4f}; layers above +0.01: {sum(d > 0.01 for d, _ in per)}")
+    # input second moment per column (the GN diagonal summed over rows ~ x^2 mean x sum_i gy^2): use Hd's column sums
+    for q in (0.001, 0.01, 0.05):
+        sel_ex, sel_in = {}, {}
+        for i in T0:
+            cs = Hd[i].sum(0); kq = max(1, int(q * cs.numel()))
+            top = torch.zeros_like(cs, dtype=torch.bool); top[cs.topk(kq).indices] = True
+            sel_ex[i] = rnd_sel(i, ~top); sel_in[i] = rnd_sel(i, top)
+        print(f"  top {100*q:g}% columns excluded: {apply(sel_ex):+.4f} | only those columns: {apply(sel_in):+.4f}", flush=True)
 print(f"done in {time.time() - t0:.0f}s")
