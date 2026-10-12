@@ -17,8 +17,10 @@ set -u
 S=$HOME/Scratch/tern; RUN="apptainer exec --nv -B /myriadfs -B $HOME/Scratch $S/ubuntu24.sif bash -c"
 M=$HOME/Scratch/hf/models/Qwen3.8-27B; N=qw27_gq_s400_th64; STEPS=${STEPS:-1000}
 mkdir -p checkpoints/$N logs/qwen27
-[ -f data/wikiq8_val.bin ] || $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python scripts/quant/retok.py data/wiki32k_val.bin data/wikiq8_val.bin --target $M"
-[ -f data/wikiq8_train.bin ] || $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python scripts/quant/retok.py data/wiki32k_train.bin data/wikiq8_train.bin --target $M"
+export RAYON_NUM_THREADS=4 TOKENIZERS_PARALLELISM=true OMP_NUM_THREADS=4   # the job's own 4 cores only
+TOK="export HF_HOME=$HOME/Scratch/hf HF_HUB_OFFLINE=1 RAYON_NUM_THREADS=4;"
+[ -f data/wikiq8_val.bin ] || $RUN "source $S/env.sh; $TOK cd $HOME/Scratch/ternary-LLM; python scripts/quant/retok.py data/wiki32k_val.bin data/wikiq8_val.bin --target $M"
+[ -f data/wikiq8_train.bin ] || $RUN "source $S/env.sh; $TOK cd $HOME/Scratch/ternary-LLM; python scripts/quant/retok.py data/wiki32k_train.bin data/wikiq8_train.bin --target $M"
 [ -f logs/qwen27/ref.txt ] || $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python scripts/quant/qwen_check.py $M --data data/wikiq8_val.bin --n 16 --methods ''" > logs/qwen27/ref.txt 2>&1
 $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train --init_hf $M --init_hf_method gptq --init_stream \
   --data data/wikiq8_train.bin --val data/wikiq8_val.bin --data_u32 --seq_len 2048 --batch_size 4 --grad_accum 4 --ts_micro \
