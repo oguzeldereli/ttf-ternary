@@ -118,6 +118,61 @@ class FeedForward(nn.Module):
         return self.w_down(_FN["swiglu"](self.w_gate(x), self.w_up(x)))
 
 
+class MoEFeedForward(nn.Module):
+    """--moe E:K[:H]: a mixture of E SwiGLU experts (hidden H each), top-K routing by a float router. Each expert's three
+    linears are ternary layers of their own, so each gets its own TTF state, trained only by the tokens routed to it
+    (its gradient comes from those tokens alone). Switch-style load-balancing loss E * sum_e f_e P_e, kept in aux_loss for
+    the model to add (weight BitTransformer.moe_aux_w)."""
+
+    def __init__(self, dim, n_exp, top_k, hidden, make_linear):
+        super().__init__()
+        self.E, self.k = n_exp, top_k
+        self.router = nn.Linear(dim, n_exp, bias=False)
+        nn.init.normal_(self.router.weight, std=0.02)
+        self.experts = nn.ModuleList()
+        for _ in range(n_exp):
+            e = nn.Module()
+            e.w_gate = make_linear(dim, hidden); e.w_up = make_linear(dim, hidden); e.w_down = make_linear(hidden, dim)
+            self.experts.append(e)
+        self.aux_loss = None
+        self.load = None
+
+    def forward(self, x):
+        B, T, d = x.shape
+        xf = x.reshape(-1, d)
+        logits = self.router(xf).float()
+        probs = logits.softmax(-1)
+        w, idx = probs.topk(self.k, dim=-1)
+        w = (w / w.sum(-1, keepdim=True)).to(x.dtype)
+        out = torch.zeros_like(xf)
+        frac = torch.zeros(self.E, device=x.device)
+        for e, ex in enumerate(self.experts):
+            sel = (idx == e)
+            rows = sel.any(-1).nonzero().squeeze(1)
+            if rows.numel() == 0:
+                continue
+            frac[e] = rows.numel() / xf.shape[0]
+            we = (w * sel).sum(-1)[rows]
+            xe = xf[rows]
+            ye = ex.w_down(_FN["swiglu"](ex.w_gate(xe), ex.w_up(xe)))
+            out.index_add_(0, rows, ye * we[:, None])
+        self.aux_loss = self.E * (frac.detach() * probs.mean(0)).sum() / self.k
+        self.load = frac.detach()
+        return out.view(B, T, d)
+
+
+def enable_moe(model, spec, make_linear):
+    """replace every block's feed-forward by an MoEFeedForward (spec E:K[:H], H defaults to the dense hidden size)"""
+    parts = [int(x) for x in spec.split(":")]
+    E, k = parts[0], parts[1]
+    c = model.c
+    H = parts[2] if len(parts) > 2 else c.hidden_dim
+    dev = next(model.parameters()).device
+    for blk in model.layers:
+        blk.ffn = MoEFeedForward(c.dim, E, k, H, make_linear).to(dev)
+    return E, k, H
+
+
 class Block(nn.Module):
     def __init__(self, c: ModelConfig, make_linear):
         super().__init__()
@@ -200,6 +255,7 @@ class BitTransformer(nn.Module):
     # forward / backward; the loss becomes (1 - kd_w) CE + kd_w KL(teacher || student), per token
     kd_logp = None
     kd_w = 1.0
+    moe_aux_w = 0.01      # --moe: weight of the load-balancing loss
 
     @staticmethod
     def _loss_chunk_kd(h, w, tgt, tlp, a):
@@ -242,7 +298,11 @@ class BitTransformer(nn.Module):
                 continue
             total = total + (checkpoint(self._loss_chunk, hc, w, tc, use_reentrant=False)
                              if ckpt else self._loss_chunk(hc, w, tc))
-        return None, total / (tf != -1).sum().clamp_min(1)
+        loss = total / (tf != -1).sum().clamp_min(1)
+        aux = [l.ffn.aux_loss for l in self.layers if getattr(l.ffn, "aux_loss", None) is not None]
+        if aux and self.moe_aux_w:
+            loss = loss + self.moe_aux_w * torch.stack(aux).mean()
+        return None, loss
 
     def float_tail_parameters(self):
         """Params NOT handled by the master-free BitLinear hooks (small tail).

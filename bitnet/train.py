@@ -2879,6 +2879,9 @@ def main():
     ap.add_argument("--distill", default="", help="a full-precision teacher (Hugging Face Llama dir): the loss is "
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
     ap.add_argument("--distill_w", type=float, default=1.0, help="--distill: weight of the KL term (1: KL only)")
+    ap.add_argument("--moe", default="", help="E:K[:H]: mixture-of-experts feed-forward, E ternary SwiGLU experts (hidden H, default "
+                    "the dense one), top-K routing (bitnet/model.py MoEFeedForward)")
+    ap.add_argument("--moe_aux", type=float, default=0.01, help="--moe: weight of the load-balancing loss")
     ap.add_argument("--data_u32", action="store_true", help="--data / --val are uint32 token streams (vocabularies above 65536)")
     ap.add_argument("--init_calib", type=int, default=64, help="--init_hf_method gptq: calibration windows "
                     "(of --seq_len tokens) for the input second moments")
@@ -3309,6 +3312,19 @@ def main():
 
     BitTransformer.loss_chunk = args.loss_chunk
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    _WS = int(os.environ.get("WORLD_SIZE", "1"))      # data-parallel proof of concept (torchrun --nproc_per_node G)
+    _RK = int(os.environ.get("RANK", "0"))
+    if _WS > 1:
+        import torch.distributed as _dist
+        _lr_ = int(os.environ.get("LOCAL_RANK", "0"))
+        _ng_ = torch.cuda.device_count()
+        torch.cuda.set_device(_lr_ % max(_ng_, 1))
+        _dist.init_process_group("nccl" if _ng_ >= _WS else "gloo")   # gloo: several ranks on one GPU (a correctness test)
+        print(f"data parallel: rank {_RK} of {_WS}, GPU {_lr_ % max(_ng_, 1)} of {_ng_}, "
+              f"{'nccl' if _ng_ >= _WS else 'gloo'}", flush=True)
+        if _RK > 0 and args.out_dir:
+            args.out_dir = args.out_dir.rstrip("/") + f"_rank{_RK}"
+            tc.out_dir = args.out_dir
     if args.mem_cap_gib and device == "cuda":   # --mem_cap_gib G: PyTorch may use at most G GiB of this GPU (a 96 GB card
         # standing in for a 24 GB one in memory-matched comparisons; allocations beyond it raise out-of-memory)
         tot_ = torch.cuda.get_device_properties(0).total_memory / 2**30
@@ -3361,6 +3377,14 @@ def main():
     else:
         model = BitTransformer(mc, grad_checkpoint=tc.grad_checkpoint)
     model = model.to(device)
+    if args.moe:      # --moe E:K[:H]: every feed-forward becomes a mixture of E ternary experts, top-K routing
+        from .model import enable_moe
+        _mk = (lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, rate=args.rate, beta=use_beta, int8=args.int8,
+                                                  dw_mode=args.dw_mode, int8_dx=args.int8_dx, g_ref=args.g_ref).to(device)) \
+            if args.mode == "kernel" else (lambda i_, o_: nn.Linear(i_, o_, bias=False).to(device))
+        E_, k_, H_ = enable_moe(model, args.moe, _mk)
+        BitTransformer.moe_aux_w = args.moe_aux
+        print(f"--moe: {E_} experts of hidden {H_}, top-{k_} routing, load-balancing weight {args.moe_aux}", flush=True)
     model.train()
     if args.tern_emb:
         from .tern_emb import enable_tern_emb
@@ -3589,7 +3613,7 @@ def main():
         n = enable_flip_tracking(model)
         print(f"flip tracking on for {n} ternary layers", flush=True)
 
-    sampler = torch.Generator().manual_seed(tc.seed)
+    sampler = torch.Generator().manual_seed(tc.seed + 1_000_003 * _RK)   # data parallel: each rank its own batches
     # separate stream for cross-batch look-ahead, so the training batch order is unchanged
     la_gen = torch.Generator().manual_seed(tc.seed + 4242)
     lr_state = {}
@@ -3852,7 +3876,12 @@ def main():
                       shadow_layers=TS_SHADOWS[1])
         for i_, m_ in enumerate([m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]):
             m_._ts_idx = i_
-            m_.on_grad = lambda layer, g, _c=ts_cfg: ts_layer(layer, g, lr_state, _c)
+            if _WS > 1:   # data parallel: every rank's TTF update sees the mean gradient, so all ranks move the same trits
+                def _og(layer, g, _c=ts_cfg):
+                    _dist.all_reduce(g); g.div_(_WS); ts_layer(layer, g, lr_state, _c)
+                m_.on_grad = _og
+            else:
+                m_.on_grad = lambda layer, g, _c=ts_cfg: ts_layer(layer, g, lr_state, _c)
             m_.ts_micro = bool(args.ts_micro)
         print("--ts_fused: the update runs inside each layer's backward", flush=True)
     movediag = None
@@ -4065,7 +4094,17 @@ def main():
             ar_state["mult"] = min(max(ar_state["mult"] * math.exp(args.adapt_rate_gain * (ar_state["ema"] - args.adapt_rate_target)),
                                        1 / 16), 2.0)
             rs_info["rate_mult"] = ar_state["mult"]; rs_info["cos_ema"] = ar_state["ema"]
+        if _WS > 1:       # data parallel: the float tail's gradients are averaged before the clip and the step
+            for p_ in tail:
+                if p_.grad is not None:
+                    _dist.all_reduce(p_.grad); p_.grad.div_(_WS)
         torch.nn.utils.clip_grad_norm_([p_ for p_ in tail if id(p_) not in _lat_ids] if args.m_clip_tail and args.mode == "master" else tail, tc.grad_clip)
+        if _WS > 1 and step % 100 == 0:   # data parallel: the ranks' trits must stay identical (same g, same rule)
+            _ck = torch.tensor([float(sum(int(m_.wpacked.sum()) for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)))],
+                               device=device, dtype=torch.float64)
+            _cks = [torch.zeros_like(_ck) for _ in range(_WS)]; _dist.all_gather(_cks, _ck)
+            print(f"  data parallel step {step}: packed-trit checksums {[int(x.item()) for x in _cks]} "
+                  f"({'in sync' if len({int(x.item()) for x in _cks}) == 1 else 'OUT OF SYNC'})", flush=True)
         tail_opt.step()
         if args.ts_rank_adapt and lr_state:
             ra_e, ra_s = (args.ts_rank_adapt.split(":") + ["500"])[:2]
