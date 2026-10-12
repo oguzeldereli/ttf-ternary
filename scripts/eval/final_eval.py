@@ -46,7 +46,11 @@ def load_model(path, device, mag_kind="add"):
     else:
         raise SystemExit(f"mode {mode} not supported")
     model = model.to(device)
-    if "tok_emb.wpacked" in sd or "tok_emb.latent" in sd:     # --tern_emb
+    if "tok_emb.table.wpacked" in sd:                         # --tern_emb tied_wide:M
+        from bitnet.tern_emb import enable_tern_emb
+        M_ = sd["tok_emb.table.col_scale"].numel() // sd["tok_emb.proj.row_scale"].numel()
+        enable_tern_emb(model, f"tied_wide:{M_}", "kernel")
+    elif "tok_emb.wpacked" in sd or "tok_emb.latent" in sd:     # --tern_emb
         from bitnet.tern_emb import enable_tern_emb
         enable_tern_emb(model, "untied" if ("lm_head.wpacked" in sd or "lm_head.latent" in sd) else "tied",
                         "master" if mode == "master" else "kernel")

@@ -51,8 +51,8 @@ class TernEmbed(nn.Module):
             Ln = L / L.abs().mean().clamp_min(1e-8)
             T = Ln + (Ln.round().clamp(-1, 1) - Ln).detach()          # straight-through estimator
         else:
-            T = unpack_rows(self.wpacked, self.K).float()
-        W = T * self.scale()
+            T = unpack_rows(self.wpacked, self.K).to(getattr(self, "cdt", torch.float32))
+        W = T * self.scale().to(T.dtype)
         if W.requires_grad:
             W.retain_grad()
         self._W = W
@@ -74,9 +74,44 @@ class TernEmbed(nn.Module):
         """dL/dT (fp32, trit units) of the last forward, or None"""
         if self._W is None or self._W.grad is None:
             return None
-        g = self._W.grad * self.scale().detach()
+        g = self._W.grad.float() * self.scale().detach()
         self._W = None
         return g
+
+
+class TernEmbedWide(nn.Module):
+    """--tern_emb tied_wide:M: a ternary embedding with the bytes of a float one. Packed trits cost 1.6 bits against 32
+    for fp32, so a table of width M * dim (M = 20 matches fp32) holds the same memory; a ternary projection [dim, M dim]
+    maps it to the model width. The effective embedding E = table @ proj^T [vocab, dim] is formed once per forward
+    (dense, transient, bf16), used for the lookup and as the tied output head; both factors are TernEmbed matrices that
+    TTF trains from their own dL/dT (the product's gradient, by autograd)."""
+
+    def __init__(self, vocab: int, dim: int, mult: int, mode: str = "kernel"):
+        super().__init__()
+        D = mult * dim
+        self.table = TernEmbed(vocab, D, mode, std=0.02)
+        self.table.cdt = torch.bfloat16                           # the wide table expanded in bf16 (trits are exact)
+        self.proj = TernEmbed(dim, D, mode, std=1.0 / D ** 0.5)   # E's entries keep the float embedding's std 0.02
+        self.N, self.K = vocab, dim
+        self._E = None
+        self._fresh = False
+
+    def _compute(self):
+        E = (self.table._compute().to(torch.bfloat16) @ self.proj._compute().to(torch.bfloat16).T).float()
+        self._E = E
+        return E
+
+    @property
+    def weight(self):
+        if self._fresh:
+            self._fresh = False
+            return self._E
+        return self._compute()
+
+    def forward(self, idx):
+        E = self._compute()
+        self._fresh = True
+        return F.embedding(idx, E)
 
 
 def tern_emb_layers(model):
@@ -87,6 +122,14 @@ def enable_tern_emb(model, kind: str, mode: str):
     """replace the float token embedding by a TernEmbed; `untied`: a second one as the output head"""
     V, d = model.tok_emb.weight.shape
     dev = model.tok_emb.weight.device
+    if kind.startswith("tied_wide"):                 # tied_wide[:M], M = 20 by default (the bytes of an fp32 table)
+        mult = int(kind.split(":")[1]) if ":" in kind else 20
+        assert model.lm_head is None, "--tern_emb tied_wide needs a tied model"
+        model.tok_emb = TernEmbedWide(V, d, mult, mode).to(dev)
+        lays = tern_emb_layers(model)
+        for i, m in enumerate(lays):
+            m._ts_idx = 10_000 + i
+        return sum(m.N * m.K for m in lays)
     model.tok_emb = TernEmbed(V, d, mode).to(dev)
     if kind == "untied":
         model.lm_head = TernEmbed(V, d, mode).to(dev)
