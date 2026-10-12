@@ -2883,6 +2883,8 @@ def main():
     ap.add_argument("--moe", default="", help="E:K[:H]: mixture-of-experts feed-forward, E ternary SwiGLU experts (hidden H, default "
                     "the dense one), top-K routing (bitnet/model.py MoEFeedForward)")
     ap.add_argument("--moe_aux", type=float, default=0.01, help="--moe: weight of the load-balancing loss")
+    ap.add_argument("--init_stream", action="store_true", help="--init_hf (Qwen): convert layer by layer, sequentially, reading "
+                    "each layer's weights from the safetensors (27B: no full-precision copy in memory)")
     ap.add_argument("--data_u32", action="store_true", help="--data / --val are uint32 token streams (vocabularies above 65536)")
     ap.add_argument("--init_calib", type=int, default=64, help="--init_hf_method gptq: calibration windows "
                     "(of --seq_len tokens) for the input second moments")
@@ -3451,7 +3453,12 @@ def main():
         assert not (args.init_acc and (args.ts_offload or args.ts_offload_async or args.ts_tiles > 1)), \
             "--init_acc: state on the GPU, no tiles"
         _hess = None
-        if _QWEN:
+        if _QWEN and args.init_stream:   # --init_stream: layer by layer, sequential (models too big for one fp copy)
+            from .qwen import convert_qwen_streaming
+            convert_qwen_streaming(model, args.init_hf, _qsw, tc.data_path, method=args.init_hf_method,
+                                   n_seq=args.init_calib, seq=tc.seq_len, dev=device, dtype_u32=args.data_u32,
+                                   log=lambda m_: print(m_, flush=True))
+        elif _QWEN:
             from .qwen import load_qwen, calib_hessians_qwen
             if args.init_hf_method == "gptq":
                 _hess = calib_hessians_qwen(args.init_hf, tc.data_path, n_seq=args.init_calib, seq=tc.seq_len,
