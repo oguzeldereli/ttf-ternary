@@ -2868,6 +2868,7 @@ def main():
     ap.add_argument("--distill", default="", help="a full-precision teacher (Hugging Face Llama dir): the loss is "
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
     ap.add_argument("--distill_w", type=float, default=1.0, help="--distill: weight of the KL term (1: KL only)")
+    ap.add_argument("--data_u32", action="store_true", help="--data / --val are uint32 token streams (vocabularies above 65536)")
     ap.add_argument("--init_calib", type=int, default=64, help="--init_hf_method gptq: calibration windows "
                     "(of --seq_len tokens) for the input second moments")
     ap.add_argument("--init_acc", type=float, default=0.0, help="--init_hf with --ts: the accumulator starts at KAPPA "
@@ -3262,9 +3263,16 @@ def main():
     TIME = os.environ.get("TERN_TIME") == "1"   # time the forward/backward vs the momentum step (synchronizes)
 
     mc: ModelConfig = PRESETS[args.preset]
+    _QWEN = False
     if args.init_hf:
-        from .hf_init import model_config_from_hf
-        mc = model_config_from_hf(args.init_hf)
+        from .qwen import is_qwen35
+        _QWEN = is_qwen35(args.init_hf)
+        if _QWEN:              # Qwen3.5 / 3.8 (Gated DeltaNet + gated attention): transformers' model, ternary linears
+            from .qwen import model_config as _qmc
+            mc = _qmc(args.init_hf)
+        else:
+            from .hf_init import model_config_from_hf
+            mc = model_config_from_hf(args.init_hf)
     tc = TrainConfig()
     if args.seed is not None: tc.seed = args.seed
     if args.data: tc.data_path = args.data
@@ -3300,7 +3308,16 @@ def main():
     print(mc.report())
     use_beta = args.mode in ("kernel", "evidence") and not args.no_beta
 
-    if args.mode == "kernel":
+    _qsw = {}
+    if _QWEN:
+        assert args.mode == "kernel" and not args.distill and not args.tern_emb, "Qwen: kernel mode, no --distill / --tern_emb yet"
+        from .qwen import build_qwen, QwenTern
+        QwenTern.loss_chunk = args.loss_chunk
+        model, _qsw = build_qwen(args.init_hf, "kernel", grad_checkpoint=tc.grad_checkpoint, device=device,
+                                 make_linear=lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, rate=args.rate,
+                                     beta=use_beta, int8=args.int8, dw_mode=args.dw_mode, int8_dx=args.int8_dx,
+                                     g_ref=args.g_ref))
+    elif args.mode == "kernel":
         model = build_kernel_transformer(mc, grad_checkpoint=tc.grad_checkpoint,
                                          rate=args.rate, beta=use_beta,
                                          int8=args.int8, dw_mode=args.dw_mode,
@@ -3393,11 +3410,19 @@ def main():
         assert not (args.init_acc and (args.ts_offload or args.ts_offload_async or args.ts_tiles > 1)), \
             "--init_acc: state on the GPU, no tiles"
         _hess = None
-        if args.init_hf_method == "gptq":     # input second moments of the full-precision model (not the run's windows)
+        if _QWEN:
+            from .qwen import load_qwen, calib_hessians_qwen
+            if args.init_hf_method == "gptq":
+                _hess = calib_hessians_qwen(args.init_hf, tc.data_path, n_seq=args.init_calib, seq=tc.seq_len,
+                                            dev=device, dtype_u32=args.data_u32, log=lambda m_: print(m_, flush=True))
+            load_qwen(model, args.init_hf, _qsw, method=args.init_hf_method, rc=args.rc_scale, hess=_hess,
+                      log=lambda m_: print(m_, flush=True))
+            _hess = None
+        elif args.init_hf_method == "gptq":     # input second moments of the full-precision model (not the run's windows)
             from .hf_init import calib_hessians
             _hess = calib_hessians(args.init_hf, tc.data_path, n_seq=args.init_calib, dev=device,
                                    log=lambda m_: print(m_, flush=True))
-        _acc_init = init_from_hf(model, args.init_hf, args.mode, args.init_hf_method, rc=args.rc_scale, hess=_hess,
+        _acc_init = {} if _QWEN else init_from_hf(model, args.init_hf, args.mode, args.init_hf_method, rc=args.rc_scale, hess=_hess,
                                  acc=args.init_acc if args.ts else 0.0, theta=args.ts_theta, rank=args.lowrank, clip=args.init_acc_clip,
                                  log=lambda m_: print(m_, flush=True))
     _teacher = None
@@ -3568,8 +3593,9 @@ def main():
             raise SystemExit("--rate_search requires --mode kernel and --grad_accum 1")
         print(f"flip-rate line search: every {args.rs_every} steps, factors "
               f"{args.rs_factors}, tuning batch {args.rs_batch}x{tc.seq_len}", flush=True)
-    train_data = np.memmap(tc.data_path, dtype=np.uint16, mode="r")
-    val_data = np.memmap(tc.val_path, dtype=np.uint16, mode="r") if os.path.exists(tc.val_path) else train_data
+    _ddt = np.uint32 if args.data_u32 else np.uint16      # --data_u32: token ids above 65535 (Qwen's 248k vocabulary)
+    train_data = np.memmap(tc.data_path, dtype=_ddt, mode="r")
+    val_data = np.memmap(tc.val_path, dtype=_ddt, mode="r") if os.path.exists(tc.val_path) else train_data
 
     os.makedirs(tc.out_dir, exist_ok=True)
     ckpt_path = os.path.join(tc.out_dir, "ckpt.pt")
