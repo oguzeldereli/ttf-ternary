@@ -196,8 +196,8 @@ if a.bydepth:
     f = float(a.bydepth)
     print(f"\nby layer at fraction {f:g} (TTF's choice, this layer's moves alone): loss change, per 1k moves, consistency")
     print("  layer           moves   dloss    per1k   SNR(mean^2/var, mean)  top-1% SNR  |g|/sqrt(v) mean")
+    sel, _ = choose("ttf", f, only=None)
     for i in T0:
-        sel, _ = choose("ttf", f, only=None)
         one = {i: sel[i]}
         dl = apply(one); nm = len(sel[i][0])
         snr = (G[i] * G[i] / SQ[i]).view(-1)
