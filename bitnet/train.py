@@ -945,7 +945,13 @@ def ts_layer(l, g, state, c):
         if c.get("resid"):        # --ts_resid: what the last projection discarded comes back with this step (dense)
             R_ = st.get(("resid", key))
             if R_ is not None:
-                u = u + R_ * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)
+                rd_ = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau
+                if c.get("resid_steps"):      # --ts_resid_steps K: the residual is temporary, it fades within ~K steps
+                    rd_ *= 1 - 1.0 / c["resid_steps"]
+                if isinstance(R_, tuple):     # --ts_resid_sparse F: only its largest entries were kept
+                    u = u.clone(); u.view(-1).index_add_(0, R_[0].long(), R_[1].float() * rd_)
+                else:
+                    u = u + R_ * rd_
             Afull = U @ V.T + u
         oe_ = int(c.get("orth_every") or 1)
         if c.get("orth_defer") and not (oe_ > 1 and t % oe_):
@@ -984,7 +990,12 @@ def ts_layer(l, g, state, c):
         if V.shape[1] != ra:      # --ts_rank_sched: grow / shrink the accumulator to this step's rank
             U, V = _resize_lowrank(U, V, ra, u, 1.0, 8_000_000 + 2 * getattr(l, "_ts_idx", 0) + t)
         if c.get("resid"):
-            st[("resid", key)] = Afull - U @ V.T; del Afull
+            R_ = Afull - U @ V.T; del Afull
+            if c.get("resid_sparse"):     # keep the top share F of |R|: int32 index + bf16 value, 6 bytes per kept entry
+                k_ = max(1, int(c["resid_sparse"] * R_.numel()))
+                i_ = R_.abs().view(-1).topk(k_).indices
+                R_ = (i_.to(torch.int32), R_.view(-1)[i_].to(torch.bfloat16)); del i_
+            st[("resid", key)] = R_
         if diag:      # evidence dropped by the projection (U_new = Ad Vn) and share of this step's u that is kept
             _ts_rec(st, "a_drop", 1 - (U.norm() ** 2 / Ad.norm().clamp_min(1e-30) ** 2).item())
             x_ = ((u @ Vn).norm() ** 2 / u.norm().clamp_min(1e-30) ** 2).item(); del Ad
@@ -2945,6 +2956,10 @@ def main():
     ap.add_argument("--ts_dump_layers", default="0,6", help="--ts_dump_steps: layer indices (block 0: q = 0, down = 6)")
     ap.add_argument("--ts_sketch", type=float, default=0.0, help="--ts: a random sketch of each step u joins the "
                     "accumulator's basis update with this share of its norm (lets new directions in at low rank)")
+    ap.add_argument("--ts_resid_sparse", type=float, default=0.0, help="--ts_resid: keep only the largest share F of the "
+                    "discarded evidence (index + bf16 value: 6 bytes per kept entry, 0.06 bytes per weight at F 1%%)")
+    ap.add_argument("--ts_resid_steps", type=float, default=0.0, help="--ts_resid: the fed-back residual fades within ~K steps "
+                    "(a temporary residual) instead of persisting")
     ap.add_argument("--ts_resid", action="store_true", help="--ts: feed what the accumulator's projection discarded back "
                     "into the next step (dense N x K per layer: an upper-bound test, not sublinear)")
     ap.add_argument("--ts_rank_s_types", default="", help="--ts: per-layer-type rank of the short momentum only, e.g. "
@@ -3893,7 +3908,7 @@ def main():
             ts_cfg["lr_ratio"] = _ts_scale(args, step, tc, lr)   # --ts_anneal_floor F
             ts_cfg["progress"] = step / max(1, tc.max_steps)
             ts_cfg["step"] = step; ts_cfg["start"] = args.ts_start; ts_cfg["vdiag"] = args.ts_vdiag
-            ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar; ts_cfg["urms"] = args.ts_urms
+            ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar; ts_cfg["urms"] = args.ts_urms; ts_cfg["resid_sparse"] = args.ts_resid_sparse; ts_cfg["resid_steps"] = args.ts_resid_steps
             ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
