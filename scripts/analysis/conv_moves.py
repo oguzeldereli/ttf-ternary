@@ -31,6 +31,8 @@ ap.add_argument("--fracs", default="1e-5,1e-4,1e-3"); ap.add_argument("--nval", 
 ap.add_argument("--locate", type=float, default=0.0, help="random legal moves at this fraction: (i) one layer at a time "
                 "(held-out change per layer), (ii) all layers with the input channels of the largest second moment "
                 "excluded (top 0.1 / 1 / 5%%), (iii) only those channels")
+ap.add_argument("--bydepth", default="", help="FRAC: per measured layer, its TTF-chosen moves applied alone (loss change "
+                "per move), with the layer's gradient consistency (per-entry SNR mean^2 / var) and evidence size")
 ap.add_argument("--bytype", default="", help="FRAC: also apply each rule's moves one matrix type at a time at FRAC")
 a = ap.parse_args()
 dev = "cuda"
@@ -46,6 +48,7 @@ for p in model.parameters():
 model.grad_checkpoint = True; model.ckpt_skip = 0; model.train()
 G = [torch.zeros(m.N, m.K, device=dev) if KEEP[i] else None for i, m in enumerate(layers)]
 Hd = [torch.zeros(m.N, m.K, device=dev) if KEEP[i] else None for i, m in enumerate(layers)]
+SQ = [torch.zeros(m.N, m.K, device=dev) if KEEP[i] else None for i, m in enumerate(layers)]
 data = np.memmap(a.data, dtype=np.uint16, mode="r")
 rng = np.random.default_rng(777)
 tok = a.micro * a.seq
@@ -59,13 +62,14 @@ for b in range(a.n):
     for i, m in enumerate(layers):
         g = m.gw; m.gw = None
         if KEEP[i]:
-            G[i].add_(g); Hd[i].add_(m.hw); m.hw = None
+            G[i].add_(g); Hd[i].add_(m.hw); SQ[i].addcmul_(g, g); m.hw = None
         del g
     if b % 12 == 11:
         print(f"  {b + 1}/{a.n} micro-batches, loss {loss.item():.3f}, {time.time() - t0:.0f}s", flush=True)
 for i in range(len(layers)):
     if KEEP[i]:
         G[i] /= a.n; Hd[i] *= tok / a.n          # mean-loss gradient; GN diagonal on the mean loss's scale
+        SQ[i] = (SQ[i] / a.n - G[i] * G[i]).clamp_min_(1e-30)   # per-entry variance across micro-batches
 for m in layers:
     m.capture = False; m.capture_h = False
 model.eval()
@@ -187,3 +191,16 @@ if a.locate:
             sel_ex[i] = rnd_sel(i, ~top); sel_in[i] = rnd_sel(i, top)
         print(f"  top {100*q:g}% columns excluded: {apply(sel_ex):+.4f} | only those columns: {apply(sel_in):+.4f}", flush=True)
 print(f"done in {time.time() - t0:.0f}s")
+
+if a.bydepth:
+    f = float(a.bydepth)
+    print(f"\nby layer at fraction {f:g} (TTF's choice, this layer's moves alone): loss change, per 1k moves, consistency")
+    print("  layer           moves   dloss    per1k   SNR(mean^2/var, mean)  top-1% SNR  |g|/sqrt(v) mean")
+    for i in T0:
+        sel, _ = choose("ttf", f, only=None)
+        one = {i: sel[i]}
+        dl = apply(one); nm = len(sel[i][0])
+        snr = (G[i] * G[i] / SQ[i]).view(-1)
+        top = snr.topk(max(1, snr.numel() // 100)).values.mean()
+        ev = (G[i].abs() / VF[i].view_as(G[i]).clamp_min(1e-30)).mean() if i in VF else float("nan")
+        print(f"  {names[i]:15s} {nm:6d} {dl:+.4f} {1000 * dl / max(nm, 1):+.4f}  {float(snr.mean()):.3e}  {float(top):.3e}  {float(ev):.3e}", flush=True)
