@@ -1057,8 +1057,10 @@ def ts_layer(l, g, state, c):
         # a move must beat its cost (h / 2, with v as the curvature proxy), not only clear a fixed bar
         R_, C_ = _host_get(st, ("v", key), dev, off)
         sR, sC = R_.clamp_min(0).sqrt(), C_.clamp_min(0).sqrt()
-        th = th * ((sR / sR.mean().clamp_min(1e-30))[:, None] * (sC / sC.mean().clamp_min(1e-30))[None, :]).pow(
-            float(c["vbar"])).clamp(0.25, 4.0)
+        # relative to the median entry (the mean is dominated by outlier rows / columns and put most entries' bar far
+        # below theta: theta 32 conversions blew up at theta / 4), and only ever raised: a move must beat its cost
+        th = th * ((sR / sR.median().clamp_min(1e-30))[:, None] * (sC / sC.median().clamp_min(1e-30))[None, :]).pow(
+            float(c["vbar"])).clamp(1.0, 4.0)
         del R_, C_, sR, sC
     fire = (A.abs() >= th) & ((w0.float() + d).abs() <= 1)
     bst = None
