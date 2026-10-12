@@ -132,11 +132,8 @@ def build_qwen(path, mode, make_linear=None, grad_checkpoint=True, device="cuda"
         p.data = p.data.to(dtype)
     # the ternary layers are built after to_empty (which would leave their own buffers uninitialised), in fp32
     swapped = _swap_linears(hf, lambda i, o: make_linear(i, o).to(device)) if mode == "kernel" else {}
-    # buffers (rotary inv_freq) are recomputed: to_empty leaves them uninitialised
-    re = hf.model.rotary_emb
-    if hasattr(re, "rope_init_fn"):
-        inv, sc = re.rope_init_fn(re.config, device)
-        re.inv_freq = inv; re.original_inv_freq = inv; re.attention_scaling = sc
+    # the rotary module is rebuilt: to_empty leaves its inv_freq buffer uninitialised (non-persistent, not in checkpoints)
+    hf.model.rotary_emb = type(hf.model.rotary_emb)(t).to(device)
     m = QwenTern(hf, grad_checkpoint=grad_checkpoint)
     return m, swapped
 
