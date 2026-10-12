@@ -2944,8 +2944,8 @@ def main():
                     "ratio): a gradient spike against a lagging second moment cannot fire a whole layer")
     ap.add_argument("--ts_move_cap", type=float, default=0.0, help="--ts: at most a share F of a layer's weights move in one "
                     "step (those with the largest |A| / bar)")
-    ap.add_argument("--ts_vbar", type=float, default=0.0, help="--ts: the fire bar is theta (sqrt v / mean sqrt v)^K per "
-                    "entry (clamped to 1/4 .. 4 theta): a move must beat its curvature cost, v the proxy")
+    ap.add_argument("--ts_vbar", type=float, default=0.0, help="--ts: the fire bar is theta (sqrt v / median sqrt v)^K per "
+                    "entry, never below theta (clamped to 1 .. 4 theta): a move must beat its curvature cost, v the proxy")
     ap.add_argument("--ts_vdiag", action="store_true", help="--ts: log per step the gradient's size against the second "
                     "moment it is divided by (g^2 / v, mean and max over layers) and the |u| tail")
     ap.add_argument("--ts_nomom", action="store_true", help="--ts: no short momentum; the accumulator takes the "
