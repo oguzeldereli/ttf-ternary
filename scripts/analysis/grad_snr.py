@@ -28,6 +28,10 @@ from bitnet.flip import KernelTernaryLinear                         # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument("ckpt", nargs="?"); ap.add_argument("--data")
 ap.add_argument("--save_mu", default=""); ap.add_argument("--persist", nargs=2, default=None)
+ap.add_argument("--save_thirds", action="store_true", help="--save_mu also keeps the means of the three independent "
+                "thirds (bf16), for within-checkpoint cross spectra (rank_spectrum.py)")
+ap.add_argument("--seed", type=int, default=1234, help="data windows (another seed gives independent batches)")
+ap.add_argument("--every", type=int, default=1, help="keep every k-th ternary layer only (memory at 1.3B / 2.9B)")
 ap.add_argument("--n", type=int, default=96, help="micro-batch gradients (a multiple of 3)")
 ap.add_argument("--micro", type=int, default=4); ap.add_argument("--batch", type=int, default=16)
 ap.add_argument("--seq", type=int, default=2048); ap.add_argument("--no_svd", action="store_true")
@@ -82,10 +86,11 @@ for i, m in enumerate(layers):      # would not fit next to the accumulators at 
 model.grad_checkpoint = True; model.ckpt_skip = 0; model.train()   # activations of a 2.9B micro-batch otherwise ~20 GB
 
 data = np.memmap(a.data, dtype=np.uint16, mode="r")
-rng = np.random.default_rng(1234)
+rng = np.random.default_rng(a.seed)
 n3 = a.n // 3
-S = [[torch.zeros(m.N, m.K, device=dev) for _ in range(3)] for m in layers]
-SQ = [torch.zeros(m.N, m.K, device=dev) for m in layers]
+KEEP = [i % a.every == 0 for i in range(len(layers))]
+S = [[torch.zeros(m.N, m.K, device=dev) for _ in range(3)] if KEEP[i] else None for i, m in enumerate(layers)]
+SQ = [torch.zeros(m.N, m.K, device=dev) if KEEP[i] else None for i, m in enumerate(layers)]
 EMP = [None] * len(layers)          # empirical second moment, if the checkpoint has no v
 for b in range(3 * n3):
     starts = rng.integers(0, len(data) - a.seq - 1, a.micro)
@@ -96,6 +101,9 @@ for b in range(3 * n3):
     loss.backward()
     for i, m in enumerate(layers):
         g = m.gw; m.gw = None
+        if not KEEP[i]:
+            del g
+            continue
         if vfac[i] is None:
             EMP[i] = g * g if EMP[i] is None else EMP[i].add_(g * g)
             u = g
@@ -115,8 +123,10 @@ tan = bool(cg.get("ts_tau_anneal", False))
 # the leak per step is a / tau with --ts_tau_anneal (a = rho^p), 1 / tau otherwise: bar theta / (tau_eff a)
 bar = (theta / tau if tan else theta / (tau * rho ** p_)) if rho else None
 print(f"\nrho {rho}, fire bar theta / (tau_eff a) = {bar} (theta {theta}, tau {tau}{' annealed' if tan else ''}, p {p_})")
-rows = []; MU, SIG = [], []
+rows = []; MU, SIG, TH = [], [], []
 for i, m in enumerate(layers):
+    if not KEEP[i]:
+        continue
     if vfac[i] is None:                # normalise by the empirical factored second moment at the training batch
         e = EMP[i] / n; R = e.mean(1); C = e.mean(0)
         w = 1.0 / ((R[:, None] * C[None, :] / R.mean().clamp_min(1e-30)).sqrt() + 1e-8)
@@ -143,11 +153,14 @@ for i, m in enumerate(layers):
                      noise_rms=(noise / NK) ** 0.5, cross=cross, cap_svd=cap_svd, cap_acc=cap_acc, r=r))
     if a.save_mu:
         MU.append(mu.to(torch.bfloat16).cpu()); SIG.append(sig)
+        if a.save_thirds:
+            TH.append([x.to(torch.bfloat16).cpu() for x in G])
     S[i] = None; SQ[i] = None; del tot, mu, var, G
     torch.cuda.empty_cache()
 
 if a.save_mu:
-    torch.save({"step": step, "mu": MU, "sig": SIG, "names": names}, a.save_mu); MU = None
+    torch.save({"step": step, "mu": MU, "sig": SIG, "names": [nm for nm, k in zip(names, KEEP) if k], **({"thirds": TH} if a.save_thirds else {})},
+               a.save_mu); MU = TH = None
 TYPES = ["q", "k", "v", "o", "gate", "up", "down"]
 nl = len(rows) // 7
 six = np.array_split(np.arange(nl), 6)

@@ -132,10 +132,102 @@ def _rel_err(W, T, a, c):
     return float((W - a[:, None] * c[None, :] * T.float()).norm() / W.norm())
 
 
+def _out_err(W, T, a, c, H):
+    """output-space relative error tr(E H E^T) / tr(W H W^T), E = W - a c T, H = X^T X of the layer's inputs"""
+    E = W - a[:, None] * c[None, :] * T.float()
+    return float(((E @ H) * E).sum() / ((W @ H) * W).sum())
+
+
 @torch.no_grad()
-def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0, rank=0, clip=0.5, log=print):
+def calib_hessians(path, data_path, n_seq=64, seq=2048, dev="cuda", log=print):
+    """H = X^T X / tokens of every linear's input in the full-precision model on n_seq random windows of the run's
+    data (q / k / v share one, gate / up another): {(block, name): H [K, K] fp32 on the CPU}"""
+    import numpy as np
+    import torch.nn as nn
+    from .model import BitTransformer
+    mc = model_config_from_hf(path, max_seq_len=seq)
+    m = BitTransformer(mc, grad_checkpoint=False, make_linear=lambda i, o: nn.Linear(i, o, bias=False)).to(dev)
+    init_from_hf(m, path, "fp32", log=lambda *_: None)
+    m.eval()
+    H, hooks, cnt = {}, [], {}
+    own = {"wq": "wq", "wk": "wq", "wv": "wq", "wo": "wo", "w_gate": "w_gate", "w_up": "w_gate", "w_down": "w_down"}
+    for i, blk in enumerate(m.layers):
+        for sub, name in (("attn", "wq"), ("attn", "wo"), ("ffn", "w_gate"), ("ffn", "w_down")):
+            lin = getattr(getattr(blk, sub), name)
+            key = (i, name)
+            H[key] = torch.zeros(lin.in_features, lin.in_features, device=dev)
+            cnt[key] = 0
+
+            def hook(mod, inp, key=key):
+                x = inp[0].reshape(-1, inp[0].shape[-1]).float()
+                H[key].addmm_(x.T, x); cnt[key] += x.shape[0]
+            hooks.append(lin.register_forward_pre_hook(hook))
+    data = np.memmap(data_path, dtype=np.uint16, mode="r")
+    rng = np.random.default_rng(4321)                   # not the training stream's windows
+    for s in rng.integers(0, len(data) - seq - 1, n_seq):
+        x = torch.tensor(data[s:s + seq + 1].astype(np.int64), device=dev)[None]
+        m(x[:, :-1], x[:, 1:])
+    for h in hooks:
+        h.remove()
+    out = {}
+    for (i, name), h in H.items():
+        h /= max(cnt[(i, name)], 1)
+        for n2, o in own.items():
+            if o == name:
+                out[(i, n2)] = h.cpu()
+    del m, H
+    torch.cuda.empty_cache()
+    log(f"calibration: input second moments of {len(out)} linears from {n_seq} x {seq} tokens of {data_path}")
+    return out
+
+
+@torch.no_grad()
+def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2):
+    """GPTQ (Frantar et al. 2022) onto the ternary grid {-a_i, 0, a_i} c_j: columns are rounded one at a time and each
+    one's rounding error is pushed onto the not-yet-rounded columns through the inverse input second moment, so the
+    trits minimise the layer's output error |X (W - a c T)^T| instead of |W - a c T|. The column scale c comes from
+    ALS (folded into the inputs), the row magnitude a is refitted in output space after each pass."""
+    N, K = W.shape
+    Wc = W / c[None, :]                                  # fold c into the input: X' = X c, H' = c H c
+    Hc = H.to(W.device) * c[:, None] * c[None, :]
+    dead = torch.diagonal(Hc) <= 0
+    Hc[dead, dead] = 1.0
+    Wc[:, dead] = 0.0
+    Hc += damp * torch.diagonal(Hc).mean() * torch.eye(K, device=W.device)
+    perm = torch.argsort(torch.diagonal(Hc), descending=True) if act_order else torch.arange(K, device=W.device)
+    inv = torch.argsort(perm)
+    Wp, Hp = Wc[:, perm], Hc[perm][:, perm]
+    L = torch.linalg.cholesky(Hp)
+    Hinv = torch.cholesky_inverse(L)
+    U = torch.linalg.cholesky(Hinv, upper=True)          # GPTQ's upper factor of H^-1
+    del L, Hinv
+    for _ in range(refits):
+        Q = Wp.clone()
+        T = torch.zeros(N, K, device=W.device)
+        ai = a[:, None]
+        for i1 in range(0, K, block):
+            i2 = min(i1 + block, K)
+            Wb = Q[:, i1:i2].clone(); Ub = U[i1:i2, i1:i2]; E = torch.zeros_like(Wb)
+            for j in range(i2 - i1):
+                w = Wb[:, j]
+                t = (w / ai[:, 0]).round().clamp(-1, 1)
+                T[:, i1 + j] = t
+                e = (w - ai[:, 0] * t) / Ub[j, j]
+                Wb[:, j:] -= e[:, None] * Ub[j, j:][None, :]
+                E[:, j] = e
+            Q[:, i2:] -= E @ U[i1:i2, i2:]
+        # output-space least-squares magnitude per row: a_i = <W_i H, T_i> / <T_i H, T_i>
+        TH = T @ Hp
+        a = ((Wp @ Hp) * T).sum(1) / (TH * T).sum(1).clamp_min(1e-30)
+        a = torch.where(a > 0, a, torch.full_like(a, 1e-3))
+        del TH, Q
+    return T[:, inv].to(torch.int8), a, c
+
+
+@torch.no_grad()
+def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0, rank=0, clip=0.5, log=print, hess=None):
     """copy / convert the checkpoint into model (built with model_config_from_hf); returns {layer: (U, V)} for
-    --init_acc (empty otherwise)"""
+    --init_acc (empty otherwise). method gptq needs hess = calib_hessians(...)"""
     from .flip import KernelTernaryLinear
     from .kernel import pack_rows, trit_beta
     from .master import MasterTernaryLinear
@@ -149,7 +241,7 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
     model.norm.weight.copy_(sd["model.norm.weight"])
     if model.lm_head is not None:
         model.lm_head.weight.copy_(sd.get("lm_head.weight", sd["model.embed_tokens.weight"]))
-    acc_state, errs, kept = {}, [], []
+    acc_state, errs, kept, oerrs = {}, [], [], []
     for i, blk in enumerate(model.layers):
         p = f"model.layers.{i}."
         blk.attn_norm.weight.copy_(sd[p + "input_layernorm.weight"])
@@ -167,7 +259,14 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
             if not isinstance(lin, KernelTernaryLinear):        # fp32 mode: nn.Linear
                 lin.weight.copy_(W)
                 continue
-            T, a, c = ternarize(W, method)
+            T, a, c = ternarize(W, "als" if method == "gptq" else method)
+            if hess is not None and method != "zero":
+                Hl = hess[(i, name)].to(dev)
+                e0 = _out_err(W, T, a, c, Hl)
+                if method == "gptq":
+                    T, a, c = ternarize_gptq(W, Hl, a, c)
+                oerrs.append((e0, _out_err(W, T, a, c, Hl)))
+                del Hl
             if method != "zero":
                 errs.append(_rel_err(W, T, a, c))
             lin.wpacked.copy_(pack_rows(T))
@@ -202,6 +301,10 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
     if errs:
         log(f"--init_hf {path}: {method}, relative error |W - a c T| / |W| mean {sum(errs) / len(errs):.4f} "
             f"(min {min(errs):.4f}, max {max(errs):.4f}) over {len(errs)} layers")
+    if oerrs:
+        e0, e1 = zip(*oerrs)
+        log(f"--init_hf {method}: output-space relative error |X (W - a c T)^T|^2 / |X W^T|^2 mean {sum(e1) / len(e1):.4f}"
+            f" (als rounding {sum(e0) / len(e0):.4f}) over {len(e1)} layers")
     if kept:
         log(f"--init_acc {acc}: rank {rank} keeps {sum(kept) / len(kept):.3f} of the accumulator's energy on average "
             f"(min {min(kept):.3f})")

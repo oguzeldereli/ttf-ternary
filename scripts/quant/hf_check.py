@@ -18,7 +18,7 @@ from final_eval import window_losses                                            
 from bitnet.flip import build_kernel_transformer, enable_rc_scales               # noqa: E402
 from bitnet.master import build_master_transformer, MasterTernaryLinear         # noqa: E402
 from bitnet.model import BitTransformer                                          # noqa: E402
-from bitnet.hf_init import model_config_from_hf, init_from_hf                    # noqa: E402
+from bitnet.hf_init import model_config_from_hf, init_from_hf, calib_hessians    # noqa: E402
 
 
 class _HF(nn.Module):
@@ -37,6 +37,10 @@ def main():
     ap.add_argument("--methods", default="absmean,row,als")
     ap.add_argument("--skip_hf", action="store_true")
     ap.add_argument("--data", default="data/wiki32k_val.bin")
+    ap.add_argument("--calib", type=int, default=0, help="calibration windows from --calib_data for the input second "
+                    "moments (method gptq; with it every method also reports its output-space error)")
+    ap.add_argument("--calib_data", default="data/wiki32k_train.bin")
+    ap.add_argument("--skip_fp", action="store_true", help="skip the fp32 and master checks")
     a = ap.parse_args()
     dev = "cuda"
     data = np.memmap(a.data, dtype=np.uint16, mode="r")
@@ -54,14 +58,18 @@ def main():
         from transformers import AutoModelForCausalLM
         m = AutoModelForCausalLM.from_pretrained(a.hf_dir, torch_dtype=torch.float32).to(dev)
         run("hf", _HF(m)); del m; torch.cuda.empty_cache()
-    m = BitTransformer(mc, grad_checkpoint=False, make_linear=lambda i, o: nn.Linear(i, o, bias=False)).to(dev)
-    init_from_hf(m, a.hf_dir, "fp32"); run("fp32", m); del m; torch.cuda.empty_cache()
-    m = build_master_transformer(mc, grad_checkpoint=False).to(dev)
-    init_from_hf(m, a.hf_dir, "master"); run("master", m); del m; torch.cuda.empty_cache()
+    if not a.skip_fp:
+        m = BitTransformer(mc, grad_checkpoint=False, make_linear=lambda i, o: nn.Linear(i, o, bias=False)).to(dev)
+        init_from_hf(m, a.hf_dir, "fp32"); run("fp32", m); del m; torch.cuda.empty_cache()
+        m = build_master_transformer(mc, grad_checkpoint=False).to(dev)
+        init_from_hf(m, a.hf_dir, "master"); run("master", m); del m; torch.cuda.empty_cache()
+    hess = calib_hessians(a.hf_dir, a.calib_data, n_seq=a.calib, dev=dev) if a.calib else None
     for meth in a.methods.split(","):
         m = build_kernel_transformer(mc, grad_checkpoint=False, rate=0.0, beta=True, int8=True, dw_mode="dense").to(dev)
         enable_rc_scales(m)
-        init_from_hf(m, a.hf_dir, "kernel", meth, rc=True)
+        t0 = time.time()
+        init_from_hf(m, a.hf_dir, "kernel", meth, rc=True, hess=hess)
+        print(f"  converted in {time.time() - t0:.0f}s", flush=True)
         run("kernel:" + meth, m); del m; torch.cuda.empty_cache()
 
 

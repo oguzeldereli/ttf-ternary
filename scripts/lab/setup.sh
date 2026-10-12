@@ -22,7 +22,7 @@ fi
 "$S/env/bin/python" -c "import scipy, matplotlib" 2>/dev/null || \
   "$S/env/bin/pip" install --quiet --no-cache-dir numpy==2.3.5 scipy matplotlib
 mkdir -p "$S/repo/data" "$S/repo/checkpoints"
-"$S/env/bin/rsync" -a --delete --exclude checkpoints --exclude data --exclude __pycache__ --exclude .git \
+"$S/env/bin/rsync" -a --delete --exclude checkpoints --exclude data --exclude logs --exclude __pycache__ --exclude .git \
   "$HOME/ternary-LLM/" "$S/repo/"
 for f in wiki32k_train.bin wiki32k_val.bin; do
   [ -f "$S/repo/data/$f" ] || cp "$HOME/ternary-data/$f" "$S/repo/data/$f"

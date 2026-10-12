@@ -2827,8 +2827,10 @@ def main():
     ap.add_argument("--init_hf", default="", help="start from a pretrained Llama checkpoint in Hugging Face format (a "
                     "directory with config.json and safetensors); the model shape comes from its config (--preset is ignored). "
                     "See bitnet/hf_init.py")
-    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "zero", "scratch"],
+    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "gptq", "zero", "scratch"],
                     help="--init_hf, kernel mode: how the weights become trits and scales (bitnet/hf_init.py)")
+    ap.add_argument("--init_calib", type=int, default=64, help="--init_hf_method gptq: calibration windows "
+                    "(of --seq_len tokens) for the input second moments")
     ap.add_argument("--init_acc", type=float, default=0.0, help="--init_hf with --ts: the accumulator starts at KAPPA "
                     "x each weight's position inside its bin (2 theta (x - T)), at the run's rank (0: starts empty)")
     ap.add_argument("--init_acc_clip", type=float, default=0.5, help="--init_acc: cap on |x - T| (0: no cap, the "
@@ -3339,7 +3341,12 @@ def main():
         assert args.mode in ("kernel", "master", "fp32"), "--init_hf: kernel, master or fp32 mode"
         assert not (args.init_acc and (args.ts_offload or args.ts_offload_async or args.ts_tiles > 1)), \
             "--init_acc: state on the GPU, no tiles"
-        _acc_init = init_from_hf(model, args.init_hf, args.mode, args.init_hf_method, rc=args.rc_scale,
+        _hess = None
+        if args.init_hf_method == "gptq":     # input second moments of the full-precision model (not the run's windows)
+            from .hf_init import calib_hessians
+            _hess = calib_hessians(args.init_hf, tc.data_path, n_seq=args.init_calib, dev=device,
+                                   log=lambda m_: print(m_, flush=True))
+        _acc_init = init_from_hf(model, args.init_hf, args.mode, args.init_hf_method, rc=args.rc_scale, hess=_hess,
                                  acc=args.init_acc if args.ts else 0.0, theta=args.ts_theta, rank=args.lowrank, clip=args.init_acc_clip,
                                  log=lambda m_: print(m_, flush=True))
     if args.m_lora:
