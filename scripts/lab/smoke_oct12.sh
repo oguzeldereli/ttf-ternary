@@ -13,4 +13,13 @@ run sm_rtemp python -m bitnet.train $B --steps 40 --batch_size 4 --ts_resid --ts
 run sm_moe python -m bitnet.train $B --steps 40 --batch_size 4 --moe 8:2:1024
 run sm_dp python -m torch.distributed.run --nproc_per_node 2 -m bitnet.train $B --steps 101 --batch_size 2
 grep -h "data parallel" logs/smoke_sm_dp.txt | tail -4 >> logs/smoke.log
+# Qwen streaming conversion check (0.8B): stepping layer by layer = the model's loss; sequential GPTQ loss
+python -c "import transformers, fla" 2>/dev/null || pip install --quiet --no-cache-dir "transformers==5.19.0" flash-linear-attention
+M=$S/hf/models/Qwen3.5-0.8B-Base
+[ -f $M/config.json ] || HF_HOME=$S/hf python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('Qwen/Qwen3.5-0.8B-Base', local_dir='$M', allow_patterns=['*.json', '*.safetensors', '*.txt', '*.jinja'])" > /dev/null 2>&1
+for f in wikiqw_val.bin wikiqw_train.bin; do [ -f data/$f ] || scp -q -o BatchMode=yes oguzelde@whitebait-l.cs.ucl.ac.uk:$S/repo/data/$f data/; done
+python scripts/quant/qwen_stream_check.py $M --data data/wikiqw_val.bin --calib_data data/wikiqw_train.bin > logs/smoke_qwen_stream.txt 2>&1
+grep -E "^fp:|streaming|Error|Traceback" logs/smoke_qwen_stream.txt | tail -3 | sed 's/^/qwen_stream: /' >> logs/smoke.log
 echo "$(date '+%T') smoke done" >> logs/smoke.log
