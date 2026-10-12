@@ -3407,9 +3407,9 @@ def main():
         _teacher = _BT(_mch(args.distill, max_seq_len=tc.seq_len), grad_checkpoint=False,
                        make_linear=lambda i_, o_: nn.Linear(i_, o_, bias=False)).to(device)
         _ifh(_teacher, args.distill, "fp32", log=lambda *_: None)
-        _teacher = _teacher.to(torch.bfloat16).eval()
-        for p_ in _teacher.parameters():
-            p_.requires_grad_(False)
+        _teacher = _teacher.eval()
+        for p_ in _teacher.parameters():   # parameters only: Module.to(bf16) would also cast the complex RoPE table
+            p_.data = p_.data.to(torch.bfloat16); p_.requires_grad_(False)   # to real (teacher CE 5.20 instead of 2.34)
         model.kd_w = args.distill_w
         print(f"--distill {args.distill}: teacher in bf16, loss (1 - {args.distill_w}) CE + {args.distill_w} KL", flush=True)
     if args.m_lora:
