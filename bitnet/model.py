@@ -155,7 +155,7 @@ class MoEFeedForward(nn.Module):
             we = (w * sel).sum(-1)[rows]
             xe = xf[rows]
             ye = ex.w_down(_FN["swiglu"](ex.w_gate(xe), ex.w_up(xe)))
-            out.index_add_(0, rows, ye * we[:, None])
+            out.index_add_(0, rows, (ye * we[:, None]).to(out.dtype))   # experts may return fp32 (row scales)
         self.aux_loss = self.E * (frac.detach() * probs.mean(0)).sum() / self.k
         self.load = frac.detach()
         return out.view(B, T, d)
