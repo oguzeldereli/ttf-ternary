@@ -236,3 +236,107 @@ def tern_gemv2(q, w2):
     grid = lambda meta: (triton.cdiv(N, meta["BN"]), M, meta["SPLIT"])
     _gemv2_kernel[grid](xw, ww, y, N, KW, M, xw.stride(0), ww.stride(0), y.stride(0))
     return y - q.to(torch.int32).sum(1, keepdim=True)
+
+
+# ---- embedding lookup straight from pinned host memory (unified addressing): no host sync, capturable in a graph --
+@triton.jit
+def _uva_embed_kernel(ids_ptr, tab_ptr, out_ptr, D, BD: tl.constexpr):
+    i = tl.program_id(0)
+    tok = tl.load(ids_ptr + i).to(tl.int64)
+    for d0 in range(0, D, BD):
+        rd = d0 + tl.arange(0, BD)
+        v = tl.load(tab_ptr + tok * D + rd, mask=rd < D)
+        tl.store(out_ptr + i * D + rd, v, mask=rd < D)
+
+
+class _HostPtr:
+    """a pinned host tensor's address as a Triton pointer argument (valid on the device under unified addressing)"""
+    def __init__(self, t):
+        self.t, self.dtype = t, t.dtype
+
+    def data_ptr(self):
+        return self.t.data_ptr()
+
+
+_UVA_TABLES = {}
+
+
+@torch.library.custom_op("ttf::uva_embed", mutates_args=())
+def uva_embed(ids: torch.Tensor, key: int, dim: int) -> torch.Tensor:
+    tab = _UVA_TABLES[key]
+    flat = ids.reshape(-1).contiguous()
+    out = torch.empty(flat.numel(), dim, dtype=tab.dtype, device=ids.device)
+    _uva_embed_kernel[(flat.numel(),)](flat, _HostPtr(tab), out, dim, BD=1024)
+    return out.view(*ids.shape, dim)
+
+
+@uva_embed.register_fake
+def _(ids, key, dim):
+    return ids.new_empty(*ids.shape, dim, dtype=torch.bfloat16)
+
+
+
+# ---- 2-bit GEMV with the TTF epilogue fused: y = (beta s (q . t) + A[n] . r) * rowscale, fp32 accumulate --------------
+@triton.autotune(configs=[triton.Config({"BN": bn, "BW": bw, "SPLIT": sp}, num_warps=w, num_stages=st)
+                          for bn in (16, 32, 64) for bw in (32, 64, 128) for w in (4, 8) for sp in (1, 2, 4)
+                          for st in (2, 3)],
+                 key=["N", "KW"], reset_to_zero=["y_ptr"])
+@triton.jit
+def _gemv2_epi_kernel(xq_ptr, w_ptr, y_ptr, s_ptr, sumx_ptr, r_ptr, a_ptr, rs_ptr, beta, N, KW, M, R,
+                      sxm, swn, sym, BN: tl.constexpr, BW: tl.constexpr, SPLIT: tl.constexpr, BR: tl.constexpr):
+    pid_n = tl.program_id(0)
+    m = tl.program_id(1)
+    ps = tl.program_id(2)
+    rn = pid_n * BN + tl.arange(0, BN)
+    mn = rn < N
+    acc = tl.zeros((BN,), dtype=tl.int32)
+    chunk = tl.cdiv(tl.cdiv(KW, SPLIT), BW) * BW
+    for k0 in range(ps * chunk, tl.minimum((ps + 1) * chunk, KW), BW):
+        rk = k0 + tl.arange(0, BW)
+        mk = rk < KW
+        wv = tl.load(w_ptr + rn[:, None] * swn + rk[None, :], mask=mn[:, None] & mk[None, :], other=0x55555555)
+        for byte in tl.static_range(4):
+            bb = (wv >> (8 * byte)) & 0xFF
+            lanes = (bb & 0x3) | ((bb & 0xC) << 6) | ((bb & 0x30) << 12) | ((bb & 0xC0) << 18)
+            xw = tl.load(xq_ptr + m * sxm + rk * 4 + byte, mask=mk, other=0)
+            d = tl.inline_asm_elementwise("dp4a.u32.s32 $0, $1, $2, 0;", "=r,r,r",
+                                          [lanes, xw[None, :].broadcast_to(BN, BW)],
+                                          dtype=tl.int32, is_pure=True, pack=1)
+            acc += tl.sum(d, axis=1)
+    first = (ps == 0).to(tl.int32)
+    acc = acc - first * tl.load(sumx_ptr + m)            # sum (c - 1) x = sum c x - sum x, once
+    s = tl.load(s_ptr + m)
+    rr = tl.arange(0, BR)
+    rv = tl.load(r_ptr + m * R + rr, mask=rr < R, other=0.0)
+    av = tl.load(a_ptr + rn[:, None] * R + rr[None, :], mask=mn[:, None] & (rr[None, :] < R), other=0.0).to(tl.float32)
+    ad = tl.sum(av * rv[None, :], axis=1) * first.to(tl.float32)
+    rs = tl.load(rs_ptr + rn, mask=mn, other=0.0).to(tl.float32)
+    tl.atomic_add(y_ptr + m * sym + rn, (acc.to(tl.float32) * (s * beta) + ad) * rs, mask=mn)
+
+
+@torch.library.custom_op("ttf::layer2", mutates_args=())
+def ttf_layer2(x: torch.Tensor, col_scale: torch.Tensor, mag_B: torch.Tensor, mag_A: torch.Tensor,
+               row_scale: torch.Tensor, w2: torch.Tensor, beta: float) -> torch.Tensor:
+    """a whole TTF layer for a few tokens on the 2-bit layout: x [M, K] bf16 -> bf16 [M, N]"""
+    M, K = x.shape
+    N, K4p = w2.shape
+    xc = x * col_scale.to(x.dtype)
+    s = xc.abs().amax(-1).clamp_min(1e-5).float() / 127.0
+    q = (xc.float() / s[:, None]).round().clamp_(-128, 127).to(torch.int8)
+    if K < K4p * 4:
+        q = torch.nn.functional.pad(q, (0, K4p * 4 - K))
+    sumx = q.to(torch.int32).sum(1)
+    r = (xc.to(torch.bfloat16) @ mag_B).float().contiguous()
+    R = mag_A.shape[1]
+    xw = q.contiguous().view(torch.int32).view(M, K4p)
+    ww = w2.view(torch.int32)
+    y = torch.zeros(M, N, dtype=torch.float32, device=x.device)
+    grid = lambda meta: (triton.cdiv(N, meta["BN"]), M, meta["SPLIT"])
+    _gemv2_epi_kernel[grid](xw, ww, y, s, sumx, r, mag_A, row_scale, beta, N, K4p // 4, M, R,
+                            xw.stride(0), ww.stride(0), y.stride(0), BR=triton.next_power_of_2(max(R, 2)))
+    return y.to(torch.bfloat16)
+
+
+@ttf_layer2.register_fake
+def _(x, col_scale, mag_B, mag_A, row_scale, w2, beta):
+    return x.new_empty(x.shape[0], w2.shape[0], dtype=torch.bfloat16)

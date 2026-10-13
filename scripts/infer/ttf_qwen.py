@@ -18,7 +18,9 @@ import torch.nn as nn
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from bitnet.kernel import tern_gemm_i8, trit_beta                    # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ttf_kernels import act_quant_planes, tern_gemv_planes, tern_gemv2, repack_2bit   # noqa: E402
+from ttf_kernels import act_quant_planes, tern_gemv_planes, tern_gemv2, repack_2bit, _UVA_TABLES, _gemv2_epi_kernel   # noqa: E402
+import triton                                                          # noqa: E402
+import ttf_kernels                                                     # noqa: E402,F401  (registers ttf::uva_embed)
 DECODE_M = 4
 TWO_BIT = os.environ.get("TTF_TWO_BIT", "1") == "1"   # 2-bit layout + dp4a (faster, +25% trit memory)
 
@@ -43,6 +45,23 @@ class PackedTLinear(nn.Module):
             self.beta = float(trit_beta(self.wpacked, self.K))
         shp = x.shape
         x2 = x.reshape(-1, self.K)
+        if getattr(self, "w2", None) is not None and x2.shape[0] <= DECODE_M:   # decode: GEMV with the epilogue fused
+            M_, K4p = x2.shape[0], self.w2.shape[1]
+            xc = x2 * self.col_scale.to(x2.dtype)
+            sc = xc.abs().amax(-1).clamp_min(1e-5).float() / 127.0
+            q = (xc.float() / sc[:, None]).round().clamp_(-128, 127).to(torch.int8)
+            if self.K < K4p * 4:
+                q = torch.nn.functional.pad(q, (0, K4p * 4 - self.K))
+            sumx = q.to(torch.int32).sum(1)
+            r = (xc.to(torch.bfloat16) @ self.mag_B).float().contiguous()
+            xw = q.contiguous().view(torch.int32).view(M_, K4p)
+            ww = self.w2.view(torch.int32)
+            y = torch.zeros(M_, self.N, dtype=torch.float32, device=x.device)
+            grid = lambda meta: (triton.cdiv(self.N, meta["BN"]), M_, meta["SPLIT"])
+            _gemv2_epi_kernel[grid](xw, ww, y, sc, sumx, r, self.mag_A, self.row_scale, self.beta, self.N, K4p // 4,
+                                    M_, self.mag_A.shape[1], xw.stride(0), ww.stride(0), y.stride(0),
+                                    BR=triton.next_power_of_2(max(self.mag_A.shape[1], 2)))
+            return y.to(torch.bfloat16).view(*shp[:-1], self.N)
         if getattr(self, "w2", None) is not None:      # 2-bit layout (repacked at load): dp4a GEMV / per-layer expand
             xc = x2 * self.col_scale.to(x2.dtype)
             s = xc.abs().amax(-1, keepdim=True).clamp_min(1e-5).float() / 127.0
@@ -69,6 +88,21 @@ class PackedTLinear(nn.Module):
         y = y + (x.to(torch.bfloat16) @ self.mag_B) @ self.mag_A.t()
         y = y * self.row_scale.to(y.dtype)
         return y.view(*shp[:-1], self.N)
+
+
+class UVAEmbedding(nn.Module):
+    """the 248k x d embedding in pinned host memory, read by a GPU kernel through unified addressing: no host sync and
+    no graph break (the lookup is a custom op), 2.4 GiB of GPU memory saved; exact (the same bf16 rows)"""
+
+    def __init__(self, weight, dev):
+        super().__init__()
+        self.tab = weight.contiguous().pin_memory()
+        self.key = id(self)
+        _UVA_TABLES[self.key] = self.tab
+        self.dim = weight.shape[1]
+
+    def forward(self, ids):
+        return torch.ops.ttf.uva_embed(ids, self.key, self.dim)
 
 
 class CPUEmbedding(nn.Module):
@@ -111,7 +145,7 @@ def build(model_dir, weights, dev, emb_cpu):
     sd = sd.get("model", sd)
     sd = {k[3:]: v for k, v in sd.items() if k.startswith("hf.")}           # the trainer's QwenTern prefix
     if emb_cpu:
-        hf.model.embed_tokens = CPUEmbedding(sd.pop("model.embed_tokens.weight").to(torch.bfloat16).clone(), dev)
+        hf.model.embed_tokens = UVAEmbedding(sd.pop("model.embed_tokens.weight").to(torch.bfloat16), dev)
     own = hf.state_dict()
     missing = [k for k in own if k not in sd]
     unexpected = [k for k in sd if k not in own]
@@ -139,6 +173,61 @@ def build(model_dir, weights, dev, emb_cpu):
     for p in hf.parameters():
         p.requires_grad_(False)
     return hf, t
+
+
+def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len=4096, on_tokens=None, every=8):
+    """decode with a static cache and a compiled (CUDA-graph) forward; the next token stays on the GPU, the host syncs
+    every `every` tokens (to stream them and check for eos). Greedy for temp 0, else temperature / top-k / top-p."""
+    from transformers import StaticCache
+    dev = ids.device
+    if not hasattr(hf, "_ttf_step"):
+        hf._ttf_step = torch.compile(hf.forward, mode="reduce-overhead", fullgraph=False)
+    cache = getattr(hf, "_ttf_cache", None)       # one cache, reset per prompt: the compiled step is reused (no recompile)
+    if cache is None or getattr(hf, "_ttf_cache_len", 0) != max_len:
+        cache = hf._ttf_cache = StaticCache(config=t, max_cache_len=max_len)
+        hf._ttf_cache_len = max_len
+    else:
+        cache.reset()
+    L = ids.shape[1]
+    with torch.no_grad():
+        logits = hf(input_ids=ids, past_key_values=cache, cache_position=torch.arange(L, device=dev),
+                    use_cache=True).logits[:, -1].float()
+
+        def pick(lg):
+            if temp <= 0:
+                return lg.argmax(-1, keepdim=True)
+            lg = lg / temp
+            if top_k:
+                v, _ = lg.topk(top_k)
+                lg = lg.masked_fill(lg < v[:, -1:], -float("inf"))
+            p = lg.softmax(-1)
+            if top_p < 1.0:
+                sp, si = p.sort(-1, descending=True)
+                keep = sp.cumsum(-1) - sp < top_p
+                p = torch.zeros_like(p).scatter_(-1, si, sp * keep)
+            return torch.multinomial(p / p.sum(-1, keepdim=True), 1)
+
+        out, pend = [], []
+        tok = pick(logits)
+        pos = torch.tensor([L], device=dev)
+        for i in range(n):
+            pend.append(tok)
+            if len(pend) == every or i == n - 1:
+                got = torch.cat(pend, 1)[0].tolist(); pend = []
+                stop = eos is not None and eos in got
+                if stop:
+                    got = got[:got.index(eos)]
+                out += got
+                if on_tokens:
+                    on_tokens(got)
+                if stop:
+                    break
+            if i == n - 1 or L + i + 1 >= max_len:
+                break
+            logits = hf._ttf_step(input_ids=tok, past_key_values=cache, cache_position=pos, use_cache=True).logits[:, -1].float()
+            tok = pick(logits)
+            pos = pos + 1
+    return out
 
 
 def main():
