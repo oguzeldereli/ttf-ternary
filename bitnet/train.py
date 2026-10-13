@@ -3052,6 +3052,8 @@ def main():
     ap.add_argument("--mem_snapshot", default="", help="PATH:STEP: record every CUDA allocation (with its Python stack) "
                     "from the start and dump the history to PATH (a pickle) at logged step STEP; scripts/analysis/mem_snapshot.py "
                     "attributes the peak")
+    ap.add_argument("--eval_first_n", type=int, default=0, help="before training: the loss over the first N val windows in "
+                    "order (qwen_check.py's windows), e.g. a conversion against the full-precision reference")
     ap.add_argument("--mem_report", action="store_true", help="log the MiB of trits, float tail, its gradients and "
                     "optimizer state, TTF state on GPU / host, allocated and peak, at steps 10 / 50 / 100 / 1000")
     ap.add_argument("--ts_offload", action="store_true", help="--ts: keep the state in pinned host memory; each layer's "
@@ -3949,6 +3951,18 @@ def main():
         md_e, md_nb, md_w = md_ + ["", "8", "1000"][len(md_):]
         movediag = MoveDiag(model, train_data, tc, device, args.mode, int(md_e), int(md_nb), undo_window=int(md_w))
         print(f"--movediag: every {md_e} steps, {md_nb} + {md_nb} probe batches, {len(movediag.layers)} layers", flush=True)
+    if args.eval_first_n and start_step == 0:   # --eval_first_n N: the model as built (e.g. right after --init_hf), scored on
+        model.eval(); STATE.updates_enabled = False   # the first N val windows in order (qwen_check.py's windows)
+        ls_ = []
+        with torch.no_grad():
+            for i_ in range(args.eval_first_n):
+                w_ = torch.from_numpy(val_data[i_ * tc.seq_len:(i_ + 1) * tc.seq_len + 1].astype(np.int64)).to(device)[None]
+                with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
+                    ls_.append(float(model(w_[:, :-1], w_[:, 1:])[1]))
+        print(f"eval_first_n: loss {np.mean(ls_):.4f} over the first {args.eval_first_n} val windows ("
+              + " ".join(f"{x:.4f}" for x in ls_) + ")", flush=True)
+        log_metrics({"step": 0, "first_n_loss": float(np.mean(ls_))})
+        model.train(); STATE.updates_enabled = True
     for step in range(start_step, end_step):
         ORTH_DBG[0] = ORTH_DEBUG and step % 10 == 0
         if args.profile and step == start_step + 20:         # after autotune / warm-up
