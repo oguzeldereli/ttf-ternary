@@ -3,9 +3,11 @@
 
 Every large linear of the decoder is a TTF layer,
     y = r * ( beta * (Q(c * x) @ T^T)  +  ((c * x) @ B) @ A^T )
-with trits T packed 5 per byte, computed by an int8 x packed-trit GEMM (Triton, bitnet/kernel.py); the rest of the model
-(Gated DeltaNet, gated attention, norms, embedding, head) is transformers' own Qwen3.5 code. Needs transformers >= 5.19
-and flash-linear-attention.
+with trits T stored 5 per byte and re-packed at load to 2 bits each; a few tokens (decoding, short prompts) go through a
+dp4a int8 x trit GEMV with the scales and the low-rank adapter fused into its epilogue (ttf_kernels.py), longer prompts
+through a per-layer expansion to bf16. The rest of the model (Gated DeltaNet, gated attention, norms, embedding, head)
+is transformers' own Qwen3.5 code; the decode step is one compiled CUDA graph. Needs transformers >= 5.19 and
+flash-linear-attention.
 
   python ttf_qwen.py MODEL_DIR WEIGHTS.pt [-p "prompt"] [-i] [--chat] [-n 256] [--temp 0.7]
 MODEL_DIR holds config.json and the tokenizer files; WEIGHTS.pt the trainer's model state (scripts: slim27.py).
@@ -193,7 +195,7 @@ def build(model_dir, weights, dev, emb_cpu):
 
 
 def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len=4096, on_tokens=None, every=8,
-                  eos_set=None):
+                  eos_set=None, rep=1.0):
     """decode with a static cache and a compiled (CUDA-graph) forward; the next token stays on the GPU, the host syncs
     every `every` tokens (to stream them and check for eos). Greedy for temp 0, else temperature / top-k / top-p."""
     from transformers import StaticCache
@@ -216,7 +218,14 @@ def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len
         logits = hf(input_ids=ids, past_key_values=cache, cache_position=torch.arange(L, device=dev),
                     use_cache=True).logits[:, -1].float()
 
+        seen = None
+        if rep != 1.0:                  # repetition penalty over prompt + output (transformers' rule), on the GPU
+            seen = torch.zeros(lg_len := logits.shape[-1], dtype=torch.bool, device=dev)
+            seen[ids[0].clamp(max=lg_len - 1)] = True
+
         def pick(lg):
+            if seen is not None:
+                lg = torch.where(seen, torch.where(lg > 0, lg / rep, lg * rep), lg)
             if temp <= 0:
                 return lg.argmax(-1, keepdim=True)
             lg = lg / temp
@@ -232,6 +241,8 @@ def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len
 
         out, pend = [], []
         tok = pick(logits)
+        if seen is not None:
+            seen[tok[0]] = True
         pos = torch.tensor([L], device=dev)
         torch.cuda.synchronize()
         hf._ttf_prefill_s = time.time() - _t0      # one sync per prompt: prefill and decode reported separately
@@ -253,6 +264,8 @@ def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len
                 break
             logits = hf._ttf_step(input_ids=tok, past_key_values=cache, cache_position=pos, use_cache=True).logits[:, -1].float()
             tok = pick(logits)
+            if seen is not None:
+                seen[tok[0]] = True
             pos = pos + 1
     return out
 
@@ -328,10 +341,16 @@ def main():
                 sys.stdout.write(txt[len(shown["txt"]):]); sys.stdout.flush(); shown["txt"] = txt
             eos = [tok.eos_token_id] + [tok.convert_tokens_to_ids(x) for x in ("<|im_end|>", "<|endoftext|>")]
             out = fast_generate(hf, t, ids, a.n, temp=a.temp, top_p=a.top_p, top_k=a.top_k, eos=None,
-                                max_len=a.ctx, on_tokens=emit, eos_set=set(e for e in eos if e is not None))
+                                max_len=a.ctx, on_tokens=emit, eos_set=set(e for e in eos if e is not None), rep=a.rep)
             n = len(out); print()
-            if a.chat:
-                hist.append({"role": "assistant", "content": shown["txt"]})
+            if a.chat:                  # a thinking block goes to the template's own reasoning slot
+                txt = shown["txt"]
+                if "</think>" in txt:
+                    r_, c_ = txt.split("</think>", 1)
+                    hist.append({"role": "assistant", "content": c_.lstrip("\n"),
+                                 "reasoning_content": r_.replace("<think>", "").strip()})
+                else:
+                    hist.append({"role": "assistant", "content": txt})
             pf = hf._ttf_prefill_s
             print(f"[prefill {ids.shape[1]} tokens {pf:.2f}s; decode {n} tokens {n / (time.time() - t1 - pf):.2f} tok/s]",
                   file=sys.stderr)
