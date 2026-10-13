@@ -3052,6 +3052,10 @@ def main():
     ap.add_argument("--mem_snapshot", default="", help="PATH:STEP: record every CUDA allocation (with its Python stack) "
                     "from the start and dump the history to PATH (a pickle) at logged step STEP; scripts/analysis/mem_snapshot.py "
                     "attributes the peak")
+    ap.add_argument("--spike_dump", type=float, default=0.0, help="when a step's loss exceeds F x the median of the "
+                    "last 50, replay its batches on the state before / after the previous step's update, with trits and "
+                    "floats mixed, and save spike_STEP.pt (keeps two CPU copies of the model state)")
+    ap.add_argument("--spike_test", default="", help="S:F: multiply step S's loss (so its gradient) by F, a controlled gradient spike")
     ap.add_argument("--eval_first_n", type=int, default=0, help="before training: the loss over the first N val windows in "
                     "order (qwen_check.py's windows), e.g. a conversion against the full-precision reference")
     ap.add_argument("--mem_report", action="store_true", help="log the MiB of trits, float tail, its gradients and "
@@ -3963,6 +3967,7 @@ def main():
               + " ".join(f"{x:.4f}" for x in ls_) + ")", flush=True)
         log_metrics({"step": 0, "first_n_loss": float(np.mean(ls_))})
         model.train(); STATE.updates_enabled = True
+    spike_st = {}   # --spike_dump state
     for step in range(start_step, end_step):
         ORTH_DBG[0] = ORTH_DEBUG and step % 10 == 0
         if args.profile and step == start_step + 20:         # after autotune / warm-up
@@ -4048,6 +4053,40 @@ def main():
         # (SGD is linear, so summing micro-steps approximates one averaged step).
         if movediag is not None and movediag.on(step):
             movediag.pre(step)
+        if args.spike_dump:   # --spike_dump F: keep the state at the start of the last two steps (CPU); when a step's loss
+            snap_ = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}   # exceeds F x the median
+            sp_ = spike_st                                                                    # of the last 50, replay
+            if sp_.get("hit") is not None and sp_.get("n_dump", 0) < 2:                       # its batches on the state
+                t_, Sp_, Sc_, bt_ = sp_.pop("hit")                                            # before / after the last
+                tr_ = lambda k: k.endswith("wpacked") or k.endswith("bpacked")               # step's update, mixing
+                mix = {"before": Sp_, "after": Sc_,                                           # trits and floats
+                       "trits after, floats before": {k: (Sc_[k] if tr_(k) else Sp_[k]) for k in Sp_},
+                       "trits before, floats after": {k: (Sp_[k] if tr_(k) else Sc_[k]) for k in Sp_}}
+                model.eval(); STATE.updates_enabled = False; res_ = {}
+                with torch.no_grad():
+                    for nm_, sd_ in mix.items():
+                        model.load_state_dict(sd_, strict=True)
+                        ls_ = []
+                        for xb_, yb_ in bt_:
+                            with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
+                                ls_.append(float(model(xb_.to(device), yb_.to(device))[1]))
+                        res_[nm_] = float(np.mean(ls_))
+                    model.load_state_dict(snap_, strict=True)
+                model.train()
+                ntr_ = {k: int((Sp_[k] != Sc_[k]).sum()) for k in Sp_ if tr_(k)}
+                nfl_ = {k: float((Sp_[k].float() - Sc_[k].float()).norm() / Sp_[k].float().norm().clamp_min(1e-30))
+                        for k in Sp_ if not tr_(k) and Sp_[k].is_floating_point()}
+                print(f"spike_dump step {t_}: batch loss on the state before / after step {t_ - 1}'s update and mixed: "
+                      + ", ".join(f"{k} {v:.4f}" for k, v in res_.items()), flush=True)
+                print("  packed bytes changed, largest: " + ", ".join(f"{k} {v}" for k, v in
+                      sorted(ntr_.items(), key=lambda kv: -kv[1])[:8]), flush=True)
+                print("  float tensors, largest relative change: " + ", ".join(f"{k} {v:.2e}" for k, v in
+                      sorted(nfl_.items(), key=lambda kv: -kv[1])[:8]), flush=True)
+                torch.save({"step": t_, "before": Sp_, "after": Sc_, "batches": bt_, "losses": res_},
+                           os.path.join(tc.out_dir, f"spike_{t_}.pt"))
+                sp_["n_dump"] = sp_.get("n_dump", 0) + 1
+            sp_["prev"], sp_["cur"] = sp_.get("cur"), snap_
+            sp_["bt_prev"], sp_["bt"] = sp_.get("bt"), []
         STATE.updates_enabled = True
         STATE.grad_scale = tc.grad_accum
         tail_opt.zero_grad(set_to_none=True)
@@ -4070,12 +4109,23 @@ def main():
                 model.kd_logp = F.log_softmax(tz_.float(), -1).to(torch.bfloat16).reshape(-1, tz_.shape[-1]); del tz_
             with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
                 _, loss = model(x, y)
-            (loss / tc.grad_accum).backward()  # triggers BitLinear fused updates
+            if args.spike_dump:
+                spike_st["bt"].append((x.detach().cpu(), y.detach().cpu()))
+            sc_ = float(args.spike_test.split(":")[1]) if args.spike_test and step == int(args.spike_test.split(":")[0]) else 1.0
+            (loss * sc_ / tc.grad_accum).backward()  # triggers BitLinear fused updates (--spike_test S:F: x F at step S)
             model.kd_logp = None
             if args.tern_emb and args.mode != "master":   # the ternary embedding's TTF update (both of its gradients)
                 from .tern_emb import tern_emb_step
                 tern_emb_step(model, lr_state, ts_cfg, ts_layer)
             last_loss = loss.item()
+        if args.spike_dump:   # this step's mean loss against the median of the last 50 steps
+            hl_ = spike_st.setdefault("hist", [])
+            lm_ = float(last_loss)
+            if len(hl_) >= 20 and lm_ > args.spike_dump * float(np.median(hl_[-50:])) and spike_st.get("prev") is not None:
+                spike_st["hit"] = (step, spike_st["prev"], spike_st["cur"], spike_st["bt"])
+                print(f"spike_dump: step {step} loss {lm_:.3f} vs median {np.median(hl_[-50:]):.3f}; replaying next step",
+                      flush=True)
+            hl_.append(lm_)
         if args.mode in ("kernel", "evidence") and tc.grad_accum > 1:
             flip_accumulated(model)
         if TIME:
