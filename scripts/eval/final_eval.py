@@ -80,6 +80,12 @@ def load_model(path, device, mag_kind="add"):
         for m in model.modules():
             if isinstance(m, (KernelTernaryLinear, MasterTernaryLinear)):
                 m.enable_lowrank_mag(mag_kind, r)
+    tmags = [k for k in sd if k.endswith("mag_At.col_scale")]      # --lowrank_mag taddw:R (trits, rank 20 R)
+    if tmags:
+        r = sd[tmags[0]].shape[0] // 20
+        for m in model.modules():
+            if isinstance(m, KernelTernaryLinear):
+                m.enable_lowrank_mag("taddw", r)
     model.load_state_dict(sd, strict=True)
     model.eval()
     return model, ck

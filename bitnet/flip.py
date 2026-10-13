@@ -664,6 +664,15 @@ class KernelTernaryLinear(nn.Module):
         T x + sum_k a_k o T (b_k o x) with r extra ternary GEMMs. r (N + K) floats."""
         dev = self.wpacked.device
         self.mag_kind = kind
+        if kind == "taddw":   # the 'add' adapter in trits with the bytes of fp32 (rank 20 r: 1.6 bits vs 32 per entry):
+            from .tern_emb import TernEmbed     # A_t [N, 20r], B_t [K, 20r], each s0 r c T, trained by TTF like the
+            R = 20 * r                          # ternary embedding; A_t's row scales start at 0 (layer unchanged)
+            self.mag_At = TernEmbed(self.N, R, "kernel", std=1.0).to(dev)
+            self.mag_Bt = TernEmbed(self.K, R, "kernel", std=(1.0 / self.K) ** 0.5).to(dev)
+            self.mag_At.row_scale.data.zero_()
+            n_ = KernelTernaryLinear._taddw_n = getattr(KernelTernaryLinear, "_taddw_n", 0) + 1
+            self.mag_At._ts_idx, self.mag_Bt._ts_idx = 20_000 + 2 * n_, 20_001 + 2 * n_   # TTF seeds, distinct per matrix
+            return [self.mag_At.row_scale, self.mag_At.col_scale, self.mag_Bt.row_scale, self.mag_Bt.col_scale]
         self.mag_A = nn.Parameter(torch.zeros(self.N, r, device=dev))
         std = (1.0 / self.K) ** 0.5 if kind == "add" else 1.0
         self.mag_B = nn.Parameter(torch.randn(self.K, r, device=dev) * std)
@@ -678,6 +687,8 @@ class KernelTernaryLinear(nn.Module):
         y = _KernelTernFn.apply(x, self.wpacked, self)
         if getattr(self, "bpacked", None) is not None:      # --ts_boost: W = T + s B
             y = y + self.boost_s.to(y.dtype) * _TernBoostFn.apply(x, self.bpacked, self)
+        if getattr(self, "mag_At", None) is not None:      # --lowrank_mag taddw:R
+            y = y + (x @ self.mag_Bt._compute().to(x.dtype)) @ self.mag_At._compute().to(y.dtype).T
         if getattr(self, "mag_A", None) is not None:
             A, B = self.mag_A.to(y.dtype), self.mag_B.to(x.dtype)
             if self.mag_kind == "add":

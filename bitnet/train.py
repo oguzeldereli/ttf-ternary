@@ -1044,9 +1044,20 @@ def ts_layer(l, g, state, c):
     w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
     d = A.sign()
     th = theta
-    if c.get("theta_noise"):   # --ts_theta_noise K: the layer's bar is K x a slow average (~100 steps) of its accumulator's
-        r_ = float(A.pow(2).mean().sqrt())      # rms, never below theta: set by the layer's own evidence spread, not a
-        e_ = st.get(("arms", key))              # constant chosen for training from scratch
+    if c.get("theta_noise") and c.get("theta_noise_win"):   # --ts_theta_noise_win N: the bar is measured ONCE: for the
+        fb = st.get(("thfix", key))                           # layer's first N active steps the evidence is only kept
+        if fb is None:                                        # (nothing fires), then bar = max(theta, K x rms(A)), fixed
+            n_ = st.get(("nwin", key), 0) + 1; st[("nwin", key)] = n_
+            if n_ < int(c["theta_noise_win"]):
+                th = 1e30
+            else:
+                fb = max(theta, c["theta_noise"] * float(A.pow(2).mean().sqrt())); st[("thfix", key)] = fb
+        if fb is not None:
+            th = fb
+            _ts_rec(st, "theta_eff", th); _ts_recmax(st, "theta_eff", th)
+    elif c.get("theta_noise"):   # --ts_theta_noise K: the layer's bar is K x a slow average (~100 steps) of its accumulator's
+        r_ = float(A.pow(2).mean().sqrt())      # rms, never below theta. Runs away from scratch (13 Oct): A keeps what the
+        e_ = st.get(("arms", key))              # moves did not spend, so a higher bar raises rms(A) and the bar again
         e_ = r_ if e_ is None else 0.99 * e_ + 0.01 * r_
         st[("arms", key)] = e_
         th = max(theta, c["theta_noise"] * e_)
@@ -2938,6 +2949,7 @@ def main():
                     "clears B before the trit moves (bitnet/flip.py enable_boost)")
     ap.add_argument("--ts_theta_noise", type=float, default=0.0, help="--ts: per layer, the fire bar is K x a ~100-step average of "
                     "the accumulator's rms (never below --ts_theta): a threshold set by the layer's own evidence spread")
+    ap.add_argument("--ts_theta_noise_win", type=int, default=0, help="--ts_theta_noise: measure the bar once instead: each layer keeps evidence without firing for its first N active steps, then bar = max(theta, K x rms(A)), fixed")
     ap.add_argument("--ts_urms", type=float, default=0.0, help="--ts: scale each layer's step u down so its rms is at most D "
                     "(units of the lr ratio; Adafactor's update clipping): a gradient spike against a lagging v fires no burst")
     ap.add_argument("--ts_uclip", type=float, default=0.0, help="--ts: clip each entry of the step u at C (units of the lr "
@@ -3770,7 +3782,7 @@ def main():
         if blob.get("beta", False) != use_beta:
             raise SystemExit(f"checkpoint beta={blob.get('beta', False)} but run beta="
                              f"{use_beta}: forward differs, refusing to resume")
-        if args.lowrank_mag and any(k.endswith("mag_A") for k in blob["model"]):
+        if args.lowrank_mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):
             enable_mag(int(blob.get("step", 0)) + 1)
         new_rc = args.rc_scale and not any(k.endswith("row_scale") for k in blob["model"])
         if new_rc:
@@ -3979,7 +3991,7 @@ def main():
             ts_cfg["lr_ratio"] = _ts_scale(args, step, tc, lr)   # --ts_anneal_floor F
             ts_cfg["progress"] = step / max(1, tc.max_steps)
             ts_cfg["step"] = step; ts_cfg["start"] = args.ts_start; ts_cfg["vdiag"] = args.ts_vdiag
-            ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar; ts_cfg["urms"] = args.ts_urms; ts_cfg["theta_noise"] = args.ts_theta_noise; ts_cfg["boost"] = args.ts_boost; ts_cfg["resid_sparse"] = args.ts_resid_sparse; ts_cfg["resid_steps"] = args.ts_resid_steps
+            ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar; ts_cfg["urms"] = args.ts_urms; ts_cfg["theta_noise"] = args.ts_theta_noise; ts_cfg["theta_noise_win"] = args.ts_theta_noise_win; ts_cfg["boost"] = args.ts_boost; ts_cfg["resid_sparse"] = args.ts_resid_sparse; ts_cfg["resid_steps"] = args.ts_resid_steps
             ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
