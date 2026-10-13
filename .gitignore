@@ -20,3 +20,4 @@ __pycache__/
 # paper build output
 docs/paper/build/
 docs/paper/ttf_paper.pdf
+models/
