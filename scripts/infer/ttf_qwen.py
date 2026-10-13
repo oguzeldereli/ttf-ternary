@@ -17,6 +17,10 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from bitnet.kernel import tern_gemm_i8, trit_beta                    # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ttf_kernels import act_quant_planes, tern_gemv_planes, tern_gemv2, repack_2bit   # noqa: E402
+DECODE_M = 4
+TWO_BIT = os.environ.get("TTF_TWO_BIT", "1") == "1"   # 2-bit layout + dp4a (faster, +25% trit memory)
 
 _KEEP_FLOAT = ("in_proj_a", "in_proj_b")
 
@@ -38,11 +42,30 @@ class PackedTLinear(nn.Module):
         if self.beta is None:
             self.beta = float(trit_beta(self.wpacked, self.K))
         shp = x.shape
-        x = x.reshape(-1, self.K) * self.col_scale.to(x.dtype)
-        amax = x.abs().amax(-1, keepdim=True).clamp_min(1e-5).float()
-        s = amax / 127.0
-        q = (x.float() / s).round().clamp_(-128, 127).to(torch.int8)
-        y = tern_gemm_i8(q, s.squeeze(-1), self.wpacked, self.K, self.beta)             # bf16 [M, N]
+        x2 = x.reshape(-1, self.K)
+        if getattr(self, "w2", None) is not None:      # 2-bit layout (repacked at load): dp4a GEMV / per-layer expand
+            xc = x2 * self.col_scale.to(x2.dtype)
+            s = xc.abs().amax(-1, keepdim=True).clamp_min(1e-5).float() / 127.0
+            q = (xc.float() / s).round().clamp_(-128, 127).to(torch.int8)
+            if x2.shape[0] <= DECODE_M:
+                acc = tern_gemv2(q, self.w2).float()
+            else:
+                sh = torch.tensor([0, 2, 4, 6], device=x.device, dtype=torch.uint8)
+                Wt = ((self.w2[:, :, None] >> sh) & 3).reshape(self.N, -1)[:, :self.K].to(torch.bfloat16) - 1
+                acc = (q.to(torch.bfloat16) @ Wt.t()).float()
+                del Wt
+            y = (acc * (s * self.beta)).to(torch.bfloat16) + (xc.to(torch.bfloat16) @ self.mag_B) @ self.mag_A.t()
+            return (y * self.row_scale.to(y.dtype)).view(*shp[:-1], self.N)
+        if x2.shape[0] <= DECODE_M:     # decode: fused quantisation + a GEMV that reads the packed trits once
+            xp, sc = act_quant_planes(x2.contiguous(), self.col_scale, self.wpacked.shape[1])
+            y = (tern_gemv_planes(xp, self.wpacked).float() * (sc[:, None] * self.beta)).to(torch.bfloat16)
+            x = x2 * self.col_scale.to(x2.dtype)
+        else:
+            x = x2 * self.col_scale.to(x.dtype)
+            amax = x.abs().amax(-1, keepdim=True).clamp_min(1e-5).float()
+            s = amax / 127.0
+            q = (x.float() / s).round().clamp_(-128, 127).to(torch.int8)
+            y = tern_gemm_i8(q, s.squeeze(-1), self.wpacked, self.K, self.beta)         # bf16 [M, N]
         y = y + (x.to(torch.bfloat16) @ self.mag_B) @ self.mag_A.t()
         y = y * self.row_scale.to(y.dtype)
         return y.view(*shp[:-1], self.N)
@@ -55,8 +78,9 @@ class CPUEmbedding(nn.Module):
         super().__init__()
         self.weight_cpu, self.dev = weight, dev
 
+    @torch.compiler.disable             # a host lookup: kept out of the compiled / CUDA-graph region
     def forward(self, ids):
-        return self.weight_cpu[ids.cpu()].to(self.dev, non_blocking=True)
+        return self.weight_cpu[ids.cpu()].to(self.dev)
 
 
 def build(model_dir, weights, dev, emb_cpu):
@@ -76,9 +100,8 @@ def build(model_dir, weights, dev, emb_cpu):
     emb_shape = tuple(hf.model.embed_tokens.weight.shape)
     if emb_cpu:
         hf.model.embed_tokens = nn.Identity()
+    hf = hf.to(torch.bfloat16)            # still on meta: free; to_empty then allocates bf16 directly (no fp32 copy)
     hf = hf.to_empty(device=dev)
-    for p in hf.parameters():
-        p.data = p.data.to(torch.bfloat16)
     for (name, cname), (i, o) in shapes.items():
         mod = hf.model.layers.get_submodule(name) if name else hf.model.layers
         setattr(mod, cname, PackedTLinear(i, o).to(dev))
@@ -95,6 +118,21 @@ def build(model_dir, weights, dev, emb_cpu):
     for k, v in own.items():
         if k in sd:
             v.copy_(sd[k].to(v.dtype))
+    del own, sd                         # the state dict holds the unpadded buffers: release them first
+    torch.cuda.empty_cache()
+    for mod in hf.modules():            # rows padded to 16 bytes (aligned, vectorised loads); the padding byte 121
+        if isinstance(mod, PackedTLinear):  # decodes to five zero trits; wpacked stays the logical [N, K5] view
+            N_, K5_ = mod.wpacked.shape
+            K5p = (K5_ + 15) // 16 * 16
+            if K5p != K5_:
+                buf = torch.full((N_, K5p), 121, dtype=torch.uint8, device=dev)
+                buf[:, :K5_] = mod.wpacked
+                mod.wpacked = buf[:, :K5_]
+            mod.beta = float(trit_beta(mod.wpacked, mod.K))   # at load: no host sync inside a CUDA graph
+            if TWO_BIT:                     # 2-bit layout for the dp4a decode kernel; the base-3 buffer is dropped
+                mod.w2 = repack_2bit(mod.wpacked, mod.K)
+                mod.wpacked = torch.empty(0, dtype=torch.uint8, device=dev)
+                torch.cuda.empty_cache()
     print(f"loaded {weights} in {time.time() - t0:.0f}s; missing {len(missing)} {missing[:4]}, unexpected "
           f"{len(unexpected)} {unexpected[:4]}", file=sys.stderr)
     hf.eval()
