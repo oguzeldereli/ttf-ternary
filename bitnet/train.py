@@ -3832,7 +3832,9 @@ def main():
     start_step = 0
     _touched_origin = {"v": 0}
     if args.resume and os.path.exists(ckpt_path):
-        blob = torch.load(ckpt_path, map_location=device, weights_only=False)
+        # to host memory: every piece is copied to its device below (on the GPU the whole checkpoint would sit next
+        # to the model it is loaded into: the 27B's 10.5 GB did not fit)
+        blob = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
         if blob.get("beta", False) != use_beta:
             raise SystemExit(f"checkpoint beta={blob.get('beta', False)} but run beta="
                              f"{use_beta}: forward differs, refusing to resume")
@@ -3908,6 +3910,8 @@ def main():
                       f"counts only from step {start_step}, NOT since init. The true "
                       f"since-init value is <= the last value logged before this "
                       f"resume (it is monotone non-increasing).", flush=True)
+        del blob
+        torch.cuda.empty_cache()
 
     # save on SIGTERM/SIGINT so `kill` (or Ctrl-C) leaves a fresh resumable ckpt
     import signal
