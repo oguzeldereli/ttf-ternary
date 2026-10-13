@@ -3428,10 +3428,11 @@ def main():
         print(f"--ts_boost {args.ts_boost}: boost planes on {enable_boost(model, args.ts_boost)} ternary layers", flush=True)
     if args.moe:      # --moe E:K[:H]: every feed-forward becomes a mixture of E ternary experts, top-K routing
         from .model import enable_moe
+        from .master import MasterTernaryLinear as _MTL   # main() imports the name locally later on
         _mk = (lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, rate=args.rate, beta=use_beta, int8=args.int8,
                                                   dw_mode=args.dw_mode, int8_dx=args.int8_dx, g_ref=args.g_ref).to(device)) \
             if args.mode == "kernel" else \
-            (lambda i_, o_: MasterTernaryLinear(i_, o_, mc.act_bits, dtype=torch.float32 if args.master_dtype == "fp32"
+            (lambda i_, o_: _MTL(i_, o_, mc.act_bits, dtype=torch.float32 if args.master_dtype == "fp32"
                                                 else torch.bfloat16).to(device)) if args.mode == "master" else \
             (lambda i_, o_: nn.Linear(i_, o_, bias=False).to(device))   # master: ternary experts with latents, as its layers
         E_, k_, H_ = enable_moe(model, args.moe, _mk)
