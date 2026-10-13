@@ -36,8 +36,11 @@ def model_config(path, max_seq_len=2048):
     """our ModelConfig with the text decoder's sizes (for the trainer's report and bookkeeping only)"""
     from .config import ModelConfig
     t = text_config(path)
+    nh = t.num_attention_heads        # Qwen3.8-27B: 24 heads x head_dim 256 != hidden 5120, which ModelConfig rejects;
+    if t.hidden_size % nh:            # its heads are unused here (transformers' attention runs), so report the KV heads
+        nh = t.num_key_value_heads
     return ModelConfig(vocab_size=t.vocab_size, dim=t.hidden_size, n_layers=t.num_hidden_layers,
-                       n_heads=t.num_attention_heads, n_kv_heads=t.num_key_value_heads,
+                       n_heads=nh, n_kv_heads=t.num_key_value_heads,
                        hidden_dim=t.intermediate_size, max_seq_len=max_seq_len,
                        tie_embeddings=bool(getattr(t, "tie_word_embeddings", False)))
 
