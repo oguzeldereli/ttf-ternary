@@ -19,8 +19,10 @@ ap.add_argument("hf_dir"); ap.add_argument("--data", required=True); ap.add_argu
 ap.add_argument("--n", type=int, default=32); ap.add_argument("--seq", type=int, default=2048)
 ap.add_argument("--methods", default="als,gptq"); ap.add_argument("--calib", type=int, default=64)
 ap.add_argument("--skip_hf", action="store_true")
+ap.add_argument("--device", default="cuda", help="cpu: the full-precision reference of a model too big for the GPU")
+ap.add_argument("--hf_only", action="store_true", help="only the reference (transformers' own model)")
 a = ap.parse_args()
-dev = "cuda"
+dev = a.device
 data = np.memmap(a.data, dtype=np.uint32, mode="r")
 
 
@@ -29,8 +31,9 @@ def windows_loss(fwd):
     ls = []
     for i in range(a.n):
         x = torch.tensor(data[i * a.seq:(i + 1) * a.seq + 1].astype(np.int64), device=dev)[None]
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type="cuda" if dev == "cuda" else "cpu", dtype=torch.bfloat16):
             ls.append(float(fwd(x[:, :-1], x[:, 1:])))
+        print(f"  window {i + 1}/{a.n}: {ls[-1]:.4f}", flush=True)
     return sum(ls) / len(ls)
 
 
@@ -41,6 +44,8 @@ if not a.skip_hf:
     L = windows_loss(lambda x, y: F.cross_entropy(m(input_ids=x).logits[0].float(), y[0]))
     print(f"hf          loss {L:.4f}  ({a.n} x {a.seq}, {time.time() - t:.0f}s)", flush=True)
     del m; torch.cuda.empty_cache()
+if a.hf_only:
+    sys.exit()
 
 m, sw = build_qwen(a.hf_dir, "fp32", grad_checkpoint=False, device=dev)
 load_qwen(m, a.hf_dir, sw)
