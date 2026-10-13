@@ -277,9 +277,8 @@ def _(ids, key, dim):
 
 
 # ---- 2-bit GEMV with the TTF epilogue fused: y = (beta s (q . t) + A[n] . r) * rowscale, fp32 accumulate --------------
-@triton.autotune(configs=[triton.Config({"BN": bn, "BW": bw, "SPLIT": sp}, num_warps=w, num_stages=st)
-                          for bn in (16, 32, 64) for bw in (32, 64, 128) for w in (4, 8) for sp in (1, 2, 4)
-                          for st in (2, 3)],
+@triton.autotune(configs=[triton.Config({"BN": bn, "BW": bw, "SPLIT": sp}, num_warps=4)
+                          for bn in (16, 32) for bw in (64, 128) for sp in (1, 2, 4)],
                  key=["N", "KW"], reset_to_zero=["y_ptr"])
 @triton.jit
 def _gemv2_epi_kernel(xq_ptr, w_ptr, y_ptr, s_ptr, sumx_ptr, r_ptr, a_ptr, rs_ptr, beta, N, KW, M, R,

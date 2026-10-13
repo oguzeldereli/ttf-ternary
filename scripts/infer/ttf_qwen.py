@@ -7,7 +7,7 @@ with trits T packed 5 per byte, computed by an int8 x packed-trit GEMM (Triton, 
 (Gated DeltaNet, gated attention, norms, embedding, head) is transformers' own Qwen3.5 code. Needs transformers >= 5.19
 and flash-linear-attention.
 
-  python ttf_qwen.py MODEL_DIR WEIGHTS.pt [-p "prompt"] [-i] [--chat] [-n 256] [--temp 0.7] [--emb_cpu]
+  python ttf_qwen.py MODEL_DIR WEIGHTS.pt [-p "prompt"] [-i] [--chat] [-n 256] [--temp 0.7]
 MODEL_DIR holds config.json and the tokenizer files; WEIGHTS.pt the trainer's model state (scripts: slim27.py).
 """
 import argparse, os, sys, time, math
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ttf_kernels import act_quant_planes, tern_gemv_planes, tern_gemv2, repack_2bit, _UVA_TABLES, _gemv2_epi_kernel   # noqa: E402
 import triton                                                          # noqa: E402
 import ttf_kernels                                                     # noqa: E402,F401  (registers ttf::uva_embed)
-DECODE_M = 4
+DECODE_M = 16      # up to this many tokens per call: the GEMV path (prefill of short prompts too)
 TWO_BIT = os.environ.get("TTF_TWO_BIT", "1") == "1"   # 2-bit layout + dp4a (faster, +25% trit memory)
 
 _KEEP_FLOAT = ("in_proj_a", "in_proj_b")
@@ -175,7 +175,8 @@ def build(model_dir, weights, dev, emb_cpu):
     return hf, t
 
 
-def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len=4096, on_tokens=None, every=8):
+def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len=4096, on_tokens=None, every=8,
+                  eos_set=None):
     """decode with a static cache and a compiled (CUDA-graph) forward; the next token stays on the GPU, the host syncs
     every `every` tokens (to stream them and check for eos). Greedy for temp 0, else temperature / top-k / top-p."""
     from transformers import StaticCache
@@ -189,6 +190,7 @@ def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len
     else:
         cache.reset()
     L = ids.shape[1]
+    _t0 = time.time()
     with torch.no_grad():
         logits = hf(input_ids=ids, past_key_values=cache, cache_position=torch.arange(L, device=dev),
                     use_cache=True).logits[:, -1].float()
@@ -210,13 +212,17 @@ def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len
         out, pend = [], []
         tok = pick(logits)
         pos = torch.tensor([L], device=dev)
+        if on_tokens is None and os.environ.get("TTF_TIMING"):
+            torch.cuda.synchronize(); print(f"  prefill {L} tokens: {time.time() - _t0:.2f}s", flush=True)
         for i in range(n):
             pend.append(tok)
             if len(pend) == every or i == n - 1:
                 got = torch.cat(pend, 1)[0].tolist(); pend = []
-                stop = eos is not None and eos in got
+                stops = (eos_set or set()) | ({eos} if eos is not None else set())
+                hit = [k for k, g in enumerate(got) if g in stops]
+                stop = bool(hit)
                 if stop:
-                    got = got[:got.index(eos)]
+                    got = got[:hit[0]]
                 out += got
                 if on_tokens:
                     on_tokens(got)
@@ -239,12 +245,15 @@ def main():
     ap.add_argument("-n", type=int, default=256); ap.add_argument("--temp", type=float, default=0.7)
     ap.add_argument("--top_p", type=float, default=0.9); ap.add_argument("--top_k", type=int, default=20)
     ap.add_argument("--rep", type=float, default=1.05, help="repetition penalty")
-    ap.add_argument("--emb_cpu", action="store_true", help="keep the input embedding in host memory (saves 2.4 GiB)")
+    ap.add_argument("--emb_gpu", action="store_true", help="keep the input embedding on the GPU (default: pinned host "
+                    "memory read by the GPU, exact and 2.4 GiB smaller)")
+    ap.add_argument("--slow", action="store_true", help="transformers' generate instead of the compiled decode loop")
+    ap.add_argument("--ctx", type=int, default=4096, help="static cache length (prompt + new tokens)")
     ap.add_argument("--ppl", default="", help="uint32 token file: mean loss on the first --n_win windows of 2048")
     ap.add_argument("--n_win", type=int, default=8)
     a = ap.parse_args()
     dev = "cuda"
-    hf, t = build(a.model_dir, a.weights, dev, a.emb_cpu)
+    hf, t = build(a.model_dir, a.weights, dev, not a.emb_gpu)
     print(f"GPU memory {torch.cuda.memory_allocated() / 2**30:.2f} GiB after loading", file=sys.stderr)
     if a.ppl:
         import numpy as np, torch.nn.functional as F
@@ -275,12 +284,24 @@ def main():
             print(q, end="", flush=True)
         ids = tok(text, return_tensors="pt").input_ids.to(dev)
         t1 = time.time()
-        with torch.no_grad():
-            out = hf.generate(ids, max_new_tokens=a.n, do_sample=a.temp > 0, temperature=max(a.temp, 1e-5),
-                              top_p=a.top_p, top_k=a.top_k, repetition_penalty=a.rep, streamer=streamer,
-                              pad_token_id=tok.eos_token_id)
-        n = out.shape[1] - ids.shape[1]
-        print(f"[{ids.shape[1]} prompt + {n} new tokens, {n / (time.time() - t1):.2f} tok/s, peak "
+        if a.slow:
+            with torch.no_grad():
+                out = hf.generate(ids, max_new_tokens=a.n, do_sample=a.temp > 0, temperature=max(a.temp, 1e-5),
+                                  top_p=a.top_p, top_k=a.top_k, repetition_penalty=a.rep, streamer=streamer,
+                                  pad_token_id=tok.eos_token_id)
+            n = out.shape[1] - ids.shape[1]
+        else:
+            shown = {"ids": [], "txt": ""}
+
+            def emit(got):
+                shown["ids"] += got
+                txt = tok.decode(shown["ids"], skip_special_tokens=True)
+                sys.stdout.write(txt[len(shown["txt"]):]); sys.stdout.flush(); shown["txt"] = txt
+            eos = [tok.eos_token_id] + [tok.convert_tokens_to_ids(x) for x in ("<|im_end|>", "<|endoftext|>")]
+            out = fast_generate(hf, t, ids, a.n, temp=a.temp, top_p=a.top_p, top_k=a.top_k, eos=None,
+                                max_len=a.ctx, on_tokens=emit, eos_set=set(e for e in eos if e is not None))
+            n = len(out); print()
+        print(f"[{ids.shape[1]} prompt + {n} new tokens, {n / (time.time() - t1):.2f} tok/s incl. prefill, peak "
               f"{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB]", file=sys.stderr)
 
     if a.prompt:
