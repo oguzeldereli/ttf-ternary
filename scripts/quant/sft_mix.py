@@ -25,12 +25,12 @@ def _files(repo, prefix):
     return sorted(f for f in list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet") and prefix in f)
 
 
-def nemotron_rows(split, rng, max_files):
+def nemotron_rows(split, rng, max_files, skip_files=0):
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
     fs = _files(NEMO, f"data/{SPLIT_FILES[split]}-")
     rng.shuffle(fs)
-    for f in fs[:max_files]:
+    for f in fs[skip_files:skip_files + max_files]:     # --skip_files: held-out files for validation
         t = pq.read_table(hf_hub_download(NEMO, f, repo_type="dataset"), columns=["reasoning", "messages", "metadata"])
         rows = t.to_pylist()
         rng.shuffle(rows)
@@ -103,7 +103,7 @@ def build(a):
         name, budget = parts[0], float(parts[-1])
         rng = random.Random(a.seed)
         if name == "nemotron":
-            it, tag = nemotron_rows(parts[1], rng, a.max_files), parts[1]
+            it, tag = nemotron_rows(parts[1], rng, a.max_files, a.skip_files), parts[1]
         elif name == "hermes":
             it, tag = hermes_rows(rng), "hermes"
         elif name == "toolace":
@@ -164,7 +164,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build"); b.add_argument("model_dir"); b.add_argument("out")
     b.add_argument("--source", nargs="+", required=True); b.add_argument("--seed", type=int, default=0)
-    b.add_argument("--max_files", type=int, default=2); b.add_argument("--max_len", type=int, default=32768)
+    b.add_argument("--max_files", type=int, default=2); b.add_argument("--skip_files", type=int, default=0); b.add_argument("--max_len", type=int, default=32768)
     b.add_argument("--show", type=int, default=0)
     m = sub.add_parser("mix"); m.add_argument("out_bin"); m.add_argument("total"); m.add_argument("parts", nargs="+")
     m.add_argument("--seed", type=int, default=0)

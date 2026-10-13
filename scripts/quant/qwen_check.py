@@ -4,8 +4,12 @@ stream for
   fp        our wrapper with every linear in float (must match hf)
   kernel:M  the trits and scales of method M (als, gptq), the run's forward (beta, row / column scales, int8 activations)
     python scripts/quant/qwen_check.py HF_DIR --data data/wikiqw_val.bin [--n 32] [--seq 2048] [--methods als,gptq]
+  --q8: the reference with every weight matrix (embedding and head too) rounded as llama.cpp's Q8_0 does (blocks of
+  32 along the input dimension, scale = absmax / 127, int8 codes), for the "close to 8-bit" comparison
 """
 import argparse, os, sys, time
+if "cpu" in sys.argv:      # fla's Gated DeltaNet kernels are Triton (GPU only): hide fla so transformers uses its
+    sys.modules["fla"] = None   # pure-PyTorch path (before transformers checks for it)
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -21,6 +25,7 @@ ap.add_argument("--methods", default="als,gptq"); ap.add_argument("--calib", typ
 ap.add_argument("--skip_hf", action="store_true")
 ap.add_argument("--device", default="cuda", help="cpu: the full-precision reference of a model too big for the GPU")
 ap.add_argument("--hf_only", action="store_true", help="only the reference (transformers' own model)")
+ap.add_argument("--q8", action="store_true", help="the reference with Q8_0-rounded weight matrices")
 a = ap.parse_args()
 dev = a.device
 data = np.memmap(a.data, dtype=np.uint32, mode="r")
@@ -41,8 +46,19 @@ if not a.skip_hf:
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     t = time.time()
     m = Qwen3_5ForCausalLM.from_pretrained(a.hf_dir, dtype=torch.bfloat16).to(dev).eval()
+    if a.q8:
+        with torch.no_grad():
+            nq = 0
+            for name, p_ in m.named_parameters():
+                if p_.dim() == 2 and p_.shape[1] % 32 == 0 and p_.numel() >= 1 << 16:
+                    for r0 in range(0, p_.shape[0], 4096):          # in row chunks: no fp32 copy of a whole matrix
+                        w = p_[r0:r0 + 4096].float().view(-1, p_.shape[1] // 32, 32)
+                        sc = w.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127
+                        p_[r0:r0 + 4096] = ((w / sc).round().clamp_(-127, 127) * sc).view(-1, p_.shape[1]).to(p_.dtype)
+                    nq += 1
+            print(f"Q8_0: {nq} weight matrices rounded", flush=True)
     L = windows_loss(lambda x, y: F.cross_entropy(m(input_ids=x).logits[0].float(), y[0]))
-    print(f"hf          loss {L:.4f}  ({a.n} x {a.seq}, {time.time() - t:.0f}s)", flush=True)
+    print(f"hf{'-q8' if a.q8 else ''}          loss {L:.4f}  ({a.n} x {a.seq} of {a.data}, {time.time() - t:.0f}s)", flush=True)
     del m; torch.cuda.empty_cache()
 if a.hf_only:
     sys.exit()
