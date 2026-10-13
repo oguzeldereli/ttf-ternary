@@ -116,11 +116,14 @@ def _ce_chunk(h, w, tgt):
 def _kd_topk_chunk(h, w, tgt, ids, tlp, a):
     """cross-entropy to the teacher's top-k distribution (renormalised over its k tokens; the gradient of the KL to it),
     mixed with next-token cross-entropy: (1 - a) CE + a KD, summed over tokens"""
-    lp = F.log_softmax(F.linear(h, w).float(), -1)
-    kd = -(torch.softmax(tlp.float(), -1) * lp.gather(1, ids)).sum()
+    z = F.linear(h, w).float()
+    lse = torch.logsumexp(z, -1, keepdim=True)        # no full log-softmax: the k gathered logits minus the logsumexp
+    kd = -(torch.softmax(tlp.float(), -1) * (z.gather(1, ids) - lse)).sum()
     if a >= 1.0:
         return kd
-    return (1 - a) * F.nll_loss(lp, tgt, ignore_index=-1, reduction="sum") + a * kd
+    ok = tgt != -1
+    ce = -(z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0][ok].sum()
+    return (1 - a) * ce + a * kd
 
 
 def _swap_linears(hf_model, make_linear):
