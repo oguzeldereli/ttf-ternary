@@ -291,19 +291,27 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model_dir)
     streamer = TextStreamer(tok, skip_prompt=True, skip_special_tokens=True)
 
+    hist = []                       # --chat: the conversation so far (user / assistant turns), /reset clears it
+
     def gen(q):
         if a.chat:
+            hist.append({"role": "user", "content": q})
             kw = {} if a.think else {"enable_thinking": False}
             try:
-                text = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False,
+                text = tok.apply_chat_template(hist, tokenize=False,
                                                add_generation_prompt=True, **kw)
             except TypeError:
-                text = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False,
+                text = tok.apply_chat_template(hist, tokenize=False,
                                                add_generation_prompt=True)
         else:
             text = q
             print(q, end="", flush=True)
         ids = tok(text, return_tensors="pt").input_ids.to(dev)
+        while a.chat and len(hist) > 1 and ids.shape[1] + a.n > a.ctx:    # drop the oldest turns to fit the cache
+            del hist[:2]
+            text = tok.apply_chat_template(hist, tokenize=False, add_generation_prompt=True,
+                                           **({} if a.think else {"enable_thinking": False}))
+            ids = tok(text, return_tensors="pt").input_ids.to(dev)
         t1 = time.time()
         if a.slow:
             with torch.no_grad():
@@ -322,6 +330,8 @@ def main():
             out = fast_generate(hf, t, ids, a.n, temp=a.temp, top_p=a.top_p, top_k=a.top_k, eos=None,
                                 max_len=a.ctx, on_tokens=emit, eos_set=set(e for e in eos if e is not None))
             n = len(out); print()
+            if a.chat:
+                hist.append({"role": "assistant", "content": shown["txt"]})
             pf = hf._ttf_prefill_s
             print(f"[prefill {ids.shape[1]} tokens {pf:.2f}s; decode {n} tokens {n / (time.time() - t1 - pf):.2f} tok/s]",
                   file=sys.stderr)
@@ -339,6 +349,8 @@ def main():
                 break
             if not q.strip():
                 break
+            if q.strip() == "/reset":
+                hist.clear(); print("(conversation cleared)", file=sys.stderr); continue
             gen(q)
 
 
