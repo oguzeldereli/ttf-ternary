@@ -14,6 +14,33 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 "3 Oct 04:45").
 
 
+## 7-13 Oct: rank scaling, squeeze, embeddings, conversion, 27B (details: QUEUE.md 12-13 Oct, paper Appendix "Index")
+
+| run(s) | what | result |
+|---|---|---|
+| `b340_t75_r{64,128,256,512,1024}`, `x1b_t75_r{128,256}`, `x1b_t75_full`, `x1b_nomom1024_lr15` | rank sweeps, final recipe | fixed Wikipedia 340M 2.8142 / 2.7175 / 2.6246 / 2.5563 / 2.5167 (master + extras 2.5878); 1.3B 2.6464 / 2.5654 / 2.5012 / 2.4742 / full 2.4289 (master 2.4796) |
+| `x1b_nomom1024_lr15_seed2`, `x1b_mx_extras_lr50_seed2` | 1.3B second seeds | TTF 2.4656 / 3.4031, master 2.4807 / 3.4374: two-seed lead -0.010 / -0.027 |
+| `sw704_t75_s3052`, `sw512_t75_xs_s3052`, `b340_r{512,896,full}_s3052` | full-rank bonus, 1/3 length | 110M 704 3.0128 (512 3.0339, full 3.0107), 512 + exact spend 3.0321; 340M 2.9215 / 2.8869 / 2.8787: on the log-rank line |
+| `sw768_b64`, `sw256_b64`, `sw64_b64` | batch 64, same tokens | fixed 64 / 256: 3.1527 / 2.9542: 0.099 per halving (batch 16 0.103) |
+| `rspec`, `b340_spec512` + `rspec340` (uaru) | rank spectra 110M / 340M / 1.3B / 2.9B | 0.15-0.17 of a step's energy per halving at every width; persistent signal matched at rank ~ d^0.5-0.65 |
+| `sw{64,128}_t75_s3052_th{8,12}` | lower theta at low rank | r64 theta 16 / 12 / 8: 3.2805 / 3.3593 / 3.6606; r128 3.1833 / 3.2338 / 3.4986 |
+| `sq128_all`, `sq128_rsparse`, `sq128_xs_lr3` | squeeze at rank 128 | 3.1310 / 3.1750 / 3.1354 vs 3.1833 (rank 256 3.0992) |
+| `sq128_vbar1` | cost-aware bar from scratch | 3.2008 (+0.018) |
+| `sq128_thn4`, `sw128_thnw_s3052` | noise-set bar every step / once | 3.8206 (runaway) / 3.2522 (+0.069) |
+| `sw512_t75_boost05` | boost plane | fixed 2.6683 / 3.6255 vs 2.6728 / 3.6226 |
+| `sw512_t75_ternwide20` | wide ternary embedding (fp32 bytes) | fixed 2.7265 / 3.6832 |
+| `sw512_t75_alltern` | all-ternary (wide embedding + ternary adapters) | running |
+| `moe8_r128`, `moe8_mx`, `moe8_r320` | MoE 8 x top-2, TTF r128 / master / TTF r320 | 3.1213 (fixed 3.0865) / 3.0111 (fixed 2.9780) / running |
+| `sw512_t75_mul16` (Myriad) | multiplicative adapter, newest recipe | running |
+| `wsd_md_t75`, `wsd_md_mx`, `md_t75b`, `wsd50_t75` | WSD 20% (TTF / master), cosine with move diagnostics, WSD 50% | fixed 2.7081 / 2.6982 / 2.6736; WSD 50% running |
+| `rw_t75_half` | re-warm to half the peak | running |
+| `sn_b1z`, `sn_b1z_ref`, `sn_mreset`, `mx_cliptail` | master snap / beta1 0 / momentum reset / tail clip | 2.7196 / 2.8259 / 2.8066 / 2.7363 |
+| `sw512_t75_micro4` | micro-batches 4 x 4, no momentum, full schedule | fixed 2.6733 / 3.6242 (3.12 GiB) |
+| `tl_*` (16M), `tl50_*` (50M) | TinyLlama conversion | see paper Table "Converting pretrained models"; GPTQ frozen 2.2332, theta 64 2.2296, master 2.5973 |
+| `qw08_gq_frozen`, `qw08_gq_s400_th64` | Qwen3.5-0.8B conversion | 2.8639 / 2.8503 |
+| `tl_gq_cal400` + conv_moves, `tl_gq_th64_r32` | which layers move after a conversion | k / v (full-rank state) take the moves; rank-32 control running |
+| `b27_train`, `b27_lean` (scoter), `qw27_probe` / `qw27_lean` (shoveler) | 26.5B / Qwen3.8-27B memory | 26.5B 17.3 GiB (rank 1024, 70% state on GPU), leanest 9.73 GiB at 19.5 s / step; Qwen 21.2 GiB all state on GPU, 236 s / 32k-token step; full-precision reference 1.9034 (8 windows) |
+
 ## 5-6 Oct: no momentum at scale, step schedules (details in RUNS.md "6 Oct")
 
 | run(s) | what | result |

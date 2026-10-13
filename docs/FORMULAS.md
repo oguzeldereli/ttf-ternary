@@ -86,6 +86,35 @@ rule's. Results (110M, 300M tokens, vs master 2.7513):
 The float extras (row/column scales, rank-16 additive adapter, qk temperature) are in every row; master with the same
 extras (`mx_extras_*`) is the fair reference (running).
 
+## 2c. Later TTF flags (5-13 Oct)
+
+Final recipe (110M): `--ts --ts_nomom --lowrank 512 --ts_rank_s 512 --ts_theta 16 --ts_tau 1000 --ts_anneal 0.75
+--ts_tau_anneal --ts_fused --gemm int8mm --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp`. Results of each flag:
+paper Appendix "Index of mechanisms and results" and docs/RUN_INDEX.md.
+
+| flag | what it does |
+|---|---|
+| `--ts_nomom` | no short momentum: $u=-g/\sqrt v$ (factored $v$) goes straight into the accumulator |
+| `--ts_micro` (with `--grad_accum M`) | each micro-batch's $u_i=-g_i/\sqrt{\tilde v_i}$, $\tilde v_i=\beta_2\hat v_{t-1}+(1-\beta_2)M^2\overline{g_i^2}$, enters the accumulator; the batch's $v$ from the micro-batches' squares plus sketched cross terms; firing and spend once per step (paper App. micro) |
+| `--ts_start S` | trits frozen until step S: no evidence kept, nothing fires; $v$ and the floats train |
+| `--ts_vdiag` | logs $g^2/v$ (layer mean `dg_g2_over_v`, max `dgmax_g2_over_v`) and the $|u|$ tail. With `--ts_micro` the ratio is per micro-batch, so its normal level is $1/M$ |
+| `--ts_uclip C`, `--ts_urms D` | clip $u$ per entry at $C\,\rho$ / scale a layer's $u$ so its rms is at most $D$ (Adafactor-style) |
+| `--ts_move_cap F` | at most a share F of a layer's weights move per step (largest $|A|/\text{bar}$) |
+| `--ts_vbar K` | cost-aware bar: $\theta\,\big(\sqrt{R_i}/\mathrm{med}\sqrt R\cdot\sqrt{C_j}/\mathrm{med}\sqrt C\big)^K$, clamped to $[\theta,4\theta]$ |
+| `--ts_theta_noise K` | bar $=\max(\theta, K\cdot\overline{\mathrm{rms}(A)})$ with an EMA (0.99) of the layer's $\mathrm{rms}(A)$, every step (runs away from scratch) |
+| `--ts_theta_noise_win N` | with `--ts_theta_noise K`: the bar is measured once: N active steps with evidence kept and nothing firing, then bar $=\max(\theta, K\,\mathrm{rms}(A))$, fixed |
+| `--ts_boost S` | a second trit plane $B$: $W=T+S\beta B$; evidence past the bar at a trit already at $\pm1$ sets $B$, the first move back clears it |
+| `--ts_resid --ts_resid_sparse F` | the largest share F of what the rank-$r$ projection drops is kept (index + bf16 value) and fed back the next step; `--ts_resid_steps K` keeps it K steps |
+| `--ts_exact_spend` | the spend is applied exactly at moved entries (a sparse correction), not through the low-rank basis |
+| `--tern_emb tied` / `untied` / `tied_wide:M` | ternary embedding (and head): $E=s_0\,r c\,T$; `tied_wide:M`: $E=T_{V\times Md}\,P^\top$ with a ternary $P_{d\times Md}$ ($M=20$ = fp32's bytes), both trained by TTF |
+| `--lowrank_mag taddw:R` | the rank-R float adapter $AB^\top$ as ternary factors $A_t$ (N x 20R), $B_t$ (K x 20R) at fp32's bytes, trained by TTF; $A_t$'s row scales start at 0 |
+| `--moe E:K:H` | every feed-forward is E SwiGLU experts of hidden H, top-K routing by a float router, load-balancing loss `--moe_aux`; each expert its own accumulator (master: experts with latents) |
+| `WORLD_SIZE` / `RANK` (data parallel) | the gradient of each layer is all-reduced before the TTF update; ranks stay bit-identical |
+| `--init_hf DIR --init_hf_method als / gptq` | convert a pretrained model: trits and scales by alternating least squares or by GPTQ onto the ternary grid (calibration `--init_calib`); `--init_stream` converts one decoder layer at a time from the safetensors (sequential GPTQ) |
+| `--distill W` | KL to the full-precision teacher (its parameters cast to bf16) |
+| `--eval_first_n N` | before training, the loss over the first N val windows in order (as `scripts/quant/qwen_check.py`) |
+| `--lr_rewarm S:W:F` | re-warm a decayed run from step S over W steps to F times the peak |
+
 ## 2b. What master cannot do without (master from scratch with one ingredient changed, `--m_*`, `bitnet/master_opt.py`)
 
 | flag | change | final (master 2.7513) |
