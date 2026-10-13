@@ -281,7 +281,7 @@ def _(ids, key, dim):
                           for bn in (16, 32) for bw in (64, 128) for sp in (1, 2, 4)],
                  key=["N", "KW"], reset_to_zero=["y_ptr"])
 @triton.jit
-def _gemv2_epi_kernel(xq_ptr, w_ptr, y_ptr, s_ptr, sumx_ptr, r_ptr, a_ptr, rs_ptr, beta, N, KW, M, R,
+def _gemv2_epi_kernel(xq_ptr, w_ptr, y_ptr, s_ptr, sumx_ptr, r_ptr, a_ptr, rs_ptr, beta_ptr, N, KW, M, R,
                       sxm, swn, sym, BN: tl.constexpr, BW: tl.constexpr, SPLIT: tl.constexpr, BR: tl.constexpr):
     pid_n = tl.program_id(0)
     m = tl.program_id(1)
@@ -310,6 +310,7 @@ def _gemv2_epi_kernel(xq_ptr, w_ptr, y_ptr, s_ptr, sumx_ptr, r_ptr, a_ptr, rs_pt
     av = tl.load(a_ptr + rn[:, None] * R + rr[None, :], mask=mn[:, None] & (rr[None, :] < R), other=0.0).to(tl.float32)
     ad = tl.sum(av * rv[None, :], axis=1) * first.to(tl.float32)
     rs = tl.load(rs_ptr + rn, mask=mn, other=0.0).to(tl.float32)
+    beta = tl.load(beta_ptr)      # a pointer, not a float: one compiled graph serves every layer
     tl.atomic_add(y_ptr + m * sym + rn, (acc.to(tl.float32) * (s * beta) + ad) * rs, mask=mn)
 
 
@@ -331,7 +332,8 @@ def ttf_layer2(x: torch.Tensor, col_scale: torch.Tensor, mag_B: torch.Tensor, ma
     ww = w2.view(torch.int32)
     y = torch.zeros(M, N, dtype=torch.float32, device=x.device)
     grid = lambda meta: (triton.cdiv(N, meta["BN"]), M, meta["SPLIT"])
-    _gemv2_epi_kernel[grid](xw, ww, y, s, sumx, r, mag_A, row_scale, beta, N, K4p // 4, M, R,
+    beta_t = torch.tensor([beta], dtype=torch.float32, device=x.device)
+    _gemv2_epi_kernel[grid](xw, ww, y, s, sumx, r, mag_A, row_scale, beta_t, N, K4p // 4, M, R,
                             xw.stride(0), ww.stride(0), y.stride(0), BR=triton.next_power_of_2(max(R, 2)))
     return y.to(torch.bfloat16)
 

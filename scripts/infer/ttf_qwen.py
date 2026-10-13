@@ -41,7 +41,7 @@ class PackedTLinear(nn.Module):
         self.beta = None
 
     def forward(self, x):
-        if self.beta is None:
+        if getattr(self, "beta_t", None) is None:   # set at load; the compiled decode reads only beta_t
             self.beta = float(trit_beta(self.wpacked, self.K))
         shp = x.shape
         x2 = x.reshape(-1, self.K)
@@ -58,7 +58,7 @@ class PackedTLinear(nn.Module):
             ww = self.w2.view(torch.int32)
             y = torch.zeros(M_, self.N, dtype=torch.float32, device=x.device)
             grid = lambda meta: (triton.cdiv(self.N, meta["BN"]), M_, meta["SPLIT"])
-            _gemv2_epi_kernel[grid](xw, ww, y, sc, sumx, r, self.mag_A, self.row_scale, self.beta, self.N, K4p // 4,
+            _gemv2_epi_kernel[grid](xw, ww, y, sc, sumx, r, self.mag_A, self.row_scale, self.beta_t, self.N, K4p // 4,
                                     M_, self.mag_A.shape[1], xw.stride(0), ww.stride(0), y.stride(0),
                                     BR=triton.next_power_of_2(max(self.mag_A.shape[1], 2)))
             return y.to(torch.bfloat16).view(*shp[:-1], self.N)
@@ -117,7 +117,23 @@ class CPUEmbedding(nn.Module):
         return self.weight_cpu[ids.cpu()].to(self.dev)
 
 
+def _use_fla_conv():
+    """transformers falls back to plain PyTorch for the DeltaNet causal convolution when the causal_conv1d CUDA package
+    is missing (it does not build against this torch's CUDA). The prefill convolution goes to fla's Triton kernel (same
+    result within one bf16 rounding); the single-token update stays in PyTorch: fla's is wrapped in
+    torch.compiler.disable, which breaks the compiled decode graph at every DeltaNet layer (8-11 tok/s instead of 22.7)"""
+    import transformers.models.qwen3_5.modeling_qwen3_5 as mq
+    from fla.modules.convolution import causal_conv1d as fla_conv
+
+    def fn(hidden_states, weight, bias=None, activation=None, **kwargs):
+        y = fla_conv(hidden_states.transpose(1, 2).contiguous(), weight=weight, bias=bias, activation=activation)
+        return (y[0] if isinstance(y, tuple) else y).transpose(1, 2)
+    mq.causal_conv1d_fn = fn
+
+
 def build(model_dir, weights, dev, emb_cpu):
+    if os.environ.get("TTF_FLA_CONV", "1") == "1":
+        _use_fla_conv()
     from transformers import AutoConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     c = AutoConfig.from_pretrained(model_dir)
@@ -163,6 +179,7 @@ def build(model_dir, weights, dev, emb_cpu):
                 buf[:, :K5_] = mod.wpacked
                 mod.wpacked = buf[:, :K5_]
             mod.beta = float(trit_beta(mod.wpacked, mod.K))   # at load: no host sync inside a CUDA graph
+            mod.beta_t = torch.tensor([mod.beta], dtype=torch.float32, device=dev)  # the decode kernel reads it
             if TWO_BIT:                     # 2-bit layout for the dp4a decode kernel; the base-3 buffer is dropped
                 mod.w2 = repack_2bit(mod.wpacked, mod.K)
                 mod.wpacked = torch.empty(0, dtype=torch.uint8, device=dev)
@@ -182,6 +199,10 @@ def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len
     from transformers import StaticCache
     dev = ids.device
     if not hasattr(hf, "_ttf_step"):
+        # a safety net: if anything breaks the graph inside a layer, each resumed piece is guarded on its layer index,
+        # and with the default limit (8) dynamo runs every later layer eagerly (8-11 tok/s instead of 22.7)
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 4 * t.num_hidden_layers)
+        torch._dynamo.config.accumulated_recompile_limit = max(torch._dynamo.config.accumulated_recompile_limit, 4096)
         hf._ttf_step = torch.compile(hf.forward, mode="reduce-overhead", fullgraph=False)
     cache = getattr(hf, "_ttf_cache", None)       # one cache, reset per prompt: the compiled step is reused (no recompile)
     if cache is None or getattr(hf, "_ttf_cache_len", 0) != max_len:
@@ -212,8 +233,8 @@ def fast_generate(hf, t, ids, n, temp=0.0, top_p=1.0, top_k=0, eos=None, max_len
         out, pend = [], []
         tok = pick(logits)
         pos = torch.tensor([L], device=dev)
-        if on_tokens is None and os.environ.get("TTF_TIMING"):
-            torch.cuda.synchronize(); print(f"  prefill {L} tokens: {time.time() - _t0:.2f}s", flush=True)
+        torch.cuda.synchronize()
+        hf._ttf_prefill_s = time.time() - _t0      # one sync per prompt: prefill and decode reported separately
         for i in range(n):
             pend.append(tok)
             if len(pend) == every or i == n - 1:
@@ -301,6 +322,9 @@ def main():
             out = fast_generate(hf, t, ids, a.n, temp=a.temp, top_p=a.top_p, top_k=a.top_k, eos=None,
                                 max_len=a.ctx, on_tokens=emit, eos_set=set(e for e in eos if e is not None))
             n = len(out); print()
+            pf = hf._ttf_prefill_s
+            print(f"[prefill {ids.shape[1]} tokens {pf:.2f}s; decode {n} tokens {n / (time.time() - t1 - pf):.2f} tok/s]",
+                  file=sys.stderr)
         print(f"[{ids.shape[1]} prompt + {n} new tokens, {n / (time.time() - t1):.2f} tok/s incl. prefill, peak "
               f"{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB]", file=sys.stderr)
 
