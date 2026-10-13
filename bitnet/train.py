@@ -3430,7 +3430,10 @@ def main():
         from .model import enable_moe
         _mk = (lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, rate=args.rate, beta=use_beta, int8=args.int8,
                                                   dw_mode=args.dw_mode, int8_dx=args.int8_dx, g_ref=args.g_ref).to(device)) \
-            if args.mode == "kernel" else (lambda i_, o_: nn.Linear(i_, o_, bias=False).to(device))
+            if args.mode == "kernel" else \
+            (lambda i_, o_: MasterTernaryLinear(i_, o_, mc.act_bits, dtype=torch.float32 if args.master_dtype == "fp32"
+                                                else torch.bfloat16).to(device)) if args.mode == "master" else \
+            (lambda i_, o_: nn.Linear(i_, o_, bias=False).to(device))   # master: ternary experts with latents, as its layers
         E_, k_, H_ = enable_moe(model, args.moe, _mk)
         BitTransformer.moe_aux_w = args.moe_aux
         print(f"--moe: {E_} experts of hidden {H_}, top-{k_} routing, load-balancing weight {args.moe_aux}", flush=True)
