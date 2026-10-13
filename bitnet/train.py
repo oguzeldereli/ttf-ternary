@@ -46,6 +46,38 @@ from .flip import (build_flip_transformer, build_stateless_transformer,
                    reset_lockout, lockout_stats)
 
 
+_KD_SHARD = {}
+
+
+def _kd_cache_batch(args, idx, data, seq_len, device):
+    """--kd_cache: window idx of the precomputed teacher targets (shards kd_00000.npz, ... of B windows each); waits
+    for a shard that is still being written. Returns x, y [1, seq] and (ids [seq, k], log-probs [seq, k]) on device."""
+    import glob
+    if "B" not in _KD_SHARD:
+        while not glob.glob(os.path.join(args.kd_cache, "kd_00000.npz")):
+            time.sleep(30)
+        _KD_SHARD["B"] = len(np.load(os.path.join(args.kd_cache, "kd_00000.npz"))["starts"])
+    B = _KD_SHARD["B"]
+    sh, j = divmod(max(idx, 0), B)
+    fn = os.path.join(args.kd_cache, f"kd_{sh:05d}.npz")
+    if _KD_SHARD.get("sh") != sh:
+        waited = 0
+        while not os.path.exists(fn):
+            if os.path.exists(os.path.join(args.kd_cache, "done")):     # the cache ran out: wrap around
+                n = len(glob.glob(os.path.join(args.kd_cache, "kd_*.npz")))
+                sh = sh % n; fn = os.path.join(args.kd_cache, f"kd_{sh:05d}.npz"); break
+            if waited % 600 == 0:
+                print(f"--kd_cache: waiting for {fn}", flush=True)
+            time.sleep(30); waited += 30
+        z = np.load(fn)
+        _KD_SHARD.update(sh=sh, starts=z["starts"], ids=z["ids"], lp=z["lp"])
+    s0 = int(_KD_SHARD["starts"][j])
+    w = torch.from_numpy(data[s0:s0 + seq_len + 1].astype(np.int64)).to(device)
+    ids = torch.from_numpy(_KD_SHARD["ids"][j].astype(np.int64)).to(device)
+    lp = torch.from_numpy(_KD_SHARD["lp"][j]).to(device)
+    return w[None, :-1], w[None, 1:], (ids, lp)
+
+
 def get_batch(data, bs, seq_len, device, gen=None):
     # gen: dedicated RNG so the data order is identical across runs regardless of
     # what else consumes the global RNG (different modes draw differently).
@@ -2916,6 +2948,8 @@ def main():
     ap.add_argument("--distill", default="", help="a full-precision teacher (Hugging Face Llama dir): the loss is "
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
     ap.add_argument("--distill_w", type=float, default=1.0, help="--distill: weight of the KL term (1: KL only)")
+    ap.add_argument("--kd_cache", default="", help="distil from precomputed teacher targets (scripts/quant/teacher_topk.py: fixed windows of --data with the teacher's top-k log-probabilities): each micro-batch takes the next window in order; the loss is (1 - --distill_w) CE + --distill_w x cross-entropy to the renormalised top k (Qwen models, batch_size 1)")
+    ap.add_argument("--kd_cache_start", type=int, default=0, help="--kd_cache: the training step that reads window 0 (the step a run is resumed at when the cache is introduced)")
     ap.add_argument("--moe", default="", help="E:K[:H]: mixture-of-experts feed-forward, E ternary SwiGLU experts (hidden H, default "
                     "the dense one), top-K routing (bitnet/model.py MoEFeedForward)")
     ap.add_argument("--moe_aux", type=float, default=0.01, help="--moe: weight of the load-balancing loss")
@@ -3502,7 +3536,12 @@ def main():
         else:
             print(f"row/column scales: {enable_rc_scales(model) / 1e3:.1f}k floats", flush=True)
     _acc_init = {}
-    if args.init_hf:
+    _resuming = args.resume and os.path.exists(os.path.join(tc.out_dir, "ckpt.pt"))
+    if args.init_hf and _resuming:   # the checkpoint holds the converted model (trits, scales, float parts)
+        print(f"--init_hf: resuming from {tc.out_dir}/ckpt.pt, conversion skipped", flush=True)
+        if _QWEN:   # as the conversion leaves them: embedding and head frozen (the optimizer is built below)
+            model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
+    if args.init_hf and not _resuming:
         from .hf_init import init_from_hf
         assert args.mode in ("kernel", "master", "fp32"), "--init_hf: kernel, master or fp32 mode"
         assert not (args.init_acc and (args.ts_offload or args.ts_offload_async or args.ts_tiles > 1)), \
@@ -3529,6 +3568,11 @@ def main():
                                  acc=args.init_acc if args.ts else 0.0, theta=args.ts_theta, rank=args.lowrank, clip=args.init_acc_clip,
                                  log=lambda m_: print(m_, flush=True))
     _teacher = None
+    if args.kd_cache:  # precomputed teacher targets (scripts/quant/teacher_topk.py)
+        assert tc.batch_size == 1 and hasattr(model, "kd_topk"), "--kd_cache: Qwen models with --batch_size 1"
+        model.kd_w = args.distill_w
+        print(f"--kd_cache {args.kd_cache}: from window 0 at step {args.kd_cache_start}, loss (1 - {args.distill_w}) CE "
+              f"+ {args.distill_w} KD to the teacher's top k", flush=True)
     if args.distill:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels
         from .hf_init import model_config_from_hf as _mch, init_from_hf as _ifh
         from .model import BitTransformer as _BT
@@ -4102,7 +4146,11 @@ def main():
                 for l_ in model.modules():
                     if isinstance(l_, KernelTernaryLinear):
                         l_.cap_accum = True; l_.cap_final = micro == tc.grad_accum - 1
-            x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
+            if args.kd_cache:          # --kd_cache: the next precomputed window, its tokens and the teacher's top k
+                x, y, model.kd_topk = _kd_cache_batch(args, (step - args.kd_cache_start) * tc.grad_accum + micro,
+                                                      train_data, tc.seq_len, device)
+            else:
+                x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
             if _teacher is not None:   # --distill: the full-precision model's next-token distribution for this batch
                 with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
                     tz_, _ = _teacher(x)
@@ -4114,6 +4162,8 @@ def main():
             sc_ = float(args.spike_test.split(":")[1]) if args.spike_test and step == int(args.spike_test.split(":")[0]) else 1.0
             (loss * sc_ / tc.grad_accum).backward()  # triggers BitLinear fused updates (--spike_test S:F: x F at step S)
             model.kd_logp = None
+            if args.kd_cache:
+                model.kd_topk = None
             if args.tern_emb and args.mode != "master":   # the ternary embedding's TTF update (both of its gradients)
                 from .tern_emb import tern_emb_step
                 tern_emb_step(model, lr_state, ts_cfg, ts_layer)

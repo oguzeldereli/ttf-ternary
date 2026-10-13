@@ -69,6 +69,7 @@ class QwenTern(nn.Module):
         self.ckpt_skip = 0
         self.kd_logp = None
         self.kd_w = 1.0
+        self.kd_topk = None      # --kd_cache: (ids [T, k] long, log-probs [T, k]) of the teacher's top k per token
 
     def _head_w(self):
         lm = self.hf.lm_head
@@ -91,7 +92,10 @@ class QwenTern(nn.Module):
         kd = self.kd_logp
         for i in range(0, hf_.shape[0], n):
             hc, tc = hf_[i:i + n], tf[i:i + n]
-            if kd is not None:
+            if self.kd_topk is not None:
+                f_ = _kd_topk_chunk
+                args_ = (hc, w.to(hc.dtype), tc, self.kd_topk[0][i:i + n], self.kd_topk[1][i:i + n], self.kd_w)
+            elif kd is not None:
                 from .model import BitTransformer
                 f_ = BitTransformer._loss_chunk_kd
                 args_ = (hc, w.to(hc.dtype), tc, kd[i:i + n], self.kd_w)
@@ -107,6 +111,16 @@ class QwenTern(nn.Module):
 
 def _ce_chunk(h, w, tgt):
     return F.cross_entropy(F.linear(h, w).float(), tgt, ignore_index=-1, reduction="sum")
+
+
+def _kd_topk_chunk(h, w, tgt, ids, tlp, a):
+    """cross-entropy to the teacher's top-k distribution (renormalised over its k tokens; the gradient of the KL to it),
+    mixed with next-token cross-entropy: (1 - a) CE + a KD, summed over tokens"""
+    lp = F.log_softmax(F.linear(h, w).float(), -1)
+    kd = -(torch.softmax(tlp.float(), -1) * lp.gather(1, ids)).sum()
+    if a >= 1.0:
+        return kd
+    return (1 - a) * F.nll_loss(lp, tgt, ignore_index=-1, reduction="sum") + a * kd
 
 
 def _swap_linears(hf_model, make_linear):
