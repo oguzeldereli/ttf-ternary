@@ -3955,7 +3955,7 @@ def main():
         md_e, md_nb, md_w = md_ + ["", "8", "1000"][len(md_):]
         movediag = MoveDiag(model, train_data, tc, device, args.mode, int(md_e), int(md_nb), undo_window=int(md_w))
         print(f"--movediag: every {md_e} steps, {md_nb} + {md_nb} probe batches, {len(movediag.layers)} layers", flush=True)
-    if args.eval_first_n and start_step == 0:   # --eval_first_n N: the model as built (e.g. right after --init_hf), scored on
+    if args.eval_first_n:   # --eval_first_n N: the model as built or resumed (e.g. right after --init_hf), scored on
         model.eval(); STATE.updates_enabled = False   # the first N val windows in order (qwen_check.py's windows)
         ls_ = []
         with torch.no_grad():
