@@ -46,6 +46,19 @@ def load_model(path, device, mag_kind="add"):
     else:
         raise SystemExit(f"mode {mode} not supported")
     model = model.to(device)
+    if "layers.0.ffn.router.weight" in sd:                   # --moe E:K:H (top-K from the run's arguments, else 2)
+        from bitnet.model import enable_moe, BitTransformer
+        E_ = sd["layers.0.ffn.router.weight"].shape[0]
+        H_ = next(v.shape for k, v in sd.items() if k.startswith("layers.0.ffn.experts.0.w_gate.")
+                  and k.split(".")[-1] in ("weight", "wpacked"))[0]
+        a_ = ck.get("args") or {}
+        a_ = a_ if isinstance(a_, dict) else vars(a_)
+        k_ = int(str(a_.get("moe") or f"{E_}:2").split(":")[1])
+        mk = (lambda i, o: MasterTernaryLinear(i, o, mc.act_bits, dtype=dt).to(device)) if mode == "master" else \
+             (lambda i, o: KernelTernaryLinear(i, o, mc.act_bits, rate=0.0, beta=ck.get("beta", False),
+                                               int8=ck.get("int8", False), dw_mode=ck.get("dw_mode", "int8"),
+                                               int8_dx=ck.get("int8_dx", False), g_ref=ck.get("g_ref", 3.0)).to(device))
+        enable_moe(model, f"{E_}:{k_}:{H_}", mk)
     if any(k.endswith(".bpacked") for k in sd):              # --ts_boost
         from bitnet.flip import enable_boost
         enable_boost(model)
