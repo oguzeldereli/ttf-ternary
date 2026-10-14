@@ -2949,6 +2949,7 @@ def main():
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
     ap.add_argument("--distill_w", type=float, default=1.0, help="--distill: weight of the KL term (1: KL only)")
     ap.add_argument("--kd_cache", default="", help="distil from precomputed teacher targets (scripts/quant/teacher_topk.py: fixed windows of --data with the teacher's top-k log-probabilities): each micro-batch takes the next window in order; the loss is (1 - --distill_w) CE + --distill_w x cross-entropy to the renormalised top k (Qwen models, batch_size 1)")
+    ap.add_argument("--kd_mode", default="renorm", choices=["rest", "renorm"], help="--kd_cache: rest = the top k plus one bucket for the teacher's remaining mass (the KL on that distribution); renorm = the top k renormalised (drops the tail)")
     ap.add_argument("--kd_cache_start", type=int, default=0, help="--kd_cache: the training step that reads window 0 (the step a run is resumed at when the cache is introduced)")
     ap.add_argument("--moe", default="", help="E:K[:H]: mixture-of-experts feed-forward, E ternary SwiGLU experts (hidden H, default "
                     "the dense one), top-K routing (bitnet/model.py MoEFeedForward)")
@@ -3571,6 +3572,8 @@ def main():
     if args.kd_cache:  # precomputed teacher targets (scripts/quant/teacher_topk.py)
         assert tc.batch_size == 1 and hasattr(model, "kd_topk"), "--kd_cache: Qwen models with --batch_size 1"
         model.kd_w = args.distill_w
+        model.kd_mode = args.kd_mode
+        print(f"--kd_cache ({args.kd_mode})", flush=True)
         print(f"--kd_cache {args.kd_cache}: from window 0 at step {args.kd_cache_start}, loss (1 - {args.distill_w}) CE "
               f"+ {args.distill_w} KD to the teacher's top k", flush=True)
     if args.distill:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels

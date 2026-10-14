@@ -69,6 +69,7 @@ class QwenTern(nn.Module):
         self.ckpt_skip = 0
         self.kd_logp = None
         self.kd_w = 1.0
+        self.kd_mode = "renorm"
         self.kd_topk = None      # --kd_cache: (ids [T, k] long, log-probs [T, k]) of the teacher's top k per token
 
     def _head_w(self):
@@ -94,7 +95,8 @@ class QwenTern(nn.Module):
             hc, tc = hf_[i:i + n], tf[i:i + n]
             if self.kd_topk is not None:
                 f_ = _kd_topk_chunk
-                args_ = (hc, w.to(hc.dtype), tc, self.kd_topk[0][i:i + n], self.kd_topk[1][i:i + n], self.kd_w)
+                args_ = (hc, w.to(hc.dtype), tc, self.kd_topk[0][i:i + n], self.kd_topk[1][i:i + n], self.kd_w,
+                         self.kd_mode)
             elif kd is not None:
                 from .model import BitTransformer
                 f_ = BitTransformer._loss_chunk_kd
@@ -113,12 +115,22 @@ def _ce_chunk(h, w, tgt):
     return F.cross_entropy(F.linear(h, w).float(), tgt, ignore_index=-1, reduction="sum")
 
 
-def _kd_topk_chunk(h, w, tgt, ids, tlp, a):
-    """cross-entropy to the teacher's top-k distribution (renormalised over its k tokens; the gradient of the KL to it),
-    mixed with next-token cross-entropy: (1 - a) CE + a KD, summed over tokens"""
+def _kd_topk_chunk(h, w, tgt, ids, tlp, a, mode="rest"):
+    """distillation to the teacher's top k (log-probabilities under its full softmax), mixed with next-token
+    cross-entropy: (1 - a) CE + a KD, summed over tokens. mode 'rest': cross-entropy to the k tokens plus one bucket for
+    all other tokens (the teacher's remaining mass against the student's), the KL on that coarsened distribution;
+    'renorm': cross-entropy to the top k renormalised over the k (drops the teacher's tail, so the student is pushed to
+    zero mass outside the k; at 87% top-k mass this cost Qwen 0.8B 0.17)"""
     z = F.linear(h, w).float()
     lse = torch.logsumexp(z, -1, keepdim=True)        # no full log-softmax: the k gathered logits minus the logsumexp
-    kd = -(torch.softmax(tlp.float(), -1) * (z.gather(1, ids) - lse)).sum()
+    lq = z.gather(1, ids) - lse
+    if mode == "renorm":
+        kd = -(torch.softmax(tlp.float(), -1) * lq).sum()
+    else:
+        pk = tlp.float().exp()
+        p_rest = (1 - pk.sum(-1)).clamp_min(0)
+        lq_rest = torch.logsumexp(z.scatter(1, ids, float("-inf")), -1) - lse[:, 0]
+        kd = -(pk * lq).sum() - (p_rest * lq_rest).sum()
     if a >= 1.0:
         return kd
     ok = tgt != -1
