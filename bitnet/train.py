@@ -1168,7 +1168,11 @@ def ts_layer(l, g, state, c):
     elif tabmode != "spendtab":
         U = U - c["spend"] * (((th * D) @ V) if torch.is_tensor(th) and th.dim() == 2 else th * (D @ V))
     if use_tab or rsk:
-        Er = None if tabmode == "spendtab" and not rsk else c["spend"] * th * (D - (D @ V) @ V.T)   # unprojected spend
+        if tabmode == "spendtab" and not rsk:
+            Er = None
+        else:     # unprojected spend: C - C V V^T with C = th * D (th may be a per-entry bar, --ts_vbar)
+            C_ = th * D
+            Er = c["spend"] * (C_ - (C_ @ V) @ V.T); del C_
     if rsk:
         Y_, W_ = st[("rsk", key)]
         st[("rsk", key)] = (Y_ - Er @ Om, W_ - Psi @ Er)
