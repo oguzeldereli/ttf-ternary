@@ -1756,8 +1756,9 @@ def ts_step(model, state, r, step, lr_ratio, theta=16.0, tau=300.0, rank_s=128, 
              lr_ratio = lr_t / lr_peak, so steps shrink as the schedule decays, as master's latent steps do)
       fire   a trit moves by d = sign(A_ij) the step |A_ij| >= theta (deterministic, no rate), unless blocked at +-1
              (optionally only where this batch's gradient agrees: gate); the move spends spend * theta:
-             A -= spend * theta * D (kept low-rank: U -= ... (D V)). spend 1 puts the weight at its new trit's centre
-             (master with --m_snap); spend 2 leaves it at the boundary it just crossed, as master's latent does.
+             A -= spend * theta * D (kept low-rank: U -= ... (D V), the spend's projection onto V). spend 1 puts the
+             weight at its new trit's centre plus any excess beyond theta (master --m_snap discards the excess); spend 2
+             leaves it at the boundary it just crossed, as master's latent does.
              theta ~ half a bin in latent units over the peak lr (~16)."""
     c = dict(r=r, lr_ratio=lr_ratio, theta=theta, tau=tau, rank_s=rank_s, b1=b1, b2=b2, gate=gate, spend=spend,
              tau_anneal=tau_anneal, int8=int8, qfmt=qfmt, qwhich=qwhich, qnoV=qnoV, qdiag=qdiag,

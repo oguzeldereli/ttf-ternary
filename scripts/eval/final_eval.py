@@ -4,7 +4,7 @@
 
 RUN_DIR holds eval.pt (from scripts/eval/rescue.sh) or ckpt.pt / ckpt_9154.pt. Writes RUN_DIR/final_eval.json and
 RUN_DIR/final_eval.npz:
-  - wiki: every non-overlapping 2048-token window of data/wiki32k_val.bin (976 windows, 2.0M tokens);
+  - wiki: every non-overlapping 2048-token window of data/wiki32k_val.bin (974 windows, 2.0M tokens);
   - fw:   the first --fw non-overlapping windows of data/fwedu32k_val.bin (FineWeb-Edu, another domain);
   per-window mean loss (for paired comparisons, scripts/eval/compare.py), per-position mean loss, overall mean and
   bits per byte (bytes per token measured on the val sets with the same tokenizer, EOT counted as a token:
@@ -173,6 +173,11 @@ def main():
             fin = re.findall(r"FINAL val loss ([\d.]+)", open(log).read()) if os.path.exists(log) else []
             res["logged_final"] = float(fin[-1]) if fin else None
             res["check_diff"] = None if not fin else res["train_protocol_loss"] - float(fin[-1])
+            if res["check_diff"] is not None and abs(res["check_diff"]) > 1e-3:   # the model was not rebuilt as trained
+                res["check_failed"] = True                                        # (e.g. --mag_kind mul run read as add)
+                print(f"WARNING {res['run']}: rebuilt model's training-protocol loss {res['train_protocol_loss']:.4f} "
+                      f"differs from the logged final {fin[-1]} by {res['check_diff']:+.4f}: its numbers are not valid",
+                      flush=True)
         res["seconds"] = round(time.time() - t0, 1)
         json.dump(res, open(os.path.join(run, "final_eval.json"), "w"), indent=1)
         np.savez(os.path.join(run, "final_eval.npz"), **arrays)
