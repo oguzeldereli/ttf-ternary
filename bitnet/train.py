@@ -3468,6 +3468,12 @@ def main():
     else:
         model = BitTransformer(mc, grad_checkpoint=tc.grad_checkpoint)
     model = model.to(device)
+    try:   # counted from the modules (mc.report() above is a formula: approximate for hybrid / HF models)
+        n_t_ = sum(m_.N * m_.K for m_ in model.modules() if getattr(m_, "wpacked", None) is not None and hasattr(m_, "N"))
+        n_f_ = sum(p_.numel() for p_ in model.parameters())
+        print(f"counted       : ternary {n_t_ / 1e6:,.1f} M + float {n_f_ / 1e6:,.1f} M", flush=True)
+    except Exception:
+        pass
     if args.ts_boost and args.mode == "kernel":
         from .flip import enable_boost
         print(f"--ts_boost {args.ts_boost}: boost planes on {enable_boost(model, args.ts_boost)} ternary layers", flush=True)

@@ -24,7 +24,8 @@ class ModelConfig:
     # ---- parameter / memory accounting -------------------------------------
     def n_params(self) -> int:
         d, L, V, H = self.dim, self.n_layers, self.vocab_size, self.hidden_dim
-        per_layer = 4 * d * d + 3 * d * H          # attn (q,k,v,o) + swiglu (gate,up,down)
+        kv = self.n_kv_heads * (d // self.n_heads)  # GQA: k and v project to n_kv_heads heads
+        per_layer = 2 * d * d + 2 * d * kv + 3 * d * H   # attn (q,o + k,v) + swiglu (gate,up,down)
         embed = V * d
         head = 0 if self.tie_embeddings else V * d
         norms = L * 2 * d + d                       # small; rope has none
@@ -35,7 +36,8 @@ class ModelConfig:
     def n_ternary_params(self) -> int:
         """Weights stored ternary at deploy (the BitLinear weight matrices only)."""
         d, L, H = self.dim, self.n_layers, self.hidden_dim
-        return (4 * d * d + 3 * d * H) * L
+        kv = self.n_kv_heads * (d // self.n_heads)
+        return (2 * d * d + 2 * d * kv + 3 * d * H) * L
 
     def deploy_bytes(self) -> int:
         """Packed-ternary weights (~1.58 bit) + full-precision embeddings/norms (bf16)."""

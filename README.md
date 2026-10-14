@@ -61,7 +61,7 @@ the converted model runs on a 12 GB laptop GPU at 22.7 tokens per second (`scrip
 
 ## Memory
 
-- A 26.5B-parameter model trains on one 16 GB GPU (11.1–11.6 GiB at ranks 256–1024, state in host memory with
+- A 23.0B-parameter model (22.85B ternary) trains on one 16 GB GPU (11.1–11.6 GiB at ranks 256–1024, state in host memory with
   asynchronous copies; `scripts/lab/b27_lean.sh`). At its leanest it peaks at 9.73 GiB.
 - **Micro-batches without a dense gradient** (`--ts_micro`): each micro-batch's gradient enters the state and is
   discarded; 4 × 4 micro-batches match one pass of batch 16 over the full schedule (2.6733 vs 2.6728) at 3.1 instead of
