@@ -3428,7 +3428,7 @@ def main():
 
     _qsw = {}
     if _QWEN:
-        assert args.mode == "kernel" and not args.distill and not args.tern_emb, "Qwen: kernel mode, no --distill / --tern_emb yet"
+        assert args.mode == "kernel" and not args.tern_emb, "Qwen: kernel mode, no --tern_emb yet"
         from .qwen import build_qwen, QwenTern
         QwenTern.loss_chunk = args.loss_chunk
         model, _qsw = build_qwen(args.init_hf, "kernel", grad_checkpoint=tc.grad_checkpoint, device=device,
@@ -3576,7 +3576,15 @@ def main():
         print(f"--kd_cache ({args.kd_mode})", flush=True)
         print(f"--kd_cache {args.kd_cache}: from window 0 at step {args.kd_cache_start}, loss (1 - {args.distill_w}) CE "
               f"+ {args.distill_w} KD to the teacher's top k", flush=True)
-    if args.distill:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels
+    if args.distill and _QWEN:   # Qwen: transformers' own model in bf16 as the teacher (it must fit next to the student)
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as _QT
+        _qt = _QT.from_pretrained(args.distill, dtype=torch.bfloat16).to(device).eval()
+        for p_ in _qt.parameters():
+            p_.requires_grad_(False)
+        _teacher = lambda x_: (_qt(input_ids=x_).logits, None)
+        model.kd_w = args.distill_w
+        print(f"--distill {args.distill} (Qwen): teacher in bf16, loss (1 - {args.distill_w}) CE + {args.distill_w} KL", flush=True)
+    elif args.distill:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels
         from .hf_init import model_config_from_hf as _mch, init_from_hf as _ifh
         from .model import BitTransformer as _BT
         _teacher = _BT(_mch(args.distill, max_seq_len=tc.seq_len), grad_checkpoint=False,
