@@ -31,7 +31,7 @@ val numbers of different seeds use different windows and differ by up to 0.06 fo
 | `sw512_t75_ternwide20` | wide ternary embedding (fp32 bytes) | fixed 2.7265 / 3.6832 |
 | `sw512_t75_alltern` | all-ternary (wide embedding + ternary adapters) | running |
 | `moe8_r128`, `moe8_mx`, `moe8_r320` | MoE 8 x top-2, TTF r128 / master / TTF r320 | 3.1213 (fixed 3.0865) / 3.0111 (fixed 2.9780) / running |
-| `sw512_t75_mul16` (Myriad) | multiplicative adapter, newest recipe | running |
+| `sw512_t75_mul16` (Myriad) | multiplicative adapter, newest recipe | 300M | 2.6986 training-time; fixed 2.6812 / 3.6315 (final recipe 2.6728 / 3.6226) |
 | `wsd_md_t75`, `wsd_md_mx`, `md_t75b`, `wsd50_t75` | WSD 20% (TTF / master), cosine with move diagnostics, WSD 50% | fixed 2.7081 / 2.6982 / 2.6736; WSD 50% running |
 | `rw_t75_half` | re-warm to half the peak | running |
 | `sn_b1z`, `sn_b1z_ref`, `sn_mreset`, `mx_cliptail` | master snap / beta1 0 / momentum reset / tail clip | 2.7196 / 2.8259 / 2.8066 / 2.7363 |
