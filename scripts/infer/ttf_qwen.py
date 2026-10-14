@@ -162,6 +162,12 @@ def build(model_dir, weights, dev, emb_cpu):
     sd = torch.load(weights, map_location="cpu", weights_only=False, mmap=True)
     sd = sd.get("model", sd)
     sd = {k[3:]: v for k, v in sd.items() if k.startswith("hf.")}           # the trainer's QwenTern prefix
+    for k in [k for k in sd if k.endswith(".qmeta")]:  # pack_ttf.py: embedding / head in B-bit groups -> bf16
+        from pack_ttf import dequant_groups
+        b = k[:-len(".qmeta")]
+        bits, group = int(sd[k][0]), int(sd[k][1])
+        sd[b] = dequant_groups(sd.pop(b + ".q"), sd.pop(b + ".qscale"), sd.pop(b + ".qmin"), bits, group)
+        del sd[k]
     if emb_cpu:
         hf.model.embed_tokens = UVAEmbedding(sd.pop("model.embed_tokens.weight").to(torch.bfloat16), dev)
     own = hf.state_dict()
