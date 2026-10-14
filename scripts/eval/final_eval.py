@@ -146,6 +146,8 @@ def main():
     ap.add_argument("--seed", type=int, default=None, help="training seed (default: from the run name, else 1337)")
     ap.add_argument("--mag_kind", default="add")
     ap.add_argument("--no_check", action="store_true")
+    ap.add_argument("--check_val", default="", help="validation set of the training-time check (default --wiki; a run "
+                    "trained on FineWeb-Edu logs its FINAL on --fwval: pass that)")
     a = ap.parse_args()
     device = "cuda"
     assert torch.cuda.is_available(), "GPU only (never the laptop GPU: run on a lab PC / 4090 / Myriad)"
@@ -168,7 +170,8 @@ def main():
         if not a.no_check:
             m = re.search(r"seed(\d+)", res["run"])
             seed = a.seed if a.seed is not None else (int(m.group(1)) if m else 1337)
-            res["train_protocol_loss"] = train_protocol_loss(model, wiki, seed, device)
+            cv = np.memmap(a.check_val, dtype=np.uint16, mode="r") if a.check_val else wiki
+            res["train_protocol_loss"] = train_protocol_loss(model, cv, seed, device)
             log = os.path.join(run, "train.log")
             fin = re.findall(r"FINAL val loss ([\d.]+)", open(log).read()) if os.path.exists(log) else []
             res["logged_final"] = float(fin[-1]) if fin else None
@@ -176,8 +179,8 @@ def main():
             if res["check_diff"] is not None and abs(res["check_diff"]) > 1e-3:   # the model was not rebuilt as trained
                 res["check_failed"] = True                                        # (e.g. --mag_kind mul run read as add)
                 print(f"WARNING {res['run']}: rebuilt model's training-protocol loss {res['train_protocol_loss']:.4f} "
-                      f"differs from the logged final {fin[-1]} by {res['check_diff']:+.4f}: its numbers are not valid",
-                      flush=True)
+                      f"differs from the logged final {fin[-1]} by {res['check_diff']:+.4f}: the model is not rebuilt as "
+                      f"trained (or the run's validation set is not the check's: --check_val)", flush=True)
         res["seconds"] = round(time.time() - t0, 1)
         json.dump(res, open(os.path.join(run, "final_eval.json"), "w"), indent=1)
         np.savez(os.path.join(run, "final_eval.npz"), **arrays)
