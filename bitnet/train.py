@@ -3409,10 +3409,12 @@ def main():
         import torch.distributed as _dist
         _lr_ = int(os.environ.get("LOCAL_RANK", "0"))
         _ng_ = torch.cuda.device_count()
+        _lws_ = int(os.environ.get("LOCAL_WORLD_SIZE", str(_WS)))   # ranks on this machine (several machines: < WORLD_SIZE)
         torch.cuda.set_device(_lr_ % max(_ng_, 1))
-        _dist.init_process_group("nccl" if _ng_ >= _WS else "gloo")   # gloo: several ranks on one GPU (a correctness test)
-        print(f"data parallel: rank {_RK} of {_WS}, GPU {_lr_ % max(_ng_, 1)} of {_ng_}, "
-              f"{'nccl' if _ng_ >= _WS else 'gloo'}", flush=True)
+        _be_ = "nccl" if _ng_ >= _lws_ else "gloo"     # gloo: several ranks share one GPU (a correctness test)
+        _dist.init_process_group(_be_)
+        print(f"data parallel: rank {_RK} of {_WS} ({_lws_} on this machine), GPU {_lr_ % max(_ng_, 1)} of {_ng_}, "
+              f"{_be_}", flush=True)
         if _RK > 0 and args.out_dir:
             args.out_dir = args.out_dir.rstrip("/") + f"_rank{_RK}"
             tc.out_dir = args.out_dir
