@@ -1,8 +1,8 @@
 #!/bin/bash
 # 110M conversion / geometry arms (15-16 Oct; docs/QUEUE.md 23:00): one arm per lab PC, then the analyses on its result.
 #   bash /tmp/oguzelde/tern/repo/scripts/lab/geom_arms.sh ARM
-# Needs repo/models/fp32_110m_hf (scripts/analysis/export_hf_llama.py of checkpoints/fp32_baseline), fp32_110m_sp
-# (perturb_hf.py, shrink 0.8 noise 0.3) and repo/models/fp32_baseline_slim/ckpt.pt (for the comparisons).
+# Needs $S/models/fp32_110m_hf (scripts/analysis/export_hf_llama.py of checkpoints/fp32_baseline), fp32_110m_sp
+# (perturb_hf.py, shrink 0.8 noise 0.3) and repo/$MD/fp32_baseline_slim/ckpt.pt (for the comparisons).
 # All conversion arms: 50M tokens (1526 steps x 16 x 2048), KD from the fp model at weight 0.5, Wikipedia (wiki32k).
 #   conv      GPTQ start, then TTF (trits frozen to 400, theta 64, rank 512)          the current recipe
 #   sp        shrink and perturb the fp weights, then as conv                          arm c
@@ -17,7 +17,8 @@ set -u
 ARM=$1; S=${S:-/tmp/oguzelde/tern}; REPO=${REPO:-$S/repo}      # Myriad: S=~/Scratch/tern REPO=~/Scratch/ternary-LLM
 source $S/env.sh; cd $REPO
 D=checkpoints/g_$ARM; mkdir -p $D logs
-HF=models/fp32_110m_hf
+MD=${MD:-$S/models}      # outside the code tree (setup.sh mirrors the code with --delete)
+HF=$MD/fp32_110m_hf
 DATA="--data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16 --grad_accum 1"
 KD="--distill $HF --distill_w 0.5"
 TTF="--mode kernel --rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_warmup 30 --g_ref 3.0 --int8 --dw_mode dense
@@ -27,7 +28,7 @@ TTF="--mode kernel --rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_war
 CONV="--steps 1526 --warmup 300 --lr 5e-4 --min_lr 5e-5 --init_hf_method gptq --ts_theta 64 --ts_start 400"
 case $ARM in
   conv)      F="$DATA $TTF $CONV --init_hf $HF $KD" ;;
-  sp)        F="$DATA $TTF $CONV --init_hf models/fp32_110m_sp $KD" ;;
+  sp)        F="$DATA $TTF $CONV --init_hf $MD/fp32_110m_sp $KD" ;;
   gptqc)     F="$DATA $TTF ${CONV/gptq/gptqc} --init_hf $HF $KD" ;;                     # arm e: centred GPTQ start
   gptqs)     F="$DATA $TTF ${CONV/gptq/gptqs} --init_hf $HF $KD" ;;                     # sequential error-aware centred start
   convreg)   F="$DATA $TTF $CONV --init_hf $HF $KD --act_reg 0.05" ;;                    # arm f: outlier penalty on the student
@@ -48,11 +49,11 @@ echo "$(date '+%F %T') train end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.lo
 # analyses on the result (light): geometry against fp; losses of the roundings for the fp32 arms (trit_compare), fixed
 # windows for the ternary ones (final_eval)
 if [ $ARM = deout ] || [ $ARM = fpseed2 ]; then
-  python scripts/analysis/geometry.py --model fp=models/fp32_baseline_slim/ckpt.pt --model $ARM=$D/ckpt.pt --gptq_of $ARM \
+  python scripts/analysis/geometry.py --model fp=$MD/fp32_baseline_slim/ckpt.pt --model $ARM=$D/ckpt.pt --gptq_of $ARM \
     --out $D/geometry.json > $D/geometry.txt 2>&1
   python scripts/analysis/trit_compare.py --fp $D/ckpt.pt --n_eval 64 --calib 64 --out $D/roundings.json > $D/roundings.txt 2>&1
 else
-  python scripts/analysis/geometry.py --model fp=models/fp32_baseline_slim/ckpt.pt --model $ARM=$D/ckpt.pt \
+  python scripts/analysis/geometry.py --model fp=$MD/fp32_baseline_slim/ckpt.pt --model $ARM=$D/ckpt.pt \
     --out $D/geometry.json > $D/geometry.txt 2>&1
   python scripts/eval/final_eval.py $D --fw 0 > $D/final_eval.txt 2>&1
 fi
