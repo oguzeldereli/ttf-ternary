@@ -150,6 +150,9 @@ docs/            see below
 
 ## License and patents
 
-The code is licensed under the Clear BSD License ([LICENSE](LICENSE)), which grants no patent rights. The TTF training
-and inference methods are the subject of UK patent applications GB2623290.0 and GB2624374.1 (patent pending). To
-license the methods, contact the author.
+The code is licensed under the PolyForm Noncommercial License 1.0.0 ([LICENSE](LICENSE)): free for any noncommercial
+purpose, including personal research, study and use by educational, charitable, public research and government
+organisations; that licence also covers the patent claims you would infringe by using this software for those
+purposes. The TTF training and inference methods are the subject of UK patent applications GB2623290.0 and
+GB2624374.1 (patent pending). Commercial use of the software or the methods needs a separate licence: contact the
+author.
