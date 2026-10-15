@@ -75,7 +75,7 @@ def main():
         starts_all = rng.integers(0, len(data) - a.seq - 1, a.windows)
     r_, n_ = map(int, a.part.split("/"))
     assert a.batch % a.mb == 0
-    nsh = a.windows // a.batch                      # full shards only
+    nsh = len(starts_all) // a.batch                # full shards only
     # per-layer keyword arguments for a micro-batch of mb windows (rotary embeddings, the two mask kinds)
     x0 = torch.zeros(a.mb, a.seq, t.hidden_size, device=dev, dtype=torch.bfloat16)
     pos = torch.arange(a.seq, device=dev).view(1, 1, -1).expand(4, a.mb, -1)
