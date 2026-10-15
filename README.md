@@ -35,13 +35,15 @@ reference.
 
 At 600M tokens of FineWeb-Edu TTF leads master + extras by 0.056 (3.0423 vs 3.0982).
 
-**Scale (fixed windows, Wikipedia / FineWeb-Edu; difference to master + extras at its best learning rate)**
+**Scale (fixed windows; TTF minus master + extras at its best learning rate)**
 
-| size | TTF state (numbers per weight) | TTF − master |
-|---|---|---|
-| 340M | rank 512 (0.79) / full rank | −0.032 / −0.071 |
-| 1.3B | rank 1024 (0.79), two seeds | −0.010 / −0.027 |
-| 2.9B (FineWeb-Edu) | rank 1536 (0.79) | +0.002 / −0.004 |
+| size | TTF state (numbers per weight) | Wikipedia | FineWeb-Edu |
+|---|---|---|---|
+| 340M | rank 512 (0.79) | −0.032 | −0.042 |
+| 340M | full rank 1024 (1.57) | −0.071 | −0.087 |
+| 1.3B | rank 1024 (0.79), two seeds | −0.010 | −0.027 |
+| 1.3B | full rank 2048 (1.57) | −0.051 | −0.069 |
+| 2.9B (trained on FineWeb-Edu) | rank 1536 (0.79) | +0.002 | −0.004 |
 
 TTF's gap to master is a smooth function of the size of its state and closes at 0.57–0.70 numbers of state per weight
 at every size (about one byte per weight at the 12 bits the accumulator tolerates, against 12 bytes for master).
@@ -52,8 +54,8 @@ avalanche of harmful moves after a conversion).
 
 | model, recovery tokens | full precision | converted, before training | after |
 |---|---|---|---|
-| TinyLlama-1.1B, 50M | 1.875 | 8.01 | **2.2320** (latent-weight conversion: 2.5973) |
-| Qwen3.5-0.8B-Base, 50M | 2.556 | 4.96 | 2.8503 |
+| TinyLlama-1.1B, 50M | 1.875 | 8.01 | **2.2320**; with distillation 2.1878 (latent-weight conversion: 2.5973) |
+| Qwen3.5-0.8B-Base, 50M | 2.556 | 4.96 | 2.8503 (distillation does not help at this size) |
 | Qwen3.8-27B, 2M (probe) | 1.9034 | 3.8507 | 2.3644 (8 windows) |
 
 Qwen3.8-27B is converted layer by layer (streaming, about 20 minutes) and trained on one 24 GB GPU (peak 21.2 GiB);
