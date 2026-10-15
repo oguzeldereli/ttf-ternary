@@ -155,4 +155,4 @@ purpose, including personal research, study and use by educational, charitable, 
 organisations; that licence also covers the patent claims you would infringe by using this software for those
 purposes. The TTF training and inference methods are the subject of UK patent applications GB2623290.0 and
 GB2624374.1 (patent pending). Commercial use of the software or the methods needs a separate licence: contact the
-author.
+author. Contributions are accepted under the Contributor Licence Agreement in [CONTRIBUTING.md](CONTRIBUTING.md).
