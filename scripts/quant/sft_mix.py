@@ -8,7 +8,13 @@ share (the trainer samples windows uniformly, so the share of tokens is the shar
 
 Sources: nemotron:SPLIT (nvidia/Nemotron-Post-Training-Dataset-v1, CC-BY-4.0, responses by Qwen3-235B-A22B /
 DeepSeek-R1; SPLIT in chat, code, math, stem, tool), hermes (NousResearch/hermes-function-calling-v1, Apache-2.0),
-toolace (Team-ACE/ToolACE, Apache-2.0). Tulu-3 (ODC-BY) is built by chat_data.py."""
+toolace (Team-ACE/ToolACE, Apache-2.0), tulu:general / tulu:safety (allenai/tulu-3-sft-mixture, ODC-BY; safety = the
+WildJailbreak, WildGuardMix and CoCoNot subsets; the hard-coded identity answers are left out), ot3
+(open-thoughts/OpenThoughts3-1.2M, Apache-2.0, reasoning), ocr (nvidia/OpenCodeReasoning split_0, CC-BY-4.0, code
+reasoning), fineweb (HuggingFaceFW/fineweb-edu sample-10BT, ODC-BY, plain text with end-of-text between documents).
+--decon N: drop a conversation sharing any N-word sequence (lower-cased \\w+ words) with the evaluation items
+(data/bench/*.jsonl, data/zeroshot/*.jsonl); word n-grams as in GPT-3's and Tulu-3's decontamination (token n-grams
+matched code boilerplate and number lists). Tulu-3 (ODC-BY) chat-only streams: chat_data.py."""
 import argparse
 import json
 import random
@@ -95,9 +101,137 @@ def toolace_rows(rng):
             yield [{"role": "system", "content": r["system"]}] + conv, None, False
 
 
+SAFETY = ("wildjailbreak", "wildguardmix", "coconot")
+
+
+def _parquet_rows(repo, files, columns, rng):
+    """rows of the given parquet files, file by file, row group by row group (bounded memory), shuffled within a group"""
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    for f in files:
+        pf = pq.ParquetFile(hf_hub_download(repo, f, repo_type="dataset"))
+        for g in range(pf.num_row_groups):
+            rows = pf.read_row_group(g, columns=columns).to_pylist()
+            rng.shuffle(rows)
+            yield from rows
+
+
+def _split_think(c):
+    """'<think>R</think>A' -> (R, A); the chat template writes the reasoning block itself"""
+    if "</think>" in c:
+        r_, c_ = c.split("</think>", 1)
+        return r_.replace("<think>", "").strip(), c_.lstrip("\n")
+    return None, c
+
+
+def tulu_rows(kind, rng):
+    from huggingface_hub import list_repo_files
+    repo = "allenai/tulu-3-sft-mixture"
+    fs = sorted(f for f in list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet")); rng.shuffle(fs)
+    for r in _parquet_rows(repo, fs, ["messages", "source"], rng):
+        safe = any(k in r["source"] for k in SAFETY)
+        if "hard_coded" in r["source"] or safe != (kind == "safety"):
+            continue
+        m = [{"role": x["role"], "content": x["content"]} for x in r["messages"]]
+        if m and m[-1]["role"] == "assistant":
+            yield m, None, False
+
+
+def ot3_rows(rng, skip_files):
+    from huggingface_hub import list_repo_files
+    repo = "open-thoughts/OpenThoughts3-1.2M"
+    fs = sorted(f for f in list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet")); rng.shuffle(fs)
+    for r in _parquet_rows(repo, fs[skip_files:], ["conversations"], rng):
+        m = []
+        for x in r["conversations"]:
+            role = {"human": "user", "user": "user", "gpt": "assistant", "assistant": "assistant"}.get(x["from"])
+            if role is None:
+                break
+            y = {"role": role, "content": x["value"]}
+            if role == "assistant":
+                rc, y["content"] = _split_think(x["value"])
+                if rc is not None:
+                    y["reasoning_content"] = rc
+            m.append(y)
+        if m and m[-1]["role"] == "assistant":
+            yield m, None, True
+
+
+def ocr_rows(rng, skip_files):
+    from huggingface_hub import list_repo_files
+    repo = "nvidia/OpenCodeReasoning"
+    fs = sorted(f for f in list_repo_files(repo, repo_type="dataset") if f.startswith("split_0/") and f.endswith(".parquet"))
+    rng.shuffle(fs)
+    for r in _parquet_rows(repo, fs[skip_files:], ["input", "output"], rng):
+        if not r["input"] or not r["output"]:
+            continue
+        rc, ans = _split_think(r["output"])
+        y = {"role": "assistant", "content": ans}
+        if rc is not None:
+            y["reasoning_content"] = rc
+        yield [{"role": "user", "content": r["input"]}, y], None, True
+
+
+def fineweb_rows(rng, skip_files):
+    from huggingface_hub import list_repo_files
+    repo = "HuggingFaceFW/fineweb-edu"
+    fs = sorted(f for f in list_repo_files(repo, repo_type="dataset") if f.startswith("sample/10BT/")); rng.shuffle(fs)
+    for r in _parquet_rows(repo, fs[skip_files:], ["text"], rng):
+        yield r["text"], None, None                     # plain text: no chat template
+
+
+def _ngram_hashes(ids, n):
+    """rolling uint64 hashes of every n-token window of ids"""
+    x = np.asarray(ids, dtype=np.uint64)
+    if len(x) < n:
+        return np.empty(0, np.uint64)
+    w = np.lib.stride_tricks.sliding_window_view(x, n)
+    p = np.power(np.uint64(1000003), np.arange(n, dtype=np.uint64))
+    with np.errstate(over="ignore"):
+        return (w * p).sum(1)
+
+
+def _hits(h, sorted_set):
+    """any of the hashes h in the sorted unique array"""
+    i = np.searchsorted(sorted_set, h).clip(0, len(sorted_set) - 1)
+    return bool((sorted_set[i] == h).any())
+
+
+_WORD = None
+
+
+def _word_ids(text):
+    """lower-cased \\w+ words as stable integer ids (crc32), for word n-gram hashing"""
+    import re, zlib
+    global _WORD
+    _WORD = _WORD or re.compile(r"\w+")
+    return [zlib.crc32(w.encode()) for w in _WORD.findall(text.lower())]
+
+
+def eval_ngrams(tok, n):
+    import glob, os
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data")
+    texts = []
+    for f in glob.glob(os.path.join(root, "bench", "*.jsonl")) + glob.glob(os.path.join(root, "zeroshot", "*.jsonl")):
+        for l in open(f):
+            r = json.loads(l)
+            for k in ("question", "answer", "prompt", "canonical_solution", "test", "context", "target"):
+                if isinstance(r.get(k), str):
+                    texts.append(r[k])
+            for k in ("choices", "contexts"):
+                if isinstance(r.get(k), list):
+                    texts += [c for c in r[k] if isinstance(c, str)]
+    hs = [_ngram_hashes(_word_ids(t), n) for t in texts]
+    return np.unique(np.concatenate(hs)), len(texts)
+
+
 def build(a):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.model_dir)
+    eos = tok.convert_tokens_to_ids("<|endoftext|>")
+    if a.decon:
+        evh, ne = eval_ngrams(tok, a.decon)
+        print(f"decontamination: {len(evh)} word {a.decon}-grams from {ne} evaluation texts", file=sys.stderr, flush=True)
     for spec in a.source:
         parts = spec.split(":")
         name, budget = parts[0], float(parts[-1])
@@ -108,25 +242,34 @@ def build(a):
             it, tag = hermes_rows(rng), "hermes"
         elif name == "toolace":
             it, tag = toolace_rows(rng), "toolace"
+        elif name == "tulu":
+            it, tag = tulu_rows(parts[1], rng), f"tulu_{parts[1]}"
+        elif name in ("ot3", "ocr", "fineweb"):
+            it, tag = {"ot3": ot3_rows, "ocr": ocr_rows, "fineweb": fineweb_rows}[name](rng, a.skip_files), name
         else:
             raise SystemExit(f"unknown source {spec}")
-        chunks, n, k, skip, long_ = [], 0, 0, 0, 0
+        chunks, n, k, skip, long_, dec = [], 0, 0, 0, 0, 0
         for msgs, tools, think in it:
             if n >= budget:
                 break
             try:
-                txt = tok.apply_chat_template(msgs, tools=tools, tokenize=False, enable_thinking=think)
+                txt = msgs if isinstance(msgs, str) else tok.apply_chat_template(msgs, tools=tools, tokenize=False,
+                                                                                 enable_thinking=think)
             except Exception:
                 skip += 1; continue
-            ids = tok(txt, add_special_tokens=False).input_ids
+            ids = tok(txt, add_special_tokens=False).input_ids + ([eos] if isinstance(msgs, str) else [])
             if len(ids) > a.max_len:
                 long_ += 1; continue
+            if a.decon and _hits(_ngram_hashes(_word_ids(txt), a.decon), evh):
+                dec += 1; continue
             chunks.append(np.asarray(ids, dtype=np.uint32)); n += len(ids); k += 1
+            if k % 20000 == 0:
+                print(f"  {tag}: {n / 1e6:.1f}M tokens, {k} items, {dec} dropped as contaminated", file=sys.stderr, flush=True)
         arr = np.concatenate(chunks)
         out = f"{a.out}_{tag}.bin"
         arr.tofile(out)
         print(f"{out}: {len(arr) / 1e6:.2f}M tokens, {k} conversations (skipped {skip} errors, {long_} > {a.max_len} "
-              f"tokens)", file=sys.stderr, flush=True)
+              f"tokens, {dec} contaminated)", file=sys.stderr, flush=True)
         if a.show:
             print(tok.decode(arr[:a.show].tolist()), file=sys.stderr)
 
@@ -165,7 +308,7 @@ def main():
     b = sub.add_parser("build"); b.add_argument("model_dir"); b.add_argument("out")
     b.add_argument("--source", nargs="+", required=True); b.add_argument("--seed", type=int, default=0)
     b.add_argument("--max_files", type=int, default=2); b.add_argument("--skip_files", type=int, default=0); b.add_argument("--max_len", type=int, default=32768)
-    b.add_argument("--show", type=int, default=0)
+    b.add_argument("--show", type=int, default=0); b.add_argument("--decon", type=int, default=0)
     m = sub.add_parser("mix"); m.add_argument("out_bin"); m.add_argument("total"); m.add_argument("parts", nargs="+")
     m.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
