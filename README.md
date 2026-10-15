@@ -11,8 +11,8 @@ out of an ablation of master-weight training, which showed what master weights p
 evidence with a memory of about 1000 steps, and immediate moves when it crosses a boundary; neither a full-rank first
 moment nor a per-weight second moment.
 
-The paper (local draft, `docs/paper/ttf_paper.tex`, build with `scripts/paper/build_pdf.sh`) has every result below
-with its run; `docs/paper` Appendix "Index of mechanisms and results" lists everything that was tried.
+The paper (preprint to follow) has every result below with its run, and an appendix indexing every mechanism that was
+tried with its result.
 
 ## Results
 
@@ -136,16 +136,20 @@ scripts/
   eval/          final_eval.py, compare.py, zeroshot*.py
   analysis/      memory_27b.py, rank_spectrum.py, val_overlap.py, diagnostics
   lab/, remote/, myriad/, night/   launchers for the lab PCs, the 4090 workstation, UCL Myriad (A100)
-  data/, plots/, paper/  data preparation, figures, the paper's build
+  data/, plots/          data preparation, figures
 tests/           test_kernel_ref.py (kernels vs dense references) and sanity tests
 docs/            see below
 ```
 
 ## Docs
 
-- `docs/paper/ttf_paper.tex`: the paper (all results, with the index of mechanisms).
-- [docs/QUEUE.md](docs/QUEUE.md): runs in progress and the dated log of results.
-- [docs/TODO.md](docs/TODO.md): open questions, limitations, paper to-do.
-- [docs/RUNS.md](docs/RUNS.md) / [docs/RUN_INDEX.md](docs/RUN_INDEX.md): lab notebook and run index (to early October).
-- [docs/FORMULAS.md](docs/FORMULAS.md): update rules; [docs/THREATS.md](docs/THREATS.md): objections and evidence.
-- `docs/RESULTS.md`, `docs/NOTES.md` and the `MORNING_SUMMARY_*` files are historical.
+- [docs/RUN_INDEX.md](docs/RUN_INDEX.md): index of runs with their settings and results.
+- [docs/FORMULAS.md](docs/FORMULAS.md): every update rule used, with its flag.
+- [docs/RESULTS.md](docs/RESULTS.md), [docs/RELATED_WORK.md](docs/RELATED_WORK.md): early results summary (historical)
+  and related work.
+
+## License and patents
+
+The code is licensed under the Clear BSD License ([LICENSE](LICENSE)), which grants no patent rights. The TTF training
+and inference methods are the subject of UK patent applications GB2623290.0 and GB2624374.1 (patent pending). To
+license the methods, contact the author.
