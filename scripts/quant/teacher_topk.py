@@ -26,6 +26,9 @@ def main():
     ap.add_argument("--mb", type=int, default=4, help="windows per layer call")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--sequential", action="store_true", help="every non-overlapping window once, shuffled (teacher_gguf.py)")
+    ap.add_argument("--claim_dir", default="", help="a directory on a filesystem all machines share (the UCL home): a "
+                    "machine computes shard S only after creating CLAIM_DIR/S (mkdir is atomic), so any number of machines "
+                    "fill one cache in shard order, joining or leaving at any time")
     ap.add_argument("--part", default="0/1", help="R/N: only the shards with index %% N == R (N machines, one cache)")
     a = ap.parse_args()
     from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
@@ -85,6 +88,11 @@ def main():
         fn = os.path.join(a.out, f"kd_{sh:05d}.npz")
         if os.path.exists(fn) or sh % n_ != r_:
             continue
+        if a.claim_dir:
+            try:
+                os.makedirs(a.claim_dir, exist_ok=True); os.mkdir(os.path.join(a.claim_dir, f"{sh:05d}"))
+            except FileExistsError:
+                continue
         t1 = time.time()
         st = starts_all[sh * a.batch:(sh + 1) * a.batch]
         ids = np.stack([data[s:s + a.seq].astype(np.int64) for s in st])
