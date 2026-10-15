@@ -57,7 +57,8 @@ avalanche of harmful moves after a conversion).
 | Qwen3.8-27B, 2M (probe) | 1.9034 | 3.8507 | 2.3644 (8 windows) |
 
 Qwen3.8-27B is converted layer by layer (streaming, about 20 minutes) and trained on one 24 GB GPU (peak 21.2 GiB);
-the converted model runs on a 12 GB laptop GPU at 22.7 tokens per second (`scripts/infer/ttf_qwen.py`).
+the converted model runs on a 12 GB laptop GPU at 22.7 tokens per second (`scripts/infer/ttf_qwen.py`). The 27B row
+is an early 60-step probe; a release model (about 40M tokens of recovery with distillation) is in training.
 
 ## Memory
 
@@ -137,7 +138,7 @@ scripts/
   analysis/      memory_27b.py, rank_spectrum.py, val_overlap.py, diagnostics
   lab/, remote/, myriad/, night/   launchers for the lab PCs, the 4090 workstation, UCL Myriad (A100)
   data/, plots/          data preparation, figures
-tests/           test_kernel_ref.py (kernels vs dense references) and sanity tests
+tests/           test_kernel_ref.py (kernels vs dense references), test_ts.py (the TTF update), sanity tests
 docs/            see below
 ```
 
