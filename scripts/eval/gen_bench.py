@@ -2,12 +2,16 @@
 
   python scripts/eval/gen_bench.py HF_DIR --fp  --task gsm8k --limit 200 --out OUT.jsonl     # bf16, CPU offload
   python scripts/eval/gen_bench.py HF_DIR --ttf WEIGHTS.pt --task gsm8k --limit 200 --out OUT.jsonl
+  python scripts/eval/gen_bench.py HF_DIR --server http://127.0.0.1:8080 --task gsm8k --limit 200 --out OUT.jsonl
 
 Tasks (data/bench/*.jsonl, the first --limit items): gsm8k (test split), humaneval (164), ifeval (541). Chat template,
 thinking off, greedy decoding, batched with left padding (prompts sorted by length). Writes one line per item (prompt id,
 output text, generated tokens) and skips items already in OUT, so a stopped run resumes. Scoring: score_bench.py.
 --fp keeps what does not fit --gpu_gib on the GPU in CPU memory (accelerate); decoding then streams those layers
 through the GPU once per step for the whole batch, so a large batch costs little more than one sequence.
+--server: a llama-server running a GGUF file as shipped (e.g. llama-server -m F.gguf -np 16 -c 32768 -ngl 99); the same
+prompt token ids go to its /completion endpoint (greedy, top-k 1), --bs requests at a time; it stops at the file's own
+end-of-generation tokens.
 """
 import argparse, json, os, sys, time
 
@@ -18,12 +22,12 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("hf_dir"); ap.add_argument("--task", required=True, choices=["gsm8k", "humaneval", "ifeval"])
-ap.add_argument("--fp", action="store_true"); ap.add_argument("--ttf", default="")
+ap.add_argument("--fp", action="store_true"); ap.add_argument("--ttf", default=""); ap.add_argument("--server", default="")
 ap.add_argument("--limit", type=int, default=0); ap.add_argument("--bs", type=int, default=32)
 ap.add_argument("--max_new", type=int, default=0, help="default: gsm8k 512, humaneval 512, ifeval 1024")
 ap.add_argument("--gpu_gib", type=int, default=14); ap.add_argument("--out", required=True)
 a = ap.parse_args()
-assert a.fp != bool(a.ttf), "--fp or --ttf WEIGHTS"
+assert a.fp + bool(a.ttf) + bool(a.server) == 1, "--fp, --ttf WEIGHTS or --server URL"
 max_new = a.max_new or {"gsm8k": 512, "humaneval": 512, "ifeval": 1024}[a.task]
 
 GSM = ("{q}\n\nSolve the problem step by step. End with the final answer on its own line in the form "
@@ -60,6 +64,26 @@ if not todo:
     sys.exit(0)
 
 t0 = time.time()
+if a.server:
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+
+    def complete(i):
+        req = {"prompt": tok(texts[i]).input_ids, "n_predict": max_new, "temperature": 0, "top_k": 1, "cache_prompt": False,
+               "return_tokens": True}
+        r = urllib.request.Request(a.server + "/completion", json.dumps(req).encode(), {"Content-Type": "application/json"})
+        return json.loads(urllib.request.urlopen(r, timeout=7200).read())
+    with open(a.out, "a") as fo, ThreadPoolExecutor(a.bs) as pool:
+        for b in range(0, len(todo), a.bs):
+            chunk = todo[b:b + a.bs]; t = time.time()
+            for (i, p), r in zip(chunk, pool.map(complete, [i for i, _ in chunk])):
+                fo.write(json.dumps({"id": i, "prompt": p, "output": tok.decode(r["tokens"], skip_special_tokens=True),
+                                     "gen_tokens": r["tokens_predicted"]}) + "\n")
+            fo.flush()
+            print(f"  batch {b // a.bs + 1}/{(len(todo) + a.bs - 1) // a.bs}: {len(chunk)} items, {time.time() - t:.0f} s",
+                  flush=True)
+    print(f"done in {time.time() - t0:.0f} s", flush=True)
+    sys.exit(0)
 if a.fp:
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     hf = Qwen3_5ForCausalLM.from_pretrained(a.hf_dir, dtype=torch.bfloat16, device_map="auto",
