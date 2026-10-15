@@ -2948,7 +2948,7 @@ def main():
     ap.add_argument("--init_hf", default="", help="start from a pretrained Llama checkpoint in Hugging Face format (a "
                     "directory with config.json and safetensors); the model shape comes from its config (--preset is ignored). "
                     "See bitnet/hf_init.py")
-    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "gptq", "gptqc", "zero", "scratch"],
+    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "gptq", "gptqc", "gptqs", "zero", "scratch"],
                     help="--init_hf, kernel mode: how the weights become trits and scales (bitnet/hf_init.py)")
     ap.add_argument("--distill", default="", help="a full-precision teacher (Hugging Face Llama dir): the loss is "
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
@@ -3579,6 +3579,10 @@ def main():
             load_qwen(model, args.init_hf, _qsw, method=args.init_hf_method, rc=args.rc_scale, hess=_hess,
                       log=lambda m_: print(m_, flush=True))
             _hess = None
+        elif args.init_hf_method == "gptqs":    # sequential, error-aware, centred GPTQ (training-free conversion)
+            from .hf_init import convert_seq_asym
+            _hess = convert_seq_asym(args.init_hf, tc.data_path, n_seq=min(args.init_calib, 32), dev=device,
+                                     log=lambda m_: print(m_, flush=True))
         elif args.init_hf_method in ("gptq", "gptqc"):     # input second moments of the full-precision model (not the run's windows)
             from .hf_init import calib_hessians
             _hess = calib_hessians(args.init_hf, tc.data_path, n_seq=args.init_calib, dev=device,
