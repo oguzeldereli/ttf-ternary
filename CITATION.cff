@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "ttf-ternary: training and converting ternary language models without master weights"
+type: software
+authors:
+  - family-names: "Güzeldereli"
+    given-names: "Özgür"
+    affiliation: "University College London"
+license: PolyForm-Noncommercial-1.0.0
+repository-code: "https://github.com/oguzeldereli/ttf-ternary"
+abstract: >-
+  Two-timescale threshold flips (TTF): training ternary ({-1, 0, 1}) language models without full-precision master
+  weights, and converting pretrained models to ternary weights with the same update.
+keywords:
+  - ternary neural networks
+  - low-bit training
+  - large language models
