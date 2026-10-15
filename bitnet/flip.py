@@ -678,7 +678,14 @@ class KernelTernaryLinear(nn.Module):
         self.mag_B = nn.Parameter(torch.randn(self.K, r, device=dev) * std)
         return [self.mag_A, self.mag_B]
 
+    def enable_centering(self, mu, bias):
+        """--init_hf_method gptqc: y = layer(x - mu) + bias, mu a fixed buffer, bias a float parameter (init W mu)"""
+        self.register_buffer("in_mean", mu.detach().clone().float())
+        self.out_bias = nn.Parameter(bias.detach().clone().float())
+
     def forward(self, x):
+        if getattr(self, "in_mean", None) is not None:      # gptqc: centred input (before the activation quantisation)
+            x = x - self.in_mean.to(x.dtype)
         # column scale before the GEMM (and before the int8 activation quantization),
         # row scale after it: the packed kernels are unchanged, autograd handles r and c,
         # and the flip rule's dL/dq comes out scaled by r_i * c_j per weight
@@ -704,6 +711,8 @@ class KernelTernaryLinear(nn.Module):
                     y = y + A[:, k] * _TernNoFlipFn.apply(x * B[:, k], self.wpacked, self)
         if self.row_scale is not None:
             y = y * self.row_scale.to(y.dtype)
+        if getattr(self, "out_bias", None) is not None:
+            y = y + self.out_bias.to(y.dtype)
         return y
 
     @torch.no_grad()

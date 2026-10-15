@@ -9,9 +9,12 @@
 #   deout     fp32 fine-tune with the residual outlier penalty (--act_reg 0.05), then GPTQ in the analysis   arm a
 #   homo      master mode, homotopy fp -> ternary over 1000 steps (--m_qmix 1000)     arm b
 #   kdscratch TTF from scratch (final recipe, theta 16) with the same KD and tokens   arm d (insight only)
+#   gptqc     centred GPTQ start (input mean out before rounding, W mu as a float bias), then as conv   arm e
+#   convreg   as conv with the residual outlier penalty on the ternary student (--act_reg 0.05)       arm f
 #   fpseed2   full precision from scratch, seed 2, 300M tokens, snapshots every 1000 steps (baselines)
 set -u
-ARM=$1; S=/tmp/oguzelde/tern; source $S/env.sh; cd $S/repo
+ARM=$1; S=${S:-/tmp/oguzelde/tern}; REPO=${REPO:-$S/repo}      # Myriad: S=~/Scratch/tern REPO=~/Scratch/ternary-LLM
+source $S/env.sh; cd $REPO
 D=checkpoints/g_$ARM; mkdir -p $D logs
 HF=models/fp32_110m_hf
 DATA="--data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16 --grad_accum 1"
@@ -24,6 +27,8 @@ CONV="--steps 1526 --warmup 300 --lr 5e-4 --min_lr 5e-5 --init_hf_method gptq --
 case $ARM in
   conv)      F="$DATA $TTF $CONV --init_hf $HF $KD" ;;
   sp)        F="$DATA $TTF $CONV --init_hf models/fp32_110m_sp $KD" ;;
+  gptqc)     F="$DATA $TTF ${CONV/gptq/gptqc} --init_hf $HF $KD" ;;                     # arm e: centred GPTQ start
+  convreg)   F="$DATA $TTF $CONV --init_hf $HF $KD --act_reg 0.05" ;;                    # arm f: outlier penalty on the student
   deout)     F="$DATA --mode fp32 --init_hf $HF $KD --act_reg 0.05 --steps 1526 --warmup 100 --lr 3e-4 --min_lr 3e-5
                --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
   homo)      F="$DATA --mode master --init_hf $HF $KD --m_qmix 1000 --rc_scale --tail_fp32 --steps 1526 --warmup 100

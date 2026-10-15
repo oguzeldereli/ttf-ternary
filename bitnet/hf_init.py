@@ -4,6 +4,10 @@ The float parts (token embedding, output head, RMSNorm gains) are copied. Each l
   fp32    the weight as is (sanity check: the loss should match the original model's)
   master  the latent is the weight (BitNet's absmean ternary in the forward, as published conversions do)
   kernel  the weight is ternarized (--init_hf_method):
+            gptqc    GPTQ on the input covariance instead of the second moment, the layer computing W_hat (x - mu) + W mu:
+                     the input mean mu (fixed) is taken out before the activation quantisation and its product with
+                     the fp weight is a float bias (trained); for fp models whose residual stream carries a large
+                     constant offset (massive activations)
             absmean  T = round(clip(W / mean|W|)) per tensor, the output scale mean|W| (BitNet b1.58)
             row      a per-row scale a_i chosen from a grid to minimise |W_i - a_i T_i| (least-squares magnitude)
             als      W ~ a_i c_j T_ij, row and column scales by alternating least squares (needs --rc_scale)
@@ -149,18 +153,19 @@ def calib_hessians(path, data_path, n_seq=64, seq=2048, dev="cuda", log=print):
     m = BitTransformer(mc, grad_checkpoint=False, make_linear=lambda i, o: nn.Linear(i, o, bias=False)).to(dev)
     init_from_hf(m, path, "fp32", log=lambda *_: None)
     m.eval()
-    H, hooks, cnt = {}, [], {}
+    H, hooks, cnt, MU = {}, [], {}, {}
     own = {"wq": "wq", "wk": "wq", "wv": "wq", "wo": "wo", "w_gate": "w_gate", "w_up": "w_gate", "w_down": "w_down"}
     for i, blk in enumerate(m.layers):
         for sub, name in (("attn", "wq"), ("attn", "wo"), ("ffn", "w_gate"), ("ffn", "w_down")):
             lin = getattr(getattr(blk, sub), name)
             key = (i, name)
             H[key] = torch.zeros(lin.in_features, lin.in_features, device=dev)
+            MU[key] = torch.zeros(lin.in_features, device=dev)
             cnt[key] = 0
 
             def hook(mod, inp, key=key):
                 x = inp[0].reshape(-1, inp[0].shape[-1]).float()
-                H[key].addmm_(x.T, x); cnt[key] += x.shape[0]
+                H[key].addmm_(x.T, x); MU[key] += x.sum(0); cnt[key] += x.shape[0]
             hooks.append(lin.register_forward_pre_hook(hook))
     data = np.memmap(data_path, dtype=np.uint16, mode="r")
     rng = np.random.default_rng(4321)                   # not the training stream's windows
@@ -172,9 +177,11 @@ def calib_hessians(path, data_path, n_seq=64, seq=2048, dev="cuda", log=print):
     out = {}
     for (i, name), h in H.items():
         h /= max(cnt[(i, name)], 1)
+        mu = MU[(i, name)] / max(cnt[(i, name)], 1)
         for n2, o in own.items():
             if o == name:
                 out[(i, n2)] = h.cpu()
+                out[("mu", i, n2)] = mu.cpu()       # the input mean (gptqc: centred conversion)
     del m, H
     torch.cuda.empty_cache()
     log(f"calibration: input second moments of {len(out)} linears from {n_seq} x {seq} tokens of {data_path}")
@@ -259,12 +266,16 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
             if not isinstance(lin, KernelTernaryLinear):        # fp32 mode: nn.Linear
                 lin.weight.copy_(W)
                 continue
-            T, a, c = ternarize(W, "als" if method == "gptq" else method)
+            T, a, c = ternarize(W, "als" if method in ("gptq", "gptqc") else method)
             if hess is not None and method != "zero":
                 Hl = hess[(i, name)].to(dev)
                 e0 = _out_err(W, T, a, c, Hl)
                 if method == "gptq":
                     T, a, c = ternarize_gptq(W, Hl, a, c)
+                elif method == "gptqc":     # centred: GPTQ on the input covariance; the layer subtracts the input mean
+                    mu = hess[("mu", i, name)].to(dev)  # before its activation quantisation and adds W mu back as a bias
+                    T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)
+                    lin.enable_centering(mu, W @ mu)
                 oerrs.append((e0, _out_err(W, T, a, c, Hl)))
                 del Hl
             if method != "zero":
