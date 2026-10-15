@@ -2952,6 +2952,11 @@ def main():
                     help="--init_hf, kernel mode: how the weights become trits and scales (bitnet/hf_init.py)")
     ap.add_argument("--distill", default="", help="a full-precision teacher (Hugging Face Llama dir): the loss is "
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
+    ap.add_argument("--m_qmix", type=int, default=0, help="--mode master: homotopy onto the ternary grid, the forward "
+                    "uses lam T(W) + (1 - lam) W with lam rising linearly from 0 at step 0 to 1 at step N (then ternary)")
+    ap.add_argument("--act_reg", type=float, default=0.0, help="penalty W x mean over block inputs 1.. and the final norm "
+                    "input of log E_token mean_d (h_d / rms(h))^4 (residual-stream outliers: ~3 for a Gaussian stream, "
+                    "~200 for the 110M fp model's massive activations); added to the training loss only")
     ap.add_argument("--distill_w", type=float, default=1.0, help="--distill: weight of the KL term (1: KL only)")
     ap.add_argument("--kd_cache", default="", help="distil from precomputed teacher targets (scripts/quant/teacher_topk.py: fixed windows of --data with the teacher's top-k log-probabilities): each micro-batch takes the next window in order; the loss is (1 - --distill_w) CE + --distill_w x cross-entropy to the renormalised top k (Qwen models, batch_size 1)")
     ap.add_argument("--kd_mode", default="renorm", choices=["rest", "renorm"], help="--kd_cache: rest = the top k plus one bucket for the teacher's remaining mass (the KL on that distribution); renorm = the top k renormalised (drops the tail)")
@@ -4040,8 +4045,21 @@ def main():
         log_metrics({"step": 0, "first_n_loss": float(np.mean(ls_))})
         model.train(); STATE.updates_enabled = True
     spike_st = {}   # --spike_dump state
+    _areg = []
+    if args.act_reg:                       # --act_reg: residual-stream outlier penalty, collected by pre-hooks
+        def _areg_hook(mod, inp):
+            h = inp[0].float()
+            m4 = (h / h.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)).pow(4).mean()
+            _areg.append(torch.log(m4))
+        for _i, _blk in enumerate(model.layers):
+            if _i > 0:
+                _blk.register_forward_pre_hook(_areg_hook)
+        model.norm.register_forward_pre_hook(_areg_hook)
     for step in range(start_step, end_step):
         ORTH_DBG[0] = ORTH_DEBUG and step % 10 == 0
+        if args.m_qmix:                    # --m_qmix: the homotopy's mixing weight for this step
+            from . import master as _mst
+            _mst.QMIX["lam"] = min(1.0, step / args.m_qmix)
         if args.profile and step == start_step + 20:         # after autotune / warm-up
             from torch.profiler import profile, ProfilerActivity
             prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
@@ -4183,8 +4201,15 @@ def main():
                 with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
                     tz_, _ = _teacher(x)
                 model.kd_logp = F.log_softmax(tz_.float(), -1).to(torch.bfloat16).reshape(-1, tz_.shape[-1]); del tz_
+            _areg.clear()
             with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
                 _, loss = model(x, y)
+            if args.act_reg and _areg:
+                _ar = torch.stack(_areg).mean()
+                if micro == 0 and step % 50 == 0:
+                    print(f"act_reg: step {step} mean log m4 {_ar.item():.3f} (m4 {_ar.exp().item():.1f})", flush=True)
+                loss = loss + args.act_reg * _ar
+                _areg.clear()
             if args.spike_dump:
                 spike_st["bt"].append((x.detach().cpu(), y.detach().cpu()))
             sc_ = float(args.spike_test.split(":")[1]) if args.spike_test and step == int(args.spike_test.split(":")[0]) else 1.0

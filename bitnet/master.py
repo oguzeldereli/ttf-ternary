@@ -30,6 +30,9 @@ def _ternary_ste(w: torch.Tensor, gamma=None) -> torch.Tensor:
     return w + (t - w).detach()
 
 
+QMIX = {"lam": None}   # --m_qmix: the forward uses lam * ternary(W) + (1 - lam) * W (homotopy onto the grid); None = ternary
+
+
 class MasterTernaryLinear(nn.Module):
     """Ternary-in-the-forward linear with a latent master weight (an nn.Parameter)."""
 
@@ -96,6 +99,10 @@ class MasterTernaryLinear(nn.Module):
             w = self.weight
             gamma = self.gamma_fixed if self.gamma_fixed is not None else w.detach().abs().mean().clamp_min(1e-5)
             return F.linear(_act_quant_ste(x, self.act_bits), w + (self.T.to(w.dtype) * gamma - w).detach())
+        lam = QMIX["lam"]
+        if lam is not None and lam < 1.0:          # --m_qmix: part of the way from the float weight to its ternary value
+            w = self.latent()
+            return F.linear(_act_quant_ste(x, self.act_bits), lam * _ternary_ste(w, self.gamma_fixed) + (1.0 - lam) * w)
         return F.linear(_act_quant_ste(x, self.act_bits), _ternary_ste(self.latent(), self.gamma_fixed))
 
     @torch.no_grad()
