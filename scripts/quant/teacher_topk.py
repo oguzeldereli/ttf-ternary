@@ -21,10 +21,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("hf_dir"); ap.add_argument("data"); ap.add_argument("out")
-    ap.add_argument("--windows", type=int, default=24000); ap.add_argument("--batch", type=int, default=48)
+    ap.add_argument("--windows", type=int, default=24000, help="0 with --sequential: all windows"); ap.add_argument("--batch", type=int, default=48)
     ap.add_argument("--k", type=int, default=32); ap.add_argument("--seq", type=int, default=2048)
     ap.add_argument("--mb", type=int, default=4, help="windows per layer call")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--sequential", action="store_true", help="every non-overlapping window once, shuffled (teacher_gguf.py)")
+    ap.add_argument("--part", default="0/1", help="R/N: only the shards with index %% N == R (N machines, one cache)")
     a = ap.parse_args()
     from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
     from bitnet.qwen import text_config, _safetensor_index
@@ -63,7 +65,12 @@ def main():
     print(f"weights pinned in {time.time() - t0:.0f}s", flush=True)
     data = np.memmap(a.data, dtype=np.uint32, mode="r")
     rng = np.random.default_rng(a.seed)
-    starts_all = rng.integers(0, len(data) - a.seq - 1, a.windows)
+    if a.sequential:                                # as teacher_gguf.py: the same starts for the same data and seed
+        starts_all = rng.permutation((len(data) - 1) // a.seq).astype(np.int64) * a.seq
+        starts_all = starts_all[:a.windows] if a.windows else starts_all
+    else:
+        starts_all = rng.integers(0, len(data) - a.seq - 1, a.windows)
+    r_, n_ = map(int, a.part.split("/"))
     assert a.batch % a.mb == 0
     nsh = a.windows // a.batch                      # full shards only
     # per-layer keyword arguments for a micro-batch of mb windows (rotary embeddings, the two mask kinds)
@@ -76,7 +83,7 @@ def main():
     del x0
     for sh in range(nsh):
         fn = os.path.join(a.out, f"kd_{sh:05d}.npz")
-        if os.path.exists(fn):
+        if os.path.exists(fn) or sh % n_ != r_:
             continue
         t1 = time.time()
         st = starts_all[sh * a.batch:(sh + 1) * a.batch]
@@ -108,7 +115,8 @@ def main():
         os.replace(tmp, fn)
         cov = float(np.exp(top_l.astype(np.float32)).sum(-1).mean())
         print(f"shard {sh + 1}/{nsh}: {len(st)} windows in {time.time() - t1:.0f}s, top-{a.k} mass {cov:.3f}", flush=True)
-    open(os.path.join(a.out, "done"), "w").close()
+    if all(os.path.exists(os.path.join(a.out, f"kd_{sh:05d}.npz")) for sh in range(nsh)):
+        open(os.path.join(a.out, "done"), "w").close()
 
 
 if __name__ == "__main__":
