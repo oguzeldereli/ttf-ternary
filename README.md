@@ -1,4 +1,4 @@
-# ternary-LLM
+# ttf-ternary
 
 Ternary ({-1, 0, 1}) language models trained **without full-precision master weights**, and pretrained models
 converted to ternary weights with the same update. The weights stay packed at 1.6 bits (5 trits per byte) during
