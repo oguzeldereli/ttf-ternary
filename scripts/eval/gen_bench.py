@@ -69,8 +69,11 @@ else:
     from ttf_qwen import build
     hf, _ = build(a.hf_dir, a.ttf, "cuda", True)
 print(f"model loaded in {time.time() - t0:.0f} s", flush=True)
-eos = hf.generation_config.eos_token_id
-pad = tok.pad_token_id if tok.pad_token_id is not None else (eos[0] if isinstance(eos, list) else eos)
+from transformers import GenerationConfig                                 # noqa: E402
+gc = GenerationConfig.from_pretrained(a.hf_dir)   # the model's own stop tokens (<|im_end|> too): ttf_qwen.build() makes
+eos = gc.eos_token_id                             # the model from config.json, whose eos is <|endoftext|> only
+pad = gc.pad_token_id if gc.pad_token_id is not None else (eos[0] if isinstance(eos, list) else eos)
+print(f"eos {eos}, pad {pad}", flush=True)
 
 with open(a.out, "a") as fo:
     for b in range(0, len(todo), a.bs):
