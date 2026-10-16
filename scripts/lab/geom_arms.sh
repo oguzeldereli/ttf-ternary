@@ -41,6 +41,7 @@ case $ARM in
   homo1500)  F="$DATA --mode master --init_hf $HF $KD --m_qmix 1500 --rc_scale --tail_fp32 --steps 1526 --warmup 100
                --lr 5e-4 --min_lr 5e-5 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
   conv_long) F="$DATA $TTF ${CONV/--steps 1526/--steps 4578} --init_hf $HF $KD" ;;                # 150M tokens: does the base matter later?
+  gptqc_long) F="$DATA $TTF $(echo $CONV | sed "s/--steps 1526/--steps 4578/; s/method gptq /method gptqc /") --init_hf $HF $KD" ;;
   homo_long) F="$DATA --mode master --init_hf $HF $KD --m_qmix 3000 --rc_scale --tail_fp32 --steps 4578 --warmup 100
                --lr 5e-4 --min_lr 5e-5 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
   resann_150M) F="$DATA $TTF $(echo $CONV | sed "s/--steps 1526/--steps 4578/; s/--ts_start 400/--ts_start 100/") --init_hf $HF $KD --res_anneal 3000" ;;
