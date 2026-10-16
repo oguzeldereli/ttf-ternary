@@ -678,12 +678,32 @@ class KernelTernaryLinear(nn.Module):
         self.mag_B = nn.Parameter(torch.randn(self.K, r, device=dev) * std)
         return [self.mag_A, self.mag_B]
 
+    def enable_res_anneal(self, R, rank=0):
+        """--res_anneal: the fp weight's rounding residual R = W - W_hat (fixed, not saved; full or rank-r factors),
+        added to the output scaled by RES_ANNEAL["f"] (1 -> 0 over the anneal): the layer starts as the fp layer"""
+        if rank and rank < min(R.shape):
+            U, S_, Vh = torch.linalg.svd(R.float(), full_matrices=False)
+            self.register_buffer("res_U", (U[:, :rank] * S_[:rank]).to(torch.bfloat16).contiguous(), persistent=False)
+            self.register_buffer("res_V", Vh[:rank].T.to(torch.bfloat16).contiguous(), persistent=False)
+        else:
+            self.register_buffer("res_W", R.to(torch.bfloat16).contiguous(), persistent=False)
+
     def enable_centering(self, mu, bias):
         """--init_hf_method gptqc: y = layer(x - mu) + bias, mu a fixed buffer, bias a float parameter (init W mu)"""
         self.register_buffer("in_mean", mu.detach().clone().float())
         self.out_bias = nn.Parameter(bias.detach().clone().float())
 
     def forward(self, x):
+        f_ = RES_ANNEAL["f"]
+        if f_ > 0 and (getattr(self, "res_W", None) is not None or getattr(self, "res_U", None) is not None):
+            if getattr(self, "res_W", None) is not None:   # --res_anneal: the fading fp residual, on the raw input
+                r_ = F.linear(x, self.res_W.to(x.dtype))
+            else:
+                r_ = (x @ self.res_V.to(x.dtype)) @ self.res_U.to(x.dtype).T
+            return self._forward_t(x) + f_ * r_
+        return self._forward_t(x)
+
+    def _forward_t(self, x):
         if getattr(self, "in_mean", None) is not None:      # gptqc: centred input (before the activation quantisation)
             x = x - self.in_mean.to(x.dtype)
         # column scale before the GEMM (and before the int8 activation quantization),
@@ -734,6 +754,9 @@ class KernelTernaryLinear(nn.Module):
             return w, trit_beta(self.wpacked, self.K).item()
         scale = w.to(torch.float32).abs().mean().clamp_min(1e-5)
         return w, scale
+
+
+RES_ANNEAL = {"f": 0.0}   # --res_anneal: weight of the fp rounding residual in every layer's output (1 -> 0)
 
 
 def build_kernel_transformer(c: ModelConfig, grad_checkpoint: bool = True,

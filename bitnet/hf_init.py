@@ -298,7 +298,8 @@ def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2):
 
 
 @torch.no_grad()
-def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0, rank=0, clip=0.5, log=print, hess=None):
+def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0, rank=0, clip=0.5, log=print, hess=None,
+                 res_rank=-1):
     """copy / convert the checkpoint into model (built with model_config_from_hf); returns {layer: (U, V)} for
     --init_acc (empty otherwise). method gptq needs hess = calib_hessians(...)"""
     from .flip import KernelTernaryLinear
@@ -355,6 +356,8 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
             if method != "zero":
                 errs.append(_rel_err(W, T, a, c))
             lin.wpacked.copy_(pack_rows(T))
+            if res_rank >= 0 and method != "zero":   # --res_anneal: keep the rounding residual (fixed) to fade out
+                lin.enable_res_anneal(W - a[:, None] * c[None, :] * T.float(), res_rank)
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
             if method == "zero":     # the trits are all 0, so beta is that of an empty layer; use the density the
                 beta = 1.0 / (lin.K * 0.6) ** 0.5   # first firing will give (~0.6 nonzero), refined as trits move

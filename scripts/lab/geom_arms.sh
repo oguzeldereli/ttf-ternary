@@ -12,6 +12,9 @@
 #   gptqc     centred GPTQ start (input mean out before rounding, W mu as a float bias), then as conv   arm e
 #   gptqs     sequential, error-aware, centred GPTQ start (convert_seq_asym), then as conv
 #   convreg   as conv with the residual outlier penalty on the ternary student (--act_reg 0.05)       arm f
+#   resann    TTF-native homotopy: GPTQ trits + the fp rounding residual faded 1 -> 0 over 1000 steps (--res_anneal)
+#   resann256 the same with the residual at rank 256 (the memory-cheap form for big models); resann_long: 1400 steps
+#   homo1500  master homotopy over 1500 steps
 #   fpseed2   full precision from scratch, seed 2, 300M tokens, snapshots every 1000 steps (baselines)
 set -u
 ARM=$1; S=${S:-/tmp/oguzelde/tern}; REPO=${REPO:-$S/repo}      # Myriad: S=~/Scratch/tern REPO=~/Scratch/ternary-LLM
@@ -31,6 +34,11 @@ case $ARM in
   sp)        F="$DATA $TTF $CONV --init_hf $MD/fp32_110m_sp $KD" ;;
   gptqc)     F="$DATA $TTF ${CONV/gptq/gptqc} --init_hf $HF $KD" ;;                     # arm e: centred GPTQ start
   gptqs)     F="$DATA $TTF ${CONV/gptq/gptqs} --init_hf $HF $KD" ;;                     # sequential error-aware centred start
+  resann)    F="$DATA $TTF ${CONV/--ts_start 400/--ts_start 100} --init_hf $HF $KD --res_anneal 1000" ;;      # TTF homotopy, full residual
+  resann256) F="$DATA $TTF ${CONV/--ts_start 400/--ts_start 100} --init_hf $HF $KD --res_anneal 1000:256" ;;  # rank-256 residual
+  resann_long) F="$DATA $TTF ${CONV/--ts_start 400/--ts_start 100} --init_hf $HF $KD --res_anneal 1400" ;;   # slower fade
+  homo1500)  F="$DATA --mode master --init_hf $HF $KD --m_qmix 1500 --rc_scale --tail_fp32 --steps 1526 --warmup 100
+               --lr 5e-4 --min_lr 5e-5 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
   convreg)   F="$DATA $TTF $CONV --init_hf $HF $KD --act_reg 0.05" ;;                    # arm f: outlier penalty on the student
   deout)     F="$DATA --mode fp32 --init_hf $HF $KD --act_reg 0.05 --steps 1526 --warmup 100 --lr 3e-4 --min_lr 3e-5
                --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;

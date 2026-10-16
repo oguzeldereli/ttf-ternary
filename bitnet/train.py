@@ -2954,6 +2954,9 @@ def main():
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
     ap.add_argument("--m_qmix", type=int, default=0, help="--mode master: homotopy onto the ternary grid, the forward "
                     "uses lam T(W) + (1 - lam) W with lam rising linearly from 0 at step 0 to 1 at step N (then ternary)")
+    ap.add_argument("--res_anneal", default="", help="N[:R] (--init_hf, kernel): keep every layer's rounding residual "
+                    "W - W_hat (rank R, 0 / omitted = full) and add it to the output with weight 1 - step / N: the run starts "
+                    "as the fp model and slides onto the ternary weights while TTF trains them (TTF-native homotopy)")
     ap.add_argument("--act_reg", type=float, default=0.0, help="penalty W x mean over block inputs 1.. and the final norm "
                     "input of log E_token mean_d (h_d / rms(h))^4 (residual-stream outliers: ~3 for a Gaussian stream, "
                     "~200 for the 110M fp model's massive activations); added to the training loss only")
@@ -3587,7 +3590,8 @@ def main():
             from .hf_init import calib_hessians
             _hess = calib_hessians(args.init_hf, tc.data_path, n_seq=args.init_calib, dev=device,
                                    log=lambda m_: print(m_, flush=True))
-        _acc_init = {} if _QWEN else init_from_hf(model, args.init_hf, args.mode, args.init_hf_method, rc=args.rc_scale, hess=_hess,
+        _rr = (int(args.res_anneal.split(":")[1]) if ":" in args.res_anneal else 0) if args.res_anneal else -1
+        _acc_init = {} if _QWEN else init_from_hf(model, args.init_hf, args.mode, args.init_hf_method, rc=args.rc_scale, hess=_hess, res_rank=_rr,
                                  acc=args.init_acc if args.ts else 0.0, theta=args.ts_theta, rank=args.lowrank, clip=args.init_acc_clip,
                                  log=lambda m_: print(m_, flush=True))
     _teacher = None
@@ -4061,6 +4065,9 @@ def main():
         model.norm.register_forward_pre_hook(_areg_hook)
     for step in range(start_step, end_step):
         ORTH_DBG[0] = ORTH_DEBUG and step % 10 == 0
+        if args.res_anneal:                # --res_anneal: the fp residual's weight for this step
+            from .flip import RES_ANNEAL as _RA
+            _RA["f"] = max(0.0, 1.0 - step / int(args.res_anneal.split(":")[0]))
         if args.m_qmix:                    # --m_qmix: the homotopy's mixing weight for this step
             from . import master as _mst
             _mst.QMIX["lam"] = min(1.0, step / args.m_qmix)
