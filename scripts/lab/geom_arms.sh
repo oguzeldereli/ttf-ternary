@@ -52,6 +52,8 @@ case $ARM in
   gptqc_ts0) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD" ;;   # the two gains together
   gptqc_ts0_long) F="$DATA $TTF $(echo $CONV | sed "s/--steps 1526/--steps 4578/; s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD" ;;
   conv_ts0_t32) F="$DATA $TTF $(echo $CONV | sed "s/--ts_theta 64/--ts_theta 32/; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD" ;;   # no freeze, more moves
+  gptqc_ts0_kd025) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.25" ;;
+  gptqc_ts0_kd0) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF" ;;   # labels only
   conv_ts0_t128) F="$DATA $TTF $(echo $CONV | sed "s/--ts_theta 64/--ts_theta 128/; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD" ;;   # no freeze, fewer moves
   conv_t128) F="$DATA $TTF ${CONV/--ts_theta 64/--ts_theta 128} --init_hf $HF $KD" ;;                    # fewer trit moves
   conv_kd1)  F="$DATA $TTF $CONV --init_hf $HF --distill $HF --distill_w 1.0" ;;                     # KD only
