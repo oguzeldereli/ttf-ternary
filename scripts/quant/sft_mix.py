@@ -132,6 +132,8 @@ def tulu_rows(kind, rng):
         safe = any(k in r["source"] for k in SAFETY)
         if "hard_coded" in r["source"] or safe != (kind == "safety"):
             continue
+        if kind == "if" and "ifdata" not in r["source"]:      # tulu:if: the persona instruction-following set only
+            continue
         m = [{"role": x["role"], "content": x["content"]} for x in r["messages"]]
         if m and m[-1]["role"] == "assistant":
             yield m, None, False
@@ -170,6 +172,21 @@ def ocr_rows(rng, skip_files):
         if rc is not None:
             y["reasoning_content"] = rc
         yield [{"role": "user", "content": r["input"]}, y], None, True
+
+
+def oci_rows(rng, skip_files):
+    """nvidia/OpenCodeInstruct (CC-BY-4.0): Python function problems with a solution and unit tests; only solutions that
+    passed every test (average_test_score 1). Direct answers, no thinking block."""
+    from huggingface_hub import list_repo_files
+    repo = "nvidia/OpenCodeInstruct"
+    fs = sorted(f for f in list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet")); rng.shuffle(fs)
+    for r in _parquet_rows(repo, fs[skip_files:], ["input", "output", "average_test_score"], rng):
+        try:
+            ok = float(r["average_test_score"]) >= 1.0
+        except (TypeError, ValueError):
+            ok = False
+        if ok and r["input"] and r["output"]:
+            yield [{"role": "user", "content": r["input"]}, {"role": "assistant", "content": r["output"]}], None, False
 
 
 def fineweb_rows(rng, skip_files):
@@ -244,8 +261,8 @@ def build(a):
             it, tag = toolace_rows(rng), "toolace"
         elif name == "tulu":
             it, tag = tulu_rows(parts[1], rng), f"tulu_{parts[1]}"
-        elif name in ("ot3", "ocr", "fineweb"):
-            it, tag = {"ot3": ot3_rows, "ocr": ocr_rows, "fineweb": fineweb_rows}[name](rng, a.skip_files), name
+        elif name in ("ot3", "ocr", "fineweb", "oci"):
+            it, tag = {"ot3": ot3_rows, "ocr": ocr_rows, "fineweb": fineweb_rows, "oci": oci_rows}[name](rng, a.skip_files), name
         else:
             raise SystemExit(f"unknown source {spec}")
         chunks, n, k, skip, long_, dec = [], 0, 0, 0, 0, 0

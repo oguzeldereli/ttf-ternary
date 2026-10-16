@@ -49,9 +49,10 @@ from .flip import (build_flip_transformer, build_stateless_transformer,
 _KD_SHARD = {}
 
 
-def _kd_cache_batch(args, idx, data, seq_len, device):
-    """--kd_cache: window idx of the precomputed teacher targets (shards kd_00000.npz, ... of B windows each); waits
-    for a shard that is still being written. Returns x, y [1, seq] and (ids [seq, k], log-probs [seq, k]) on device."""
+def _kd_window(args, idx):
+    """--kd_cache: (start, ids [seq, k], log-probs [seq, k]) of window idx of the precomputed teacher targets (shards
+    kd_00000.npz, ... of B windows each); waits for a shard that is still being written, wraps around once the cache
+    is marked done."""
     import glob
     if "B" not in _KD_SHARD:
         while not glob.glob(os.path.join(args.kd_cache, "kd_00000.npz")):
@@ -71,11 +72,19 @@ def _kd_cache_batch(args, idx, data, seq_len, device):
             time.sleep(30); waited += 30
         z = np.load(fn)
         _KD_SHARD.update(sh=sh, starts=z["starts"], ids=z["ids"], lp=z["lp"])
-    s0 = int(_KD_SHARD["starts"][j])
-    w = torch.from_numpy(data[s0:s0 + seq_len + 1].astype(np.int64)).to(device)
-    ids = torch.from_numpy(_KD_SHARD["ids"][j].astype(np.int64)).to(device)
-    lp = torch.from_numpy(_KD_SHARD["lp"][j]).to(device)
-    return w[None, :-1], w[None, 1:], (ids, lp)
+    return int(_KD_SHARD["starts"][j]), _KD_SHARD["ids"][j], _KD_SHARD["lp"][j]
+
+
+def _kd_cache_batch(args, idx, data, seq_len, device, bs=1):
+    """--kd_cache: micro-batch idx = windows idx * bs ... idx * bs + bs - 1 of the cache (bs 1: window idx, as before).
+    Returns x, y [bs, seq] and (ids [bs * seq, k], log-probs [bs * seq, k]) on device, rows in the order of x.flatten."""
+    ws, ids_, lps_ = [], [], []
+    for b in range(bs):
+        s0, ids, lp = _kd_window(args, idx * bs + b)
+        ws.append(torch.from_numpy(data[s0:s0 + seq_len + 1].astype(np.int64)))
+        ids_.append(torch.from_numpy(ids.astype(np.int64))); lps_.append(torch.from_numpy(lp))
+    w = torch.stack(ws).to(device)
+    return w[:, :-1], w[:, 1:], (torch.cat(ids_).to(device), torch.cat(lps_).to(device))
 
 
 def get_batch(data, bs, seq_len, device, gen=None):
@@ -3618,7 +3627,7 @@ def main():
                                  log=lambda m_: print(m_, flush=True))
     _teacher = None
     if args.kd_cache:  # precomputed teacher targets (scripts/quant/teacher_topk.py)
-        assert tc.batch_size == 1 and hasattr(model, "kd_topk"), "--kd_cache: Qwen models with --batch_size 1"
+        assert hasattr(model, "kd_topk"), "--kd_cache: Qwen models"
         model.kd_w = args.distill_w
         model.kd_mode = args.kd_mode
         print(f"--kd_cache ({args.kd_mode})", flush=True)
@@ -4226,8 +4235,9 @@ def main():
                     if isinstance(l_, KernelTernaryLinear):
                         l_.cap_accum = True; l_.cap_final = micro == tc.grad_accum - 1
             if args.kd_cache:          # --kd_cache: the next precomputed window, its tokens and the teacher's top k
-                x, y, model.kd_topk = _kd_cache_batch(args, (step - args.kd_cache_start) * tc.grad_accum + micro,
-                                                      train_data, tc.seq_len, device)
+                # data parallel: each rank its own windows (rank 0 of 1 reads what a single run always read)
+                x, y, model.kd_topk = _kd_cache_batch(args, ((step - args.kd_cache_start) * tc.grad_accum + micro) * _WS + _RK,
+                                                      train_data, tc.seq_len, device, bs=tc.batch_size)
             else:
                 x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
             if args.local_kd and step < args.local_kd:   # --local_kd: the teacher's stream at every block boundary
