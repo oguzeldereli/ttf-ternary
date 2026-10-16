@@ -22,7 +22,7 @@ rate() { awk '/^step +1360 /{a=$0} /^step +1370 /{b=$0} END{ if (a && b) { split
           gsub(/[ s]/, "", ta); gsub(/[ s]/, "", tb); printf "%.1f", (tb - ta) / 10 } else printf "fail" }' $1; }
 peak() { grep -o "peakVRAM [0-9.]*GiB" $1 | tail -1; }
 best=""; bestt=1e9
-for mb in 1 2 4 8 16; do
+for mb in ${MBS:-1 2 4 8 16}; do
   D=$B/b$mb; rm -rf $D; mkdir -p $D; ln -f $W/tern/ckpt/qw27_rel_ckpt.pt $D/ckpt.pt
   timeout 3000 python -m bitnet.train $F --batch_size $mb --grad_accum $((16 / mb)) --out_dir $D > $D/train.log 2>&1
   t=$(rate $D/train.log); echo "1 GPU, micro-batch $mb x $((16 / mb)): $t s/step, $(peak $D/train.log) $(grep -c -i 'out of memory' $D/train.log) OOM" | tee -a $B/summary.txt

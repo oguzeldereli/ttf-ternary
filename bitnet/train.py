@@ -4262,7 +4262,7 @@ def main():
             sc_ = float(args.spike_test.split(":")[1]) if args.spike_test and step == int(args.spike_test.split(":")[0]) else 1.0
             (loss * sc_ / tc.grad_accum).backward()  # triggers BitLinear fused updates (--spike_test S:F: x F at step S)
             model.kd_logp = None
-            if model.local_h is not None:
+            if getattr(model, "local_h", None) is not None:
                 model.local_h = None
                 if step + 1 == args.local_kd:   # the local phase ends: free its buffers before the KD logits arrive
                     torch.cuda.empty_cache()
