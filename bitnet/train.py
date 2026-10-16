@@ -2983,6 +2983,9 @@ def main():
                     "(default the checkpoint's); a wider ternary FFN can hold the fp model's crowded features apart")
     ap.add_argument("--local_kd", type=int, default=0, help="steps of block-local distillation first (needs --distill, "
                     "a Llama-type teacher): each block learns the teacher block's map from the teacher's input")
+    ap.add_argument("--w_cache", default="off", choices=["off", "int8"], help="keep every ternary layer's unpacked "
+                    "int8 trits between updates (1 byte per weight on the GPU; 80 GB cards): no unpacking per forward / "
+                    "backward / recompute; the results are bit-identical")
     ap.add_argument("--init_rot", default="", choices=["", "down", "out", "all"], help="GPTQ conversion: a fixed random "
                     "orthogonal rotation of these linears' inputs (down = w_down, out = wo + w_down, all), applied online")
     ap.add_argument("--init_zero_frac", type=float, default=None, help="GPTQ conversion: rounding threshold at this per-row "
@@ -3578,6 +3581,10 @@ def main():
         else:
             print(f"row/column scales: {enable_rc_scales(model) / 1e3:.1f}k floats", flush=True)
     _acc_init = {}
+    if args.w_cache != "off":
+        from .flip import WCACHE as _WC
+        _WC["mode"] = args.w_cache
+        print(f"--w_cache {args.w_cache}: unpacked trits kept between updates", flush=True)
     _resuming = args.resume and os.path.exists(os.path.join(tc.out_dir, "ckpt.pt"))
     if args.init_hf and _resuming:   # the checkpoint holds the converted model (trits, scales, float parts)
         print(f"--init_hf: resuming from {tc.out_dir}/ckpt.pt, conversion skipped", flush=True)
@@ -4061,7 +4068,10 @@ def main():
                     _dist.all_reduce(g); g.div_(_WS); ts_layer(layer, g, lr_state, _c)
                 m_.on_grad = _og
             else:
-                m_.on_grad = lambda layer, g, _c=ts_cfg: ts_layer(layer, g, lr_state, _c)
+                def _og1(layer, g, _c=ts_cfg):
+                    with torch.profiler.record_function("ttf.update"):
+                        ts_layer(layer, g, lr_state, _c)
+                m_.on_grad = _og1
             m_.ts_micro = bool(args.ts_micro)
         print("--ts_fused: the update runs inside each layer's backward", flush=True)
     movediag = None

@@ -42,6 +42,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import record_function as _rf      # named ranges for TERN_PROF (cheap when not profiling)
 
 from .config import ModelConfig
 from .model import BitTransformer
@@ -256,7 +257,7 @@ def build_stateless_transformer(c: ModelConfig, grad_checkpoint: bool = True,
 
 
 # ---- Triton-kernel stateless layer (fast path) ----------------------------
-from .kernel import (pack_rows, unpack_rows, tern_gemm, tern_gemm_dx, fused_flip,
+from .kernel import (pack_rows, unpack_rows, unpack_fast, tern_gemm, tern_gemm_dx, fused_flip,
                      fused_flip_ev, trit_beta, trit_diff, popcount,
                      tern_gemm_i8, tern_gemm_dx_i8, act_quant_i8, dw_int8, dw_sign,
                      dw_cublas, expand_trit_mask, fused_flip_lock, fused_flip_row)
@@ -322,15 +323,20 @@ def enable_boost(model, s0=0.5):
     return n
 
 
+WCACHE = {"mode": "off"}     # --w_cache int8: keep each layer's unpacked int8 trits between updates (1 byte / weight)
+
+
 class _KernelTernFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, wpacked, layer):
-        beta = trit_beta(wpacked, layer.K) if layer.use_beta else None
+        beta = layer._cached_beta(wpacked) if layer.use_beta else None
         if layer.int8:
             # int8 path: activations are already 8-bit, so x @ W^T is exact in int32
             # on the s8 tensor cores, and the saved activation is 1 byte/element.
             xq, xs = act_quant_i8(x.reshape(-1, layer.K), layer.act_bits)
-            y = tern_gemm_i8(xq, xs, wpacked, layer.K, beta if beta is not None else 1.0)
+            with _rf("tern.fwd"):
+                y = tern_gemm_i8(xq, xs, wpacked, layer.K, beta if beta is not None else 1.0,
+                                 w8=layer._cached_w8(wpacked))
             y = y.view(*x.shape[:-1], layer.N)
             ctx.save_for_backward(xq, xs, wpacked)
         else:
@@ -362,7 +368,8 @@ class _KernelTernFn(torch.autograd.Function):
             elif layer.dw_mode == "cublas":
                 gw = dw_cublas(gyf, xq, xs)
             else:
-                gw = gyf.transpose(0, 1) @ (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype))
+                with _rf("tern.dw"):
+                    gw = gyf.transpose(0, 1) @ (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype))
         else:
             x, wpacked = ctx.saved_tensors
             xq = _act_quant_plain(x, layer.act_bits).reshape(-1, layer.K)
@@ -382,7 +389,8 @@ class _KernelTernFn(torch.autograd.Function):
             del gw
             return gx.view(ctx.xshape).to(gy.dtype), None, None
 
-        gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
+        with _rf("tern.dx"):
+            gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
         if layer.capture and getattr(layer, "cap_accum", False) and getattr(layer, "ts_micro", False):
             # --ts_micro: the TTF update sees every micro-batch's gradient (momentum and v step per micro-batch; the
             # accumulator, firing and spend on the last one), so no dense gradient is kept across micro-batches
@@ -435,6 +443,7 @@ class _KernelTernFn(torch.autograd.Function):
         before = wpacked.clone() if layer.track else None
         if layer.norm_mode == "row":
             fused_flip_row(wpacked, gw, layer.rate, layer.g_ref, _FLIP_SEED[0])
+            layer._invalidate()
             if layer.track:
                 layer._record_flips(before, wpacked)
             del gw
@@ -444,13 +453,16 @@ class _KernelTernFn(torch.autograd.Function):
             fused_flip_lock(wpacked, gw, layer.lock, layer.lock_dir, layer.rate,
                             layer.g_ref, _FLIP_SEED[0], gmean=gm,
                             mode=layer.lockout_mode)
+            layer._invalidate()
         elif layer.evidence is not None:
             fused_flip_ev(wpacked, gw, layer.evidence, layer.rate, layer.g_ref,
                           _FLIP_SEED[0], smax=layer.ev_max, gmean=gm)
+            layer._invalidate()
         else:
             fused_flip(wpacked, gw, layer.rate, layer.g_ref, _FLIP_SEED[0], gmean=gm,
                        inv=layer.inv_prob, hump=layer.hump, hump_g0=layer.hump_g0,
                        hump_alpha=layer.hump_alpha)
+            layer._invalidate()
         if before is not None:
             layer._record_flips(before, wpacked)
         del gw
@@ -460,7 +472,7 @@ class _KernelTernFn(torch.autograd.Function):
 def _grad_x(layer, gyf, wpacked):
     if layer.int8 and layer.int8_dx:
         return tern_gemm_dx_i8(gyf, wpacked, layer.K)
-    return tern_gemm_dx(gyf, wpacked, layer.K)
+    return tern_gemm_dx(gyf, wpacked, layer.K, w8=layer._cached_w8(wpacked))
 
 
 @torch.no_grad()
@@ -480,6 +492,7 @@ def _ef_backward(layer, gyf, xq, xs, gw, wpacked):
     before = wpacked.clone()
     _FLIP_SEED[0] += 1
     fused_flip(wpacked, gw, layer.rate, layer.g_ref, _FLIP_SEED[0], gmean=gm)
+    layer._invalidate()
     fired = expand_trit_mask(trit_diff(before, wpacked), layer.K)
     if layer.track:
         layer._record_flips(before, wpacked)
@@ -575,6 +588,32 @@ class KernelTernaryLinear(nn.Module):
         self.track = False
         self.touched = None      # uint8 [N,K5] sticky mask: trit ever changed
         self.flips = None        # 0-dim int64: trit changes since last reset
+
+    # --w_cache: the trits change only when an update writes wpacked (copy_ bumps its version; the Triton flip kernels
+    # call _invalidate), so beta and the unpacked int8 weight are computed once per change instead of on every
+    # forward, backward and recompute. Same values, bit for bit.
+    def _wkey(self, wpacked):
+        return (wpacked.data_ptr(), wpacked._version)
+
+    @torch.no_grad()
+    def _cached_beta(self, wpacked):
+        k = self._wkey(wpacked)
+        if getattr(self, "_beta_key", None) != k:
+            self._beta_val = trit_beta(wpacked, self.K); self._beta_key = k
+        return self._beta_val
+
+    @torch.no_grad()
+    def _cached_w8(self, wpacked):
+        if WCACHE["mode"] != "int8":
+            return None
+        k = self._wkey(wpacked)
+        if getattr(self, "_w8_key", None) != k:
+            self._w8 = None
+            self._w8 = unpack_fast(wpacked, self.K); self._w8_key = k
+        return self._w8
+
+    def _invalidate(self):
+        self._beta_key = None; self._w8_key = None; self._w8 = None
 
     @torch.no_grad()
     def _flip_scale(self, grad_w):

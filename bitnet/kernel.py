@@ -36,7 +36,7 @@ def _mm_f32(a, b):
 
 
 def _w_bf16(wpacked, K):
-    return unpack_rows(wpacked, K).to(torch.bfloat16)
+    return unpack_fast(wpacked, K, torch.bfloat16)
 
 
 def pack_rows(w: torch.Tensor) -> torch.Tensor:
@@ -53,6 +53,37 @@ def pack_rows(w: torch.Tensor) -> torch.Tensor:
     for j in (3, 2, 1, 0):
         out.mul_(3).add_(x[:, :, j])
     return out                                        # [N, K5]
+
+
+@triton.jit
+def _unpack_kernel(p_ptr, o_ptr, N, K, K5, spn, son, BLOCK: tl.constexpr, OUT_BF16: tl.constexpr):
+    """one row block of packed bytes -> 5 trits each, written as int8 (or bf16) {-1, 0, 1}; the padding past K is
+    dropped"""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    n = offs // K5
+    k5 = offs % K5
+    m = offs < N * K5
+    b = tl.load(p_ptr + n * spn + k5, mask=m, other=0).to(tl.int32)
+    for j in tl.static_range(5):
+        t = (b % 3) - 1
+        b = b // 3
+        k = k5 * 5 + j
+        mk = m & (k < K)
+        if OUT_BF16:
+            tl.store(o_ptr + n * son + k, t.to(tl.bfloat16), mask=mk)
+        else:
+            tl.store(o_ptr + n * son + k, t.to(tl.int8), mask=mk)
+
+
+def unpack_fast(packed: torch.Tensor, K: int, dtype=torch.int8) -> torch.Tensor:
+    """uint8 [N, K5] -> contiguous [N, K] of dtype (int8 or bf16) {-1, 0, 1}: unpack_rows in one kernel (same values)"""
+    N, K5 = packed.shape
+    out = torch.empty(N, K, dtype=dtype, device=packed.device)
+    BLOCK = 1024
+    _unpack_kernel[(triton.cdiv(N * K5, BLOCK),)](packed, out, N, K, K5, packed.stride(0), out.stride(0),
+                                                 BLOCK=BLOCK, OUT_BF16=(dtype == torch.bfloat16))
+    return out
 
 
 def unpack_rows(packed: torch.Tensor, K: int) -> torch.Tensor:
@@ -221,10 +252,12 @@ def _dx_kernel(gy_ptr, w_ptr, gx_ptr, M, N, K, K5,
                  mask=(offm[:, None] < M) & (offkx[None, :] < K))
 
 
-def tern_gemm_dx(gy: torch.Tensor, wpacked: torch.Tensor, K: int) -> torch.Tensor:
-    """grad_x = gy @ decode(wpacked), gy [M,N] -> [M,K]. Packed weight, no unpack."""
+def tern_gemm_dx(gy: torch.Tensor, wpacked: torch.Tensor, K: int, w8=None) -> torch.Tensor:
+    """grad_x = gy @ decode(wpacked), gy [M,N] -> [M,K]. Packed weight, no unpack (Triton); cuBLAS: unpacked to bf16
+    per call, or cast from the cached int8 trits w8."""
     if GEMM_BACKEND[0] in ("cublas", "int8mm"):
-        return torch.mm(gy.contiguous().to(torch.bfloat16), _w_bf16(wpacked, K))
+        wb = w8.to(torch.bfloat16) if w8 is not None else _w_bf16(wpacked, K)
+        return torch.mm(gy.contiguous().to(torch.bfloat16), wb)
     M, N = gy.shape
     Nw, K5 = wpacked.shape
     gy = gy.contiguous().to(torch.bfloat16)
@@ -485,13 +518,15 @@ def _dev_scalar(v, device):
 
 
 def tern_gemm_i8(xq: torch.Tensor, xs: torch.Tensor, wpacked: torch.Tensor, K: int,
-                 beta=1.0) -> torch.Tensor:
+                 beta=1.0, w8=None) -> torch.Tensor:
     """int8 x [M,K] (codes) @ decode(wpacked)^T * xs[:,None] * beta -> bf16 [M,N].
-    beta: float or a 0-dim device tensor (read in the kernel, so no host sync)."""
+    beta: float or a 0-dim device tensor (read in the kernel, so no host sync). w8: the unpacked int8 trits [N, K] if
+    the caller holds them (KernelTernaryLinear's weight cache), else they are unpacked here."""
     if GEMM_BACKEND[0] == "int8mm":
         # --gemm int8mm: int8 activation codes x int8 trits on the int8 tensor cores (cuBLASLt via torch._int_mm),
         # int32 accumulation: exact; the trits are unpacked per call to int8 (1 byte per weight, half of bf16)
-        w8 = unpack_rows(wpacked, K).contiguous()     # unpack_rows returns a view with row stride 5 * ceil(K / 5)
+        if w8 is None:
+            w8 = unpack_fast(wpacked, K)
         M_, N_ = xq.shape[0], w8.shape[0]
         if M_ > 16 and K % 8 == 0 and N_ % 8 == 0:
             y32 = torch._int_mm(xq.contiguous(), w8.t())
