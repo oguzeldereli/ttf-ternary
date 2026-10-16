@@ -5,10 +5,10 @@
 #   nohup bash ~/ternary-LLM/scripts/quant/teacher_lab.sh > /tmp/oguzelde/teacher_lab.log 2>&1 &
 set -u
 T=/tmp/oguzelde; mkdir -p $T/kd3 $T/hfcache
-if $T/tern/env/bin/python -c "import torch, transformers, fla" 2>/dev/null; then S=$T/tern
+if $T/tern/env/bin/python -c "import torch, transformers, fla" 2>/dev/null; then S=$T/tern; bash ~/ternary-LLM/scripts/lab/setup.sh
 else
   S=$T/tern2
-  [ -x $S/env/bin/python ] || { sed 's#^S=/tmp/$USER/tern$#S=/tmp/$USER/tern2#' ~/ternary-LLM/scripts/lab/setup.sh > $T/setup2.sh; bash $T/setup2.sh; }
+  sed 's#^S=/tmp/$USER/tern$#S=/tmp/$USER/tern2#' ~/ternary-LLM/scripts/lab/setup.sh > $T/setup2.sh; bash $T/setup2.sh   # env once, code always
   $S/env/bin/python -m pip install -q --no-cache-dir transformers==5.19.0 accelerate==1.15.0 safetensors==0.8.0 \
     huggingface_hub==2.2.0 tokenizers==0.23.3 flash-linear-attention==0.5.2
 fi
