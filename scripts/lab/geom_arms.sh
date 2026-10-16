@@ -47,6 +47,7 @@ case $ARM in
   homo_long) F="$DATA --mode master --init_hf $HF $KD --m_qmix 3000 --rc_scale --tail_fp32 --steps 4578 --warmup 100
                --lr 5e-4 --min_lr 5e-5 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
   resann_150M) F="$DATA $TTF $(echo $CONV | sed "s/--steps 1526/--steps 4578/; s/--ts_start 400/--ts_start 100/") --init_hf $HF $KD --res_anneal 3000" ;;
+  conv_s2)   F="$DATA $TTF $CONV --init_hf $HF $KD --seed 2" ;;                                       # seed noise of a conversion
   convreg)   F="$DATA $TTF $CONV --init_hf $HF $KD --act_reg 0.05" ;;                    # arm f: outlier penalty on the student
   deout)     F="$DATA --mode fp32 --init_hf $HF $KD --act_reg 0.05 --steps 1526 --warmup 100 --lr 3e-4 --min_lr 3e-5
                --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
