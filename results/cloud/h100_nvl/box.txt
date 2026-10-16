@@ -1,0 +1,5 @@
+vast.ai instance 56269453, 1x H100 NVL (93.6 GB), Czech Republic, Secure datacenter 214845, $0.762/h (16 Oct 2026)
+vast.ai figures: 48.3 TFLOPS, 3361.1 GB/s memory bandwidth, DLPerf 377.1 (519.3 DLP/$/h), PCIe 5.0 x16 55 GB/s,
+AMD EPYC 9554 (28 of 224 vCPU), 193.5 GB RAM, 32 GB disk (12 GB/s), network 7.7 / 8.1 Gbps, CUDA 13.4 driver.
+Earlier box (results/cloud/h100_pcie): 1x H100 PCIe 80 GB, South Africa, $2.965/h on-demand, 41.0 TFLOPS, 1763.1 GB/s,
+DLPerf 256.1, PCIe 4.0 x16, EPYC 7713.
