@@ -38,6 +38,8 @@ case $ARM in
   resann)    F="$DATA $TTF ${CONV/--ts_start 400/--ts_start 100} --init_hf $HF $KD --res_anneal 1000" ;;      # TTF homotopy, full residual
   resann256) F="$DATA $TTF ${CONV/--ts_start 400/--ts_start 100} --init_hf $HF $KD --res_anneal 1000:256" ;;  # rank-256 residual
   resann_long) F="$DATA $TTF ${CONV/--ts_start 400/--ts_start 100} --init_hf $HF $KD --res_anneal 1400" ;;   # slower fade
+  resann_t16) F="$DATA $TTF $(echo $CONV | sed "s/--ts_theta 64/--ts_theta 16/; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD --res_anneal 1000" ;;
+  resann_t32) F="$DATA $TTF $(echo $CONV | sed "s/--ts_theta 64/--ts_theta 32/; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD --res_anneal 1000" ;;
   homo1500)  F="$DATA --mode master --init_hf $HF $KD --m_qmix 1500 --rc_scale --tail_fp32 --steps 1526 --warmup 100
                --lr 5e-4 --min_lr 5e-5 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
   conv_long) F="$DATA $TTF ${CONV/--steps 1526/--steps 4578} --init_hf $HF $KD" ;;                # 150M tokens: does the base matter later?
