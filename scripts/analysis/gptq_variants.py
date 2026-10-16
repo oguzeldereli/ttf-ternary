@@ -9,6 +9,8 @@ activations), the realised zero fraction (by linear type) and the output-space e
                  all = every linear. Spreads each input's energy over all dimensions (float activations here, so the
                  int8 activation side of a rotation is not measured).
   cen=1          centred GPTQ (covariance, W mu as exact bias), as gptqc
+  src=train|random|self|wprior|eye  calibration source: training windows, uniform random tokens, text sampled from
+                 the fp model itself, input covariances derived from the weights alone (no data), identity (no data)
   calib=N        calibration windows (default 32); damp=X GPTQ damping (default 0.01); several options joined by ||
   python scripts/analysis/gptq_variants.py --fp models/fp32_baseline_slim/ckpt.pt \
       --variants "plain:,zf23:zf=0.23,zf30:zf=0.30,rotdown:rot=down"
@@ -39,7 +41,66 @@ def loss(m):
 
 
 @torch.no_grad()
-def stats(m, n):
+def windows(m, n, src):
+    """calibration token windows: train (random windows of --train), random (uniform token ids), self (sampled from
+    the fp model itself, temperature 1, from BOS: no external data)"""
+    if src == "train":
+        tr = np.memmap(a.train, dtype=np.uint16, mode="r")
+        return [torch.tensor(tr[s:s + a.seq + 1].astype(np.int64), device=dev)[None]
+                for s in np.random.default_rng(4321).integers(0, len(tr) - a.seq - 1, n)]
+    V = m.tok_emb.weight.shape[0]
+    g = torch.Generator(device=dev).manual_seed(4321)
+    if src == "random":
+        return [torch.randint(0, V, (1, a.seq + 1), generator=g, device=dev) for _ in range(n)]
+    out = []
+    for b0 in range(0, n, 16):          # self-generation, no KV cache (110M: minutes)
+        nb = min(16, n - b0)
+        x = torch.full((nb, 1), 1, dtype=torch.long, device=dev)
+        while x.shape[1] < a.seq + 1:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                lg = m(x[:, -a.seq:])[0][:, -1].float()
+            x = torch.cat([x, torch.multinomial(torch.softmax(lg, -1), 1, generator=g)], 1)
+        out += [x[i:i + 1] for i in range(nb)]
+    return out
+
+
+@torch.no_grad()
+def wprior(m):
+    """data-free input covariances from the weights alone: the residual stream starts as the embedding table's
+    covariance (uniform over the vocabulary) and gains W_o C W_o^T and W_down C W_down^T per block (sources taken as
+    independent); each norm rescales it to unit mean variance and applies its gain; attention outputs are taken as
+    mixtures of values (C_v = W_v C_x W_v^T, repeated per kv group); the FFN hidden as silu(g) u with silu(g) ~ g / 2
+    (Isserlis: C_d = (C_gg o C_uu + C_gu o C_ug) / 4)"""
+    E = m.tok_emb.weight.float()
+    Ch = (E - E.mean(0)).T @ (E - E.mean(0)) / E.shape[0]
+    out = {}
+    def normed(C, gw):
+        g_ = gw.float(); return (C / (torch.trace(C) / C.shape[0])) * g_[:, None] * g_[None, :]
+    z = lambda K: torch.zeros(K, device=dev)
+    for i, blk in enumerate(m.layers):
+        at, ff = blk.attn, blk.ffn
+        Cx = normed(Ch, blk.attn_norm.weight)
+        for nm in ("wq", "wk", "wv"):
+            out[(i, nm)] = (Cx, z(Cx.shape[0]))
+        Wv = at.wv.weight.float(); Cv = Wv @ Cx @ Wv.T
+        hd, rep = at.head_dim, at.rep
+        idx = torch.arange(at.n_heads * hd, device=dev); kv = (idx // hd) // rep * hd + idx % hd
+        Co = Cv[kv][:, kv]
+        out[(i, "wo")] = (Co, z(Co.shape[0]))
+        Wo = at.wo.weight.float(); Ch = Ch + Wo @ Co @ Wo.T
+        Cx2 = normed(Ch, blk.ffn_norm.weight)
+        for nm in ("w_gate", "w_up"):
+            out[(i, nm)] = (Cx2, z(Cx2.shape[0]))
+        Wg, Wu = ff.w_gate.weight.float(), ff.w_up.weight.float()
+        Cgg, Cuu, Cgu = Wg @ Cx2 @ Wg.T, Wu @ Cx2 @ Wu.T, Wg @ Cx2 @ Wu.T
+        Cd = (Cgg * Cuu + Cgu * Cgu.T) / 4
+        out[(i, "w_down")] = (Cd, z(Cd.shape[0]))
+        Wd = ff.w_down.weight.float(); Ch = Ch + Wd @ Cd @ Wd.T
+    return out
+
+
+@torch.no_grad()
+def stats(m, n, src="train"):
     S, mu, cnt, hooks = {}, {}, {}, []
     for i, blk in enumerate(m.layers):
         for sub, nm in M.LIN:
@@ -51,9 +112,8 @@ def stats(m, n):
                 x = inp[0].reshape(-1, inp[0].shape[-1]).double()
                 S[key] += x.T @ x; mu[key] += x.sum(0); cnt[key] += x.shape[0]
             hooks.append(lin.register_forward_pre_hook(hk))
-    tr = np.memmap(a.train, dtype=np.uint16, mode="r")
-    for s in np.random.default_rng(4321).integers(0, len(tr) - a.seq - 1, n):
-        x = torch.tensor(tr[s:s + a.seq + 1].astype(np.int64), device=dev)[None]; m(x[:, :-1], x[:, 1:])
+    for x in windows(m, n, src):
+        m(x[:, :-1], x[:, 1:])
     for h in hooks:
         h.remove()
     return {k: ((S[k] / cnt[k]).float(), (mu[k] / cnt[k]).float()) for k in S}
@@ -61,10 +121,10 @@ def stats(m, n):
 
 def parse(v):
     name, _, kv = v.partition(":")
-    o = {"zf": None, "rot": "none", "cen": 0, "calib": 32, "damp": 0.01}
+    o = {"zf": None, "rot": "none", "cen": 0, "calib": 32, "damp": 0.01, "src": "train"}
     for p in filter(None, kv.split("|")):
         k, x = p.split("=")
-        o[k] = x if k == "rot" else (int(x) if k in ("cen", "calib") else float(x))
+        o[k] = x if k in ("rot", "src") else (int(x) if k in ("cen", "calib") else float(x))
     return name, o
 
 
@@ -74,9 +134,16 @@ m0 = M.load(a.fp); R["fp"] = loss(m0); print(f"fp {R['fp']:.4f}", flush=True)
 ST = {}
 for v in a.variants.split(","):
     name, o = parse(v)
-    if o["calib"] not in ST:
-        ST[o["calib"]] = stats(m0, o["calib"])
-    st = ST[o["calib"]]
+    key = (o["calib"], o["src"])
+    if key not in ST:
+        if o["src"] == "wprior":
+            ST[key] = wprior(m0)
+        elif o["src"] == "eye":
+            ST[key] = {k: (torch.eye(v[0].shape[0], device=dev), torch.zeros(v[0].shape[0], device=dev))
+                       for k, v in wprior(m0).items()}
+        else:
+            ST[key] = stats(m0, o["calib"], o["src"])
+    st = ST[key]
     m = M.load(a.fp)
     errs, zeros = [], {}
     g = torch.Generator(device="cpu").manual_seed(0)

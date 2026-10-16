@@ -2,7 +2,8 @@
 
 Qwen3.5-0.8B-Base, streaming sequential conversion (bitnet/qwen.py convert_qwen_streaming), calibrated on each
 --calib set in turn (64 x 2048 tokens), then scored on every --eval set (first --n windows of each; fp first).
-Sets are NAME=path to uint32 Qwen3.5 token files; a calib entry may join two files with '+' (half the windows each).
+Sets are NAME=path to uint32 Qwen3.5 token files; a calib entry may join two files with '+' (half the windows each),
+and NAME=als rounds without data (nearest-grid ALS, no GPTQ).
   python scripts/quant/qwen_calib_domain.py HF_DIR --calib wiki=data/wikiqw_train40.bin,chat=data/chatqw_train.bin,\
       mix=data/wikiqw_train40.bin+data/chatqw_train.bin --eval wiki=data/wikiqw_val.bin,chat=data/chatqw_val.bin
 """
@@ -49,8 +50,11 @@ for name, p in sets(a.calib):
         L = min(len(x) for x in parts)
         p = os.path.join(tmp, name + ".bin"); np.concatenate([x[:L] for x in parts]).astype(np.uint32).tofile(p)
     m, sw = build_qwen(a.hf_dir, "kernel", make_linear=mk, grad_checkpoint=False, device=dev); enable_rc_scales(m); m.eval()
-    convert_qwen_streaming(m, a.hf_dir, sw, p, method=a.method, n_seq=64, seq=a.seq, log=lambda *_: None)
-    R["calib_" + name] = score(m); print(f"{a.method} calibrated on {name}:", R["calib_" + name], flush=True)
+    if p == "als":
+        load_qwen(m, a.hf_dir, sw, method="als")
+    else:
+        convert_qwen_streaming(m, a.hf_dir, sw, p, method=a.method, n_seq=64, seq=a.seq, log=lambda *_: None)
+    R["calib_" + name] = score(m); print(f"{'als' if p == 'als' else a.method} calibrated on {name}:", R["calib_" + name], flush=True)
     del m; torch.cuda.empty_cache()
     if a.out:
         json.dump(R, open(a.out, "w"), indent=1)
