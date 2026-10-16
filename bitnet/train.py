@@ -4229,6 +4229,11 @@ def main():
             for l in model.modules():
                 if isinstance(l, KernelTernaryLinear): l.capture = True
         if TIME: torch.cuda.synchronize(); _t0 = time.time()
+        _prof = None      # TERN_PROF=DIR: one profiled step (the 3rd of the run), GPU time by operation into DIR
+        if os.environ.get("TERN_PROF") and step == start_step + 2:
+            from torch.profiler import profile, ProfilerActivity
+            _prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False)
+            _prof.__enter__(); torch.cuda.synchronize(); _pt0 = time.time()
         for micro in range(tc.grad_accum):
             if args.ts and tc.grad_accum > 1:      # --ts with accumulation: sum the captured micro-batch gradients
                 for l_ in model.modules():
@@ -4396,6 +4401,15 @@ def main():
                   f"{md_['md_realized_per_move']:.3e} survive {md_['md_survive']:.2f} trits {md_['md_realized']:+.2e} "
                   f"float {md_['md_float']:+.2e} undo {md_['md_undo_frac']:.3f} win {md_['md_win_realized']:+.2e} "
                   f"net {md_['md_win_net']} age {md_['md_win_age']}", flush=True)
+        if _prof is not None:
+            torch.cuda.synchronize(); _pdt = time.time() - _pt0; _prof.__exit__(None, None, None)
+            _pd = os.environ["TERN_PROF"]; os.makedirs(_pd, exist_ok=True)
+            _ka = _prof.key_averages()
+            with open(os.path.join(_pd, f"prof_step{step}.txt"), "w") as _f:
+                _f.write(f"step {step} wall {_pdt:.2f}s\n")
+                _f.write(_ka.table(sort_by="self_cuda_time_total", row_limit=60, max_name_column_width=70))
+                _f.write("\n\nby CPU time\n" + _ka.table(sort_by="self_cpu_time_total", row_limit=30, max_name_column_width=70))
+            print(f"TERN_PROF: step {step} profiled ({_pdt:.1f}s wall) -> {_pd}", flush=True)
         if TIME:
             torch.cuda.synchronize(); _t2 = time.time()
             print(f"time step {step}: forward+backward {_t1 - _t0:.3f}s, update (momentum step / AdamW) {_t2 - _t1:.3f}s"
