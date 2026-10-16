@@ -426,12 +426,22 @@ def _decode(c, s):
 
 
 def _store_pair(enc, U, V):
+    with torch.profiler.record_function("ttf.codec"):
+        return _store_pair_(enc, U, V)
+
+
+def _store_pair_(enc, U, V):
     """(U, V) -> flat tuple of stored tensors (U codes[, U scale], V codes[, V scale]), so checkpoint / resume code that
     moves tuples of tensors works unchanged"""
     return enc(U) + enc(V)
 
 
 def _load_pair(t):
+    with torch.profiler.record_function("ttf.codec"):
+        return _load_pair_(t)
+
+
+def _load_pair_(t):
     """inverse of _store_pair (and a no-op on a plain fp32 (U, V))"""
     if len(t) == 4:
         return _decode(t[0], t[1]), _decode(t[2], t[3])
@@ -479,6 +489,11 @@ _PINNED = _PinnedPool()
 
 
 def _host_get(d, k, dev, off):
+    with torch.profiler.record_function("ttf.store"):
+        return _host_get_(d, k, dev, off)
+
+
+def _host_get_(d, k, dev, off):
     """--ts_offload: a state tuple kept in pinned host memory, copied to the GPU for this layer's update (the copy is
     queued on the current stream, so it is ordered before the kernels that read it; no host sync)"""
     if off == "async":
@@ -491,6 +506,11 @@ _STATE_INPLACE = [False]   # --ts_state_inplace
 
 
 def _host_put(d, k, v, off):
+    with torch.profiler.record_function("ttf.store"):
+        return _host_put_(d, k, v, off)
+
+
+def _host_put_(d, k, v, off):
     """--ts_offload: write a state tuple back to its pinned host buffers (reused across steps; the device-to-host copy
     is queued on the same stream after this step's kernels and before next step's host-to-device copy)"""
     if not off:
@@ -626,6 +646,11 @@ def _q8(X):
 
 
 def _orth(X):
+    with torch.profiler.record_function("ttf.orth"):
+        return _orth_(X)
+
+
+def _orth_(X):
     """orthonormal basis of the columns of X (tall, K x r): two-pass Cholesky-QR (GEMMs plus an r x r Cholesky in
     fp64, no host sync) instead of a Householder QR, which was 1.6 s per 1.3B step. Only the span matters to --ts
     (A = U V^T does not depend on the basis chosen)."""
@@ -4256,7 +4281,7 @@ def main():
         _prof = None      # TERN_PROF=DIR: one profiled step (the 3rd of the run), GPU time by operation into DIR
         if os.environ.get("TERN_PROF") and step == start_step + 2:
             from torch.profiler import profile, ProfilerActivity
-            _prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False)
+            _prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, with_stack=True)
             _prof.__enter__(); torch.cuda.synchronize(); _pt0 = time.time()
         for micro in range(tc.grad_accum):
             if args.ts and tc.grad_accum > 1:      # --ts with accumulation: sum the captured micro-batch gradients
@@ -4278,7 +4303,8 @@ def main():
                 tz_ = tz_.reshape(-1, tz_.shape[-1])   # in row chunks: the fp32 copy of all logits is ~4 GB at 32k tokens
                 model.kd_logp = torch.cat([F.log_softmax(c_.float(), -1).to(torch.bfloat16) for c_ in tz_.split(4096)]); del tz_
             _areg.clear()
-            with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
+            with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16), \
+                    torch.profiler.record_function("model.fwd"):
                 _, loss = model(x, y)
             if args.act_reg and _areg:
                 _ar = torch.stack(_areg).mean()
@@ -4289,7 +4315,8 @@ def main():
             if args.spike_dump:
                 spike_st["bt"].append((x.detach().cpu(), y.detach().cpu()))
             sc_ = float(args.spike_test.split(":")[1]) if args.spike_test and step == int(args.spike_test.split(":")[0]) else 1.0
-            (loss * sc_ / tc.grad_accum).backward()  # triggers BitLinear fused updates (--spike_test S:F: x F at step S)
+            with torch.profiler.record_function("model.bwd"):   # includes the fused TTF updates (ttf.update)
+                (loss * sc_ / tc.grad_accum).backward()  # triggers BitLinear fused updates (--spike_test S:F: x F at step S)
             model.kd_logp = None
             if getattr(model, "local_h", None) is not None:
                 model.local_h = None
@@ -4433,6 +4460,16 @@ def main():
                 _f.write(f"step {step} wall {_pdt:.2f}s\n")
                 _f.write(_ka.table(sort_by="self_cuda_time_total", row_limit=60, max_name_column_width=70))
                 _f.write("\n\nby CPU time\n" + _ka.table(sort_by="self_cpu_time_total", row_limit=30, max_name_column_width=70))
+                _rng = [e for e in _ka if e.key.split(".")[0] in ("tern", "ttf", "model", "loss")]   # the named ranges
+                _f.write("\n\nnamed ranges (CUDA total = everything inside them)\n")
+                for e in sorted(_rng, key=lambda e: -e.device_time_total if hasattr(e, "device_time_total") else -e.cuda_time_total):
+                    ct = getattr(e, "device_time_total", None) or e.cuda_time_total
+                    _f.write(f"  {e.key:28s} calls {e.count:7d}  CUDA {ct / 1e6:9.3f} s  CPU {e.cpu_time_total / 1e6:9.3f} s\n")
+            with open(os.path.join(_pd, f"prof_step{step}_stack.txt"), "w") as _f:   # by the Python line that launched it
+                _f.write(_prof.key_averages(group_by_stack_n=6).table(sort_by="self_cuda_time_total", row_limit=50,
+                                                                       max_name_column_width=60))
+            if os.environ.get("TERN_PROF_TRACE"):
+                _prof.export_chrome_trace(os.path.join(_pd, f"trace_step{step}.json"))
             print(f"TERN_PROF: step {step} profiled ({_pdt:.1f}s wall) -> {_pd}", flush=True)
         if TIME:
             torch.cuda.synchronize(); _t2 = time.time()

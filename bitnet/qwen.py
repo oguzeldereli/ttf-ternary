@@ -87,25 +87,29 @@ class QwenTern(nn.Module):
         w = self._head_w()
         if targets is None:
             return F.linear(h, w.to(h.dtype)), None
+        _lrf = torch.profiler.record_function("loss.head_kd"); _lrf.__enter__()   # the 248k head + the (KD) loss
         hf_, tf = h.reshape(-1, h.shape[-1]), targets.reshape(-1)
         n = self.loss_chunk
         total = hf_.new_zeros((), dtype=torch.float32)
         kd = self.kd_logp
+        wc = w.to(hf_.dtype)      # the head in the activations' dtype once per forward, not once per chunk (same values)
         for i in range(0, hf_.shape[0], n):
             hc, tc = hf_[i:i + n], tf[i:i + n]
             if self.kd_topk is not None:
                 f_ = _kd_topk_chunk
-                args_ = (hc, w.to(hc.dtype), tc, self.kd_topk[0][i:i + n], self.kd_topk[1][i:i + n], self.kd_w,
+                args_ = (hc, wc, tc, self.kd_topk[0][i:i + n], self.kd_topk[1][i:i + n], self.kd_w,
                          self.kd_mode)
             elif kd is not None:
                 from .model import BitTransformer
                 f_ = BitTransformer._loss_chunk_kd
-                args_ = (hc, w.to(hc.dtype), tc, kd[i:i + n], self.kd_w)
+                args_ = (hc, wc, tc, kd[i:i + n], self.kd_w)
             else:
                 f_ = _ce_chunk
-                args_ = (hc, w.to(hc.dtype), tc)
+                args_ = (hc, wc, tc)
             total = total + (checkpoint(f_, *args_, use_reentrant=False) if ckpt else f_(*args_))
-        return None, total / (tf != -1).sum().clamp_min(1)
+        out = total / (tf != -1).sum().clamp_min(1)
+        _lrf.__exit__(None, None, None)
+        return None, out
 
     def float_tail_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
