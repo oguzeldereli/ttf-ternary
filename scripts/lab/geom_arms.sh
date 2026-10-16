@@ -15,6 +15,7 @@
 #   resann    TTF-native homotopy: GPTQ trits + the fp rounding residual faded 1 -> 0 over 1000 steps (--res_anneal)
 #   resann256 the same with the residual at rank 256 (the memory-cheap form for big models); resann_long: 1400 steps
 #   homo1500  master homotopy over 1500 steps
+#   conv_long / homo_long / resann_150M   the same at 150M tokens (4578 steps; fades over 3000)
 #   fpseed2   full precision from scratch, seed 2, 300M tokens, snapshots every 1000 steps (baselines)
 set -u
 ARM=$1; S=${S:-/tmp/oguzelde/tern}; REPO=${REPO:-$S/repo}      # Myriad: S=~/Scratch/tern REPO=~/Scratch/ternary-LLM
@@ -39,6 +40,10 @@ case $ARM in
   resann_long) F="$DATA $TTF ${CONV/--ts_start 400/--ts_start 100} --init_hf $HF $KD --res_anneal 1400" ;;   # slower fade
   homo1500)  F="$DATA --mode master --init_hf $HF $KD --m_qmix 1500 --rc_scale --tail_fp32 --steps 1526 --warmup 100
                --lr 5e-4 --min_lr 5e-5 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
+  conv_long) F="$DATA $TTF ${CONV/--steps 1526/--steps 4578} --init_hf $HF $KD" ;;                # 150M tokens: does the base matter later?
+  homo_long) F="$DATA --mode master --init_hf $HF $KD --m_qmix 3000 --rc_scale --tail_fp32 --steps 4578 --warmup 100
+               --lr 5e-4 --min_lr 5e-5 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
+  resann_150M) F="$DATA $TTF $(echo $CONV | sed "s/--steps 1526/--steps 4578/; s/--ts_start 400/--ts_start 100/") --init_hf $HF $KD --res_anneal 3000" ;;
   convreg)   F="$DATA $TTF $CONV --init_hf $HF $KD --act_reg 0.05" ;;                    # arm f: outlier penalty on the student
   deout)     F="$DATA --mode fp32 --init_hf $HF $KD --act_reg 0.05 --steps 1526 --warmup 100 --lr 3e-4 --min_lr 3e-5
                --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
