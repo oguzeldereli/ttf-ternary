@@ -3026,6 +3026,8 @@ def main():
                     "step (those with the largest |A| / bar)")
     ap.add_argument("--ts_vbar", type=float, default=0.0, help="--ts: the fire bar is theta (sqrt v / median sqrt v)^K per "
                     "entry, never below theta (clamped to 1 .. 4 theta): a move must beat its curvature cost, v the proxy")
+    ap.add_argument("--ts_vdiag_every", type=int, default=1, help="--ts_vdiag on every N-th step only (it is "
+                    "logging alone, but its full-size passes and host reads cost ~28k GPU stalls per 27B step)")
     ap.add_argument("--ts_vdiag", action="store_true", help="--ts: log per step the gradient's size against the second "
                     "moment it is divided by (g^2 / v, mean and max over layers) and the |u| tail")
     ap.add_argument("--ts_nomom", action="store_true", help="--ts: no short momentum; the accumulator takes the "
@@ -4155,7 +4157,8 @@ def main():
         if ts_cfg is not None:
             ts_cfg["lr_ratio"] = _ts_scale(args, step, tc, lr)   # --ts_anneal_floor F
             ts_cfg["progress"] = step / max(1, tc.max_steps)
-            ts_cfg["step"] = step; ts_cfg["start"] = args.ts_start; ts_cfg["vdiag"] = args.ts_vdiag
+            ts_cfg["step"] = step; ts_cfg["start"] = args.ts_start
+            ts_cfg["vdiag"] = args.ts_vdiag and step % max(args.ts_vdiag_every, 1) == 0   # diagnostics only
             ts_cfg["uclip"] = args.ts_uclip; ts_cfg["move_cap"] = args.ts_move_cap; ts_cfg["vbar"] = args.ts_vbar; ts_cfg["urms"] = args.ts_urms; ts_cfg["theta_noise"] = args.ts_theta_noise; ts_cfg["theta_noise_win"] = args.ts_theta_noise_win; ts_cfg["boost"] = args.ts_boost; ts_cfg["resid_sparse"] = args.ts_resid_sparse; ts_cfg["resid_steps"] = args.ts_resid_steps
             ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure

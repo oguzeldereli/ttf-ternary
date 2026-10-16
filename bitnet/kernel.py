@@ -87,7 +87,9 @@ def unpack_fast(packed: torch.Tensor, K: int, dtype=torch.int8) -> torch.Tensor:
 
 
 def unpack_rows(packed: torch.Tensor, K: int) -> torch.Tensor:
-    """uint8 [N,K5] -> int8 {-1,0,1} [N,K]."""
+    """uint8 [N,K5] -> int8 {-1,0,1} [N,K] (on the GPU: one kernel, contiguous; same values)."""
+    if packed.is_cuda:
+        return unpack_fast(packed, K)
     N, K5 = packed.shape
     x = packed.to(torch.int16)
     out = torch.empty(N, K5, 5, dtype=torch.int8, device=packed.device)
