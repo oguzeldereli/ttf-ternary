@@ -532,6 +532,8 @@ def tern_gemm_i8(xq: torch.Tensor, xs: torch.Tensor, wpacked: torch.Tensor, K: i
         M_, N_ = xq.shape[0], w8.shape[0]
         if M_ > 16 and K % 8 == 0 and N_ % 8 == 0:
             y32 = torch._int_mm(xq.contiguous(), w8.t())
+            if y32.is_contiguous():
+                return i8_epilogue(y32, xs, beta)
             return (y32.float() * xs.float()[:, None] * beta).to(torch.bfloat16)
         return (_mm_f32(xq.to(torch.bfloat16), w8.to(torch.bfloat16).t()) * xs.float()[:, None] * beta).to(torch.bfloat16)
     if GEMM_BACKEND[0] in ("cublas", "int8mm"):
@@ -821,3 +823,61 @@ def ttf_u(g: torch.Tensor, r: torch.Tensor, c: torch.Tensor, m: torch.Tensor, lr
     _ttf_u_kernel[(triton.cdiv(N * K, BLOCK),)](g, r.contiguous(), c.contiguous(), m.reshape(1).float(), u, N, K,
                                                 g.stride(0), u.stride(0), float(lr), float(eps), BLOCK=BLOCK)
     return u
+
+
+@triton.jit
+def _i8_epi_kernel(y_ptr, xs_ptr, b_ptr, o_ptr, M, N, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    msk = offs < M * N
+    r = offs // N
+    y = tl.load(y_ptr + offs, mask=msk, other=0).to(tl.float32)
+    xs = tl.load(xs_ptr + r, mask=msk, other=0.0)
+    b = tl.load(b_ptr)
+    tl.store(o_ptr + offs, ((y * xs) * b).to(tl.bfloat16), mask=msk)
+
+
+def i8_epilogue(y32: torch.Tensor, xs: torch.Tensor, beta) -> torch.Tensor:
+    """(y32.float() * xs[:, None] * beta).to(bf16) in one pass over the int32 GEMM result (the same fp32 products in the
+    same order, then the same round-to-nearest-even into bf16: bit-identical)"""
+    M, N = y32.shape
+    out = torch.empty(M, N, dtype=torch.bfloat16, device=y32.device)
+    BLOCK = 2048
+    _i8_epi_kernel[(triton.cdiv(M * N, BLOCK),)](y32, xs.float().contiguous(), _dev_scalar(beta, y32.device), out, M, N,
+                                                BLOCK=BLOCK)
+    return out
+
+
+@triton.jit
+def _actq_kernel(x_ptr, q_ptr, s_ptr, K, sxm, sqm, qp, rqp, lo, BK: tl.constexpr):
+    row = tl.program_id(0)
+    amax = tl.zeros((BK,), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        offs = k0 + tl.arange(0, BK)
+        x = tl.load(x_ptr + row * sxm + offs, mask=offs < K, other=0.0).to(tl.float32)
+        amax = tl.maximum(amax, tl.abs(x))
+    a = tl.maximum(tl.max(amax, axis=0), lo)
+    scale = a * rqp                       # torch's tensor / scalar is a * fp32(1 / scalar), not a true division
+    tl.store(s_ptr + row, scale)
+    for k0 in range(0, K, BK):
+        offs = k0 + tl.arange(0, BK)
+        x = tl.load(x_ptr + row * sxm + offs, mask=offs < K, other=0.0).to(tl.float32)
+        q = tl.extra.cuda.libdevice.rint(tl.div_rn(x, scale))        # round half to even, as torch.round
+        q = tl.minimum(tl.maximum(q, -qp - 1.0), qp)
+        tl.store(q_ptr + row * sqm + offs, q.to(tl.int8), mask=offs < K)
+
+
+def act_quant_i8_fast(x: torch.Tensor, bits: int = 8):
+    """act_quant_i8 in one kernel per row (two passes over the row in registers / L2): the same amax, the same fp32
+    scale (amax / qp), the same x / scale rounded half to even and clamped: bit-identical codes and scales"""
+    x2 = x.reshape(-1, x.shape[-1])
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+    M, K = x2.shape
+    q = torch.empty(M, K, dtype=torch.int8, device=x.device)
+    sc = torch.empty(M, dtype=torch.float32, device=x.device)
+    qp = float(2 ** (bits - 1) - 1)
+    rqp = float(torch.tensor(1.0 / qp, dtype=torch.float32))   # the fp32 reciprocal torch multiplies by
+    lo = float(torch.tensor(1e-5, dtype=x.dtype))              # clamp_min(1e-5) happens in x's dtype in act_quant_i8
+    _actq_kernel[(M,)](x2, q, sc, K, x2.stride(0), q.stride(0), qp, rqp, lo, BK=1024)
+    return q.view(*x.shape[:-1], K), sc.view(x.shape[:-1])

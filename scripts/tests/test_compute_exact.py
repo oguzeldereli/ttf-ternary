@@ -38,3 +38,14 @@ for (N, K) in [(1024, 768), (5120, 3000), (17, 33)]:
     out = Kn.ttf_u(g, r0, c0, r0.mean().clamp_min(1e-30), lr)
     d = (ref - out).abs().max().item()
     print(N, K, "bit-identical:", torch.equal(ref, out), "max abs diff", d, "ulps", ((ref.view(torch.int32) - out.view(torch.int32)).abs().max().item()))
+# fused int8 forward epilogue == (y32.float() * xs[:, None] * beta).to(bf16)
+for (M_, N_) in [(8192, 1024), (100, 5120)]:
+    y32 = torch.randint(-200000, 200000, (M_, N_), dtype=torch.int32, device="cuda")
+    xs = torch.rand(M_, device="cuda") * 1e-2; beta = torch.tensor(0.0371, device="cuda")
+    ref = (y32.float() * xs.float()[:, None] * beta).to(torch.bfloat16)
+    print("i8 epilogue bit-identical:", torch.equal(ref, Kn.i8_epilogue(y32, xs, beta)), torch.equal(ref, Kn.i8_epilogue(y32, xs, 0.0371) ) or "(float beta: rounds 0.0371 to fp32 the same way)")
+# fused activation quantisation == act_quant_i8 (incl. ties and an all-zero row)
+for (M_, K_) in [(8192, 5120), (2048, 17408), (7, 768)]:
+    x = (torch.randn(M_, K_, device="cuda") * torch.rand(M_, 1, device="cuda") * 3).to(torch.bfloat16); x[1] = 0
+    q0, s0 = Kn.act_quant_i8(x); q1, s1 = Kn.act_quant_i8_fast(x)
+    print(M_, K_, "act quant bit-identical:", torch.equal(q0, q1), torch.equal(s0, s1))

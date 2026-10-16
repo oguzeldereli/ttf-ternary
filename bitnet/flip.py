@@ -259,7 +259,7 @@ def build_stateless_transformer(c: ModelConfig, grad_checkpoint: bool = True,
 # ---- Triton-kernel stateless layer (fast path) ----------------------------
 from .kernel import (pack_rows, unpack_rows, unpack_fast, tern_gemm, tern_gemm_dx, fused_flip,
                      fused_flip_ev, trit_beta, trit_diff, popcount,
-                     tern_gemm_i8, tern_gemm_dx_i8, act_quant_i8, dw_int8, dw_sign,
+                     tern_gemm_i8, tern_gemm_dx_i8, act_quant_i8, act_quant_i8_fast, dw_int8, dw_sign,
                      dw_cublas, expand_trit_mask, fused_flip_lock, fused_flip_row)
 
 _FLIP_SEED = [0]
@@ -333,7 +333,7 @@ class _KernelTernFn(torch.autograd.Function):
         if layer.int8:
             # int8 path: activations are already 8-bit, so x @ W^T is exact in int32
             # on the s8 tensor cores, and the saved activation is 1 byte/element.
-            xq, xs = act_quant_i8(x.reshape(-1, layer.K), layer.act_bits)
+            xq, xs = (act_quant_i8_fast if x.is_cuda else act_quant_i8)(x.reshape(-1, layer.K), layer.act_bits)
             with _rf("tern.fwd"):
                 y = tern_gemm_i8(xq, xs, wpacked, layer.K, beta if beta is not None else 1.0,
                                  w8=layer._cached_w8(wpacked))
