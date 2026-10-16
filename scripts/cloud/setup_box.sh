@@ -6,7 +6,7 @@
 set -euo pipefail
 W=${W:-/workspace}; mkdir -p $W/tern; cd $W/tern
 CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)
-IDX=https://download.pytorch.org/whl/cu126; [ "$CAP" -ge 100 ] && IDX=https://download.pytorch.org/whl/cu128
+IDX=https://download.pytorch.org/whl/cu126; [ "$CAP" -ge 100 ] && IDX=https://download.pytorch.org/whl/cu129   # 2.13 has no cu128 build; cu129 runs on 12.8 drivers (minor-version compatibility)
 [ -x env/bin/python ] || python3 -m venv env
 env/bin/pip install -q --upgrade pip
 env/bin/python -c "import torch" 2>/dev/null || env/bin/pip install -q --no-cache-dir torch==2.13.0 --index-url $IDX

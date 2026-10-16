@@ -3408,6 +3408,12 @@ def main():
                          "float-tail LR schedule")
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the elementwise parts (RMSNorm, RoPE, SwiGLU)")
+    ap.add_argument("--pipe", action="store_true", help="Qwen, under torchrun --nproc_per_node G: pipeline parallel over G "
+                    "GPUs (stage r runs a contiguous block of decoder layers; only hidden states cross stages, nothing is "
+                    "all-reduced); every stage reads the same batches. Checkpoints: one per stage (OUT_DIR, OUT_DIR_rank1, "
+                    "...: scripts/pp_merge.py joins them); a resume reads its own stage's file, else OUT_DIR/ckpt.pt (a "
+                    "single-GPU checkpoint or stage 0's)")
+    ap.add_argument("--pipe_split", default="", help="--pipe: decoder layers per stage, e.g. 17,16,16,15 (default even)")
     ap.add_argument("--ckpt_skip", type=int, default=0,
                     help="leave the last K layers without gradient checkpointing (faster, "
                          "more VRAM; ~1.3 GiB per layer at 16x2048 tokens)")
@@ -3489,6 +3495,12 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _WS = int(os.environ.get("WORLD_SIZE", "1"))      # data-parallel proof of concept (torchrun --nproc_per_node G)
     _RK = int(os.environ.get("RANK", "0"))
+    _PP = (_RK, _WS) if args.pipe else None           # --pipe: (stage, stages); the data is then that of one GPU
+    assert not args.pipe or _WS > 1, "--pipe: run under torchrun with several processes"
+    assert not args.pipe or not (args.frame_reg or args.act_reg or args.local_kd or args.distill or args.spike_dump
+                                 or args.spike_test or args.tern_emb or args.lookahead or args.rate_search
+                                 or args.accum_flip), "--pipe: none of the per-micro-batch extras yet"
+    _base_out = args.out_dir
     if _WS > 1:
         import torch.distributed as _dist
         _lr_ = int(os.environ.get("LOCAL_RANK", "0"))
@@ -3497,11 +3509,13 @@ def main():
         torch.cuda.set_device(_lr_ % max(_ng_, 1))
         _be_ = "nccl" if _ng_ >= _lws_ else "gloo"     # gloo: several ranks share one GPU (a correctness test)
         _dist.init_process_group(_be_)
-        print(f"data parallel: rank {_RK} of {_WS} ({_lws_} on this machine), GPU {_lr_ % max(_ng_, 1)} of {_ng_}, "
-              f"{_be_}", flush=True)
+        print(f"{'pipeline stage' if _PP else 'data parallel: rank'} {_RK} of {_WS} ({_lws_} on this machine), GPU "
+              f"{_lr_ % max(_ng_, 1)} of {_ng_}, {_be_}", flush=True)
         if _RK > 0 and args.out_dir:
             args.out_dir = args.out_dir.rstrip("/") + f"_rank{_RK}"
             tc.out_dir = args.out_dir
+    if _PP:
+        _WS, _RK = 1, 0       # --pipe: no data-parallel reduction, every stage reads the same windows
     if args.mem_cap_gib and device == "cuda":   # --mem_cap_gib G: PyTorch may use at most G GiB of this GPU (a 96 GB card
         # standing in for a 24 GB one in memory-matched comparisons; allocations beyond it raise out-of-memory)
         tot_ = torch.cuda.get_device_properties(0).total_memory / 2**30
@@ -3521,10 +3535,19 @@ def main():
         assert args.mode == "kernel" and not args.tern_emb, "Qwen: kernel mode, no --tern_emb yet"
         from .qwen import build_qwen, QwenTern
         QwenTern.loss_chunk = args.loss_chunk
-        model, _qsw = build_qwen(args.init_hf, "kernel", grad_checkpoint=tc.grad_checkpoint, device=device,
+        _own = None
+        if _PP:
+            from .qwen import text_config, pp_split
+            _rng = pp_split(text_config(args.init_hf).num_hidden_layers, _PP[1], args.pipe_split)
+            _own = (*_rng[_PP[0]], _PP[0] == 0, _PP[0] == _PP[1] - 1)
+            print(f"--pipe: stage {_PP[0]} of {_PP[1]}: decoder layers {_own[0]}..{_own[1] - 1} of {_rng[-1][1]}"
+                  f"{' + embedding' if _own[2] else ''}{' + norm, head and loss' if _own[3] else ''}", flush=True)
+        model, _qsw = build_qwen(args.init_hf, "kernel", grad_checkpoint=tc.grad_checkpoint, device=device, own=_own,
                                  make_linear=lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, rate=args.rate,
                                      beta=use_beta, int8=args.int8, dw_mode=args.dw_mode, int8_dx=args.int8_dx,
                                      g_ref=args.g_ref))
+        if _PP:
+            model.pp = {"rank": _PP[0], "n": _PP[1], "lo": _own[0], "hi": _own[1]}
     elif args.mode == "kernel":
         model = build_kernel_transformer(mc, grad_checkpoint=tc.grad_checkpoint,
                                          rate=args.rate, beta=use_beta,
@@ -3553,7 +3576,7 @@ def main():
                                             rate=args.rate)
     else:
         model = BitTransformer(mc, grad_checkpoint=tc.grad_checkpoint)
-    model = model.to(device)
+    model = model.to(device) if not _PP else model._apply(lambda t_: t_ if t_.is_meta else t_.to(device))   # --pipe: others' stay meta
     try:   # counted from the modules (mc.report() above is a formula: approximate for hybrid / HF models)
         n_t_ = sum(m_.N * m_.K for m_ in model.modules() if getattr(m_, "wpacked", None) is not None and hasattr(m_, "N"))
         n_f_ = sum(p_.numel() for p_ in model.parameters())
@@ -3640,19 +3663,23 @@ def main():
         from .flip import WCACHE as _WC
         _WC["mode"] = args.w_cache
         print(f"--w_cache {args.w_cache}: unpacked trits kept between updates", flush=True)
-    _resuming = args.resume and os.path.exists(os.path.join(tc.out_dir, "ckpt.pt"))
+    _resume_path = os.path.join(tc.out_dir, "ckpt.pt")
+    if _PP and not os.path.exists(_resume_path) and os.path.exists(os.path.join(_base_out, "ckpt.pt")):
+        _resume_path = os.path.join(_base_out, "ckpt.pt")    # --pipe: a single-GPU checkpoint (or stage 0's) for all
+    _resuming = args.resume and os.path.exists(_resume_path)
     if args.init_hf and _resuming:   # the checkpoint holds the converted model (trits, scales, float parts)
         print(f"--init_hf: resuming from {tc.out_dir}/ckpt.pt, conversion skipped", flush=True)
         if _QWEN:   # as the conversion leaves them: embedding and head frozen (the optimizer is built below)
             model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
         if args.init_hf_method == "gptqc" or args.init_rot:   # centred / rotated layers: their buffers and bias
-            _ck = torch.load(os.path.join(tc.out_dir, "ckpt.pt"), map_location="cpu", weights_only=False, mmap=True)["model"]
+            _ck = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)["model"]
             _nc = _nr = 0                                       # exist before the optimizer is built
             for n_, m_ in model.named_modules():
+                _dv = "meta" if isinstance(m_, KernelTernaryLinear) and m_.wpacked.is_meta else device   # --pipe
                 if isinstance(m_, KernelTernaryLinear) and f"{n_}.rot_Q" in _ck:
-                    m_.enable_rotation(_ck[f"{n_}.rot_Q"].to(device)); _nr += 1
+                    m_.enable_rotation(_ck[f"{n_}.rot_Q"].to(_dv)); _nr += 1
                 if isinstance(m_, KernelTernaryLinear) and f"{n_}.in_mean" in _ck:
-                    m_.enable_centering(_ck[f"{n_}.in_mean"].to(device), _ck[f"{n_}.out_bias"].to(device)); _nc += 1
+                    m_.enable_centering(_ck[f"{n_}.in_mean"].to(_dv), _ck[f"{n_}.out_bias"].to(_dv)); _nc += 1
             print(f"resume: {_nc} centred and {_nr} rotated layers restored", flush=True)
             del _ck
     if args.init_hf and not _resuming:
@@ -3883,6 +3910,13 @@ def main():
         metrics_f.write(json.dumps(rec) + "\n")
         metrics_f.flush()
 
+    def _opt_sd():    # --pipe: without the other stages' optimizer state (on meta after a resume from a full checkpoint)
+        sd_ = tail_opt.state_dict()
+        if _PP:
+            sd_["state"] = {k_: v_ for k_, v_ in sd_["state"].items()
+                            if not any(torch.is_tensor(t_) and t_.is_meta for t_ in v_.values())}
+        return sd_
+
     def save_ckpt(step):
         # atomic: write tmp then rename, so a kill mid-save never corrupts ckpt.pt
         if args.ts_offload_async and torch.cuda.is_available():
@@ -3896,7 +3930,8 @@ def main():
         # step the mask started accumulating from: never-flipped is a "since init"
         # number only when this is 0.
         touched_origin = _touched_origin["v"]
-        torch.save({"model": model.state_dict(), "opt": tail_opt.state_dict(),
+        torch.save({"model": {k_: v_ for k_, v_ in model.state_dict().items() if not v_.is_meta},   # --pipe: own stage's
+                    "opt": _opt_sd(), "pipe": (model.pp if _PP else None),
                     "touched": touched, "touched_origin": touched_origin,
                     "cfg": mc, "step": step, "mode": args.mode, "beta": use_beta,
                     "int8": args.int8, "dw_mode": args.dw_mode, "rate_min": args.rate_min,
@@ -3961,10 +3996,13 @@ def main():
 
     start_step = 0
     _touched_origin = {"v": 0}
-    if args.resume and os.path.exists(ckpt_path):
+    _load_path = _resume_path
+    if _PP and args.resume:
+        print(f"--pipe: stage {_PP[0]} resumes from {_load_path}", flush=True)
+    if args.resume and os.path.exists(_load_path):
         # to host memory: every piece is copied to its device below (on the GPU the whole checkpoint would sit next
         # to the model it is loaded into: the 27B's 10.5 GB did not fit)
-        blob = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
+        blob = torch.load(_load_path, map_location="cpu", weights_only=False, mmap=True)
         if blob.get("beta", False) != use_beta:
             raise SystemExit(f"checkpoint beta={blob.get('beta', False)} but run beta="
                              f"{use_beta}: forward differs, refusing to resume")
@@ -3983,6 +4021,13 @@ def main():
             for g in rc_groups:
                 tail_opt.add_param_group(g)
             print(f"row/column scales added to a checkpoint without them ({len(missing)} tensors, start at 1)", flush=True)
+        elif _PP:    # --pipe: this stage's tensors must all be there; the other stages' (meta) are skipped
+            missing, unexpected = model.load_state_dict(blob["model"], strict=False)
+            _md = dict(model.state_dict())
+            _miss = [k_ for k_ in missing if not _md[k_].is_meta]
+            assert not _miss and not unexpected, (f"--pipe: {_load_path} lacks this stage's {_miss[:4]}", unexpected[:4])
+            if "opt" in blob:
+                tail_opt.load_state_dict(blob["opt"])
         else:
             model.load_state_dict(blob["model"])
             if "opt" in blob:
@@ -4000,7 +4045,7 @@ def main():
         if blob.get("lowrank"):
             lays = _lays
             for m, uv in zip(lays, blob["lowrank"]):
-                if uv is not None:
+                if uv is not None and not m.wpacked.is_meta:
                     lr_state[id(m)] = tuple(t.to(_sdev[id(m)]) for t in uv)
             print(f"resumed low-rank momentum for {len(lr_state)} layers", flush=True)
         if blob.get("ts_ranks"):
@@ -4019,7 +4064,7 @@ def main():
             lays = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
             st_ = lr_state.setdefault("_ts", {})
             for m, d_ in zip(lays, blob["ts_state"]):
-                for k_, v_ in d_.items():
+                for k_, v_ in (d_.items() if not m.wpacked.is_meta else ()):
                     st_[(k_, id(m))] = tuple(x.to(_sdev[id(m)]) for x in v_) if isinstance(v_, tuple) else v_
             print(f"resumed --ts state (short momentum, v, step counts) for {len(lays)} layers", flush=True)
         tmask = blob.get("touched") or {}
@@ -4300,7 +4345,25 @@ def main():
             from torch.profiler import profile, ProfilerActivity
             _prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, with_stack=True)
             _prof.__enter__(); torch.cuda.synchronize(); _pt0 = time.time()
-        for micro in range(tc.grad_accum):
+        if _PP:   # --pipe: the step's micro-batches (the windows the single-GPU loop reads) through the pipeline
+            _bt = []
+            for micro in range(tc.grad_accum):
+                if args.kd_cache:
+                    x, y, kd_ = _kd_cache_batch(args, (step - args.kd_cache_start) * tc.grad_accum + micro, train_data,
+                                                tc.seq_len, device, bs=tc.batch_size)
+                else:
+                    (x, y), kd_ = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler), None
+                _bt.append((x, y, kd_))
+
+            def _pre_bwd(i_):
+                if args.ts and tc.grad_accum > 1:
+                    for l_ in model.modules():
+                        if isinstance(l_, KernelTernaryLinear):
+                            l_.cap_accum = True; l_.cap_final = i_ == tc.grad_accum - 1
+            last_loss = model.pp_train(_bt, _pre_bwd, lambda: torch.autocast(device_type=device.split(":")[0],
+                                                                             dtype=torch.bfloat16)).item()
+            del _bt
+        for micro in range(0 if _PP else tc.grad_accum):
             if args.ts and tc.grad_accum > 1:      # --ts with accumulation: sum the captured micro-batch gradients
                 for l_ in model.modules():
                     if isinstance(l_, KernelTernaryLinear):
@@ -4459,7 +4522,18 @@ def main():
             for p_ in tail:
                 if p_.grad is not None:
                     _dist.all_reduce(p_.grad); p_.grad.div_(_WS)
-        torch.nn.utils.clip_grad_norm_([p_ for p_ in tail if id(p_) not in _lat_ids] if args.m_clip_tail and args.mode == "master" else tail, tc.grad_clip)
+        _clip_ps = [p_ for p_ in tail if id(p_) not in _lat_ids] if args.m_clip_tail and args.mode == "master" else tail
+        if _PP:   # --pipe: the clip's norm over all stages' float tails (each stage holds its own gradients)
+            _gs = [p_.grad for p_ in _clip_ps if p_.grad is not None]
+            _n2 = (torch.stack([torch.linalg.vector_norm(g_, 2).float() for g_ in _gs]) ** 2).sum() if _gs else \
+                torch.zeros((), device=device)
+            _n2 = _n2.reshape(1).cpu() if _dist.get_backend() == "gloo" else _n2.reshape(1)
+            _dist.all_reduce(_n2)
+            _cf = (tc.grad_clip / (_n2.to(device).sqrt() + 1e-6)).clamp(max=1.0)[0]
+            for g_ in _gs:
+                g_.mul_(_cf.to(g_.dtype))
+        else:
+            torch.nn.utils.clip_grad_norm_(_clip_ps, tc.grad_clip)
         if _WS > 1 and step % 100 == 0:   # data parallel: the ranks' trits must stay identical (same g, same rule)
             _ck = torch.tensor([float(sum(int(m_.wpacked.sum()) for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)))],
                                device=device, dtype=torch.float64)

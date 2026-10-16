@@ -71,27 +71,40 @@ class QwenTern(nn.Module):
         self.kd_w = 1.0
         self.kd_mode = "renorm"
         self.kd_topk = None      # --kd_cache: (ids [T, k] long, log-probs [T, k]) of the teacher's top k per token
+        self.pp = None           # --pipe: {"rank", "n", "lo", "hi"} (see _stage)
 
     def _head_w(self):
         lm = self.hf.lm_head
         return lm.weight
 
-    def forward(self, idx, targets=None):
+    def _ckpt_setup(self):
         m = self.hf.model
         ckpt = self.grad_checkpoint and self.training
         if ckpt and not m.gradient_checkpointing:
             self.hf.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            self._skip_set = False
         elif not ckpt and m.gradient_checkpointing:
             self.hf.gradient_checkpointing_disable()
         if ckpt and self.ckpt_skip and not getattr(self, "_skip_set", False):   # --ckpt_skip N: the last N decoder
-            n_ = len(m.layers)                                                   # layers keep their activations (no
-            for i_, l_ in enumerate(m.layers):                                   # recompute), memory permitting
-                l_.gradient_checkpointing = i_ < n_ - self.ckpt_skip
+            n_ = len(m.layers) if self.pp is None else self.pp["hi"]             # layers (--pipe: of each stage) keep
+            for i_, l_ in enumerate(m.layers):                                   # their activations (no recompute),
+                l_.gradient_checkpointing = i_ < n_ - self.ckpt_skip             # memory permitting
             self._skip_set = True
+
+    def forward(self, idx, targets=None):
+        m = self.hf.model
+        self._ckpt_setup()
+        if self.pp is not None:
+            return self._pp_forward(idx, targets)
         h = m(input_ids=idx, use_cache=False).last_hidden_state
-        w = self._head_w()
         if targets is None:
-            return F.linear(h, w.to(h.dtype)), None
+            return F.linear(h, self._head_w().to(h.dtype)), None
+        return None, self._head_loss(h, targets)
+
+    def _head_loss(self, h, targets):
+        """the mean loss of the final hidden states: the head and the (KD) loss in chunks of loss_chunk tokens"""
+        ckpt = self.grad_checkpoint and self.training
+        w = self._head_w()
         _lrf = torch.profiler.record_function("loss.head_kd"); _lrf.__enter__()   # the 248k head + the (KD) loss
         hf_, tf = h.reshape(-1, h.shape[-1]), targets.reshape(-1)
         n = self.loss_chunk
@@ -114,7 +127,76 @@ class QwenTern(nn.Module):
             total = total + (checkpoint(f_, *args_, use_reentrant=False) if ckpt else f_(*args_))
         out = total / (tf != -1).sum().clamp_min(1)
         _lrf.__exit__(None, None, None)
-        return None, out
+        return out
+
+    # ---- pipeline parallel (--pipe): stage r of n holds decoder layers [lo, hi), the embedding on the first stage, the
+    # final norm and the head on the last; the other layers stay on the meta device (no memory), so module order, names,
+    # checkpoint keys and the TTF seeds (_ts_idx) are those of the single-GPU model. Only the hidden states cross stages
+    # (B x T x d per micro-batch); every stage's TTF update sees only its own layers' gradients, so nothing is reduced.
+    def _stage(self, x):
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as Q
+        m = self.hf.model; P = self.pp
+        h = m.embed_tokens(x) if P["rank"] == 0 else x
+        B, T = h.shape[:2]
+        pos = torch.arange(T, device=h.device).view(1, 1, -1).expand(4, B, -1)      # as Qwen3_5TextModel.forward
+        tpos, pos = pos[0], pos[1:]
+        kw = {"config": m.config, "inputs_embeds": h, "attention_mask": None, "past_key_values": None, "position_ids": tpos}
+        masks = {"full_attention": Q.create_causal_mask(**kw), "linear_attention": Q.create_recurrent_attention_mask(**kw)}
+        pe = m.rotary_emb(h, pos)
+        for i in range(P["lo"], P["hi"]):
+            h = m.layers[i](h, position_embeddings=pe, attention_mask=masks[m.config.layer_types[i]], position_ids=tpos,
+                            past_key_values=None, use_cache=False)
+        if P["rank"] == P["n"] - 1:
+            h = m.norm(h)
+        return h
+
+    def _h_meta(self, x):
+        return (x.shape[0], x.shape[1], self.hf.config.hidden_size), self.hf.model.embed_tokens.weight.dtype
+
+    def _pp_forward(self, idx, targets):
+        """a forward without gradients (evaluation): the hidden states go down the stages, the last computes the loss,
+        every stage returns it"""
+        assert targets is not None and not torch.is_grad_enabled(), "--pipe: forward() is for evaluation; training: pp_train"
+        P = self.pp; r, n = P["rank"], P["n"]
+        sh, dt = self._h_meta(idx)
+        h = self._stage(idx if r == 0 else _pp_recv(sh, dt, r - 1, idx.device))
+        if r < n - 1:
+            _pp_send(h, r + 1); loss = torch.zeros((), device=idx.device)
+        else:
+            loss = self._head_loss(h, targets).float()
+        return None, _pp_bcast(loss, n - 1)
+
+    def pp_train(self, batches, pre_bwd, autocast):
+        """one step's micro-batches through the pipeline: all forwards (stage r sends micro-batch i on while it computes
+        i + 1), then all backwards in the same order 0 .. M-1 as the single-GPU loop (pre_bwd(i) before each, for the
+        TTF accumulation flags), each scaled 1 / M. Returns the last micro-batch's loss (what the loop logs) on every
+        stage. batches: [(x, y, kd_topk or None)]"""
+        P = self.pp; r, n = P["rank"], P["n"]; M = len(batches)
+        self._ckpt_setup()
+        keep = []
+        for x, y, kd in batches:
+            sh, dt = self._h_meta(x)
+            with autocast():
+                hin = None if r == 0 else _pp_recv(sh, dt, r - 1, x.device).requires_grad_()
+                h = self._stage(x if r == 0 else hin)
+                if r < n - 1:
+                    _pp_send(h.detach(), r + 1); keep.append((hin, h))
+                else:
+                    self.kd_topk = kd
+                    keep.append((hin, self._head_loss(h, y))); self.kd_topk = None
+        last = torch.zeros((), device=batches[0][0].device)
+        for i in range(M):
+            hin, out = keep[i]; keep[i] = None
+            pre_bwd(i)
+            with torch.profiler.record_function("model.bwd"):
+                if r == n - 1:
+                    (out / M).backward(); last = out.detach().float()
+                else:
+                    out.backward(_pp_recv(out.shape, out.dtype, r + 1, out.device))
+            if r > 0:
+                _pp_send(hin.grad, r - 1)
+            del hin, out
+        return _pp_bcast(last, n - 1)
 
     def float_tail_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
@@ -147,6 +229,40 @@ def _kd_topk_chunk(h, w, tgt, ids, tlp, a, mode="rest"):
     return (1 - a) * ce + a * kd
 
 
+def _pp_gloo():
+    import torch.distributed as dist
+    return dist.get_backend() == "gloo"
+
+
+def _pp_send(t, dst):
+    import torch.distributed as dist
+    t = t.contiguous()
+    dist.send(t.cpu() if _pp_gloo() else t, dst)     # gloo (several stages on one GPU, a test): host tensors
+
+
+def _pp_recv(shape, dtype, src, dev):
+    import torch.distributed as dist
+    buf = torch.empty(shape, dtype=dtype, device="cpu" if _pp_gloo() else dev)
+    dist.recv(buf, src)
+    return buf.to(dev)
+
+
+def _pp_bcast(t, src):
+    import torch.distributed as dist
+    b = t.detach().float().reshape(1)
+    b = b.cpu() if _pp_gloo() else b
+    dist.broadcast(b, src)
+    return b.to(t.device)[0]
+
+
+def pp_split(n_layers, n_stages, spec=""):
+    """layer ranges per stage: spec 'a,b,c,...' (layer counts, sum n_layers) or an even split (earlier stages one more)"""
+    c = [int(v) for v in spec.split(",")] if spec else [n_layers // n_stages + (i < n_layers % n_stages) for i in range(n_stages)]
+    assert len(c) == n_stages and sum(c) == n_layers, f"--pipe_split {spec}: {n_stages} counts summing to {n_layers}"
+    lo = [sum(c[:i]) for i in range(n_stages)]
+    return [(lo[i], lo[i] + c[i]) for i in range(n_stages)]
+
+
 def _swap_linears(hf_model, make_linear):
     """replace the decoder's nn.Linear modules (except _KEEP_FLOAT) by make_linear(in, out); returns {name: module}"""
     swapped = {}
@@ -160,9 +276,11 @@ def _swap_linears(hf_model, make_linear):
     return swapped
 
 
-def build_qwen(path, mode, make_linear=None, grad_checkpoint=True, device="cuda", dtype=torch.bfloat16):
+def build_qwen(path, mode, make_linear=None, grad_checkpoint=True, device="cuda", dtype=torch.bfloat16, own=None):
     """the text decoder on `device`: mode 'fp32' (all linears float, the reference) or 'kernel' (make_linear for the large
-    linears); float parts in `dtype`. Weights are NOT loaded here (load_qwen)."""
+    linears); float parts in `dtype`. Weights are NOT loaded here (load_qwen). own=(lo, hi, first, last) (--pipe): only
+    decoder layers [lo, hi) (+ the embedding if first, the final norm and head if last) are allocated, the rest stay on
+    the meta device with the same module tree."""
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
     t = text_config(path)
     t._attn_implementation = "sdpa"
@@ -175,14 +293,24 @@ def build_qwen(path, mode, make_linear=None, grad_checkpoint=True, device="cuda"
                 if isinstance(child, nn.Linear) and cname not in _KEEP_FLOAT:
                     shapes[(name, cname)] = (child.in_features, child.out_features)
                     setattr(mod, cname, nn.Identity())
-    hf = hf.to_empty(device=device)
+    if own is None:
+        hf = hf.to_empty(device=device)
+    else:
+        lo, hi, first, last = own
+        for mod in ([hf.model.layers[i] for i in range(lo, hi)] + ([hf.model.embed_tokens] if first else [])
+                    + ([hf.model.norm, hf.lm_head] if last else [])):
+            mod.to_empty(device=device)
     for p in hf.parameters():
         p.data = p.data.to(dtype)
     # the ternary layers are built after to_empty (which would leave their own buffers uninitialised), in fp32
     swapped = {}
     for (name, cname), (i, o) in shapes.items():
         mod = hf.model.layers.get_submodule(name) if name else hf.model.layers
-        new = make_linear(i, o).to(device)
+        if own is None or own[0] <= int(name.split(".")[0]) < own[1]:
+            new = make_linear(i, o).to(device)
+        else:
+            with torch.device("meta"):      # --pipe: another stage's layer
+                new = make_linear(i, o)
         setattr(mod, cname, new)
         swapped[f"model.layers.{name}.{cname}" if name else f"model.layers.{cname}"] = new
     # the rotary module is rebuilt: to_empty leaves its inv_freq buffer uninitialised (non-persistent, not in checkpoints)
