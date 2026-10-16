@@ -20,7 +20,7 @@
 set -u
 ARM=$1; S=${S:-/tmp/oguzelde/tern}; REPO=${REPO:-$S/repo}      # Myriad: S=~/Scratch/tern REPO=~/Scratch/ternary-LLM
 source $S/env.sh; cd $REPO
-D=checkpoints/g_$ARM; mkdir -p $D logs
+D=checkpoints/g_$ARM${SUF:-}; mkdir -p $D logs          # SUF / STEPS: smoke tests
 MD=${MD:-$S/models}      # outside the code tree (setup.sh mirrors the code with --delete)
 HF=$MD/fp32_110m_hf
 DATA="--data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16 --grad_accum 1"
@@ -29,7 +29,7 @@ TTF="--mode kernel --rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_war
   --tail_fp32 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0 --ckpt_skip 2 --rc_scale
   --lowrank_mag add:16 --mag_wd 0.1 --ts --ts_tau 1000 --ts_anneal 0.75 --ts_tau_anneal --ts_nomom --ts_fused --gemm int8mm
   --lowrank 512 --ts_rank_s 512"
-CONV="--steps 1526 --warmup 300 --lr 5e-4 --min_lr 5e-5 --init_hf_method gptq --ts_theta 64 --ts_start 400"
+CONV="--steps ${STEPS:-1526} --warmup 300 --lr 5e-4 --min_lr 5e-5 --init_hf_method gptq --ts_theta 64 --ts_start 400"
 case $ARM in
   conv)      F="$DATA $TTF $CONV --init_hf $HF $KD" ;;
   sp)        F="$DATA $TTF $CONV --init_hf $MD/fp32_110m_sp $KD" ;;
@@ -65,6 +65,8 @@ case $ARM in
   gptqc_ts0_lr2e3) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/; s/--lr 5e-4 --min_lr 5e-5/--lr 2e-3 --min_lr 2e-4/") --init_hf $HF $KD" ;;
   gptqc_ts0_kd075_zf23) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75 --init_zero_frac 0.23" ;;   # fewer zeros (TTF has 23%)
   gptqc_ts0_kd075_zf30) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75 --init_zero_frac 0.30" ;;
+  gptqc_ts0_kd075_rotall) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75 --init_rot all" ;;   # rotated inputs
+  gptqc_ts0_kd075_rotout) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75 --init_rot out" ;;
   gptqc_ts0_kd0) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF" ;;   # labels only
   conv_ts0_t128) F="$DATA $TTF $(echo $CONV | sed "s/--ts_theta 64/--ts_theta 128/; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD" ;;   # no freeze, fewer moves
   conv_t128) F="$DATA $TTF ${CONV/--ts_theta 64/--ts_theta 128} --init_hf $HF $KD" ;;                    # fewer trit moves

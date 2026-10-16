@@ -254,7 +254,8 @@ def convert_seq_asym(path, data_path, n_seq=32, seq=2048, dev="cuda", damp=0.01,
     return out
 
 
-GPTQ_OPTS = {"zero_frac": None}      # --init_zero_frac (train.py): the default for every ternarize_gptq call
+GPTQ_OPTS = {"zero_frac": None, "rot": ""}   # --init_zero_frac, --init_rot (train.py)
+_ROT_SETS = {"down": {"w_down"}, "out": {"wo", "w_down"}, "all": {"wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"}}
 
 
 @torch.no_grad()
@@ -352,14 +353,27 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
                 lin.enable_centering(mu_, b_)
                 errs.append(_rel_err(W, T, a, c))
                 continue
+            Q = None
+            if GPTQ_OPTS["rot"] and name in _ROT_SETS[GPTQ_OPTS["rot"]] and hess is not None and method in ("gptq", "gptqc"):
+                # --init_rot: a fixed random orthogonal Q on the layer's input (exact in fp: W x = (W Q^T)(Q x)); the
+                # trits are those of W Q^T and the layer rotates its input online (spreads each input's energy)
+                assert res_rank < 0, "--init_rot with --res_anneal: not supported"
+                g_ = torch.Generator().manual_seed(1000 * i + sorted(_ROT_SETS["all"]).index(name))
+                Q = torch.linalg.qr(torch.randn(W.shape[1], W.shape[1], generator=g_, dtype=torch.float64))[0].float().to(dev)
+                W = W @ Q.T
+                lin.enable_rotation(Q)
             T, a, c = ternarize(W, "als" if method in ("gptq", "gptqc") else method)
             if hess is not None and method != "zero":
                 Hl = hess[(i, name)].to(dev)
+                if Q is not None:
+                    Hl = Q @ Hl @ Q.T
                 e0 = _out_err(W, T, a, c, Hl)
                 if method == "gptq":
                     T, a, c = ternarize_gptq(W, Hl, a, c)
                 elif method == "gptqc":     # centred: GPTQ on the input covariance; the layer subtracts the input mean
                     mu = hess[("mu", i, name)].to(dev)  # before its activation quantisation and adds W mu back as a bias
+                    if Q is not None:
+                        mu = Q @ mu
                     T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)
                     lin.enable_centering(mu, W @ mu)
                 oerrs.append((e0, _out_err(W, T, a, c, Hl)))

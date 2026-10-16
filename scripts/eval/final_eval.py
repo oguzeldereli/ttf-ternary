@@ -70,6 +70,10 @@ def load_model(path, device, mag_kind="add"):
         from bitnet.tern_emb import enable_tern_emb
         enable_tern_emb(model, "untied" if ("lm_head.wpacked" in sd or "lm_head.latent" in sd) else "tied",
                         "master" if mode == "master" else "kernel")
+    if any(k.endswith(".rot_Q") for k in sd):                # --init_rot: rotated inputs
+        for n_, m_ in model.named_modules():
+            if isinstance(m_, KernelTernaryLinear) and f"{n_}.rot_Q" in sd:
+                m_.enable_rotation(sd[f"{n_}.rot_Q"].to(device))
     if any(k.endswith(".in_mean") for k in sd):              # --init_hf_method gptqc: centred layers
         for n_, m_ in model.named_modules():
             if isinstance(m_, KernelTernaryLinear) and f"{n_}.in_mean" in sd:

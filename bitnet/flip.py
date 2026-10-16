@@ -703,7 +703,13 @@ class KernelTernaryLinear(nn.Module):
             return self._forward_t(x) + f_ * r_
         return self._forward_t(x)
 
+    def enable_rotation(self, Q):
+        """--init_rot: y = layer(Q x), Q a fixed orthogonal buffer (the trits were rounded from W Q^T)"""
+        self.register_buffer("rot_Q", Q.detach().clone().float())
+
     def _forward_t(self, x):
+        if getattr(self, "rot_Q", None) is not None:        # --init_rot: rotated input (before centring and quantisation)
+            x = x @ self.rot_Q.to(x.dtype).T
         if getattr(self, "in_mean", None) is not None:      # gptqc: centred input (before the activation quantisation)
             x = x - self.in_mean.to(x.dtype)
         # column scale before the GEMM (and before the int8 activation quantization),

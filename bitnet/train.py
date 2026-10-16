@@ -2970,6 +2970,8 @@ def main():
     ap.add_argument("--init_stream", action="store_true", help="--init_hf (Qwen): convert layer by layer, sequentially, reading "
                     "each layer's weights from the safetensors (27B: no full-precision copy in memory)")
     ap.add_argument("--data_u32", action="store_true", help="--data / --val are uint32 token streams (vocabularies above 65536)")
+    ap.add_argument("--init_rot", default="", choices=["", "down", "out", "all"], help="GPTQ conversion: a fixed random "
+                    "orthogonal rotation of these linears' inputs (down = w_down, out = wo + w_down, all), applied online")
     ap.add_argument("--init_zero_frac", type=float, default=None, help="GPTQ conversion: rounding threshold at this per-row "
                     "quantile of |W| (fewer zero trits than GPTQ's own ~40%%; hf_init.ternarize_gptq zero_frac)")
     ap.add_argument("--init_calib", type=int, default=64, help="--init_hf_method gptq: calibration windows "
@@ -3565,17 +3567,19 @@ def main():
         print(f"--init_hf: resuming from {tc.out_dir}/ckpt.pt, conversion skipped", flush=True)
         if _QWEN:   # as the conversion leaves them: embedding and head frozen (the optimizer is built below)
             model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
-        if args.init_hf_method == "gptqc":   # centred layers: in_mean / out_bias exist before the optimizer is built
+        if args.init_hf_method == "gptqc" or args.init_rot:   # centred / rotated layers: their buffers and bias
             _ck = torch.load(os.path.join(tc.out_dir, "ckpt.pt"), map_location="cpu", weights_only=False, mmap=True)["model"]
-            _nc = 0
+            _nc = _nr = 0                                       # exist before the optimizer is built
             for n_, m_ in model.named_modules():
+                if isinstance(m_, KernelTernaryLinear) and f"{n_}.rot_Q" in _ck:
+                    m_.enable_rotation(_ck[f"{n_}.rot_Q"].to(device)); _nr += 1
                 if isinstance(m_, KernelTernaryLinear) and f"{n_}.in_mean" in _ck:
                     m_.enable_centering(_ck[f"{n_}.in_mean"].to(device), _ck[f"{n_}.out_bias"].to(device)); _nc += 1
-            print(f"--init_hf_method gptqc: {_nc} centred layers restored for the resume", flush=True)
+            print(f"resume: {_nc} centred and {_nr} rotated layers restored", flush=True)
             del _ck
     if args.init_hf and not _resuming:
         from .hf_init import init_from_hf, GPTQ_OPTS as _GO
-        _GO["zero_frac"] = args.init_zero_frac
+        _GO["zero_frac"] = args.init_zero_frac; _GO["rot"] = args.init_rot
         assert args.mode in ("kernel", "master", "fp32"), "--init_hf: kernel, master or fp32 mode"
         assert not (args.init_acc and (args.ts_offload or args.ts_offload_async or args.ts_tiles > 1)), \
             "--init_acc: state on the GPU, no tiles"
