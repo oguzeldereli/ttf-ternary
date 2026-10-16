@@ -1,0 +1,7 @@
+2026-10-16 16:28:39 NVIDIA H100 NVL, mem cap 92.1 GiB, 615.71.09
+torch 2.13.0+cu126 triton 3.7.1 transformers 5.19.0
+A: micro-batch 4 x 4 --w_cache int8 | step 1351: time step 1351: forward+backward 39.610s, update (momentum step / AdamW) 1.628s | GiB allocated after backward 35.38 (pe | peakVRAM 35.38GiB | 0 OOM
+B: micro-batch 8 x 2 --w_cache int8 | step 1351: time step 1351: forward+backward 36.392s, update (momentum step / AdamW) 1.587s | GiB allocated after backward 35.53 (pe | peakVRAM 35.53GiB | 0 OOM
+C: micro-batch 16 x 1 --w_cache int8 | step 1351: time step 1351: forward+backward 35.626s, update (momentum step / AdamW) 1.593s | GiB allocated after backward 35.85 (pe | peakVRAM 35.85GiB | 0 OOM
+D: micro-batch 4 x 4  | step 1351: time step 1351: forward+backward 39.461s, update (momentum step / AdamW) 1.620s | GiB allocated after backward 12.72 (pe | peakVRAM 12.72GiB | 0 OOM
+2026-10-16 17:43:29 done: /workspace/tern/prof_results.tgz
