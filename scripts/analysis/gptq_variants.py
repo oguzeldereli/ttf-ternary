@@ -9,8 +9,11 @@ activations), the realised zero fraction (by linear type) and the output-space e
                  all = every linear. Spreads each input's energy over all dimensions (float activations here, so the
                  int8 activation side of a rotation is not measured).
   cen=1          centred GPTQ (covariance, W mu as exact bias), as gptqc
+  src=ones|lam=L  no data: inputs assumed to share one common part, H = I + (L / K) 1 1^T (error diffusion that keeps
+                 each row's sum; the user's 16 Oct proposal)
   src=train|random|self|wprior|eye  calibration source: training windows, uniform random tokens, text sampled from
                  the fp model itself, input covariances derived from the weights alone (no data), identity (no data)
+  slen=L         length of the self-generated windows (default --seq; sampling recomputes the prefix, so short is fast)
   calib=N        calibration windows (default 32); damp=X GPTQ damping (default 0.01); several options joined by ||
   python scripts/analysis/gptq_variants.py --fp models/fp32_baseline_slim/ckpt.pt \
       --variants "plain:,zf23:zf=0.23,zf30:zf=0.30,rotdown:rot=down"
@@ -41,7 +44,7 @@ def loss(m):
 
 
 @torch.no_grad()
-def windows(m, n, src):
+def windows(m, n, src, slen=0):
     """calibration token windows: train (random windows of --train), random (uniform token ids), self (sampled from
     the fp model itself, temperature 1, from BOS: no external data)"""
     if src == "train":
@@ -56,7 +59,7 @@ def windows(m, n, src):
     for b0 in range(0, n, 16):          # self-generation, no KV cache (110M: minutes)
         nb = min(16, n - b0)
         x = torch.full((nb, 1), 1, dtype=torch.long, device=dev)
-        while x.shape[1] < a.seq + 1:
+        while x.shape[1] < (slen or a.seq) + 1:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 lg = m(x[:, -a.seq:])[0][:, -1].float()
             x = torch.cat([x, torch.multinomial(torch.softmax(lg, -1), 1, generator=g)], 1)
@@ -100,7 +103,7 @@ def wprior(m):
 
 
 @torch.no_grad()
-def stats(m, n, src="train"):
+def stats(m, n, src="train", slen=0):
     S, mu, cnt, hooks = {}, {}, {}, []
     for i, blk in enumerate(m.layers):
         for sub, nm in M.LIN:
@@ -112,7 +115,7 @@ def stats(m, n, src="train"):
                 x = inp[0].reshape(-1, inp[0].shape[-1]).double()
                 S[key] += x.T @ x; mu[key] += x.sum(0); cnt[key] += x.shape[0]
             hooks.append(lin.register_forward_pre_hook(hk))
-    for x in windows(m, n, src):
+    for x in windows(m, n, src, slen):
         m(x[:, :-1], x[:, 1:])
     for h in hooks:
         h.remove()
@@ -121,7 +124,7 @@ def stats(m, n, src="train"):
 
 def parse(v):
     name, _, kv = v.partition(":")
-    o = {"zf": None, "rot": "none", "cen": 0, "calib": 32, "damp": 0.01, "src": "train"}
+    o = {"zf": None, "rot": "none", "cen": 0, "calib": 32, "damp": 0.01, "src": "train", "lam": 1.0, "slen": 0}
     for p in filter(None, kv.split("|")):
         k, x = p.split("=")
         o[k] = x if k in ("rot", "src") else (int(x) if k in ("cen", "calib") else float(x))
@@ -134,15 +137,20 @@ m0 = M.load(a.fp); R["fp"] = loss(m0); print(f"fp {R['fp']:.4f}", flush=True)
 ST = {}
 for v in a.variants.split(","):
     name, o = parse(v)
-    key = (o["calib"], o["src"])
+    key = (o["calib"], o["src"], o["lam"], o["slen"])
     if key not in ST:
         if o["src"] == "wprior":
             ST[key] = wprior(m0)
+        elif o["src"] == "ones":   # data-free error diffusion: inputs assumed to share one common part (H = I + lam 1 1^T),
+            # so GPTQ rounds each weight and pushes the sign-flipped difference evenly onto the rest of the row (keeps
+            # the row sum, the more so the larger lam: lam = K times the common part's share)
+            ST[key] = {k: (torch.eye(v[0].shape[0], device=dev) + o["lam"] * torch.ones(v[0].shape[0], v[0].shape[0], device=dev)
+                           / v[0].shape[0], torch.zeros(v[0].shape[0], device=dev)) for k, v in wprior(m0).items()}
         elif o["src"] == "eye":
             ST[key] = {k: (torch.eye(v[0].shape[0], device=dev), torch.zeros(v[0].shape[0], device=dev))
                        for k, v in wprior(m0).items()}
         else:
-            ST[key] = stats(m0, o["calib"], o["src"])
+            ST[key] = stats(m0, o["calib"], o["src"], int(o["slen"]))
     st = ST[key]
     m = M.load(a.fp)
     errs, zeros = [], {}
