@@ -4,6 +4,7 @@
 # stream to a far box ran at ~5 MB/s, six at ~13); the laptop's key is forwarded (ssh agent), nothing is stored on the
 # lab PC. The laptop sends code and the model config. Checksums are verified on the box.
 #   bash scripts/cloud/upload_lab.sh IP PORT        (the box's direct SSH: vast.ai "PUBLIC_IPADDR" and VAST_TCP_PORT_22)
+#   STREAMS=24 CHUNK_MB=256 bash ...                 (far boxes: each ssh stream is window-limited, ~0.5 MB/s to the US)
 set -u
 cd "$(dirname "$0")/../.."
 IP=$1; PT=$2; W=${W:-/workspace}; R="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $PT root@$IP"
@@ -13,11 +14,11 @@ rsync -az -e "ssh -p $PT -o BatchMode=yes" --exclude __pycache__ bitnet scripts 
 rsync -az -e "ssh -p $PT -o BatchMode=yes" models/qw27/{config.json,generation_config.json,tokenizer.json,tokenizer_config.json,chat_template.jinja,merges.txt,vocab.json} root@$IP:$W/tern/qw27/
 rsync -az -e "ssh -p $PT -o BatchMode=yes" data/wikiq8_val.bin root@$IP:$W/tern/repo/data/
 echo "$(date +%T) code / config sent; big files from shoveler"
-ssh -A -o BatchMode=yes -o ServerAliveInterval=30 -J oguzelde@knuckles.cs.ucl.ac.uk oguzelde@shoveler-l.cs.ucl.ac.uk "bash -s $IP $PT $W" <<'EOS'
-IP=$1; PT=$2; W=$3; cd /tmp/oguzelde/stage
+ssh -A -o BatchMode=yes -o ServerAliveInterval=30 -J oguzelde@knuckles.cs.ucl.ac.uk oguzelde@shoveler-l.cs.ucl.ac.uk "bash -s $IP $PT $W ${STREAMS:-6} ${CHUNK_MB:-1024}" <<'EOS'
+IP=$1; PT=$2; W=$3; P=$4; C=$5; cd /tmp/oguzelde/stage
 B="ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -p $PT root@$IP"
-send() { f=$1; d=$2; n=$(( ($(stat -L -c %s $f) + 1073741823) / 1073741824 ))
-  seq 0 $((n - 1)) | xargs -P 6 -I{} bash -c "dd if=$f bs=1M skip=\$(({} * 1024)) count=1024 status=none | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $PT root@$IP 'dd of=$d bs=1M seek=\$(({} * 1024)) conv=notrunc status=none'"
+send() { f=$1; d=$2; n=$(( ($(stat -L -c %s $f) + C * 1048576 - 1) / (C * 1048576) ))
+  seq 0 $((n - 1)) | xargs -P $P -I{} bash -c "for t in 1 2 3 4 5 6; do dd if=$f bs=1M skip=\$(({} * $C)) count=$C status=none | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $PT root@$IP 'dd of=$d bs=1M seek=\$(({} * $C)) conv=notrunc status=none' && break; sleep \$t; done"
   $B "truncate -s $(stat -L -c %s $f) $d"; }
 send qw27_rel_ckpt.pt $W/tern/ckpt/qw27_rel_ckpt.pt; echo "$(date +%T) checkpoint sent"
 send mix3_train.bin $W/tern/repo/data/mix3_train.bin; echo "$(date +%T) mix3 sent"

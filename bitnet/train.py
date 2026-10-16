@@ -3001,7 +3001,7 @@ def main():
     ap.add_argument("--init_hf", default="", help="start from a pretrained Llama checkpoint in Hugging Face format (a "
                     "directory with config.json and safetensors); the model shape comes from its config (--preset is ignored). "
                     "See bitnet/hf_init.py")
-    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "gptq", "gptqc", "gptqs", "zero", "scratch", "native"],
+    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "gptq", "gptqc", "gptqs", "zero", "scratch", "native", "random"],
                     help="--init_hf, kernel mode: how the weights become trits and scales (bitnet/hf_init.py)")
     ap.add_argument("--distill", default="", help="a full-precision teacher (Hugging Face Llama dir): the loss is "
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
@@ -3689,7 +3689,14 @@ def main():
         assert not (args.init_acc and (args.ts_offload or args.ts_offload_async or args.ts_tiles > 1)), \
             "--init_acc: state on the GPU, no tiles"
         _hess = None
-        if _QWEN and args.init_stream:   # --init_stream: layer by layer, sequential (models too big for one fp copy)
+        if _QWEN and args.init_hf_method == "random":   # speed measurements without the weights (no download):
+            with torch.no_grad():                         # the trits as built (random), float parts N(0, 0.02)
+                for p_ in model.parameters():
+                    if not p_.is_meta:
+                        p_.normal_(0, 0.02)
+                model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
+            print("--init_hf_method random: random trits and float parts (speed tests only)", flush=True)
+        elif _QWEN and args.init_stream:   # --init_stream: layer by layer, sequential (models too big for one fp copy)
             from .qwen import convert_qwen_streaming
             convert_qwen_streaming(model, args.init_hf, _qsw, tc.data_path, method=args.init_hf_method,
                                    n_seq=args.init_calib, seq=tc.seq_len, dev=device, dtype_u32=args.data_u32,
