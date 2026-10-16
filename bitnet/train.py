@@ -4440,6 +4440,7 @@ def main():
         if TIME:
             torch.cuda.synchronize(); _t1 = time.time()
             _m1, _p1 = torch.cuda.memory_allocated() / 2**30, torch.cuda.max_memory_allocated() / 2**30
+        _rfu = torch.profiler.record_function("step.update"); _rfu.__enter__()   # TERN_PROF: after the backward
         if args.lowrank:
             if la_on(step):             # propose from M, keep by the look-ahead test
                 rs_info, Ms = lowrank_step(model, lr_state, args.lowrank, args.lr_beta, step,
@@ -4474,6 +4475,7 @@ def main():
                 rs_info = bop_step(model, lr_state, args.bop_gamma, args.bop_tau, args.ts_b2, norm=not args.bop_raw,
                                    bias_correct=args.bop_bc)
             elif args.ts:
+              with torch.profiler.record_function("ttf.step"):
                 rs_info = ts_step(model, lr_state, args.lowrank, step, _ts_scale(args, step, tc, lr), args.ts_theta, args.ts_tau,
                                   args.ts_rank_s, args.ts_b1, args.ts_b2, gate=args.lr_gate, spend=args.ts_spend,
                                   tau_anneal=(args.ts_tau_anneal_pow if args.ts_tau_anneal else False), int8=args.ts_int8, fused=args.ts_fused,
@@ -4530,6 +4532,7 @@ def main():
                 if p_.grad is not None:
                     _dist.all_reduce(p_.grad); p_.grad.div_(_WS)
         _clip_ps = [p_ for p_ in tail if id(p_) not in _lat_ids] if args.m_clip_tail and args.mode == "master" else tail
+        _rfc = torch.profiler.record_function("tail.clip"); _rfc.__enter__()
         if _PP:   # --pipe: the clip's norm over all stages' float tails (each stage holds its own gradients)
             _gs = [p_.grad for p_ in _clip_ps if p_.grad is not None]
             _n2 = (torch.stack([torch.linalg.vector_norm(g_, 2).float() for g_ in _gs]) ** 2).sum() if _gs else \
@@ -4541,13 +4544,15 @@ def main():
                 g_.mul_(_cf.to(g_.dtype))
         else:
             torch.nn.utils.clip_grad_norm_(_clip_ps, tc.grad_clip)
+        _rfc.__exit__(None, None, None)
         if _WS > 1 and step % 100 == 0:   # data parallel: the ranks' trits must stay identical (same g, same rule)
             _ck = torch.tensor([float(sum(int(m_.wpacked.sum()) for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)))],
                                device=device, dtype=torch.float64)
             _cks = [torch.zeros_like(_ck) for _ in range(_WS)]; _dist.all_gather(_cks, _ck)
             print(f"  data parallel step {step}: packed-trit checksums {[int(x.item()) for x in _cks]} "
                   f"({'in sync' if len({int(x.item()) for x in _cks}) == 1 else 'OUT OF SYNC'})", flush=True)
-        tail_opt.step()
+        with torch.profiler.record_function("tail.step"):
+            tail_opt.step()
         if args.ts_rank_adapt and lr_state:
             ra_e, ra_s = (args.ts_rank_adapt.split(":") + ["500"])[:2]
             if step >= int(ra_s) and step % int(ra_e) == 0:
@@ -4562,6 +4567,7 @@ def main():
                   f"{md_['md_realized_per_move']:.3e} survive {md_['md_survive']:.2f} trits {md_['md_realized']:+.2e} "
                   f"float {md_['md_float']:+.2e} undo {md_['md_undo_frac']:.3f} win {md_['md_win_realized']:+.2e} "
                   f"net {md_['md_win_net']} age {md_['md_win_age']}", flush=True)
+        _rfu.__exit__(None, None, None)
         if _prof is not None:
             torch.cuda.synchronize(); _pdt = time.time() - _pt0; _prof.__exit__(None, None, None)
             _pd = os.environ["TERN_PROF"]; os.makedirs(_pd, exist_ok=True)

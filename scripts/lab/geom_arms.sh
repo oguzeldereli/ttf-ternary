@@ -12,6 +12,7 @@
 #   gptqc     centred GPTQ start (input mean out before rounding, W mu as a float bias), then as conv   arm e
 #   gptqs     sequential, error-aware, centred GPTQ start (convert_seq_asym), then as conv
 #   convreg   as conv with the residual outlier penalty on the ternary student (--act_reg 0.05)       arm f
+#   rec_d0 / rec_d10 / rec_d30   as conv from the decrowd0 / 10 / 30 fp fine-tunes (their own KD): superposition test 4
 #   resann    TTF-native homotopy: GPTQ trits + the fp rounding residual faded 1 -> 0 over 1000 steps (--res_anneal)
 #   resann256 the same with the residual at rank 256 (the memory-cheap form for big models); resann_long: 1400 steps
 #   homo1500  master homotopy over 1500 steps
@@ -31,8 +32,14 @@ TTF="--mode kernel --rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_war
   --lowrank_mag add:16 --mag_wd 0.1 --ts --ts_tau 1000 --ts_anneal 0.75 --ts_tau_anneal --ts_nomom --ts_fused --gemm int8mm
   --lowrank 512 --ts_rank_s 512"
 CONV="--steps ${STEPS:-1526} --warmup 300 --lr 5e-4 --min_lr 5e-5 --init_hf_method gptq --ts_theta 64 --ts_start 400"
+if [ ${ARM#rec_d} != $ARM ]; then   # rec_dN: the current recipe from the decrowdN fp fine-tune (exported to HF, its own KD)
+  DN=$MD/decrowd${ARM#rec_d}_hf
+  [ -f $DN/config.json ] || python scripts/analysis/export_hf_llama.py checkpoints/g_decrowd${ARM#rec_d}/ckpt.pt $DN \
+    --val data/wiki32k_val.bin >> $D/train.log 2>&1
+fi
 case $ARM in
   conv)      F="$DATA $TTF $CONV --init_hf $HF $KD" ;;
+  rec_d0|rec_d10|rec_d30) F="$DATA $TTF $CONV --init_hf $DN --distill $DN --distill_w 0.5" ;;   # does spreading help recovery?
   sp)        F="$DATA $TTF $CONV --init_hf $MD/fp32_110m_sp $KD" ;;
   gptqc)     F="$DATA $TTF ${CONV/gptq/gptqc} --init_hf $HF $KD" ;;                     # arm e: centred GPTQ start
   gptqs)     F="$DATA $TTF ${CONV/gptq/gptqs} --init_hf $HF $KD" ;;                     # sequential error-aware centred start
