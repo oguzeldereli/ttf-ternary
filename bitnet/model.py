@@ -266,7 +266,42 @@ class BitTransformer(nn.Module):
             return kl
         return (1 - a) * F.nll_loss(lp, tgt, ignore_index=-1, reduction="sum") + a * kl
 
+    local_h = None        # --local_kd: the teacher's residual stream at every block boundary for this batch
+
+    @torch.no_grad()
+    def hiddens(self, idx):
+        """the residual stream entering each block and leaving the last one ([L + 1] tensors [B, T, d])"""
+        h = self.tok_emb(idx)
+        if torch.is_autocast_enabled(h.device.type):
+            h = h.to(torch.get_autocast_dtype(h.device.type))
+        fc = self.freqs_cis.to(h.device)
+        out = [h]
+        for layer in self.layers:
+            h = layer(h, fc)
+            out.append(h)
+        return out
+
+    def _local_loss(self):
+        """--local_kd: every block maps the teacher's input to the teacher's output on its own (no gradient between
+        blocks). Per block, the error of its update d = h_out - h_in in two parts, each relative to the teacher's: the
+        mean over tokens (the constant offset the fp stream carries) and the varying rest, so the large constant part
+        does not swamp the features."""
+        hs = self.local_h
+        fc = self.freqs_cis.to(hs[0].device)
+        ckpt = self.grad_checkpoint and self.training
+        tot = 0.0
+        for i, layer in enumerate(self.layers):
+            out = layer(hs[i].detach(), fc, ckpt=ckpt)
+            ds, dt = (out - hs[i]).float(), (hs[i + 1] - hs[i]).float()
+            ms, mt = ds.mean((0, 1)), dt.mean((0, 1))
+            cs, ct = ds - ms, dt - mt
+            tot = tot + (ms - mt).pow(2).sum() / mt.pow(2).sum().clamp_min(1e-6) \
+                + (cs - ct).pow(2).mean() / ct.pow(2).mean().clamp_min(1e-6)
+        return tot / len(self.layers)
+
     def forward(self, idx, targets=None):
+        if self.local_h is not None and targets is not None:
+            return None, self._local_loss()
         h = self.tok_emb(idx)
         if torch.is_autocast_enabled(h.device.type):
             # keep the residual stream in the autocast dtype even when the

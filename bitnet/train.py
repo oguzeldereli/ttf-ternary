@@ -2948,7 +2948,7 @@ def main():
     ap.add_argument("--init_hf", default="", help="start from a pretrained Llama checkpoint in Hugging Face format (a "
                     "directory with config.json and safetensors); the model shape comes from its config (--preset is ignored). "
                     "See bitnet/hf_init.py")
-    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "gptq", "gptqc", "gptqs", "zero", "scratch"],
+    ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "gptq", "gptqc", "gptqs", "zero", "scratch", "native"],
                     help="--init_hf, kernel mode: how the weights become trits and scales (bitnet/hf_init.py)")
     ap.add_argument("--distill", default="", help="a full-precision teacher (Hugging Face Llama dir): the loss is "
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
@@ -2970,6 +2970,8 @@ def main():
     ap.add_argument("--init_stream", action="store_true", help="--init_hf (Qwen): convert layer by layer, sequentially, reading "
                     "each layer's weights from the safetensors (27B: no full-precision copy in memory)")
     ap.add_argument("--data_u32", action="store_true", help="--data / --val are uint32 token streams (vocabularies above 65536)")
+    ap.add_argument("--local_kd", type=int, default=0, help="steps of block-local distillation first (needs --distill, "
+                    "a Llama-type teacher): each block learns the teacher block's map from the teacher's input")
     ap.add_argument("--init_rot", default="", choices=["", "down", "out", "all"], help="GPTQ conversion: a fixed random "
                     "orthogonal rotation of these linears' inputs (down = w_down, out = wo + w_down, all), applied online")
     ap.add_argument("--init_zero_frac", type=float, default=None, help="GPTQ conversion: rounding threshold at this per-row "
@@ -4223,7 +4225,10 @@ def main():
                                                       train_data, tc.seq_len, device)
             else:
                 x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
-            if _teacher is not None:   # --distill: the full-precision model's next-token distribution for this batch
+            if args.local_kd and step < args.local_kd:   # --local_kd: the teacher's stream at every block boundary
+                with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
+                    model.local_h = _teacher.hiddens(x)
+            elif _teacher is not None:   # --distill: the full-precision model's next-token distribution for this batch
                 with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
                     tz_, _ = _teacher(x)
                 model.kd_logp = F.log_softmax(tz_.float(), -1).to(torch.bfloat16).reshape(-1, tz_.shape[-1]); del tz_
@@ -4241,6 +4246,10 @@ def main():
             sc_ = float(args.spike_test.split(":")[1]) if args.spike_test and step == int(args.spike_test.split(":")[0]) else 1.0
             (loss * sc_ / tc.grad_accum).backward()  # triggers BitLinear fused updates (--spike_test S:F: x F at step S)
             model.kd_logp = None
+            if model.local_h is not None:
+                model.local_h = None
+                if step + 1 == args.local_kd:   # the local phase ends: free its buffers before the KD logits arrive
+                    torch.cuda.empty_cache()
             if args.kd_cache:
                 model.kd_topk = None
             if args.tern_emb and args.mode != "master":   # the ternary embedding's TTF update (both of its gradients)

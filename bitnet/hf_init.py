@@ -345,6 +345,8 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
             if not isinstance(lin, KernelTernaryLinear):        # fp32 mode: nn.Linear
                 lin.weight.copy_(W)
                 continue
+            if method == "native":         # --local_kd from a ternary-native start: the floats (embedding, norms, head)
+                continue                   # come from the checkpoint, the linears keep their random ternary init
             if method == "gptqs":          # precomputed by convert_seq_asym (sequential, error-aware, centred)
                 T, a, c, mu_, b_ = (t.to(dev) for t in hess[(i, name)])
                 lin.wpacked.copy_(pack_rows(T))

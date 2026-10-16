@@ -20,6 +20,7 @@
 set -u
 ARM=$1; S=${S:-/tmp/oguzelde/tern}; REPO=${REPO:-$S/repo}      # Myriad: S=~/Scratch/tern REPO=~/Scratch/ternary-LLM
 source $S/env.sh; cd $REPO
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 D=checkpoints/g_$ARM${SUF:-}; mkdir -p $D logs          # SUF / STEPS: smoke tests
 MD=${MD:-$S/models}      # outside the code tree (setup.sh mirrors the code with --delete)
 HF=$MD/fp32_110m_hf
@@ -70,6 +71,10 @@ case $ARM in
   gptqc_ts0_kd075_lr1e3_rotout) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/; s/--lr 5e-4 --min_lr 5e-5/--lr 1e-3 --min_lr 1e-4/") --init_hf $HF --distill $HF --distill_w 0.75 --init_rot out" ;;
   best_long) F="$DATA $TTF $(echo $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/; s/--lr 5e-4 --min_lr 5e-5/--lr 1e-3 --min_lr 1e-4/") | sed "s/--steps 1526/--steps 4578/") --init_hf $HF --distill $HF --distill_w 0.75 --init_rot out" ;;   # the 16 Oct best at 150M
   best_s2) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/; s/--lr 5e-4 --min_lr 5e-5/--lr 1e-3 --min_lr 1e-4/") --init_hf $HF --distill $HF --distill_w 0.75 --init_rot out --seed 2" ;;
+  # block-local distillation first (--local_kd: every block learns its fp block's map from the fp input), then global KD 0.75
+  local_native_t16) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method native /; s/--ts_start 400/--ts_start 0/; s/--ts_theta 64/--ts_theta 16/; s/--lr 5e-4 --min_lr 5e-5/--lr 1.5e-3 --min_lr 1.5e-4/") --init_hf $HF --distill $HF --distill_w 0.75 --local_kd ${LOCAL:-1000}" ;;   # ternary-native start
+  local_native_t64) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method native /; s/--ts_start 400/--ts_start 0/; s/--lr 5e-4 --min_lr 5e-5/--lr 1e-3 --min_lr 1e-4/") --init_hf $HF --distill $HF --distill_w 0.75 --local_kd ${LOCAL:-1000}" ;;
+  local_gptqc) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/; s/--lr 5e-4 --min_lr 5e-5/--lr 1e-3 --min_lr 1e-4/") --init_hf $HF --distill $HF --distill_w 0.75 --local_kd ${LOCAL:-1000}" ;;   # same objective, fp-rounded start
   gptqc_ts0_kd0) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF" ;;   # labels only
   conv_ts0_t128) F="$DATA $TTF $(echo $CONV | sed "s/--ts_theta 64/--ts_theta 128/; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD" ;;   # no freeze, fewer moves
   conv_t128) F="$DATA $TTF ${CONV/--ts_theta 64/--ts_theta 128} --init_hf $HF $KD" ;;                    # fewer trit moves
