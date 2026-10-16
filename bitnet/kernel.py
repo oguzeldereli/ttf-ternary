@@ -881,3 +881,26 @@ def act_quant_i8_fast(x: torch.Tensor, bits: int = 8):
     lo = float(torch.tensor(1e-5, dtype=x.dtype))              # clamp_min(1e-5) happens in x's dtype in act_quant_i8
     _actq_kernel[(M,)](x2, q, sc, K, x2.stride(0), q.stride(0), qp, rqp, lo, BK=1024)
     return q.view(*x.shape[:-1], K), sc.view(x.shape[:-1])
+
+
+@triton.jit
+def _sq_sums_kernel(g_ptr, rp_ptr, cp_ptr, N, K, sgn, nkt, BR: tl.constexpr, BK: tl.constexpr):
+    pr = tl.program_id(0); pk = tl.program_id(1)
+    rows = pr * BR + tl.arange(0, BR); cols = pk * BK + tl.arange(0, BK)
+    m = (rows[:, None] < N) & (cols[None, :] < K)
+    g = tl.load(g_ptr + rows[:, None] * sgn + cols[None, :], mask=m, other=0.0).to(tl.float32)
+    g2 = g * g
+    tl.store(rp_ptr + rows * nkt + pk, tl.sum(g2, axis=1), mask=rows < N)          # per (row, column tile)
+    tl.store(cp_ptr + pr * K + cols, tl.sum(g2, axis=0), mask=cols < K)            # per (row tile, column)
+
+
+def sq_sums(g: torch.Tensor):
+    """row sums and column sums of g^2 in one pass over g ([N, K]; deterministic two-stage reduction): what
+    vector_norm(g, dim=1)^2, g2.mean(1) and their column versions read g four times (plus a g^2 copy) for"""
+    N, K = g.shape
+    BR, BK = 32, 256
+    nrt, nkt = triton.cdiv(N, BR), triton.cdiv(K, BK)
+    rp = torch.empty(N, nkt, dtype=torch.float32, device=g.device)
+    cp = torch.empty(nrt, K, dtype=torch.float32, device=g.device)
+    _sq_sums_kernel[(nrt, nkt)](g, rp, cp, N, K, g.stride(0), nkt, BR=BR, BK=BK)
+    return rp.sum(1), cp.sum(0)

@@ -100,6 +100,7 @@ TWO_STAGE = [0.0]
 LR_LINEAR = [False]               # --lr_linear: linear decay after warmup instead of the cosine
 LR_WSD = [0]                      # --lr_wsd D: warmup, constant peak lr until step D, then a cosine to min_lr at the end
 LR_REWARM = [0, 0]                # --lr_rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
+TS_FUSED_STATS = [True]          # TERN_FUSED_STATS=0: the TTF row / column sums of g^2 by torch reductions (the old path)
 TS_SHADOWS = [(), ()]             # --ts_shadows: ranks of the shadow states (0 = full rank); --ts_shadow_layers
 TS_DUMP = ["", (), ()]            # --ts_dump_steps / --ts_dump_layers: directory, steps, layer indices   # --two_stage F: BitNet-b1.58-style two-stage schedule (0: plain cosine)
 
@@ -872,8 +873,14 @@ def ts_layer(l, g, state, c):
         # micro-batch's own square (x M^2, the batch's scale) joins with weight 1 - beta2; without it a gradient spike
         # passes into the accumulator whole (110M: a 6% flip burst at step ~55, 5.64 vs 4.42 at 600 steps)
         ts_ = (t - 1) // M_
-        r0, c0 = torch.linalg.vector_norm(g, dim=1).square_().mul_(M_ * M_ / l.K), \
-            torch.linalg.vector_norm(g, dim=0).square_().mul_(M_ * M_ / l.N)
+        if g.is_cuda and TS_FUSED_STATS[0]:   # one pass for both sums of g^2 (rounding-level differences only)
+            from .kernel import sq_sums as _sq_sums
+            _rsq, _csq = _sq_sums(g)
+            r0, c0 = _rsq * (M_ * M_ / l.K), _csq * (M_ * M_ / l.N)
+        else:
+            _rsq = None
+            r0, c0 = torch.linalg.vector_norm(g, dim=1).square_().mul_(M_ * M_ / l.K), \
+                torch.linalg.vector_norm(g, dim=0).square_().mul_(M_ * M_ / l.N)
         if ("v", key) in st and ts_ > 0:
             R0, C0 = _host_get(st, ("v", key), dev, off)
             bc_ = 1 - b2o ** ts_
@@ -883,14 +890,15 @@ def ts_layer(l, g, state, c):
         else:
             sq_prev = (r0[:, None] * c0[None, :] / r0.mean().clamp_min(1e-30)).sqrt_()
         del r0, c0
-    g2 = g * g
+    fs_ = mic_nm and _rsq is not None and not c.get("vdiag")   # the fused sums stand in for g^2's means
+    g2 = None if fs_ else g * g
     if M_ > 1:    # --ts_micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
         # row / column means of (sum_i g_i)^2 = the micro-batches' own squares + 2 <g_i, sum of earlier g_i'>, the
         # cross terms through a k-dim random sketch of the running sum (unbiased; k (N + K) floats, held within the step)
         Sr, Sc = _micro_sketch(l, dev, (t - 1) // M_)
         PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (0, 0, 0, 0, 0, 0)
         gS, Sg = g @ Sr, Sc @ g
-        d1, d0 = g2.mean(1), g2.mean(0)
+        d1, d0 = (_rsq / l.K, _csq / l.N) if fs_ else (g2.mean(1), g2.mean(0))
         rs = rs + d1 + (2.0 / l.K) * (gS * PS).sum(1) if torch.is_tensor(PS) else d1
         cs = cs + d0 + (2.0 / l.N) * (Sg * SP).sum(0) if torch.is_tensor(SP) else d0
         ds, es = ds + d1, es + d0
@@ -3439,6 +3447,7 @@ def main():
         TS_DUMP[:] = [os.path.join(args.out_dir or ".", "acc_dumps"), tuple(int(x) for x in args.ts_dump_steps.split(",")),
                       tuple(int(x) for x in args.ts_dump_layers.split(","))]
     ORTH_DEBUG = os.environ.get("TERN_ORTHDBG") == "1"
+    TS_FUSED_STATS[0] = os.environ.get("TERN_FUSED_STATS", "1") != "0"
     TIME = os.environ.get("TERN_TIME") == "1"   # time the forward/backward vs the momentum step (synchronizes)
 
     mc: ModelConfig = PRESETS[args.preset]

@@ -49,3 +49,8 @@ for (M_, K_) in [(8192, 5120), (2048, 17408), (7, 768)]:
     x = (torch.randn(M_, K_, device="cuda") * torch.rand(M_, 1, device="cuda") * 3).to(torch.bfloat16); x[1] = 0
     q0, s0 = Kn.act_quant_i8(x); q1, s1 = Kn.act_quant_i8_fast(x)
     print(M_, K_, "act quant bit-identical:", torch.equal(q0, q1), torch.equal(s0, s1))
+# fused row / column sums of g^2 (TTF statistics): equal to torch's to fp32 rounding (a different summation order)
+for (N_, K_) in [(5120, 3000), (17408, 5120)]:
+    g = torch.randn(N_, K_, device="cuda") * 1e-3
+    rs, cs = Kn.sq_sums(g); r0 = torch.linalg.vector_norm(g, dim=1).square(); c0 = (g * g).sum(0)
+    print(N_, K_, "sq_sums max rel diff rows %.2e cols %.2e (fp32 eps 1.2e-7)" % (((rs - r0).abs() / r0).max().item(), ((cs - c0).abs() / c0).max().item()))
