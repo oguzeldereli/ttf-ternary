@@ -3002,6 +3002,9 @@ def main():
     ap.add_argument("--res_anneal", default="", help="N[:R] (--init_hf, kernel): keep every layer's rounding residual "
                     "W - W_hat (rank R, 0 / omitted = full) and add it to the output with weight 1 - step / N: the run starts "
                     "as the fp model and slides onto the ternary weights while TTF trains them (TTF-native homotopy)")
+    ap.add_argument("--frame_reg", type=float, default=0.0, help="fp32 mode: penalty W x mean over FFN layers of the mean "
+                    "squared cosine between distinct reading directions (w_gate / w_up rows) and writing directions "
+                    "(w_down columns): spreads crowded (superposed) features apart; the causal test of 16 Oct")
     ap.add_argument("--act_reg", type=float, default=0.0, help="penalty W x mean over block inputs 1.. and the final norm "
                     "input of log E_token mean_d (h_d / rms(h))^4 (residual-stream outliers: ~3 for a Gaussian stream, "
                     "~200 for the 110M fp model's massive activations); added to the training loss only")
@@ -4306,6 +4309,18 @@ def main():
             with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16), \
                     torch.profiler.record_function("model.fwd"):
                 _, loss = model(x, y)
+            if args.frame_reg:                     # --frame_reg: crowding of the FFN frames (fp32 weights)
+                _fr = []
+                for _blk in model.layers:
+                    for _W in (_blk.ffn.w_gate.weight, _blk.ffn.w_up.weight, _blk.ffn.w_down.weight.t()):
+                        _U = _W / _W.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                        _G = _U @ _U.t()
+                        _k = _G.shape[0]
+                        _fr.append((_G.pow(2).sum() - _G.diagonal().pow(2).sum()) / (_k * (_k - 1)))
+                _frm = torch.stack(_fr).mean()
+                if micro == 0 and step % 50 == 0:
+                    print(f"frame_reg: step {step} mean cos^2 {_frm.item():.5f}", flush=True)
+                loss = loss + args.frame_reg * _frm
             if args.act_reg and _areg:
                 _ar = torch.stack(_areg).mean()
                 if micro == 0 and step % 50 == 0:

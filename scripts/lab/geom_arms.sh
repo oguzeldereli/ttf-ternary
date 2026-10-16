@@ -85,6 +85,8 @@ case $ARM in
   convreg)   F="$DATA $TTF $CONV --init_hf $HF $KD --act_reg 0.05" ;;                    # arm f: outlier penalty on the student
   deout)     F="$DATA --mode fp32 --init_hf $HF $KD --act_reg 0.05 --steps 1526 --warmup 100 --lr 3e-4 --min_lr 3e-5
                --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
+  decrowd0|decrowd10|decrowd30) F="$DATA --mode fp32 --init_hf $HF $KD --frame_reg ${ARM#decrowd} --steps 1526 --warmup 100 --lr 3e-4
+               --min_lr 3e-5 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;   # spread the FFN frames, then round
   homo)      F="$DATA --mode master --init_hf $HF $KD --m_qmix 1000 --rc_scale --tail_fp32 --steps 1526 --warmup 100
                --lr 5e-4 --min_lr 5e-5 --eval_interval 100 --eval_iters 8 --save_secs 1800 --snap_every 0 --lookahead 0" ;;
   kdscratch) F="$DATA $TTF --preset small $KD --steps 1526 --warmup 305 --lr 1.5e-3 --min_lr 1.5e-4 --ts_theta 16 --qk_temp" ;;
@@ -99,10 +101,12 @@ python -m bitnet.train $F $R --out_dir $D >> $D/train.log 2>&1
 echo "$(date '+%F %T') train end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/train.log
 # analyses on the result (light): geometry against fp; losses of the roundings for the fp32 arms (trit_compare), fixed
 # windows for the ternary ones (final_eval)
-if [ $ARM = deout ] || [ $ARM = fpseed2 ]; then
+if [ $ARM = deout ] || [ $ARM = fpseed2 ] || [ ${ARM#decrowd} != $ARM ]; then
   python scripts/analysis/geometry.py --model fp=$MD/fp32_baseline_slim/ckpt.pt --model $ARM=$D/ckpt.pt --gptq_of $ARM \
     --out $D/geometry.json > $D/geometry.txt 2>&1
   python scripts/analysis/trit_compare.py --fp $D/ckpt.pt --n_eval 64 --calib 64 --out $D/roundings.json > $D/roundings.txt 2>&1
+  python scripts/analysis/interference.py --model fp=$MD/fp32_baseline_slim/ckpt.pt --model $ARM=$D/ckpt.pt \
+    --out $D/interference.json > $D/interference.txt 2>&1
 else
   python scripts/analysis/geometry.py --model fp=$MD/fp32_baseline_slim/ckpt.pt --model $ARM=$D/ckpt.pt \
     --out $D/geometry.json > $D/geometry.txt 2>&1
