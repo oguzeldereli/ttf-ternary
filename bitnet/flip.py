@@ -323,6 +323,7 @@ def enable_boost(model, s0=0.5):
     return n
 
 
+DW_FP32 = [False]            # --dw_fp32: dense weight gradients in fp32 from the GEMM (more precise, one copy fewer)
 WCACHE = {"mode": "off"}     # --w_cache int8: keep each layer's unpacked int8 trits between updates (1 byte / weight)
 
 
@@ -369,7 +370,11 @@ class _KernelTernFn(torch.autograd.Function):
                 gw = dw_cublas(gyf, xq, xs)
             else:
                 with _rf("tern.dw"):
-                    gw = gyf.transpose(0, 1) @ (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype))
+                    if DW_FP32[0]:   # --dw_fp32: the weight gradient straight out of the GEMM in fp32 (no bf16 rounding
+                        gw = torch.mm(gyf.transpose(0, 1), xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype),   # and no copy)
+                                      out_dtype=torch.float32)
+                    else:
+                        gw = gyf.transpose(0, 1) @ (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype))
         else:
             x, wpacked = ctx.saved_tensors
             xq = _act_quant_plain(x, layer.act_bits).reshape(-1, layer.K)

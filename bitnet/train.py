@@ -3030,6 +3030,8 @@ def main():
                     "(default the checkpoint's); a wider ternary FFN can hold the fp model's crowded features apart")
     ap.add_argument("--local_kd", type=int, default=0, help="steps of block-local distillation first (needs --distill, "
                     "a Llama-type teacher): each block learns the teacher block's map from the teacher's input")
+    ap.add_argument("--dw_fp32", action="store_true", help="the dense weight gradient comes out of the GEMM in fp32 "
+                    "(no bf16 rounding of dL/dW, one [N, K] copy fewer per layer and micro-batch)")
     ap.add_argument("--w_cache", default="off", choices=["off", "int8"], help="keep every ternary layer's unpacked "
                     "int8 trits between updates (1 byte per weight on the GPU; 80 GB cards): no unpacking per forward / "
                     "backward / recompute; the results are bit-identical")
@@ -3631,6 +3633,9 @@ def main():
         else:
             print(f"row/column scales: {enable_rc_scales(model) / 1e3:.1f}k floats", flush=True)
     _acc_init = {}
+    if args.dw_fp32:
+        from .flip import DW_FP32 as _DF
+        _DF[0] = True
     if args.w_cache != "off":
         from .flip import WCACHE as _WC
         _WC["mode"] = args.w_cache
