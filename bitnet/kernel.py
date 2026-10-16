@@ -793,3 +793,31 @@ def fused_flip_row(wpacked, grad_w, rate: float, g_ref: float, seed: int,
     _flip_row_kernel[grid](wpacked, grad_w, row_mean, N, K, K5,
                            grad_w.stride(0), grad_w.stride(1), rate, g_ref, seed,
                            BLOCK=BLOCK)
+
+
+@triton.jit
+def _ttf_u_kernel(g_ptr, r_ptr, c_ptr, m_ptr, u_ptr, N, K, sgn, sun, lr, eps, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    msk = offs < N * K
+    i = offs // K
+    j = offs % K
+    g = tl.load(g_ptr + i * sgn + j, mask=msk, other=0.0)
+    r = tl.load(r_ptr + i, mask=msk, other=1.0)
+    c = tl.load(c_ptr + j, mask=msk, other=1.0)
+    m = tl.load(m_ptr)
+    s = tl.sqrt_rn(tl.div_rn(r * c, m))                    # sqrt(v_ij) from the factors, never stored
+    u = tl.div_rn(-g, s + eps) * lr
+    tl.store(u_ptr + i * sun + j, u, mask=msk)
+
+
+def ttf_u(g: torch.Tensor, r: torch.Tensor, c: torch.Tensor, m: torch.Tensor, lr: float, eps: float = 1e-8) -> torch.Tensor:
+    """u = -g / (sqrt(r_i c_j / m) + eps) * lr in one pass over g (fp32 [N, K]; r [N], c [K], m a 0-dim tensor), the
+    same IEEE operations in the same order as the PyTorch expression (correctly rounded division and square root), so
+    the result is bit-identical; the [N, K] sqrt(v) and the temporaries are never formed."""
+    N, K = g.shape
+    u = torch.empty_like(g)
+    BLOCK = 1024
+    _ttf_u_kernel[(triton.cdiv(N * K, BLOCK),)](g, r.contiguous(), c.contiguous(), m.reshape(1).float(), u, N, K,
+                                                g.stride(0), u.stride(0), float(lr), float(eps), BLOCK=BLOCK)
+    return u

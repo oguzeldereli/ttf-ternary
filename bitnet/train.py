@@ -853,7 +853,11 @@ def ts_layer(l, g, state, c):
             R0, C0 = _host_get(st, ("v", key), dev, off)
             bc_ = 1 - b2o ** ts_
             r0 = b2o * R0 / bc_ + (1 - b2o) * r0; c0 = b2o * C0 / bc_ + (1 - b2o) * c0; del R0, C0
-        sq_prev = (r0[:, None] * c0[None, :] / r0.mean().clamp_min(1e-30)).sqrt_(); del r0, c0
+        if g.is_cuda:     # the fused kernel: u in one pass, sqrt(v) never formed (bit-identical to the expression below)
+            sq_prev = (r0, c0, r0.mean().clamp_min(1e-30))
+        else:
+            sq_prev = (r0[:, None] * c0[None, :] / r0.mean().clamp_min(1e-30)).sqrt_()
+        del r0, c0
     g2 = g * g
     if M_ > 1:    # --ts_micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
         # row / column means of (sum_i g_i)^2 = the micro-batches' own squares + 2 <g_i, sum of earlier g_i'>, the
@@ -874,7 +878,10 @@ def ts_layer(l, g, state, c):
             else:
                 R, C = (1 - b2o) * rs, (1 - b2o) * cs
             _host_put(st, ("v", key), (R, C), off)
-            v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2o ** (t // M_))
+            # the full [N, K] v only where it is read: the non-nomom update, --ts_vdiag, --ts_shadows (with --ts_nomom
+            # the micro-batch u uses the factored v of the steps before)
+            need_v = not mic_nm or c.get("vdiag") or c.get("shadows")
+            v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2o ** (t // M_)) if need_v else None
         else:
             st[("mx", key)] = (PS, SP, rs, cs, ds, es); v = None
         del PS, SP
@@ -891,7 +898,11 @@ def ts_layer(l, g, state, c):
     if c.get("nomom"):   # --ts_nomom: no short momentum: the accumulator integrates the full-rank Adam-normalised
         # gradient (its long-run sum is the momentum's anyway) and its own rank-r projection filters the noise; frees the
         # momentum's r_s (N + K) floats per layer
-        u = -g / ((sq_prev if mic_nm else v.sqrt()) + 1e-8) * lr_ratio
+        if mic_nm and isinstance(sq_prev, tuple):
+            from .kernel import ttf_u as _ttf_u
+            u = _ttf_u(g, sq_prev[0], sq_prev[1], sq_prev[2], lr_ratio)
+        else:
+            u = -g / ((sq_prev if mic_nm else v.sqrt()) + 1e-8) * lr_ratio
         if mic_nm:
             del sq_prev
         if c.get("vdiag"):    # |u| / lr_ratio: rms, and the largest entry (a spike the leaky sum turns into a burst)

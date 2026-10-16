@@ -1,0 +1,40 @@
+# Exactness of the 16 Oct compute changes (GPU): one-kernel unpack, cached beta / int8 trits, fused TTF u: bit-identical to the old code
+#   python scripts/tests/test_compute_exact.py
+import sys, torch
+sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "..", ".."))
+from bitnet import kernel as Kn, flip as F
+torch.manual_seed(0); dev = "cuda"
+Kn.GEMM_BACKEND[0] = "int8mm"
+for (N, K) in [(1024, 768), (680, 5120), (256, 333)]:
+    w = torch.randint(-1, 2, (N, K), dtype=torch.int8, device=dev)
+    p = Kn.pack_rows(w)
+    a = Kn.unpack_rows(p, K); b = Kn.unpack_fast(p, K); c = Kn.unpack_fast(p, K, torch.bfloat16)
+    print(N, K, "unpack equal", torch.equal(a, w), torch.equal(b, w), torch.equal(c, w.to(torch.bfloat16)))
+# layer forward / backward, cache off vs on, then an in-place trit change
+lin = F.KernelTernaryLinear(768, 1024, beta=True, int8=True, dw_mode="dense").to(dev); F.enable_rc_scales(torch.nn.Sequential(lin))
+x = torch.randn(4, 64, 768, device=dev, dtype=torch.bfloat16, requires_grad=True)
+def run():
+    x.grad = None; lin.capture = True; lin.gw = None
+    y = lin(x); y.float().pow(2).mean().backward()
+    return y.detach().clone(), x.grad.detach().clone(), lin.gw.clone()
+F.WCACHE["mode"] = "off"; r0 = run()
+F.WCACHE["mode"] = "int8"; r1 = run(); r1b = run()
+print("cache on == off:", all(torch.equal(u, v) for u, v in zip(r0, r1)), "second call:", all(torch.equal(u, v) for u, v in zip(r0, r1b)))
+w0 = Kn.unpack_rows(lin.wpacked, 768).clone(); w0[:7, :11] = -w0[:7, :11]
+lin.wpacked.copy_(Kn.pack_rows(w0))          # an update (copy_ bumps the version: the cache must refresh)
+r2 = run(); F.WCACHE["mode"] = "off"; r3 = run()
+print("after an update, cache == fresh:", all(torch.equal(u, v) for u, v in zip(r2, r3)), "changed:", not torch.equal(r2[0], r0[0]))
+# unpack_rows (now the kernel on CUDA) == the CPU reference
+for (N, K) in [(1024, 768), (300, 1001)]:
+    w = torch.randint(-1, 2, (N, K), dtype=torch.int8)
+    p = Kn.pack_rows(w)
+    print("unpack_rows cuda == cpu:", torch.equal(Kn.unpack_rows(p.cuda(), K).cpu(), Kn.unpack_rows(p, K)), torch.equal(Kn.unpack_rows(p, K), w))
+torch.manual_seed(1)
+for (N, K) in [(1024, 768), (5120, 3000), (17, 33)]:
+    g = torch.randn(N, K, device="cuda") * 1e-3
+    r0 = torch.rand(N, device="cuda") * 1e-6 + 1e-9; c0 = torch.rand(K, device="cuda") * 1e-6
+    lr = 0.73451234
+    ref = -g / ((r0[:, None] * c0[None, :] / r0.mean().clamp_min(1e-30)).sqrt_() + 1e-8) * lr
+    out = Kn.ttf_u(g, r0, c0, r0.mean().clamp_min(1e-30), lr)
+    d = (ref - out).abs().max().item()
+    print(N, K, "bit-identical:", torch.equal(ref, out), "max abs diff", d, "ulps", ((ref.view(torch.int32) - out.view(torch.int32)).abs().max().item()))
