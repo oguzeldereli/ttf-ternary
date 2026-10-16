@@ -44,14 +44,49 @@ class LeanAdam(torch.optim.Optimizer):
                 if torch.is_tensor(v) and k != "step":
                     self.state[p][k] = v.to(device=p.device, copy=True)
 
+    FOREACH = True        # the fp32 1-D parameters in one multi-tensor pass (same operations, same order)
+
+    @torch.no_grad()
+    def _step_foreach_1d(self, grp, ps):
+        """plain Adam for fp32 1-D parameters with multi-tensor kernels, grouped by their step count: the operations of
+        the per-tensor loop below in the same order, with tensor / scalar as torch's (a multiply by the fp32
+        reciprocal), so the result is bit-identical; ~15 launches per tensor become ~15 per group"""
+        b1, b2 = grp["betas"]
+        lr, eps, wd = grp["lr"], grp["eps"], grp["weight_decay"]
+        by_t = {}
+        for p in ps:
+            st = self.state[p]
+            if not st:
+                st["step"] = 0
+                st["m"] = torch.zeros_like(p, dtype=torch.float32); st["v"] = torch.zeros_like(p, dtype=torch.float32)
+            st["step"] += 1
+            by_t.setdefault(st["step"], []).append(p)
+        f32 = lambda x: float(torch.tensor(x, dtype=torch.float32))
+        for t, pl in by_t.items():
+            bc1, bc2 = 1 - b1 ** t, 1 - b2 ** t
+            gs = [p.grad for p in pl]; ms = [self.state[p]["m"] for p in pl]; vs = [self.state[p]["v"] for p in pl]
+            torch._foreach_mul_(ms, b1); torch._foreach_add_(ms, gs, alpha=1 - b1)
+            torch._foreach_mul_(vs, b2); torch._foreach_addcmul_(vs, gs, gs, value=1 - b2)
+            num = torch._foreach_mul(ms, f32(1.0 / bc1))
+            den = torch._foreach_mul(vs, f32(1.0 / bc2)); torch._foreach_sqrt_(den); torch._foreach_add_(den, eps)
+            upd = torch._foreach_div(num, den)
+            if wd > 0:
+                torch._foreach_mul_(pl, 1 - lr * wd)
+            torch._foreach_add_(pl, upd, alpha=-lr)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = closure() if closure is not None else None
         for grp in self.param_groups:
             b1, b2 = grp["betas"]
             lr, eps, wd = grp["lr"], grp["eps"], grp["weight_decay"]
+            fe = [p for p in grp["params"] if self.FOREACH and p.grad is not None and p.dim() != 2
+                  and p.dtype == torch.float32 and p.grad.dtype == torch.float32 and p.is_cuda]
+            if fe:
+                self._step_foreach_1d(grp, fe)
+            fe_ids = {id(p) for p in fe}
             for p in grp["params"]:
-                if p.grad is None:
+                if p.grad is None or id(p) in fe_ids:
                     continue
                 st = self.state[p]
                 two_d = p.dim() == 2

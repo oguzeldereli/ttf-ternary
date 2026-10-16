@@ -54,3 +54,16 @@ for (N_, K_) in [(5120, 3000), (17408, 5120)]:
     g = torch.randn(N_, K_, device="cuda") * 1e-3
     rs, cs = Kn.sq_sums(g); r0 = torch.linalg.vector_norm(g, dim=1).square(); c0 = (g * g).sum(0)
     print(N_, K_, "sq_sums max rel diff rows %.2e cols %.2e (fp32 eps 1.2e-7)" % (((rs - r0).abs() / r0).max().item(), ((cs - c0).abs() / c0).max().item()))
+# LeanAdam: the multi-tensor path for fp32 1-D parameters == the per-tensor loop, bit for bit, over 5 steps
+from bitnet.opt_lean import LeanAdam
+torch.manual_seed(5)
+P0 = [torch.randn(n, device="cuda") for n in (5120, 17408, 7, 48, 1)]
+res = []
+for fe in (False, True):
+    ps = [torch.nn.Parameter(p.clone()) for p in P0]; opt = LeanAdam(ps, lr=5e-4, weight_decay=0.1); opt.FOREACH = fe
+    g_ = torch.Generator(device="cuda").manual_seed(9)
+    for _ in range(5):
+        for p in ps: p.grad = torch.randn(p.shape, device="cuda", generator=g_) * 1e-3
+        opt.step()
+    res.append([p.detach().clone() for p in ps])
+print("LeanAdam foreach bit-identical:", all(torch.equal(a, b) for a, b in zip(*res)), "max diff", max((a - b).abs().max().item() for a, b in zip(*res)))
