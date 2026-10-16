@@ -1,0 +1,4 @@
+2026-10-16 20:12:31 NVIDIA GeForce RTX 5090 x 1, cap 30.6 GiB, random weights
+mb2 [--batch_size 2 --grad_accum 8]: time step 3: forward+backward 51.117s, update (momentum step / AdamW) 2.860s | peak 21.58 GiB | 0 errors
+mb4 [--batch_size 4 --grad_accum 4]: time step 3: forward+backward 47.284s, update (momentum step / AdamW) 2.970s | peak 26.95 GiB | 0 errors
+2026-10-16 20:33:56 NVIDIA GeForce RTX 5090 x 1, cap 30.6 GiB, random weights
