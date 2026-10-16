@@ -63,6 +63,8 @@ case $ARM in
   gptqc_ts0_kd1) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 1.0" ;;
   gptqc_ts0_kd075_lr1e3) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/; s/--lr 5e-4 --min_lr 5e-5/--lr 1e-3 --min_lr 1e-4/") --init_hf $HF --distill $HF --distill_w 0.75" ;;
   gptqc_ts0_lr2e3) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/; s/--lr 5e-4 --min_lr 5e-5/--lr 2e-3 --min_lr 2e-4/") --init_hf $HF $KD" ;;
+  gptqc_ts0_kd075_zf23) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75 --init_zero_frac 0.23" ;;   # fewer zeros (TTF has 23%)
+  gptqc_ts0_kd075_zf30) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75 --init_zero_frac 0.30" ;;
   gptqc_ts0_kd0) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF" ;;   # labels only
   conv_ts0_t128) F="$DATA $TTF $(echo $CONV | sed "s/--ts_theta 64/--ts_theta 128/; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD" ;;   # no freeze, fewer moves
   conv_t128) F="$DATA $TTF ${CONV/--ts_theta 64/--ts_theta 128} --init_hf $HF $KD" ;;                    # fewer trit moves

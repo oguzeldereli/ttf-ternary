@@ -254,12 +254,18 @@ def convert_seq_asym(path, data_path, n_seq=32, seq=2048, dev="cuda", damp=0.01,
     return out
 
 
+GPTQ_OPTS = {"zero_frac": None}      # --init_zero_frac (train.py): the default for every ternarize_gptq call
+
+
 @torch.no_grad()
-def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2):
+def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2, zero_frac=None):
     """GPTQ (Frantar et al. 2022) onto the ternary grid {-a_i, 0, a_i} c_j: columns are rounded one at a time and each
     one's rounding error is pushed onto the not-yet-rounded columns through the inverse input second moment, so the
     trits minimise the layer's output error |X (W - a c T)^T| instead of |W - a c T|. The column scale c comes from
-    ALS (folded into the inputs), the row magnitude a is refitted in output space after each pass."""
+    ALS (folded into the inputs), the row magnitude a is refitted in output space after each pass.
+    zero_frac: the rounding threshold is set apart from the magnitude, per row at that quantile of |W_i / c| (a weight
+    below it rounds to 0, above it to +-1, and the rest of its value goes on to the other columns as any rounding
+    error does), so about that fraction of trits is zero instead of the ~40% the magnitude's own threshold a / 2 gives."""
     N, K = W.shape
     Wc = W / c[None, :]                                  # fold c into the input: X' = X c, H' = c H c
     Hc = H.to(W.device) * c[:, None] * c[None, :]
@@ -270,6 +276,8 @@ def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2):
     perm = torch.argsort(torch.diagonal(Hc), descending=True) if act_order else torch.arange(K, device=W.device)
     inv = torch.argsort(perm)
     Wp, Hp = Wc[:, perm], Hc[perm][:, perm]
+    zero_frac = GPTQ_OPTS["zero_frac"] if zero_frac is None else zero_frac
+    thr = torch.quantile(Wp.abs(), zero_frac, dim=1) if zero_frac is not None else None
     L = torch.linalg.cholesky(Hp)
     Hinv = torch.cholesky_inverse(L)
     U = torch.linalg.cholesky(Hinv, upper=True)          # GPTQ's upper factor of H^-1
@@ -283,7 +291,10 @@ def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2):
             Wb = Q[:, i1:i2].clone(); Ub = U[i1:i2, i1:i2]; E = torch.zeros_like(Wb)
             for j in range(i2 - i1):
                 w = Wb[:, j]
-                t = (w / ai[:, 0]).round().clamp(-1, 1)
+                if thr is None:
+                    t = (w / ai[:, 0]).round().clamp(-1, 1)
+                else:
+                    t = torch.where(w.abs() > thr, torch.sign(w), torch.zeros_like(w))
                 T[:, i1 + j] = t
                 e = (w - ai[:, 0] * t) / Ub[j, j]
                 Wb[:, j:] -= e[:, None] * Ub[j, j:][None, :]
