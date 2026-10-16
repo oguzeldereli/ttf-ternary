@@ -206,12 +206,16 @@ def load_qwen(m, path, swapped, method="als", rc=True, hess=None, log=print):
     errs, oerrs = [], []
     for name, lin in swapped.items():
         W = sd[name + ".weight"].to(lin.wpacked.device).float()
-        T, a, c = ternarize(W, "als" if method == "gptq" else method)
+        T, a, c = ternarize(W, "als" if method in ("gptq", "gptqc") else method)
         if hess is not None:
             Hl = hess[name].to(W.device)
             e0 = _out_err(W, T, a, c, Hl)
             if method == "gptq":
                 T, a, c = ternarize_gptq(W, Hl, a, c)
+            elif method == "gptqc":     # centred (hf_init gptqc): GPTQ on the input covariance, the layer takes the
+                mu = hess["mu:" + name].to(W.device)    # input mean out before its activation quantisation, W mu as a bias
+                T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)
+                lin.enable_centering(mu, W @ mu)
             oerrs.append((e0, _out_err(W, T, a, c, Hl))); del Hl
         errs.append(_rel_err(W, T, a, c))
         lin.wpacked.copy_(pack_rows(T))
@@ -241,15 +245,16 @@ def calib_hessians_qwen(path, data_path, n_seq=64, seq=2048, dev="cuda", dtype_u
             p.data.copy_(src.to(p.dtype))
     del sd
     m.eval()
-    H, cnt, hooks = {}, {}, []
+    H, S, cnt, hooks = {}, {}, {}, []
     for name, mod in m.hf.model.layers.named_modules():
         if isinstance(mod, nn.Linear) and name.rsplit(".", 1)[-1] not in _KEEP_FLOAT:
             key = "model.layers." + name
             H[key] = torch.zeros(mod.in_features, mod.in_features, device=dev); cnt[key] = 0
+            S[key] = torch.zeros(mod.in_features, device=dev)
 
             def hook(mod_, inp, key=key):
                 x = inp[0].reshape(-1, inp[0].shape[-1]).float()
-                H[key].addmm_(x.T, x); cnt[key] += x.shape[0]
+                H[key].addmm_(x.T, x); S[key] += x.sum(0); cnt[key] += x.shape[0]
             hooks.append(mod.register_forward_pre_hook(hook))
     data = np.memmap(data_path, dtype=np.uint32 if dtype_u32 else np.uint16, mode="r")
     rng = np.random.default_rng(4321)
@@ -260,8 +265,9 @@ def calib_hessians_qwen(path, data_path, n_seq=64, seq=2048, dev="cuda", dtype_u
     for h in hooks:
         h.remove()
     out = {k: (v / max(cnt[k], 1)).cpu() for k, v in H.items()}
-    del m, H; torch.cuda.empty_cache()
-    log(f"calibration: input second moments of {len(out)} linears from {n_seq} x {seq} tokens")
+    out.update({"mu:" + k: (v / max(cnt[k], 1)).cpu() for k, v in S.items()})   # input means (gptqc)
+    del m, H, S; torch.cuda.empty_cache()
+    log(f"calibration: input second moments (and means) of {len(out) // 2} linears from {n_seq} x {seq} tokens")
     return out
 
 
@@ -363,11 +369,13 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
             parent = layer.get_submodule(n[len(pre_):].rsplit(".", 1)[0]); setattr(parent, n.rsplit(".", 1)[1], f)
             fp[n] = (f, parent)
         Hs = {n: torch.zeros(f.in_features, f.in_features, device=dev) for n, (f, _) in fp.items()}
+        Ss = {n: torch.zeros(f.in_features, device=dev) for n, (f, _) in fp.items()}
         cnt = {n: 0 for n in fp}
         hooks = []
         for n, (f, _) in fp.items():
             def hook(mod_, inp, n=n):
-                xx = inp[0].reshape(-1, inp[0].shape[-1]).float(); Hs[n].addmm_(xx.T, xx); cnt[n] += xx.shape[0]
+                xx = inp[0].reshape(-1, inp[0].shape[-1]).float(); Hs[n].addmm_(xx.T, xx); Ss[n] += xx.sum(0)
+                cnt[n] += xx.shape[0]
             hooks.append(f.register_forward_pre_hook(hook))
         kw = KW[li]
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -377,18 +385,21 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
             hh.remove()
         for n, (f, parent) in fp.items():               # round into the ternary layer, put it back
             lin = mine[n]
-            W = f.weight.float(); Hl = Hs.pop(n) / max(cnt[n], 1)
+            W = f.weight.float(); Hl = Hs.pop(n) / max(cnt[n], 1); mu = Ss.pop(n) / max(cnt[n], 1)
             T, a, c = ternarize(W, "als")
             e0 = _out_err(W, T, a, c, Hl)
             if method == "gptq":
                 T, a, c = ternarize_gptq(W, Hl, a, c)
+            elif method == "gptqc":                     # centred (hf_init gptqc)
+                T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)
+                lin.enable_centering(mu, W @ mu)
             oerrs.append((e0, _out_err(W, T, a, c, Hl))); errs.append(_rel_err(W, T, a, c))
             lin.wpacked.copy_(pack_rows(T))
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
             lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
             setattr(parent, n.rsplit(".", 1)[1], lin)
             del W, Hl, T
-        del fp, Hs
+        del fp, Hs, Ss
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):   # on through the converted layer
             H_in = [(lambda o: o[0] if isinstance(o, tuple) else o)(layer(h, **kw)) for h in H_in]
         torch.cuda.empty_cache()

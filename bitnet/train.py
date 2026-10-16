@@ -3563,6 +3563,14 @@ def main():
         print(f"--init_hf: resuming from {tc.out_dir}/ckpt.pt, conversion skipped", flush=True)
         if _QWEN:   # as the conversion leaves them: embedding and head frozen (the optimizer is built below)
             model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
+        if args.init_hf_method == "gptqc":   # centred layers: in_mean / out_bias exist before the optimizer is built
+            _ck = torch.load(os.path.join(tc.out_dir, "ckpt.pt"), map_location="cpu", weights_only=False, mmap=True)["model"]
+            _nc = 0
+            for n_, m_ in model.named_modules():
+                if isinstance(m_, KernelTernaryLinear) and f"{n_}.in_mean" in _ck:
+                    m_.enable_centering(_ck[f"{n_}.in_mean"].to(device), _ck[f"{n_}.out_bias"].to(device)); _nc += 1
+            print(f"--init_hf_method gptqc: {_nc} centred layers restored for the resume", flush=True)
+            del _ck
     if args.init_hf and not _resuming:
         from .hf_init import init_from_hf
         assert args.mode in ("kernel", "master", "fp32"), "--init_hf: kernel, master or fp32 mode"
@@ -3576,7 +3584,7 @@ def main():
                                    log=lambda m_: print(m_, flush=True))
         elif _QWEN:
             from .qwen import load_qwen, calib_hessians_qwen
-            if args.init_hf_method == "gptq":
+            if args.init_hf_method in ("gptq", "gptqc"):
                 _hess = calib_hessians_qwen(args.init_hf, tc.data_path, n_seq=args.init_calib, seq=tc.seq_len,
                                             dev=device, dtype_u32=args.data_u32, log=lambda m_: print(m_, flush=True))
             load_qwen(model, args.init_hf, _qsw, method=args.init_hf_method, rc=args.rc_scale, hess=_hess,

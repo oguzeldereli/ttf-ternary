@@ -13,6 +13,8 @@ from bitnet.flip import KernelTernaryLinear, enable_rc_scales                   
 
 ap = argparse.ArgumentParser(); ap.add_argument("hf_dir"); ap.add_argument("--data", required=True)
 ap.add_argument("--calib_data", required=True); ap.add_argument("--n", type=int, default=16); ap.add_argument("--seq", type=int, default=2048)
+ap.add_argument("--methods", default="gptq", help="comma list of streaming methods (gptq, gptqc: centred GPTQ)")
+ap.add_argument("--skip_fp", action="store_true")
 a = ap.parse_args(); dev = "cuda"
 data = np.memmap(a.data, dtype=np.uint32, mode="r")
 wins = [data[i * a.seq:(i + 1) * a.seq + 1] for i in range(a.n)]
@@ -41,10 +43,13 @@ def loss_stepped(m):
     return sum(ls) / len(ls)
 
 
-m, sw = build_qwen(a.hf_dir, "fp32", grad_checkpoint=False, device=dev); load_qwen(m, a.hf_dir, sw); m.eval()
-print(f"fp: model forward {loss_model(m):.4f}, stepped layer by layer {loss_stepped(m):.4f}", flush=True)
-del m; torch.cuda.empty_cache()
+if not a.skip_fp:
+    m, sw = build_qwen(a.hf_dir, "fp32", grad_checkpoint=False, device=dev); load_qwen(m, a.hf_dir, sw); m.eval()
+    print(f"fp: model forward {loss_model(m):.4f}, stepped layer by layer {loss_stepped(m):.4f}", flush=True)
+    del m; torch.cuda.empty_cache()
 mk = lambda i, o: KernelTernaryLinear(i, o, 8, rate=0.0, beta=True, int8=True, dw_mode="dense")
-m, sw = build_qwen(a.hf_dir, "kernel", make_linear=mk, grad_checkpoint=False, device=dev); enable_rc_scales(m); m.eval()
-t = time.time(); convert_qwen_streaming(m, a.hf_dir, sw, a.calib_data, method="gptq", n_seq=64, seq=a.seq)
-print(f"streaming sequential gptq: loss {loss_model(m):.4f} (converted in {time.time() - t:.0f}s; one-shot gptq 4.9580 on 32 windows)", flush=True)
+for meth in a.methods.split(","):
+    m, sw = build_qwen(a.hf_dir, "kernel", make_linear=mk, grad_checkpoint=False, device=dev); enable_rc_scales(m); m.eval()
+    t = time.time(); convert_qwen_streaming(m, a.hf_dir, sw, a.calib_data, method=meth, n_seq=64, seq=a.seq)
+    print(f"streaming sequential {meth}: loss {loss_model(m):.4f} (converted in {time.time() - t:.0f}s; one-shot gptq 4.9580 on 32 windows)", flush=True)
+    del m; torch.cuda.empty_cache()
