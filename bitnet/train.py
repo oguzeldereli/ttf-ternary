@@ -2970,6 +2970,8 @@ def main():
     ap.add_argument("--init_stream", action="store_true", help="--init_hf (Qwen): convert layer by layer, sequentially, reading "
                     "each layer's weights from the safetensors (27B: no full-precision copy in memory)")
     ap.add_argument("--data_u32", action="store_true", help="--data / --val are uint32 token streams (vocabularies above 65536)")
+    ap.add_argument("--init_hidden", type=int, default=0, help="--init_hf_method native: FFN hidden width of the student "
+                    "(default the checkpoint's); a wider ternary FFN can hold the fp model's crowded features apart")
     ap.add_argument("--local_kd", type=int, default=0, help="steps of block-local distillation first (needs --distill, "
                     "a Llama-type teacher): each block learns the teacher block's map from the teacher's input")
     ap.add_argument("--init_rot", default="", choices=["", "down", "out", "all"], help="GPTQ conversion: a fixed random "
@@ -3397,6 +3399,9 @@ def main():
         else:
             from .hf_init import model_config_from_hf
             mc = model_config_from_hf(args.init_hf)
+            if args.init_hidden:   # --init_hidden: a wider (or narrower) FFN than the checkpoint's (native start only)
+                assert args.init_hf_method == "native", "--init_hidden needs --init_hf_method native"
+                mc.hidden_dim = args.init_hidden
     tc = TrainConfig()
     if args.seed is not None: tc.seed = args.seed
     if args.data: tc.data_path = args.data
@@ -4231,7 +4236,8 @@ def main():
             elif _teacher is not None:   # --distill: the full-precision model's next-token distribution for this batch
                 with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
                     tz_, _ = _teacher(x)
-                model.kd_logp = F.log_softmax(tz_.float(), -1).to(torch.bfloat16).reshape(-1, tz_.shape[-1]); del tz_
+                tz_ = tz_.reshape(-1, tz_.shape[-1])   # in row chunks: the fp32 copy of all logits is ~4 GB at 32k tokens
+                model.kd_logp = torch.cat([F.log_softmax(c_.float(), -1).to(torch.bfloat16) for c_ in tz_.split(4096)]); del tz_
             _areg.clear()
             with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
                 _, loss = model(x, y)
