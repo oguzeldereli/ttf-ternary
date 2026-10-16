@@ -35,8 +35,11 @@ print(f"{len(lins)} ternary linears", flush=True)
 @torch.no_grad()
 def win_loss(i):
     x = torch.tensor(data[i * 2048:(i + 1) * 2048 + 1].astype(np.int64), device=dev)[None]
-    lg = hf(input_ids=x[:, :-1]).logits
-    return float(torch.nn.functional.cross_entropy(lg[0].float(), x[0, 1:]))
+    lg = hf(input_ids=x[:, :-1]).logits[0]
+    tot = sum(float(torch.nn.functional.cross_entropy(lg[j:j + 256].float(), x[0, 1 + j:257 + j], reduction="sum"))
+              for j in range(0, lg.shape[0], 256))
+    del lg
+    return tot / (x.shape[1] - 1)
 
 
 S, cnt, hooks = {}, {}, []
