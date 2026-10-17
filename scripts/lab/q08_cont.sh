@@ -20,12 +20,13 @@ F="--init_hf $M --init_stream --init_hf_method gptqc --data data/wikiqw_train40.
 B=checkpoints/q08c_base
 case $A in
   base) mkdir -p $B; python -m bitnet.train $F --ts_theta 64 --steps 400 --out_dir $B > logs/q08c_base.txt 2>&1 ;;
-  c64|c16|c32|c16z64) D=checkpoints/q08c_$A; mkdir -p $D
+  c64|c16|c32|c16z64|c64z64) D=checkpoints/q08c_$A; mkdir -p $D
     while [ ! -f $B/ckpt.pt ] || ! grep -q "FINAL val" logs/q08c_base.txt 2>/dev/null; do sleep 60; done
     [ -f $D/ckpt.pt ] || cp $B/ckpt.pt $D/ckpt.pt
     X="--ts_theta 64"; [ $A = c16 ] && X="--ts_theta 16 --ts_acc_scale 0.25"
     [ $A = c16z64 ] && X="--ts_theta 16 --ts_acc_scale 0.25 --lowrank_mag add:64"   # + adapters grown 16 -> 64
     [ $A = c32 ] && X="--ts_theta 32 --ts_acc_scale 0.5"
+    [ $A = c64z64 ] && X="--ts_theta 64 --lowrank_mag add:64"   # adapters grown, trits as before
     python -m bitnet.train $F $X --steps 800 --lr_rewarm 401:20:0.5 --resume --no_final_save --out_dir $D > logs/q08c_$A.txt 2>&1 ;;
 esac
 echo "$(date '+%T') q08c_$A: $(grep 'val loss' logs/q08c_$A.txt | grep -oE 'val loss [0-9.]+' | cut -d' ' -f3 | tr '\n' ' ')"
