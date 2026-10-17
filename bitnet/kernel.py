@@ -1036,3 +1036,53 @@ def unpack12_scaled(P: torch.Tensor, sc: torch.Tensor) -> torch.Tensor:
     BN, BP = 32, 64
     _unpack12_kernel[(triton.cdiv(N, BN), triton.cdiv(np2, BP))](P, s, out, N, n, np2, P.stride(0), out.stride(0), BN=BN, BP=BP)
     return out
+
+
+@triton.jit
+def _addrow_fwd_kernel(y_ptr, a_ptr, r_ptr, t_ptr, o_ptr, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    """t = bf16(y + a), out = bf16(t * r) (r already bf16): the add and the row scale of a ternary layer in one pass"""
+    pm = tl.program_id(0); pn = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM); cols = pn * BN + tl.arange(0, BN)
+    m = (rows[:, None] < M) & (cols[None, :] < N)
+    off = rows[:, None] * N + cols[None, :]
+    y = tl.load(y_ptr + off, mask=m, other=0.0).to(tl.float32)
+    a = tl.load(a_ptr + off, mask=m, other=0.0).to(tl.float32)
+    r = tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+    t = (y + a).to(tl.bfloat16)
+    tl.store(t_ptr + off, t, mask=m)
+    tl.store(o_ptr + off, (t.to(tl.float32) * r[None, :]).to(tl.bfloat16), mask=m)
+
+
+@triton.jit
+def _scale_bwd_kernel(g_ptr, s_ptr, x_ptr, gx_ptr, part_ptr, M, N, BM: tl.constexpr, BN: tl.constexpr):
+    """the backward of out = x * s (s per column, bf16): gx = bf16(g * s), and per row block the column sums of
+    bf16(g * x) in fp32 (the scale's gradient, summed over the blocks afterwards)"""
+    pm = tl.program_id(0); pn = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM); cols = pn * BN + tl.arange(0, BN)
+    m = (rows[:, None] < M) & (cols[None, :] < N)
+    off = rows[:, None] * N + cols[None, :]
+    g = tl.load(g_ptr + off, mask=m, other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
+    s = tl.load(s_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+    tl.store(gx_ptr + off, (g * s[None, :]).to(tl.bfloat16), mask=m)
+    gs = (g * x).to(tl.bfloat16).to(tl.float32)
+    tl.store(part_ptr + pm * N + cols, tl.sum(gs, axis=0), mask=cols < N)
+
+
+def addrow_fwd(y, a, r_bf16):
+    M, N = y.shape
+    t = torch.empty_like(y); o = torch.empty_like(y)
+    BM, BN = 32, 128
+    _addrow_fwd_kernel[(triton.cdiv(M, BM), triton.cdiv(N, BN))](y, a, r_bf16, t, o, M, N, BM=BM, BN=BN)
+    return t, o
+
+
+def scale_bwd(g, s_bf16, x):
+    """(bf16(g * s), column sums of bf16(g * x)) for out = x * s, s a per-column bf16 vector; deterministic"""
+    M, N = g.shape
+    gx = torch.empty_like(g)
+    BM, BN = 64, 128
+    nb = triton.cdiv(M, BM)
+    part = torch.empty(nb, N, dtype=torch.float32, device=g.device)
+    _scale_bwd_kernel[(nb, triton.cdiv(N, BN))](g, s_bf16, x, gx, part, M, N, BM=BM, BN=BN)
+    return gx, part.sum(0)

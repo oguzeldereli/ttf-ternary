@@ -323,6 +323,48 @@ def enable_boost(model, s0=0.5):
     return n
 
 
+FUSED_SCALES = [False]       # --fused_scales: the column scale's backward and the adapter add + row scale in fused kernels
+
+
+class _ColScaleFn(torch.autograd.Function):
+    """x * c (c per input column, cast to x's dtype) with the backward in one kernel: gx = g * c and the column sums of
+    g * x (each product rounded to x's dtype as torch's mul backward does; the sum in fp32, its order differs)"""
+    @staticmethod
+    def forward(ctx, x, c):
+        cb = c.to(x.dtype)
+        ctx.save_for_backward(x, cb); ctx.cdt = c.dtype
+        return x * cb
+
+    @staticmethod
+    def backward(ctx, g):
+        from .kernel import scale_bwd
+        x, cb = ctx.saved_tensors
+        K = x.shape[-1]
+        gx, gc = scale_bwd(g.reshape(-1, K).contiguous(), cb, x.reshape(-1, K).contiguous())
+        return gx.view(x.shape), gc.to(cb.dtype).to(ctx.cdt)
+
+
+class _AddRowFn(torch.autograd.Function):
+    """(y + a) * r (r per output row) in one kernel, the backward in one more: gy = ga = g * r and the column sums of
+    g * (y + a) for r (the same per-element roundings as the unfused add and mul)"""
+    @staticmethod
+    def forward(ctx, y, a, r):
+        from .kernel import addrow_fwd
+        rb = r.to(y.dtype)
+        N = y.shape[-1]
+        t, o = addrow_fwd(y.reshape(-1, N).contiguous(), a.reshape(-1, N).contiguous(), rb)
+        ctx.save_for_backward(t, rb); ctx.rdt = r.dtype; ctx.shape = y.shape
+        return o.view(y.shape)
+
+    @staticmethod
+    def backward(ctx, g):
+        from .kernel import scale_bwd
+        t, rb = ctx.saved_tensors
+        gt, gr = scale_bwd(g.reshape(-1, t.shape[-1]).contiguous(), rb, t)
+        gt = gt.view(ctx.shape)
+        return gt, gt, gr.to(rb.dtype).to(ctx.rdt)
+
+
 FACTORED = [False]           # --ts_factored: on for this step (off on --ts_vdiag / --ts_diag steps, which read dense g)
 DW_FP32 = [False]            # --dw_fp32: dense weight gradients in fp32 from the GEMM (more precise, one copy fewer)
 WCACHE = {"mode": "off"}     # --w_cache int8: keep each layer's unpacked int8 trits between updates (1 byte / weight)
@@ -777,6 +819,18 @@ class KernelTernaryLinear(nn.Module):
         # column scale before the GEMM (and before the int8 activation quantization),
         # row scale after it: the packed kernels are unchanged, autograd handles r and c,
         # and the flip rule's dL/dq comes out scaled by r_i * c_j per weight
+        fz = (FUSED_SCALES[0] and x.is_cuda and x.dtype == torch.bfloat16 and self.col_scale is not None
+              and self.row_scale is not None and getattr(self, "mag_A", None) is not None
+              and getattr(self, "mag_kind", "") == "add" and not getattr(self, "mag_cap", 0.0)
+              and getattr(self, "bpacked", None) is None and getattr(self, "mag_At", None) is None)
+        if fz:      # --fused_scales: the same layer, the elementwise work in fewer passes
+            x = _ColScaleFn.apply(x, self.col_scale)
+            y = _KernelTernFn.apply(x, self.wpacked, self)
+            a = (x @ self.mag_B.to(x.dtype)) @ self.mag_A.to(y.dtype).T
+            y = _AddRowFn.apply(y, a, self.row_scale)
+            if getattr(self, "out_bias", None) is not None:
+                y = y + self.out_bias.to(y.dtype)
+            return y
         if self.col_scale is not None:
             x = x * self.col_scale.to(x.dtype)
         y = _KernelTernFn.apply(x, self.wpacked, self)

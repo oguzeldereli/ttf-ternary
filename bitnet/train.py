@@ -3322,6 +3322,9 @@ def main():
                     "repack, the spend's D V) in one kernel (bitnet.kernel.ttf_fire): no [N, K] temporaries")
     ap.add_argument("--ts_acc_scale", type=float, default=1.0, help="--resume: multiply every TTF accumulator by F (a "
                     "run continued at theta F x its old theta keeps each entry's distance to the bar: no burst of moves)")
+    ap.add_argument("--fused_scales", action="store_true", help="kernel layers with row / column scales and the 'add' "
+                    "adapter: the column scale's backward and the adapter add + row scale (forward and backward) in fused "
+                    "kernels (the same per-element roundings; the scale gradients' sums in another order)")
     ap.add_argument("--ts_factored", type=int, default=0, help="--ts --ts_nomom --ts_fused: K > 0: the TTF update from "
                     "the factors of the weight gradient (g = gy^T x is never formed; the sums of g^2 from a K-column "
                     "sketch; see _ts_layer_factored). Dense on --ts_diag / --ts_qdiag steps; --ts_vdiag keeps only g^2 / v")
@@ -4393,6 +4396,9 @@ def main():
                 and not args.ts_boost and not TS_TUNNEL[0] and int(args.ts_orth_every or 1) == 1 and not args.ts_orth_defer \
                 and (args.ts_micro or tc.grad_accum == 1), "--ts_factored: the plain --ts --ts_nomom update only"
             print(f"--ts_factored {args.ts_factored}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
+    if args.fused_scales:
+        from .flip import FUSED_SCALES as _FSC
+        _FSC[0] = True
     movediag = None
     if args.movediag:
         from .movediag import MoveDiag
