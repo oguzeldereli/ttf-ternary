@@ -34,6 +34,11 @@ run q08_gqc_ts0 --init_hf_method gptqc --ts_start 0
 run q08_gqc_ts0_msvd16 --init_hf_method gptqc --ts_start 0 --init_mag_svd 16
 run q08_gqc_ts0_msvd64 --init_hf_method gptqc --ts_start 0 --lowrank_mag add:64 --init_mag_svd 64
 run q08_gqc_ts0_z64 --init_hf_method gptqc --ts_start 0 --lowrank_mag add:64
+# 17 Oct: theta (the 27B moved 1.5e-6 of its trits in 1350 steps at theta 64, this recipe 3.5e-5 in 400: nearly frozen;
+# does letting trits move help a real converted model?)
+run q08_gqc_ts0_th32 --init_hf_method gptqc --ts_start 0 --ts_theta 32
+run q08_gqc_ts0_th16 --init_hf_method gptqc --ts_start 0 --ts_theta 16
+run q08_gqc_ts0_th8 --init_hf_method gptqc --ts_start 0 --ts_theta 8
 run q08_gq_ts0 --init_hf_method gptq --ts_start 0
 run q08_gq_s120 --init_hf_method gptq --ts_start 120
 echo Q08_DONE
