@@ -84,8 +84,12 @@ def _kd_cache_batch(args, idx, data, seq_len, device, bs=1):
         s0, ids, lp = _kd_window(args, idx * bs + b)
         ws.append(torch.from_numpy(data[s0:s0 + seq_len + 1].astype(np.int64)))
         ids_.append(torch.from_numpy(ids.astype(np.int64))); lps_.append(torch.from_numpy(lp))
-    w = torch.stack(ws).to(device)
-    return w[:, :-1], w[:, 1:], (torch.cat(ids_).to(device), torch.cat(lps_).to(device))
+    if str(device).startswith("cuda"):   # pinned + non-blocking: a copy from pageable memory waits for the GPU's queue
+        put = lambda t_: t_.pin_memory().to(device, non_blocking=True)
+    else:
+        put = lambda t_: t_.to(device)
+    w = put(torch.stack(ws))
+    return w[:, :-1], w[:, 1:], (put(torch.cat(ids_)), put(torch.cat(lps_)))
 
 
 def get_batch(data, bs, seq_len, device, gen=None):
