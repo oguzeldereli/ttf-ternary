@@ -24,7 +24,7 @@ source $S/env.sh; cd $REPO
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 D=checkpoints/g_$ARM${SUF:-}; mkdir -p $D logs          # SUF / STEPS: smoke tests
 MD=${MD:-$S/models}      # outside the code tree (setup.sh mirrors the code with --delete)
-HF=$MD/fp32_110m_hf
+HF=${HF:-$MD/fp32_110m_hf}     # HF=...: another fp model to convert (fp_dose.sh)
 DATA="--data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16 --grad_accum 1"
 KD="--distill $HF --distill_w 0.5"
 TTF="--mode kernel --rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_warmup 30 --g_ref 3.0 --int8 --dw_mode dense
@@ -85,6 +85,17 @@ case $ARM in
   local_native_w3072) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method native /; s/--ts_start 400/--ts_start 0/; s/--ts_theta 64/--ts_theta 16/; s/--lr 5e-4 --min_lr 5e-5/--lr 1.5e-3 --min_lr 1.5e-4/") --init_hf $HF --distill $HF --distill_w 0.75 --local_kd ${LOCAL:-1000} --init_hidden 3072" ;;   # 1.5x FFN: room to unpack the fp superposition
   local_gptqc) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/; s/--lr 5e-4 --min_lr 5e-5/--lr 1e-3 --min_lr 1e-4/") --init_hf $HF --distill $HF --distill_w 0.75 --local_kd ${LOCAL:-1000}" ;;   # same objective, fp-rounded start
   gptqc_ts0_kd0) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF" ;;   # labels only
+  # compute tests (17 Oct): the same recipe (gptqc_ts0_kd075) through micro-batches as the 27B runs it, then each change
+  # (--int8_dx, --ts_factored) against it; dx8: int8 input gradients at the plain 16 x 1 batch
+  spd_ref|spd_ref_s2|spd_dx8|spd_fact*) B4="${DATA/--batch_size 16 --grad_accum 1/--batch_size 4 --grad_accum 4} --ts_micro"
+    F="$B4 $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75"
+    case $ARM in spd_ref_s2) F="$F --seed 2" ;; spd_dx8) F="$F --int8_dx" ;; spd_fact*) F="$F --ts_factored ${ARM#spd_fact}" ;; esac ;;
+  # --init_mag_svd (17 Oct): the rounding error's best rank-R part (input-covariance norm) in the float adapter at the
+  # start, vs the adapter of the same rank at 0 (zR); training-free 110M: R 16 / 64 / 256 take the start 2.879 -> 2.794 /
+  # 2.729 / 2.630 (fp 2.575)
+  msvd16|msvd64|msvd256|z64|z256) R_=${ARM#msvd}; R_=${R_#z}; X_=""; [ ${ARM#msvd} != $ARM ] && X_="--init_mag_svd $R_"
+    F="$DATA ${TTF/add:16/add:$R_} $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75 $X_" ;;
+  dx8) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75 --int8_dx" ;;
   conv_ts0_t128) F="$DATA $TTF $(echo $CONV | sed "s/--ts_theta 64/--ts_theta 128/; s/--ts_start 400/--ts_start 0/") --init_hf $HF $KD" ;;   # no freeze, fewer moves
   conv_t128) F="$DATA $TTF ${CONV/--ts_theta 64/--ts_theta 128} --init_hf $HF $KD" ;;                    # fewer trit moves
   conv_kd1)  F="$DATA $TTF $CONV --init_hf $HF --distill $HF --distill_w 1.0" ;;                     # KD only

@@ -254,7 +254,7 @@ def convert_seq_asym(path, data_path, n_seq=32, seq=2048, dev="cuda", damp=0.01,
     return out
 
 
-GPTQ_OPTS = {"zero_frac": None, "rot": ""}   # --init_zero_frac, --init_rot (train.py)
+GPTQ_OPTS = {"zero_frac": None, "rot": "", "mag_svd": 0}   # --init_zero_frac, --init_rot, --init_mag_svd (train.py)
 _ROT_SETS = {"down": {"w_down"}, "out": {"wo", "w_down"}, "all": {"wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"}}
 
 
@@ -307,6 +307,34 @@ def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2, z
         a = torch.where(a > 0, a, torch.full_like(a, 1e-3))
         del TH, Q
     return T[:, inv].to(torch.int8), a, c
+
+
+@torch.no_grad()
+def _mag_svd_init(lin, W, T, a, c, beta, hess, i, name, Q, method, r, dev):
+    """--init_mag_svd R: the rounding error, moved into the layer's float adapter instead of dropped. The layer computes
+    y = (a / beta) (beta T + A B^T) x' with x' = c o (x - mu), so the adapter that restores W exactly would be
+    G = diag(beta / a) (W - a c T) diag(1 / c); of G, the rank-R part that matters most for the output is kept: the
+    best rank-R fit in the input covariance's norm, |(G - A B^T) L|_F with L L^T = H' (H' the covariance of x'),
+    = truncated SVD of G L, then B^T = V_R^T L^-1. Stored on the layer for enable_lowrank_mag ('add', same R).
+    Returns the share of the output error |G L|_F^2 it removes."""
+    Hl = hess[(i, name)].to(dev).double()
+    if Q is not None:
+        Hl = Q.double() @ Hl @ Q.double().T
+    if method == "gptqc":
+        mu = hess[("mu", i, name)].to(dev).double()
+        if Q is not None:
+            mu = Q.double() @ mu
+        Hl = Hl - torch.outer(mu, mu)
+    cd = c.double().clamp_min(1e-12)
+    Hp = cd[:, None] * Hl * cd[None, :]
+    Hp.diagonal().add_(1e-4 * Hp.diagonal().mean() + 1e-30)
+    L = torch.linalg.cholesky(Hp)
+    G = (beta / a.double().clamp_min(1e-12))[:, None] * (W.double() - a.double()[:, None] * c.double()[None, :] * T.double()) / cd[None, :]
+    U, S, Vh = torch.linalg.svd(G @ L, full_matrices=False)
+    A = U[:, :r] * S[:r]
+    B = torch.linalg.solve_triangular(L.T, Vh[:r].T, upper=True)          # L^-T V_R: (x' @ B) = V_R^T L^-1 x'
+    lin._mag_init = (A.float().contiguous(), B.float().contiguous())
+    return float((S[:r] ** 2).sum() / (S ** 2).sum().clamp_min(1e-300))
 
 
 @torch.no_grad()
@@ -386,6 +414,8 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
             if res_rank >= 0 and method != "zero":   # --res_anneal: keep the rounding residual (fixed) to fade out
                 lin.enable_res_anneal(W - a[:, None] * c[None, :] * T.float(), res_rank)
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
+            if GPTQ_OPTS["mag_svd"] and hess is not None and method in ("gptq", "gptqc") and rc:
+                kept.append(_mag_svd_init(lin, W, T, a, c, beta, hess, i, name, Q, method, GPTQ_OPTS["mag_svd"], dev))
             if method == "zero":     # the trits are all 0, so beta is that of an empty layer; use the density the
                 beta = 1.0 / (lin.K * 0.6) ** 0.5   # first firing will give (~0.6 nonzero), refined as trits move
             if rc and lin.row_scale is not None:
@@ -420,7 +450,10 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
         e0, e1 = zip(*oerrs)
         log(f"--init_hf {method}: output-space relative error |X (W - a c T)^T|^2 / |X W^T|^2 mean {sum(e1) / len(e1):.4f}"
             f" (als rounding {sum(e0) / len(e0):.4f}) over {len(e1)} layers")
-    if kept:
+    if kept and GPTQ_OPTS["mag_svd"]:
+        log(f"--init_mag_svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
+            f"rounding error on average (min {min(kept):.3f}, max {max(kept):.3f}) over {len(kept)} layers")
+    elif kept:
         log(f"--init_acc {acc}: rank {rank} keeps {sum(kept) / len(kept):.3f} of the accumulator's energy on average "
             f"(min {min(kept):.3f})")
     return acc_state

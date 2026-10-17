@@ -1,0 +1,129 @@
+step 1352 wall 117.15s
+----------------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                                  Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+----------------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                              aten::mm         0.28%     595.009ms         3.78%        8.101s     169.965us       52.540s        46.40%       52.992s       1.112ms         47664  
+                                                               tern.dx         0.00%       0.000us         0.00%       0.000us       0.000us       20.904s        18.46%       20.904s       6.532ms          3200  
+                                                               tern.dw         0.00%       0.000us         0.00%       0.000us       0.000us       20.001s        17.66%       20.001s       6.250ms          3200  
+                                                            ttf.update         0.00%       0.000us         0.00%       0.000us       0.000us       19.591s        17.30%       19.591s       6.122ms          3200  
+                                                             model.fwd         0.00%       0.000us         0.00%       0.000us       0.000us       14.745s        13.02%       14.745s        1.843s             8  
+            ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_nt         0.00%       0.000us         0.00%       0.000us       0.000us       14.399s        12.72%       14.399s       5.921ms          2432  
+            ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_nn         0.00%       0.000us         0.00%       0.000us       0.000us       14.012s        12.37%       14.012s       4.561ms          3072  
+                                                              tern.fwd         0.00%       0.000us         0.00%       0.000us       0.000us       13.977s        12.34%       13.977s       2.184ms          6400  
+                                                             aten::mul         0.28%     594.010ms         4.02%        8.600s      71.504us       11.310s         9.99%       12.389s     103.015us        120266  
+                                                         aten::_int_mm         0.04%      81.948ms         1.06%        2.263s     353.626us       11.127s         9.83%       13.521s       2.113ms          6400  
+void cutlass::Kernel2<cutlass_80_tensorop_i16832gemm_s8_256x128_64x...         0.00%       0.000us         0.00%       0.000us       0.000us       10.995s         9.71%       10.995s       1.867ms          5888  
+                                                           aten::copy_         0.16%     338.018ms         6.61%       14.149s      97.649us        7.835s         6.92%        8.457s      58.370us        144892  
+                                                             ttf.codec         0.00%       0.000us         0.00%       0.000us       0.000us        5.747s         5.08%        5.747s     897.926us          6400  
+                                                   Command Buffer Full        40.34%       86.367s        40.34%       86.367s     305.141us        5.482s         4.84%        5.482s      19.368us        283038  
+           ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_32x3_nt         0.00%       0.000us         0.00%       0.000us       0.000us        4.530s         4.00%        4.530s       8.848ms           512  
+void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16...         0.00%       0.000us         0.00%       0.000us       0.000us        4.488s         3.96%        4.488s       8.766ms           512  
+void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_...         0.00%       0.000us         0.00%       0.000us       0.000us        4.436s         3.92%        4.436s     164.233us         27008  
+                                                 _KernelTernFnBackward         0.01%      11.153ms        28.76%       61.567s      19.240ms        3.918s         3.46%       64.062s      20.019ms          3200  
+                                                         _KernelTernFn         0.03%      74.355ms         3.88%        8.295s       1.296ms        3.858s         3.41%       17.673s       2.761ms          6400  
+void cutlass::Kernel2<cutlass_80_simt_sgemm_128x128_8x4_nn_align1>(...         0.00%       0.000us         0.00%       0.000us       0.000us        3.677s         3.25%        3.677s       1.512ms          2432  
+                                                             aten::add         0.16%     351.495ms         3.10%        6.641s      86.635us        3.590s         3.17%        3.808s      49.683us         76650  
+void at::native::vectorized_elementwise_kernel<4, at::native::CUDAF...         0.00%       0.000us         0.00%       0.000us       0.000us        3.067s         2.71%        3.067s     135.916us         22568  
+void at::native::unrolled_elementwise_kernel<at::native::direct_cop...         0.00%       0.000us         0.00%       0.000us       0.000us        2.619s         2.31%        2.619s      65.592us         39931  
+                                                        _unpack_kernel         0.00%       0.000us         0.00%       0.000us       0.000us        2.426s         2.14%        2.426s     242.643us         10000  
+void at::native::vectorized_elementwise_kernel<4, at::native::Binar...         0.00%       0.000us         0.00%       0.000us       0.000us        2.417s         2.13%        2.417s     281.838us          8576  
+           ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_32x3_nn         0.00%       0.000us         0.00%       0.000us       0.000us        2.263s         2.00%        2.263s       5.050ms           448  
+void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_...         0.00%       0.000us         0.00%       0.000us       0.000us        2.029s         1.79%        2.029s     317.023us          6400  
+void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16...         0.00%       0.000us         0.00%       0.000us       0.000us        2.001s         1.77%        2.001s      15.636ms           128  
+void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_...         0.00%       0.000us         0.00%       0.000us       0.000us        2.000s         1.77%        2.000s      81.137us         24648  
+                                          Optimizer.step#LeanAdam.step         0.00%       0.000us         0.00%       0.000us       0.000us        1.962s         1.73%        1.962s        1.962s             1  
+void at::native::vectorized_elementwise_kernel<4, at::native::Binar...         0.00%       0.000us         0.00%       0.000us       0.000us        1.734s         1.53%        1.734s      65.952us         26289  
+                                                         _ttf_u_kernel         0.00%       0.000us         0.00%       0.000us       0.000us        1.730s         1.53%        1.730s     540.542us          3200  
+                                                        _i8_epi_kernel         0.00%       0.000us         0.00%       0.000us       0.000us        1.694s         1.50%        1.694s     264.744us          6400  
+                                                          loss.head_kd         0.00%       0.000us         0.00%       0.000us       0.000us        1.586s         1.40%        1.586s     198.306ms             8  
+                                                             aten::sum         0.11%     239.289ms         3.31%        7.082s     235.755us        1.531s         1.35%        1.824s      60.715us         30040  
+                                                            aten::add_         0.05%     105.468ms         1.65%        3.535s      80.860us        1.472s         1.30%        1.473s      33.702us         43722  
+                                   ChunkGatedDeltaRuleFunctionBackward         0.00%       1.629ms         0.29%     628.122ms       1.636ms        1.418s         1.25%        1.487s       3.871ms           384  
+                                       ampere_sgemm_64x32_sliced1x4_nn         0.00%       0.000us         0.00%       0.000us       0.000us        1.354s         1.20%        1.354s     418.927us          3232  
+void at::native::vectorized_elementwise_kernel<4, at::native::CUDAF...         0.00%       0.000us         0.00%       0.000us       0.000us        1.297s         1.15%        1.297s      21.342us         60779  
+                                                              ttf.orth         0.00%       0.000us         0.00%       0.000us       0.000us        1.195s         1.06%        1.195s       2.988ms           400  
+                                                       aten::linalg_qr         0.02%      39.028ms         1.29%        2.761s       6.903ms        1.160s         1.02%        1.175s       2.936ms           400  
+void cutlass::Kernel2<cutlass_80_simt_sgemm_128x64_8x5_nn_align1>(c...         0.00%       0.000us         0.00%       0.000us       0.000us        1.124s         0.99%        1.124s     336.093us          3344  
+                                           ChunkGatedDeltaRuleFunction         0.01%      16.646ms         0.73%        1.568s       2.042ms        1.109s         0.98%        1.485s       1.933ms           768  
+void at::native::vectorized_elementwise_kernel<4, at::native::bfloa...         0.00%       0.000us         0.00%       0.000us       0.000us        1.025s         0.90%        1.025s      56.772us         18048  
+                                                          _actq_kernel         0.00%       0.000us         0.00%       0.000us       0.000us        1.016s         0.90%        1.016s     158.778us          6400  
+                                                ampere_sgemm_128x64_nn         0.00%       0.000us         0.00%       0.000us       0.000us        1.003s         0.89%        1.003s     674.206us          1488  
+void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16...         0.00%       0.000us         0.00%       0.000us       0.000us     987.832ms         0.87%     987.832ms     105.718us          9344  
+void geqr2_gmem_domino<float, float, 9>(int, int, float*, int, floa...         0.00%       0.000us         0.00%       0.000us       0.000us     931.416ms         0.82%     931.416ms     519.763us          1792  
+            ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_tn         0.00%       0.000us         0.00%       0.000us       0.000us     915.984ms         0.81%     915.984ms      82.254us         11136  
+                                                     aten::bitwise_and         0.13%     270.989ms         4.92%       10.526s     232.865us     910.251ms         0.80%     910.251ms      20.138us         45200  
+                                                       _sq_sums_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     909.199ms         0.80%     909.199ms     284.125us          3200  
+                                                             aten::cat         0.04%      90.315ms         0.66%        1.405s      96.812us     901.689ms         0.80%     912.347ms      62.864us         14513  
+                                                      aten::__rshift__         0.08%     174.854ms         1.72%        3.677s      82.080us     866.688ms         0.77%     866.688ms      19.346us         44800  
+                                               aten::_conv_depthwise2d         0.00%       3.444ms         0.04%      88.518ms     115.258us     732.291ms         0.65%        1.039s       1.353ms           768  
+void at::native::(anonymous namespace)::conv_depthwise2d_forward_ke...         0.00%       0.000us         0.00%       0.000us       0.000us     732.291ms         0.65%     732.291ms     953.503us           768  
+                                                      aten::bitwise_or         0.06%     125.874ms         1.95%        4.181s     130.666us     711.114ms         0.63%     711.114ms      22.222us         32000  
+                                                            aten::silu         0.01%      18.635ms         0.73%        1.566s     611.851us     659.880ms         0.58%     719.782ms     281.165us          2560  
+void at::native::(anonymous namespace)::CatArrayBatchedCopy_aligned...         0.00%       0.000us         0.00%       0.000us       0.000us     642.293ms         0.57%     642.293ms      51.798us         12400  
+                                                             aten::pow         0.03%      55.489ms         0.25%     527.130ms      78.912us     625.373ms         0.55%        1.035s     154.985us          6680  
+void at::native::vectorized_elementwise_kernel<4, at::native::(anon...         0.00%       0.000us         0.00%       0.000us       0.000us     621.882ms         0.55%     621.882ms     186.415us          3336  
+----------------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 214.076s
+Self CUDA time total: 113.234s
+
+
+by CPU time
+----------------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                                  Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+----------------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Command Buffer Full        40.34%       86.367s        40.34%       86.367s     305.141us        5.482s         4.84%        5.482s      19.368us        283038  
+                                                      cudaLaunchKernel        33.44%       71.587s        36.42%       77.962s      87.425us       0.000us         0.00%        2.895s       3.246us        891763  
+<built-in method run_backward of torch._C._EngineBase object at 0x7...         9.80%       20.982s        45.43%       97.263s       12.158s       0.000us         0.00%       0.000us       0.000us             8  
+                                                 cudaStreamSynchronize         5.01%       10.731s         5.01%       10.731s      20.401ms       0.000us         0.00%       0.000us       0.000us           526  
+                                                      cuLaunchKernelEx         1.12%        2.390s         2.22%        4.746s     124.802us       0.000us         0.00%       0.000us       0.000us         38032  
+                                                       cudaMemsetAsync         1.04%        2.230s         1.12%        2.405s      88.860us       0.000us         0.00%      44.944ms       1.661us         27064  
+                                                        cuLaunchKernel         0.99%        2.123s         1.60%        3.435s     134.674us       0.000us         0.00%        2.542s      99.679us         25504  
+                                                            cuMemUnmap         0.46%     982.267ms         0.46%     982.267ms     437.146us       0.000us         0.00%       0.000us       0.000us          2247  
+                                        bitnet/train.py(823): ts_layer         0.32%     680.133ms        27.83%       59.570s      18.616ms       0.000us         0.00%       18.332s       5.729ms          3200  
+                                                              aten::mm         0.28%     595.009ms         3.78%        8.101s     169.965us       52.540s        46.40%       52.992s       1.112ms         47664  
+                                                             aten::mul         0.28%     594.010ms         4.02%        8.600s      71.504us       11.310s         9.99%       12.389s     103.015us        120266  
+                                                   aten::empty_strided         0.22%     468.002ms         1.91%        4.084s      24.001us       0.000us         0.00%       0.000us       0.000us        170145  
+                                                           aten::empty         0.21%     453.474ms         0.21%     454.239ms       2.480us       0.000us         0.00%       0.000us       0.000us        183131  
+                                           bitnet/train.py(4354): main         0.20%     427.034ms        54.72%      117.151s      117.151s       0.000us         0.00%       22.131s       22.131s             1  
+                                       triton/runtime/jit.py(708): run         0.19%     413.714ms         2.76%        5.912s     155.460us       0.000us         0.00%       0.000us       0.000us         38032  
+                                                             aten::add         0.16%     351.495ms         3.10%        6.641s      86.635us        3.590s         3.17%        3.808s      49.683us         76650  
+                                                           aten::copy_         0.16%     338.018ms         6.61%       14.149s      97.649us        7.835s         6.92%        8.457s      58.370us        144892  
+                                          bitnet/opt_lean.py(77): step         0.13%     281.164ms         0.92%        1.962s        1.962s       0.000us         0.00%     369.395ms     369.395ms             1  
+                                                        aten::_to_copy         0.13%     276.305ms         8.11%       17.360s     145.814us       0.000us         0.00%        5.455s      45.820us        119059  
+                                                     aten::bitwise_and         0.13%     270.989ms         4.92%       10.526s     232.865us     910.251ms         0.80%     910.251ms      20.138us         45200  
+                                       bitnet/train.py(414): _unpack12         0.12%     266.635ms         5.49%       11.756s       1.837ms       0.000us         0.00%        2.241s     350.122us          6400  
+                                         bitnet/train.py(400): _pack12         0.11%     246.040ms         8.99%       19.241s       3.006ms       0.000us         0.00%        2.583s     403.594us          6400  
+                                                             aten::div         0.11%     242.573ms         1.22%        2.609s      42.342us     382.179ms         0.34%     382.254ms       6.203us         61627  
+                                                             aten::sum         0.11%     239.289ms         3.31%        7.082s     235.755us        1.531s         1.35%        1.824s      60.715us         30040  
+<built-in method _record_function_enter_new of pybind11_builtins.py...         0.09%     202.457ms         0.09%     202.457ms       6.093us       0.000us         0.00%       0.000us       0.000us         33229  
+                                            <built-in function launch>         0.09%     187.749ms         2.32%        4.960s     130.406us       0.000us         0.00%       0.000us       0.000us         38032  
+                          torch/utils/checkpoint.py(1165): unpack_hook         0.09%     185.611ms         6.60%       14.139s     241.452us       0.000us         0.00%       15.832s     270.361us         58560  
+                                                      aten::__rshift__         0.08%     174.854ms         1.72%        3.677s      82.080us     866.688ms         0.77%     866.688ms      19.346us         44800  
+                                                            aten::view         0.07%     158.220ms         0.07%     158.220ms       1.115us       0.000us         0.00%       0.000us       0.000us        141960  
+                                                             ttf.store         0.07%     149.150ms         0.07%     159.071ms      15.295us       0.000us         0.00%       0.000us       0.000us         10400  
+----------------------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 214.076s
+Self CUDA time total: 113.234s
+
+
+named ranges (CUDA total = everything inside them)
+  model.fwd                    calls       8  CUDA    21.751 s  CPU    16.355 s
+  tern.dx                      calls    3200  CUDA    20.904 s  CPU     0.000 s
+  tern.dw                      calls    3200  CUDA    20.001 s  CPU     0.000 s
+  tern.dw                      calls    3200  CUDA    19.995 s  CPU     0.585 s
+  tern.dx                      calls    3200  CUDA    19.696 s  CPU     0.489 s
+  ttf.update                   calls    3200  CUDA    19.591 s  CPU     0.000 s
+  ttf.update                   calls    3200  CUDA    18.332 s  CPU    59.634 s
+  model.fwd                    calls       8  CUDA    14.745 s  CPU     0.000 s
+  tern.fwd                     calls    6400  CUDA    13.977 s  CPU     0.000 s
+  tern.fwd                     calls    6400  CUDA    13.521 s  CPU     5.048 s
+  ttf.codec                    calls    6400  CUDA     5.747 s  CPU     0.000 s
+  ttf.codec                    calls    6400  CUDA     5.551 s  CPU    39.581 s
+  loss.head_kd                 calls       8  CUDA     1.599 s  CPU     3.202 s
+  loss.head_kd                 calls       8  CUDA     1.586 s  CPU     0.000 s
+  ttf.orth                     calls     400  CUDA     1.195 s  CPU     0.000 s
+  ttf.orth                     calls     400  CUDA     1.175 s  CPU     2.771 s
+  model.bwd                    calls       8  CUDA     0.003 s  CPU     0.000 s
+  model.bwd                    calls       8  CUDA     0.000 s  CPU    97.273 s
+  ttf.step                     calls       1  CUDA     0.000 s  CPU     0.000 s
+  ttf.step                     calls       1  CUDA     0.000 s  CPU     0.000 s

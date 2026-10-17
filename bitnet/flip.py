@@ -323,6 +323,7 @@ def enable_boost(model, s0=0.5):
     return n
 
 
+FACTORED = [False]           # --ts_factored: on for this step (off on --ts_vdiag / --ts_diag steps, which read dense g)
 DW_FP32 = [False]            # --dw_fp32: dense weight gradients in fp32 from the GEMM (more precise, one copy fewer)
 WCACHE = {"mode": "off"}     # --w_cache int8: keep each layer's unpacked int8 trits between updates (1 byte / weight)
 
@@ -359,6 +360,17 @@ class _KernelTernFn(torch.autograd.Function):
         gyf = gy.reshape(-1, layer.N).contiguous()
         if beta is not None:
             gyf = gyf * beta.to(gyf.dtype)       # y = beta * x@W^T: both grads carry beta
+        if (FACTORED[0] and layer.int8 and layer.capture and getattr(layer, "on_grad", None) is not None
+                and not layer.err_feedback and layer.dw_mode == "dense"
+                and (getattr(layer, "ts_micro", False) or not getattr(layer, "cap_accum", False))):
+            # --ts_factored: no dense weight gradient; the TTF update gets its factors (gy, x), g = gy^T x
+            xq, xs, wpacked = ctx.saved_tensors
+            with _rf("tern.dx"):
+                gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
+            if getattr(layer, "cap_accum", False):
+                layer._ts_final = getattr(layer, "cap_final", True)
+            layer.on_grad(layer, (gyf, xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype)))
+            return gx.to(gy.dtype), None, None
         # weight gradient first: error feedback needs it (and the flip) BEFORE grad_x
         if layer.int8:
             xq, xs, wpacked = ctx.saved_tensors
@@ -717,6 +729,12 @@ class KernelTernaryLinear(nn.Module):
             n_ = KernelTernaryLinear._taddw_n = getattr(KernelTernaryLinear, "_taddw_n", 0) + 1
             self.mag_At._ts_idx, self.mag_Bt._ts_idx = 20_000 + 2 * n_, 20_001 + 2 * n_   # TTF seeds, distinct per matrix
             return [self.mag_At.row_scale, self.mag_At.col_scale, self.mag_Bt.row_scale, self.mag_Bt.col_scale]
+        mi_ = getattr(self, "_mag_init", None)
+        if mi_ is not None:      # --init_mag_svd: the rounding error's best rank-r part (hf_init._mag_svd_init)
+            assert kind == "add" and mi_[0].shape[1] == r, "--init_mag_svd R needs --lowrank_mag add:R"
+            self.mag_A = nn.Parameter(mi_[0].to(dev).clone()); self.mag_B = nn.Parameter(mi_[1].to(dev).clone())
+            del self._mag_init
+            return [self.mag_A, self.mag_B]
         self.mag_A = nn.Parameter(torch.zeros(self.N, r, device=dev))
         std = (1.0 / self.K) ** 0.5 if kind == "add" else 1.0
         self.mag_B = nn.Parameter(torch.randn(self.K, r, device=dev) * std)

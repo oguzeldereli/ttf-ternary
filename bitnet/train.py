@@ -825,6 +825,8 @@ def ts_layer(l, g, state, c):
     Called from ts_step after the backward, or from the layer's backward itself (--ts_fused), right after its input
     gradient is computed, so only one layer's fp32 gradient exists at a time."""
     from .kernel import unpack_rows, pack_rows
+    if not torch.is_tensor(g):           # --ts_factored: the backward passed (gy, x) instead of the dense gradient
+        return _ts_layer_factored(l, g, state, c)
     if (c.get("fast") and c.get("nomom") and not c.get("start") and not c.get("vdiag") and not c.get("uclip") and not c.get("urms") and not c.get("theta_noise") and not c.get("boost") and not c.get("move_cap") and not c.get("vbar") and int(c.get("orth_every") or 1) == 1 and int(c.get("micro") or 1) == 1
             and int(c.get("tiles") or 1) == 1 and not getattr(l, "_ts_rank", 0)
             and not any(c.get(k_) for k_ in _TS_FAST_OFF) and not TS_TUNNEL[0]):
@@ -1271,6 +1273,129 @@ def ts_layer(l, g, state, c):
         S.sub_(c["spend"] * theta * D)
     if c.get("qdiag"): _qdiag(st, key, "a", U, V, t)
     _host_put(state, key, _store_pair(sa, U, V) if sa else (qa(U), qV(V)), off)
+    st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
+    if before is not None:
+        l._record_flips(before, l.wpacked)
+
+
+def _mmb(A, B):
+    """A (bf16, the factor) @ B on the bf16 tensor cores with fp32 accumulation and output (B rounded to bf16, as the
+    dense path rounds the weight gradient to bf16)"""
+    return torch.mm(A, B.to(A.dtype), out_dtype=torch.float32) if A.dtype == torch.bfloat16 else A @ B
+
+
+def _fg_mm_r(fg, a, W):
+    """u @ W for u = -lr diag(a) g diag(b), g = gy^T x, without g: -lr a * (gy^T (x (b W))) (fp32; W is K x r)"""
+    gy, x, b = fg
+    return a[:, None] * _mmb(gy.T, _mmb(x, b[:, None] * W))
+
+
+def _fg_mm_l(fg, a, W):
+    """u^T @ W (W is N x r) without g: -lr b * (x^T (gy (a W))) (the -lr is applied by the caller)"""
+    gy, x, b = fg
+    return b[:, None] * _mmb(x.T, _mmb(gy, a[:, None] * W))
+
+
+def _ts_layer_factored(l, fg, state, c):
+    """--ts_factored K: the --ts --ts_nomom update (16 x 1 or --ts_micro) from the factors of the weight gradient,
+    g = gy^T x, which is never formed. Everything the update reads from g is a product with a thin matrix: the
+    accumulator's projections u V and u^T U (u = -lr g / sqrt(v) with the factored v = a_i b_j, so u = -lr diag(1/a) g
+    diag(1/b)), and v's row / column sums of g^2, estimated from a K-column random sketch g S (E[S S^T] = I; with
+    --ts_micro the same sketch the cross terms use, so the batch's sums are ||(sum_i g_i) S||^2). Differences from the
+    dense path: the sums of g^2 are sketch estimates (relative noise sqrt(2 / K) per row and step, before v's EMA), and
+    the 1e-8 in sqrt(v) + 1e-8 is left out (a scale factor needs a product form). Cost per call 2 T (N + K)(K_s + 2 r)
+    instead of the dense gradient's 2 T N K."""
+    gy, x = fg                                # [T, N], [T, K] (bf16; products accumulate in fp32: _mmb)
+    r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
+    M_ = int(c.get("micro") or 1)
+    final_ = getattr(l, "_ts_final", True) if M_ > 1 else True
+    st = state.setdefault("_ts", {})
+    dev = gy.device
+    off = c.get("offload", False) if getattr(l, "_ts_host", True) else False
+    sa = _store_codec(c.get("store_a", ""))
+    key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
+    lk = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau
+    k_ = int(c["factored"])
+    ts_ = (t - 1) // M_
+    gen = torch.Generator(device=dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
+    Sr = torch.randn(l.K, k_, device=dev, generator=gen) / k_ ** 0.5
+    Sc = torch.randn(k_, l.N, device=dev, generator=gen) / k_ ** 0.5
+    gS = _mmb(gy.T, _mmb(x, Sr))                                          # g Sr  [N, k]
+    Sg = _mmb(x.T, _mmb(gy, Sc.T)).T                                      # Sc g  [k, K]
+    rsq, csq = gS.square().sum(1), Sg.square().sum(0)                     # ~ row / column sums of g^2
+    if M_ > 1:   # as ts_layer's --ts_micro --ts_nomom branch, with the sketched own squares
+        r0, c0 = rsq * (M_ * M_ / l.K), csq * (M_ * M_ / l.N)
+        if ("v", key) in st and ts_ > 0:
+            R0, C0 = _host_get(st, ("v", key), dev, off)
+            bc_ = 1 - b2 ** ts_
+            r0 = b2 * R0 / bc_ + (1 - b2) * r0; c0 = b2 * C0 / bc_ + (1 - b2) * c0; del R0, C0
+        m_ = r0.mean().clamp_min(1e-30)
+        PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (0, 0, 0, 0, 0, 0)
+        d1, d0 = rsq / l.K, csq / l.N
+        rs = rs + d1 + (2.0 / l.K) * (gS * PS).sum(1) if torch.is_tensor(PS) else d1
+        cs = cs + d0 + (2.0 / l.N) * (Sg * SP).sum(0) if torch.is_tensor(SP) else d0
+        ds, es = ds + d1, es + d0
+        PS, SP = PS + gS, SP + Sg
+        if final_:
+            rs, cs = torch.maximum(rs, ds / M_), torch.maximum(cs, es / M_)
+            if ("v", key) in st:
+                R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * rs; C = b2 * C + (1 - b2) * cs
+            else:
+                R, C = (1 - b2) * rs, (1 - b2) * cs
+            _host_put(st, ("v", key), (R, C), off)
+        else:
+            st[("mx", key)] = (PS, SP, rs, cs, ds, es)
+        del PS, SP
+        a = (r0 / m_).sqrt_(); b = c0.sqrt()                              # sqrt(v_ij) = a_i b_j
+    else:        # 16 x 1: v includes this step's g^2
+        if ("v", key) in st:
+            R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * rsq / l.K; C = b2 * C + (1 - b2) * csq / l.N
+        else:
+            R, C = (1 - b2) * rsq / l.K, (1 - b2) * csq / l.N
+        _host_put(st, ("v", key), (R, C), off)
+        a = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** t)).sqrt(); b = C.sqrt()
+    del gS, Sg
+    ia = 1.0 / a.clamp_min(1e-30 + 1e-12 * float(a.max()))                # 1 / a_i, 1 / b_j (zero rows: g is zero there)
+    ib = 1.0 / b.clamp_min(1e-30 + 1e-12 * float(b.max()))
+    fgb = (gy, x, ib)
+    if c.get("start") and c.get("step", 0) < c["start"]:                  # --ts_start: frozen, v keeps learning
+        return
+    ra = min(r, l.N, l.K)
+    if key not in state:
+        g_ = torch.Generator(device=dev).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
+        V = _orth(-lr_ratio * _fg_mm_l(fgb, ia, torch.randn(l.N, ra, device=dev, generator=g_)))
+        U = -lr_ratio * _fg_mm_r(fgb, ia, V)
+    elif M_ > 1:   # basis fixed within the step, turned on the last micro-batch from M u_M^T U (MICRO_BASIS last)
+        assert MICRO_BASIS[0] == "last", "--ts_factored: TERN_MICRO_BASIS=last only"
+        U, V = _load_pair(_host_get(state, key, dev, off))
+        if (t - 1) % M_ == 0:
+            U = U * lk
+        if final_:
+            S_ = (-lr_ratio * M_) * _fg_mm_l(fgb, ia, U)
+            Vn = _orth(V @ (U.T @ U) + S_); del S_
+            U = (U - lr_ratio * _fg_mm_r(fgb, ia, V)) @ (V.T @ Vn); V = Vn
+        else:
+            U = U - lr_ratio * _fg_mm_r(fgb, ia, V)
+    else:
+        U, V = _load_pair(_host_get(state, key, dev, off))
+        U = U * lk
+        Vn = _orth(V @ (U.T @ U) - lr_ratio * _fg_mm_l(fgb, ia, U))
+        U = U @ (V.T @ Vn) - lr_ratio * _fg_mm_r(fgb, ia, Vn); V = Vn
+    if not final_:
+        _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
+        return
+    from .kernel import unpack_rows, pack_rows
+    A = U @ V.T
+    w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
+    d = A.sign()
+    fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
+    del A
+    before = l.wpacked.clone() if l.track else None
+    D = torch.where(fire, d, torch.zeros_like(d))
+    nf = fire.sum()
+    l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))
+    U = U - c["spend"] * (theta * (D @ V))
+    _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
     if before is not None:
         l._record_flips(before, l.wpacked)
@@ -3158,6 +3283,12 @@ def main():
                     "scales) with LeanAdam: int8 first moment, factored second moment, stochastic-rounding updates")
     ap.add_argument("--ts_micro_basis", default="", choices=["", "last", "sum", "rot"], help="--ts_micro --ts_nomom: how "
                     "the accumulator's basis turns (default last; see ts_layer)")
+    ap.add_argument("--init_mag_svd", type=int, default=0, help="--init_hf gptq / gptqc with --lowrank_mag add:R: the "
+                    "float adapters start from the best rank-R part of each layer's rounding error (in the input "
+                    "covariance's norm) instead of 0: the lost precision moved into the float part (hf_init._mag_svd_init)")
+    ap.add_argument("--ts_factored", type=int, default=0, help="--ts --ts_nomom --ts_fused: K > 0: the TTF update from "
+                    "the factors of the weight gradient (g = gy^T x is never formed; the sums of g^2 from a K-column "
+                    "sketch; see _ts_layer_factored). Dense on --ts_vdiag / --ts_diag steps")
     ap.add_argument("--ts_micro", action="store_true", help="--ts_fused with --grad_accum M: the TTF update sees each "
                     "micro-batch's gradient (momentum and v step per micro-batch with beta^(1/M), v / M; accumulator, firing "
                     "and spend once per step), so no dense gradient is kept between micro-batches: activations shrink M-fold")
@@ -3684,7 +3815,7 @@ def main():
             del _ck
     if args.init_hf and not _resuming:
         from .hf_init import init_from_hf, GPTQ_OPTS as _GO
-        _GO["zero_frac"] = args.init_zero_frac; _GO["rot"] = args.init_rot
+        _GO["zero_frac"] = args.init_zero_frac; _GO["rot"] = args.init_rot; _GO["mag_svd"] = args.init_mag_svd
         assert args.mode in ("kernel", "master", "fp32"), "--init_hf: kernel, master or fp32 mode"
         assert not (args.init_acc and (args.ts_offload or args.ts_offload_async or args.ts_tiles > 1)), \
             "--init_acc: state on the GPU, no tiles"
@@ -4181,6 +4312,18 @@ def main():
                 m_.on_grad = _og1
             m_.ts_micro = bool(args.ts_micro)
         print("--ts_fused: the update runs inside each layer's backward", flush=True)
+        ts_cfg["factored"] = args.ts_factored
+        if args.ts_factored:
+            assert args.ts_nomom and not args.lr_gate and not args.ts_shadow and not args.ts_shared_v and not args.ts_sketch \
+                and not args.ts_resid and not args.ts_rescale and not args.ts_table and not args.ts_exact_spend \
+                and int(args.ts_tiles or 1) == 1 and not args.ts_rank_sched and not args.ts_rsketch and not args.ts_locate \
+                and not args.ts_spend_table and not args.ts_global and not args.ts_fuse and not args.ts_decay \
+                and not args.ts_sgate and not args.ts_refresh and not args.ts_qfmt and not args.ts_int8 \
+                and not args.ts_qfmt_a and not args.ts_store_m and not args.ts_theta_sched and not args.ts_uclip \
+                and not args.ts_move_cap and not args.ts_vbar and not args.ts_urms and not args.ts_theta_noise \
+                and not args.ts_boost and not TS_TUNNEL[0] and int(args.ts_orth_every or 1) == 1 and not args.ts_orth_defer \
+                and (args.ts_micro or tc.grad_accum == 1), "--ts_factored: the plain --ts --ts_nomom update only"
+            print(f"--ts_factored {args.ts_factored}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
     movediag = None
     if args.movediag:
         from .movediag import MoveDiag
@@ -4268,6 +4411,9 @@ def main():
             ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
             ts_cfg["qdiag"] = bool(args.ts_qdiag) and step % args.ts_qdiag in (0, 1)   # two steps: a change to measure
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
+            if args.ts_factored:   # the dense path on the steps whose diagnostics read the dense gradient
+                from .flip import FACTORED as _FCT
+                _FCT[0] = not (ts_cfg["vdiag"] or ts_cfg["diag"] or ts_cfg["qdiag"])
         rate_now = args.rate
         if args.rate_schedule != "const":
             prog = min(1.0, step / max(1, tc.max_steps))
