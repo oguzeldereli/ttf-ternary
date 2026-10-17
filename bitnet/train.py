@@ -4328,6 +4328,11 @@ def main():
         _last["stop"] = True
     signal.signal(signal.SIGTERM, _graceful)
     signal.signal(signal.SIGINT, _graceful)
+    if _RK == 0 and (not _PP or _PP[0] == 0):   # the results database: this run's records in <out_dir>/records.jsonl
+        from .results import RunLog
+        RUNLOG[0] = RunLog(tc.out_dir, os.path.basename(os.path.normpath(tc.out_dir)), vars(args), data=tc.data_path,
+                           steps=tc.max_steps, parent=(ckpt_path if start_step > 0 else None))
+        RUNLOG[0].event("running", start_step)
 
     # after any resume, so 'net' counts from the weights this run starts at
     if args.lowrank_mag and not mag_on[0]:
@@ -4963,6 +4968,8 @@ def main():
             if mwin is not None and mwin.rec is not None:
                 mwin.rec.flush()
             save_ckpt(step); print(f"saved at step {step}. exiting.", flush=True)
+            if RUNLOG[0] is not None:
+                RUNLOG[0].event("stopped", step, "signal")
             raise SystemExit(0)
 
     if mwin is not None and mwin.rec is not None:
@@ -4973,8 +4980,21 @@ def main():
     log_metrics({"step": end_step, "val_loss": vl, "val_ppl": math.exp(vl),
                  "final": True})
     print(f"FINAL val loss {vl:.4f} | ppl {math.exp(vl):.2f}", flush=True)
+    if RUNLOG[0] is not None:
+        RUNLOG[0].result("val_train", vl, n=tc.eval_iters * max(tc.batch_size, 16), step=end_step)
+        RUNLOG[0].event("finished", end_step)
     print("done", flush=True)
 
 
+RUNLOG = [None]          # the run's results.RunLog (rank 0)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as e:
+        if RUNLOG[0] is not None:
+            RUNLOG[0].event("failed", reason=f"{type(e).__name__}: {str(e)[:300]}")
+        raise

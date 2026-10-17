@@ -194,6 +194,21 @@ def main():
                       f"trained (or the run's validation set is not the check's: --check_val)", flush=True)
         res["seconds"] = round(time.time() - t0, 1)
         json.dump(res, open(os.path.join(run, "final_eval.json"), "w"), indent=1)
+        try:   # the results database: these numbers as result records of the run (<run>/records.jsonl)
+            from bitnet import results as RDB
+            rid, rp = RDB.run_of(run)
+            ev = f"final_eval.py {RDB.git_commit() or ''}".strip()
+            recs = [RDB.make("result", run=rid, metric="wiki_fixed", value=res["wiki_loss"], n=res["wiki_windows"],
+                             step=res.get("step"), eval=ev)]
+            if "fw_loss" in res:
+                recs.append(RDB.make("result", run=rid, metric="fw_fixed", value=res["fw_loss"], n=res["fw_windows"],
+                                     step=res.get("step"), eval=ev))
+            if "train_protocol_loss" in res:
+                recs.append(RDB.make("result", run=rid, metric="protocol", value=res["train_protocol_loss"],
+                                     n=res.get("check_iters", 30) * 16, step=res.get("step"), eval=ev))
+            RDB.append(recs, rp)
+        except Exception as e_:
+            print(f"results: not recorded ({e_})", flush=True)
         np.savez(os.path.join(run, "final_eval.npz"), **arrays)
         print(json.dumps(res), flush=True)
         del model
