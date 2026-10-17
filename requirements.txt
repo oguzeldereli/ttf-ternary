@@ -1,4 +1,9 @@
-torch>=2.1
+# tested with Python 3.13, torch 2.13.0 (CUDA 12.6 / 12.9 wheels, Triton 3.7), numpy 2.3
+torch>=2.13
 numpy
-# optional, only for a real BPE vocab in data_prep.py:
-# transformers
+safetensors          # --init-hf (Llama / Qwen checkpoints)
+# data preparation (scripts/data/prep_wiki.py, prep_fineweb.py)
+datasets
+tokenizers
+# Qwen3.5 / 3.8 conversion and evaluation (ttf/qwen.py): transformers==5.19.0, flash-linear-attention==0.5.2
+# tests: pytest
