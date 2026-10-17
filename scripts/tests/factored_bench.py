@@ -1,5 +1,5 @@
 """Time of the TTF update per micro-batch at 27B layer shapes (17 Oct): dense (weight gradient gy^T x, then ts_layer)
-against --ts_factored (ts_layer on the factors), --ts_micro M = 8 (non-final and final micro-batches), rank r.
+against --dw factored (ts_layer on the factors), --ttf-accum micro M = 8 (non-final and final micro-batches), rank r.
   python scripts/tests/factored_bench.py [RANK ...]
 """
 import sys, os, time

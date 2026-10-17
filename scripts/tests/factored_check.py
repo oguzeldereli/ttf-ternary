@@ -1,4 +1,4 @@
-"""--ts_factored against the dense TTF update on one layer (17 Oct): same layer, same gradients (g = gy^T x), several
+"""--dw factored against the dense TTF update on one layer (17 Oct): same layer, same gradients (g = gy^T x), several
 steps, 16 x 1 (M = 1) and micro-batched (M = 4). Reports the relative difference of the accumulator A = U V^T and of v,
 and how many moves agree, for sketch sizes K_s; as K_s grows the factored update must converge to the dense one.
   python scripts/tests/factored_check.py

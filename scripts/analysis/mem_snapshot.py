@@ -1,4 +1,4 @@
-"""What holds GPU memory at the peak of a training step (from ttf.train --mem_snapshot PATH:STEP).
+"""What holds GPU memory at the peak of a training step (from ttf.train --mem-snapshot PATH:STEP).
 
     python scripts/analysis/mem_snapshot.py SNAPSHOT.pickle [--top 30]
 

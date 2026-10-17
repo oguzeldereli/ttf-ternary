@@ -1,9 +1,9 @@
-"""Conversion check for --init_hf (no training): the loss of a pretrained Llama on the first N fixed Wikipedia windows
+"""Conversion check for --init-hf (no training): the loss of a pretrained Llama on the first N fixed Wikipedia windows
 (scripts/eval/final_eval.py), as
   hf        the original model in transformers (reference)
   fp32      our model with the copied weights (must match hf: checks the name map and the RoPE permutation)
   master    master mode, latent = the weight (BitNet absmean ternary in the forward)
-  kernel:M  the trits and scales of --init_hf_method M, with the run's forward (beta, row / column scales, int8 acts)
+  kernel:M  the trits and scales of --convert M, with the run's forward (beta, row / column scales, int8 acts)
 
     python scripts/quant/hf_check.py HF_DIR [--n 100] [--methods absmean,row,als] [--skip_hf]
 """
@@ -65,7 +65,7 @@ def main():
         init_from_hf(m, a.hf_dir, "master"); run("master", m); del m; torch.cuda.empty_cache()
     hess = calib_hessians(a.hf_dir, a.calib_data, n_seq=a.calib, dev=dev) if a.calib else None
     for meth in a.methods.split(","):
-        m = build_kernel_transformer(mc, grad_checkpoint=False, rate=0.0, beta=True, int8=True, dw_mode="dense").to(dev)
+        m = build_kernel_transformer(mc, grad_checkpoint=False, beta=True, int8=True).to(dev)
         enable_rc_scales(m)
         t0 = time.time()
         init_from_hf(m, a.hf_dir, "kernel", meth, rc=True, hess=hess)

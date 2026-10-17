@@ -19,7 +19,7 @@ ap.add_argument("--chat", action="store_true"); ap.add_argument("--mag", default
 a = ap.parse_args()
 dev = "cuda"
 t0 = time.time()
-mk = lambda i, o: KernelTernaryLinear(i, o, 8, rate=0.0, beta=True, int8=True, dw_mode="dense")
+mk = lambda i, o: KernelTernaryLinear(i, o, 8, beta=True, int8=True)
 model, _ = build_qwen(a.hf_dir, "kernel", make_linear=mk, grad_checkpoint=False, device=dev)
 enable_rc_scales(model)
 kind, r = a.mag.split(":")

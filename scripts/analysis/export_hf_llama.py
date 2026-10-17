@@ -1,5 +1,5 @@
 """Export one of our fp32 checkpoints (mode fp32, e.g. checkpoints/fp32_baseline) as a Hugging Face Llama directory, so
-the trainer's --init_hf (and GPTQ conversion) can start from it: config.json + model.safetensors, q / k rows permuted
+the trainer's --init-hf (and GPTQ conversion) can start from it: config.json + model.safetensors, q / k rows permuted
 to HF's rotate_half layout (the inverse of hf_init._unpermute). Checks the round trip: the export loaded back through
 init_from_hf("fp32") gives the original model's loss on the first --check windows of --val.
 

@@ -66,11 +66,11 @@ def load_model(path, device, mag_kind="add"):
         enable_moe(model, f"{E_}:{k_}:{H_}", mk)
     if any(k.endswith(".bpacked") for k in sd):              # --ts_boost
         FL.enable_boost(model)
-    if "tok_emb.table.wpacked" in sd:                         # --tern_emb tied_wide:M
+    if "tok_emb.table.wpacked" in sd:                         # --tern-emb tied_wide:M
         enable_tern_emb = importlib.import_module(P + ".tern_emb").enable_tern_emb
         M_ = sd["tok_emb.table.col_scale"].numel() // sd["tok_emb.proj.row_scale"].numel()
         enable_tern_emb(model, f"tied_wide:{M_}", "kernel")
-    elif "tok_emb.wpacked" in sd or "tok_emb.latent" in sd:     # --tern_emb
+    elif "tok_emb.wpacked" in sd or "tok_emb.latent" in sd:     # --tern-emb
         enable_tern_emb = importlib.import_module(P + ".tern_emb").enable_tern_emb
         enable_tern_emb(model, "untied" if ("lm_head.wpacked" in sd or "lm_head.latent" in sd) else "tied",
                         "master" if mode == "master" else "kernel")
@@ -78,7 +78,7 @@ def load_model(path, device, mag_kind="add"):
         for n_, m_ in model.named_modules():
             if isinstance(m_, KernelTernaryLinear) and f"{n_}.rot_Q" in sd:
                 m_.enable_rotation(sd[f"{n_}.rot_Q"].to(device))
-    if any(k.endswith(".in_mean") for k in sd):              # --init_hf_method gptqc: centred layers
+    if any(k.endswith(".in_mean") for k in sd):              # --convert gptqc: centred layers
         for n_, m_ in model.named_modules():
             if isinstance(m_, KernelTernaryLinear) and f"{n_}.in_mean" in sd:
                 m_.enable_centering(sd[f"{n_}.in_mean"].to(device), sd[f"{n_}.out_bias"].to(device))
@@ -105,7 +105,7 @@ def load_model(path, device, mag_kind="add"):
         for m in model.modules():
             if isinstance(m, (KernelTernaryLinear, MasterTernaryLinear)):
                 m.enable_lowrank_mag(mag_kind, r)
-    tmags = [k for k in sd if k.endswith("mag_At.col_scale")]      # --lowrank_mag taddw:R (trits, rank 20 R)
+    tmags = [k for k in sd if k.endswith("mag_At.col_scale")]      # legacy --lowrank_mag taddw:R (trits, rank 20 R)
     if tmags:
         r = sd[tmags[0]].shape[0] // 20
         for m in model.modules():

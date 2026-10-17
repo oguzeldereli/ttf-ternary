@@ -49,7 +49,7 @@ a, b = res[False], res[True]
 print(f"swiglu: y differ {float((a[0] != b[0]).float().mean()):.2e}, gg differ {float((a[1] != b[1]).float().mean()):.2e}, "
       f"gu differ {float((a[2] != b[2]).float().mean()):.2e} (shares of entries); time {a[3] * 1e3:.2f} -> {b[3] * 1e3:.2f} ms", flush=True)
 
-# the gated norm of the DeltaNet output (48 heads x 128), the gain in fp16 (--lean_tail) and in bf16
+# the gated norm of the DeltaNet output (48 heads x 128), the gain in fp16 (--tail lean) and in bf16
 from ttf.kernel import gated_norm_qwen
 for wdt in (torch.float16, torch.bfloat16):
     n = Q.Qwen3_5RMSNormGated(128, eps=1e-6).to(dev); n.weight.data = (1 + 0.1 * torch.randn(128, device=dev)).to(wdt)

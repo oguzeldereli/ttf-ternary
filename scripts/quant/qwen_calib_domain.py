@@ -42,7 +42,7 @@ R = {}
 m, sw = build_qwen(a.hf_dir, "fp32", grad_checkpoint=False, device=dev); load_qwen(m, a.hf_dir, sw); m.eval()
 R["fp"] = score(m); print("fp", R["fp"], flush=True)
 del m; torch.cuda.empty_cache()
-mk = lambda i, o: KernelTernaryLinear(i, o, 8, rate=0.0, beta=True, int8=True, dw_mode="dense")
+mk = lambda i, o: KernelTernaryLinear(i, o, 8, beta=True, int8=True)
 tmp = tempfile.mkdtemp()
 for name, p in sets(a.calib):
     if "+" in p:      # half the calibration windows from each file: interleave equal-length pieces into one file

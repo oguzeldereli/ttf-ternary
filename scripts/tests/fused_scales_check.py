@@ -1,5 +1,5 @@
-"""--fused_scales against the unfused layer (17 Oct): one KernelTernaryLinear with row / column scales (fp16, as
---lean_tail) and a rank-16 'add' adapter, bf16 input; forward and backward with and without the fused kernels. The
+"""--fused-scales against the unfused layer (17 Oct): one KernelTernaryLinear with row / column scales (fp16, as
+--tail lean) and a rank-16 'add' adapter, bf16 input; forward and backward with and without the fused kernels. The
 output and the input gradient must be bit-identical, the scale gradients equal to rounding (their sums run in another
 order); then the time of forward + backward of both.
   python scripts/tests/fused_scales_check.py

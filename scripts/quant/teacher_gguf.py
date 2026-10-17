@@ -1,4 +1,4 @@
-"""Teacher targets for --kd_cache from a GGUF teacher (e.g. Qwen3.8-27B Q4_K_M, fits a 24 GB card) through llama.cpp
+"""Teacher targets for --kd-cache from a GGUF teacher (e.g. Qwen3.8-27B Q4_K_M, fits a 24 GB card) through llama.cpp
 (llama_topk.cpp): the same kd_NNNNN.npz shards as teacher_topk.py (starts [B] int64, ids [B, seq, k] int32,
 lp [B, seq, k] fp16, log-probabilities under the full softmax), so the trainer reads either.
 

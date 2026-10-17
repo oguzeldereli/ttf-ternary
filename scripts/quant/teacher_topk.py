@@ -6,7 +6,7 @@ memory and each decoder layer is copied to the GPU once per batch of windows, th
 
 Writes OUT_DIR/kd_00000.npz, kd_00001.npz, ... (each: starts [B] int64, ids [B, seq, k] int32, lp [B, seq, k] fp16:
 log-probabilities under the full softmax) and OUT_DIR/done when finished; restarts skip finished shards. Window starts
-are drawn uniformly (seed 1234) like the trainer's batches; the trainer's --kd_cache reads them in order."""
+are drawn uniformly (seed 1234) like the trainer's batches; the trainer's --kd-cache reads them in order."""
 import argparse
 import os
 import sys
