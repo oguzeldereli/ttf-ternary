@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from ttf.model import RMSNorm
 from ttf.master import MasterTernaryLinear
-from ttf.flip import KernelTernaryLinear, set_flip_rate
+from ttf.layers import KernelTernaryLinear, set_flip_rate
 from ttf.train import lookahead_step, gpu_temp
 
 

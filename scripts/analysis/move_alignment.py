@@ -7,7 +7,7 @@ and cos(D, -R) (0 = unrelated; in ~1M dimensions a random direction gives ~0.001
 """
 import sys, numpy as np, torch
 import torch.nn.functional as F
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.kernel import unpack_rows
 from ttf.train import get_batch
 

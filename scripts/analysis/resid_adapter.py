@@ -14,7 +14,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eval"))
 import final_eval as FE                                                     # noqa: E402
-from ttf.flip import KernelTernaryLinear                                # noqa: E402
+from ttf.layers import KernelTernaryLinear                                # noqa: E402
 from ttf.hf_init import load_hf_tensors, _unpermute, _LIN              # noqa: E402
 from ttf.kernel import unpack_rows, trit_beta                          # noqa: E402
 

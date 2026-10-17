@@ -10,7 +10,7 @@ held-out loss change of applying it.
   python -m scripts.analysis.filter_sqrt_n CKPT RATE [TRUTH]
 """
 import sys, json, math, numpy as np, torch
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.kernel import fused_flip, unpack_rows, pack_rows
 from ttf.train import get_batch
 

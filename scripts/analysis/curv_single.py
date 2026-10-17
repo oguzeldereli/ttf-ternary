@@ -8,7 +8,7 @@ All quantities in flip units (weight = beta*q):  g = beta*dL/dW,  H = beta^2*d2L
 A lone flip helps iff d > 1/2 and is "right-sized" around d ~ 1.
 """
 import sys, numpy as np, torch, torch.nn as nn, torch.nn.functional as F
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.bitlinear import _act_quant_ste
 from ttf.kernel import unpack_rows, trit_beta
 from ttf.train import get_batch

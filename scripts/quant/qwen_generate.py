@@ -8,7 +8,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from ttf.qwen import build_qwen                                        # noqa: E402
-from ttf.flip import KernelTernaryLinear, enable_rc_scales            # noqa: E402
+from ttf.layers import KernelTernaryLinear, enable_rc_scales            # noqa: E402
 from ttf.bitlinear import STATE                                        # noqa: E402
 
 ap = argparse.ArgumentParser()

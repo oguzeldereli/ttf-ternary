@@ -12,7 +12,7 @@ matched to A-kept's count (is fewer flips alone the effect?).
   python -m scripts.analysis.proposal_precision [ckpt] [K]
 """
 import sys, numpy as np, torch
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.kernel import fused_flip, unpack_rows, pack_rows
 from ttf.train import get_batch
 

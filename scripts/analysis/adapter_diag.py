@@ -3,7 +3,7 @@ layer type (mean | max over blocks), A/B rms, on one validation batch.
   MAG_KIND=add python -m scripts.analysis.adapter_diag RUN_DIR STEP [STEP ...]"""
 import sys, numpy as np, torch
 from scripts.analysis.induction_heads import load
-from ttf.flip import KernelTernaryLinear, _KernelTernFn
+from ttf.layers import KernelTernaryLinear, _KernelTernFn
 from ttf.train import get_batch
 
 run, steps = sys.argv[1], sys.argv[2:]

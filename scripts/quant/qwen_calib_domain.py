@@ -12,7 +12,7 @@ import numpy as np
 import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from ttf.qwen import build_qwen, load_qwen, convert_qwen_streaming     # noqa: E402
-from ttf.flip import KernelTernaryLinear, enable_rc_scales            # noqa: E402
+from ttf.layers import KernelTernaryLinear, enable_rc_scales            # noqa: E402
 
 ap = argparse.ArgumentParser(); ap.add_argument("hf_dir"); ap.add_argument("--calib", required=True)
 ap.add_argument("--eval", required=True); ap.add_argument("--n", type=int, default=12); ap.add_argument("--seq", type=int, default=2048)

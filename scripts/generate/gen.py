@@ -4,7 +4,7 @@
 """
 import argparse, torch
 from tokenizers import Tokenizer
-from ttf.flip import build_kernel_transformer
+from ttf.layers import build_kernel_transformer
 from ttf.master import build_master_transformer
 
 ap = argparse.ArgumentParser()

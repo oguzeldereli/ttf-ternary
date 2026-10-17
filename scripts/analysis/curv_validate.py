@@ -6,7 +6,7 @@ A flip helps iff |g_q| > H_q/2.
 import math, numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from ttf.config import TrainConfig
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.bitlinear import _act_quant_ste
 from ttf.kernel import unpack_rows, trit_beta, pack_rows
 from ttf.train import get_batch

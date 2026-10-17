@@ -12,7 +12,7 @@ EVAL_BATCHES fresh batches; a random subset of the proposal with the same count 
 the control (fewer flips alone is known to help).
 """
 import sys, numpy as np, torch
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.kernel import fused_flip, unpack_rows, pack_rows
 from ttf.train import get_batch
 dev = "cuda"

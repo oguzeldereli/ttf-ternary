@@ -1,7 +1,7 @@
 """Build 27B once, sweep seq lengths to find what fits on the local GPU."""
 import time, sys, torch
 from ttf.config import ModelConfig
-from ttf.flip import build_kernel_transformer as build_stateless_transformer
+from ttf.layers import build_kernel_transformer as build_stateless_transformer
 from ttf.opt8 import Adam8bit
 
 VOCAB = int(sys.argv[1]) if len(sys.argv) > 1 else 32000

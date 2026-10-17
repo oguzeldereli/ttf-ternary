@@ -12,7 +12,7 @@ gradient vector"). Trit changes are in trit units; cosines are scale-free within
 """
 import math, os, numpy as np, torch, torch.nn.functional as F
 from ttf.master import MasterTernaryLinear
-from ttf.flip import KernelTernaryLinear, set_flip_rate
+from ttf.layers import KernelTernaryLinear, set_flip_rate
 from ttf.kernel import unpack_rows
 from scripts.mlp.mlp_lab import MLPLM, windows
 

@@ -6,7 +6,7 @@ Usage:
 """
 import json, re, argparse, torch
 from ttf.config import ModelConfig
-from ttf.flip import build_kernel_transformer, build_stateless_transformer
+from ttf.layers import build_kernel_transformer, build_stateless_transformer
 from ttf.model import BitTransformer
 
 PAT = re.compile(r"\w+|[^\w\s]")

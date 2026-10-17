@@ -6,7 +6,7 @@ import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
 import ttf.train as T
-from ttf.flip import KernelTernaryLinear
+from ttf.layers import KernelTernaryLinear
 
 dev = "cuda"
 Tk, M = 4096, 8                                   # tokens per micro-batch (2 x 2048), micro-batches per step

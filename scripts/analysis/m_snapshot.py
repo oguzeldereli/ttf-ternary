@@ -15,7 +15,7 @@ running job) and reports per layer, averaged over layers:
 """
 import sys, numpy as np, torch
 import torch.nn.functional as F
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.train import get_batch
 
 dev = "cuda"

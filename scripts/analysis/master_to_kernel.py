@@ -9,7 +9,7 @@ state starts fresh. Prints master's and the converted model's held-out loss on t
 import os, sys, numpy as np, torch
 import ttf.model as BM
 from ttf.master import build_master_transformer
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear, enable_rc_scales
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear, enable_rc_scales
 from ttf.kernel import pack_rows
 
 src, out = sys.argv[1], sys.argv[2]

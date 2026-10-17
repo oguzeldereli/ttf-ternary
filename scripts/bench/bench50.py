@@ -1,6 +1,6 @@
 import time, torch
 from ttf.config import ModelConfig
-from ttf.flip import build_kernel_transformer
+from ttf.layers import build_kernel_transformer
 from ttf.opt8 import Adam8bit
 dev='cuda'
 # ~50M: dim512 L12 hidden1408, vocab32k

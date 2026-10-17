@@ -13,7 +13,7 @@ For each checkpoint (same flip rate everywhere, one step, kernel path):
   python efficiency_test.py ckpt1.pt ckpt2.pt ...
 """
 import sys, numpy as np, torch
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.kernel import fused_flip, unpack_rows, pack_rows, trit_beta
 from ttf.train import get_batch, gpu_temp
 import time

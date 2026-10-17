@@ -3,7 +3,7 @@
 throughput is compute-bound ~ 1/params, like any bf16 model."""
 import time, sys, torch
 from ttf.config import ModelConfig
-from ttf.flip import build_stateless_transformer
+from ttf.layers import build_stateless_transformer
 from ttf.opt8 import Adam8bit
 
 SEQ = 1024; BS = 1; dev = "cuda"

@@ -17,7 +17,7 @@ eval: scores flip sets against gbar: count, precision (share with D * gbar < 0),
 """
 import sys, os, json, numpy as np, torch
 import torch.nn.functional as F
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.kernel import fused_flip, unpack_rows, pack_rows
 from ttf.train import get_batch
 
@@ -33,14 +33,14 @@ def load_model(ckpt):
     m = build_kernel_transformer(b["cfg"], grad_checkpoint=True, beta=b.get("beta", True),
                                  int8=b.get("int8", True), dw_mode=b.get("dw_mode", "dense"), g_ref=G_REF)
     if any(k.endswith("row_scale") for k in b["model"]):     # --rc_scale runs: learned row/column scales
-        from ttf.flip import enable_rc_scales
+        from ttf.layers import enable_rc_scales
         enable_rc_scales(m)
     for p in m.float_tail_parameters():
         p.data = p.data.float()
     magA = [k for k in b["model"] if k.endswith("mag_A")]          # --lowrank_mag runs (additive unless MAG_KIND=mul)
     if magA:
         import os
-        from ttf.flip import KernelTernaryLinear
+        from ttf.layers import KernelTernaryLinear
         r = b["model"][magA[0]].shape[1]
         for l in m.modules():
             if isinstance(l, KernelTernaryLinear):

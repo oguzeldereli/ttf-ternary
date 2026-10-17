@@ -7,7 +7,7 @@ is c = |mu|^2 / (|mu|^2 + var_half), so the full-batch SNR is 2c/(1-c).
   python3 diag_snr.py --ckpt checkpoints/wiki_mf/ckpt.pt --data data/wiki_gpt2_20m_train.bin
 """
 import argparse, numpy as np, torch
-from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf.model import BitTransformer
 
 ap = argparse.ArgumentParser()

@@ -2,7 +2,7 @@
 restores unit output scale, and un-collapses attention on a fresh model."""
 import math, torch
 from ttf.kernel import pack_rows, unpack_rows, trit_beta
-from ttf.flip import KernelTernaryLinear, build_kernel_transformer, _act_quant_plain
+from ttf.layers import KernelTernaryLinear, build_kernel_transformer, _act_quant_plain
 from ttf.config import ModelConfig
 from ttf import model as M
 

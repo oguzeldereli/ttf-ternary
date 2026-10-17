@@ -7,7 +7,7 @@
   python -m scripts.analysis.plateau RUN_DIR [kernel|master]"""
 import sys, glob, re, numpy as np, torch
 from scripts.analysis.induction_heads import load
-from ttf.flip import KernelTernaryLinear
+from ttf.layers import KernelTernaryLinear
 from ttf.kernel import unpack_rows
 from ttf.train import get_batch
 

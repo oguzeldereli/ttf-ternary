@@ -7,7 +7,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
 import ttf.train as T
-from ttf.flip import KernelTernaryLinear
+from ttf.layers import KernelTernaryLinear
 from ttf.kernel import unpack_rows
 
 dev = "cuda"

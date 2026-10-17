@@ -2,7 +2,7 @@
 Same 27B layer geometry, vary n_layers, measure peak VRAM for 1 fwd+bwd."""
 import torch
 from ttf.config import ModelConfig
-from ttf.flip import build_stateless_transformer
+from ttf.layers import build_stateless_transformer
 from ttf.opt8 import Adam8bit
 
 dev = "cuda"; SEQ = 1024

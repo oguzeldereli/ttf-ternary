@@ -340,7 +340,7 @@ def _mag_svd_init(lin, W, T, a, c, beta, hess, i, name, method, r, dev):
 def init_from_hf(model, path, mode, method="als", rc=False, log=print, hess=None):
     """copy / convert the checkpoint into model (built with model_config_from_hf). method gptq / gptqc needs
     hess = calib_hessians(...)"""
-    from .flip import KernelTernaryLinear
+    from .layers import KernelTernaryLinear
     from .kernel import pack_rows, trit_beta
     from .master import MasterTernaryLinear
     if method == "scratch":       # the checkpoint's shape only, random init (the baseline for the same model)
