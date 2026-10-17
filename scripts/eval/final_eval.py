@@ -38,7 +38,8 @@ def load_model(path, device, mag_kind="add"):
     # the low-rank latent baseline) are read by ttf.legacy, the code they were trained with
     legacy = mag_kind != "add" or any(k.endswith((".bpacked", ".rot_Q", "mag_At.col_scale", "lora_B")) for k in sd)
     P = "ttf.legacy" if legacy else "ttf"
-    FL, MA = importlib.import_module(P + ".flip"), importlib.import_module(P + ".master")
+    FL = importlib.import_module("ttf.legacy.flip" if legacy else "ttf.layers")
+    MA = importlib.import_module(P + ".master")
     KernelTernaryLinear, MasterTernaryLinear = FL.KernelTernaryLinear, MA.MasterTernaryLinear
     Attention = importlib.import_module(P + ".model").Attention
     kw = dict(beta=ck.get("beta", False), int8=ck.get("int8", False), int8_dx=ck.get("int8_dx", False))
