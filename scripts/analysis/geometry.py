@@ -55,7 +55,8 @@ def spec(W):
 def eff_weight(lin):
     K = lin.in_features if hasattr(lin, "in_features") else lin.K
     I = torch.eye(K, device=dev)
-    return lin(I).float().T                                                  # [N, K]
+    z = torch.zeros(1, K, device=dev)                                        # the affine part (gptqc: b - W mu) apart
+    return (lin(I).float() - lin(z).float()).T                               # [N, K]
 
 
 def zero_layout(T):

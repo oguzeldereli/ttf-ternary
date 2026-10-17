@@ -32,7 +32,8 @@ WRITE, READ = ("wo", "w_down"), ("wq", "wk", "wv", "w_gate", "w_up")
 @torch.no_grad()
 def eff(lin):
     K = lin.in_features if hasattr(lin, "in_features") else lin.K
-    return lin(torch.eye(K, device=dev)).float().T                       # [N, K]
+    z = torch.zeros(1, K, device=dev)                                    # the affine part (gptqc: b - W mu) apart
+    return (lin(torch.eye(K, device=dev)).float() - lin(z).float()).T     # [N, K]
 
 
 @torch.no_grad()
