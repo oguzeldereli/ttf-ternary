@@ -1,10 +1,10 @@
 # data + derived tokens (corpus is restricted — never commit)
 corpus/
-data/
+/data
 *.bin
 
 # model checkpoints / weights
-checkpoints/
+/checkpoints
 *.pt
 
 # logs + scratch
@@ -17,4 +17,4 @@ __pycache__/
 *.pyo
 .ipynb_checkpoints/
 
-models/
+/models
