@@ -1,3 +1,0 @@
-# NAME flags, one run per line; the first non-comment line runs next. Default order, revised after the swing arms.
-gate_rc_s0 --rc_scale --lr_gate
-vnorm_rc_s0 --rc_scale --lr_vnorm 0.99

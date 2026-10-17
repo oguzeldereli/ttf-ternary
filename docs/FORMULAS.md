@@ -1,8 +1,9 @@
 # Formulas
 
 Every update rule used in this project: the current recipe first, then each mechanism that was tried, with its flag
-and result. Flags are `ttf/train.py` arguments; results are final validation loss at 300M tokens (110M model,
-from scratch) unless noted. Run details: [RUNS.md](RUNS.md), run list: [RUN_INDEX.md](RUN_INDEX.md).
+and result. Flags are those of the trainer up to 17 Oct 2026 (`python -m ttf.legacy.train`; the current options of
+the kept ones: [OPTIONS_MAP.md](OPTIONS_MAP.md)); results are final validation loss at 300M tokens (110M model,
+from scratch) unless noted. Run details: the results database (`python scripts/results.py show NAME`).
 
 Notation, per ternary layer: trits $T\in\{-1,0,1\}^{N\times K}$; the batch gradient with respect to the trits
 $g=\partial L/\partial T$ ($N\times K$, one batch of $16\times2048$ tokens); the momentum $M$; step $t$ of $T_{\max}=9155$.
@@ -90,7 +91,7 @@ extras (`mx_extras_*`) is the fair reference (running).
 
 Final recipe (110M): `--ts --ts_nomom --lowrank 512 --ts_rank_s 512 --ts_theta 16 --ts_tau 1000 --ts_anneal 0.75
 --ts_tau_anneal --ts_fused --gemm int8mm --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp`. Results of each flag:
-paper Appendix "Index of mechanisms and results" and docs/RUN_INDEX.md.
+paper Appendix "Index of mechanisms and results" and docs/RUN_INDEX.md (tag pre-consolidation-2026-10-17).
 
 | flag | what it does |
 |---|---|
@@ -172,7 +173,7 @@ $$G\leftarrow0.99\,G+0.01\,\|g\|,\qquad f=\frac{\max(\|M\|-D\,G,\ 0)}{\|M\|},\qq
 
 With the relative flip rule this is a global decay $b_{\text{eff}}=f=1-DG/\|M\|$ that sets its own memory:
 measured 0.9954 / 0.9965 / 0.9960 / 0.9974 (memory 219 / 283 / 251 / 388 steps) at steps 1000 / 3000 / 6000 / 9154 of
-`gvsharp_dry_s0` (`scripts/analysis/eff_beta.py`). $D=0.0303$ (1/33).
+`gvsharp_dry_s0` (`scripts/analysis/eff_beta.py` at tag `pre-consolidation-2026-10-17`). $D=0.0303$ (1/33).
 
 **2.6 Spend** (`--spend c`). A flip consumes the push that caused it. With $\Delta=T_{\text{new}}-T_{\text{old}}$ (so
 $\Delta_{ij}=-\operatorname{sign}S_{ij}$ where a trit moved) and $m_0=\operatorname{mean}|M|$ before the Adam step:

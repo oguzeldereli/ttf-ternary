@@ -192,7 +192,7 @@ def convert_seq_asym(path, data_path, n_seq=32, seq=2048, dev="cuda", damp=0.01,
         b = W mu_x, mu_hat = E[x_hat]  (covariances of the centred inputs)
     so each layer repairs part of the error that arrives from below, the inputs' mean (the fp residual stream's large
     constant offset) passes exactly, and GPTQ's precision goes to the varying part. 110M: rounding gap +0.364 (plain
-    GPTQ) -> +0.274 (scripts/analysis/seq_gptq.py). Returns {(block, name): (T int8, a, c, mu_hat, b)} on the CPU."""
+    GPTQ) -> +0.274 (scripts/analysis/seq_gptq.py, tag pre-consolidation-2026-10-17). Returns {(block, name): (T int8, a, c, mu_hat, b)} on the CPU."""
     import numpy as np
     import torch.nn as nn
     from .model import BitTransformer

@@ -67,7 +67,9 @@ is an early 60-step probe; a release model (about 40M tokens of recovery with di
 ## Memory
 
 - A 23.0B-parameter model (22.85B ternary) trains on one 16 GB GPU (11.1–11.6 GiB at ranks 256–1024, state in host memory with
-  asynchronous copies; `scripts/lab/b27_lean.sh`). At its leanest it peaks at 9.73 GiB.
+  asynchronous copies; measured with `scripts/lab/b27_lean.sh` at tag `pre-consolidation-2026-10-17`). At its leanest it
+  peaks at 9.73 GiB. The core keeps the host offload with synchronous copies (`--ttf-offload host`); the asynchronous
+  variant is in `ttf.legacy` (`--ts_offload_async`).
 - **Micro-batches without a dense gradient** (`--ttf-accum micro`, the default): each micro-batch's gradient enters the state and is
   discarded; 4 × 4 micro-batches match one pass of batch 16 over the full schedule (2.6733 vs 2.6728) at 3.1 instead of
   7.4 GiB.
