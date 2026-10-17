@@ -1388,23 +1388,29 @@ def _ts_layer_factored(l, fg, state, c):
         _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
     from .kernel import unpack_rows, pack_rows
-    A = U @ V.T
-    w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
-    d = A.sign()
-    fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
-    del A
     before = l.wpacked.clone() if l.track else None
-    D = torch.where(fire, d, torch.zeros_like(d))
-    nf = fire.sum()
-    l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))
-    U = U - c["spend"] * (theta * (D @ V))
+    if FIRE_FUSED[0] and dev.type == "cuda":   # --ts_fire_fused: A, the moves, the repack and D V in one kernel
+        from .kernel import ttf_fire
+        DV, nf = ttf_fire(U, V, l.wpacked, l.K, theta)
+        U = U - c["spend"] * (theta * DV); del DV
+    else:
+        A = U @ V.T
+        w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
+        d = A.sign()
+        fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
+        del A
+        D = torch.where(fire, d, torch.zeros_like(d))
+        nf = fire.sum()
+        l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))
+        U = U - c["spend"] * (theta * (D @ V))
     _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
-    st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
+    st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
     if before is not None:
         l._record_flips(before, l.wpacked)
 
 
 MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "64"))]   # sketch size (TERN_MICRO_K: tests only)
+FIRE_FUSED = [False]          # --ts_fire_fused (with --ts_factored): bitnet.kernel.ttf_fire
 
 
 def _micro_sketch(l, dev, step):
@@ -3156,6 +3162,9 @@ def main():
     ap.add_argument("--data_u32", action="store_true", help="--data / --val are uint32 token streams (vocabularies above 65536)")
     ap.add_argument("--init_hidden", type=int, default=0, help="--init_hf_method native: FFN hidden width of the student "
                     "(default the checkpoint's); a wider ternary FFN can hold the fp model's crowded features apart")
+    ap.add_argument("--hid_kd", type=float, default=0.0, help="--distill: W > 0 adds W x the error of every block's "
+                    "update against the teacher block's (mean and varying parts, each relative), along the student's "
+                    "own path, to the global loss (more targets per token than the logits)")
     ap.add_argument("--local_kd", type=int, default=0, help="steps of block-local distillation first (needs --distill, "
                     "a Llama-type teacher): each block learns the teacher block's map from the teacher's input")
     ap.add_argument("--dw_fp32", action="store_true", help="the dense weight gradient comes out of the GEMM in fp32 "
@@ -3289,6 +3298,8 @@ def main():
     ap.add_argument("--init_mag_svd", type=int, default=0, help="--init_hf gptq / gptqc with --lowrank_mag add:R: the "
                     "float adapters start from the best rank-R part of each layer's rounding error (in the input "
                     "covariance's norm) instead of 0: the lost precision moved into the float part (hf_init._mag_svd_init)")
+    ap.add_argument("--ts_fire_fused", action="store_true", help="--ts_factored: the firing (A = U V^T, legal moves, "
+                    "repack, the spend's D V) in one kernel (bitnet.kernel.ttf_fire): no [N, K] temporaries")
     ap.add_argument("--ts_factored", type=int, default=0, help="--ts --ts_nomom --ts_fused: K > 0: the TTF update from "
                     "the factors of the weight gradient (g = gy^T x is never formed; the sums of g^2 from a K-column "
                     "sketch; see _ts_layer_factored). Dense on --ts_vdiag / --ts_diag steps")
@@ -4338,6 +4349,7 @@ def main():
             m_.ts_micro = bool(args.ts_micro)
         print("--ts_fused: the update runs inside each layer's backward", flush=True)
         ts_cfg["factored"] = args.ts_factored
+        FIRE_FUSED[0] = bool(args.ts_fire_fused)
         if args.ts_factored:
             assert args.ts_nomom and not args.lr_gate and not args.ts_shadow and not args.ts_shared_v and not args.ts_sketch \
                 and not args.ts_resid and not args.ts_rescale and not args.ts_table and not args.ts_exact_spend \
@@ -4557,7 +4569,12 @@ def main():
                     model.local_h = _teacher.hiddens(x)
             elif _teacher is not None:   # --distill: the full-precision model's next-token distribution for this batch
                 with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
-                    tz_, _ = _teacher(x)
+                    if args.hid_kd:      # --hid_kd: the teacher's stream at every block boundary too (one forward)
+                        model.hid_t = _teacher.hiddens(x); model.hid_w = args.hid_kd
+                        tz_ = F.linear(_teacher.norm(model.hid_t[-1]),
+                                       _teacher.tok_emb.weight if _teacher.lm_head is None else _teacher.lm_head.weight)
+                    else:
+                        tz_, _ = _teacher(x)
                 tz_ = tz_.reshape(-1, tz_.shape[-1])   # in row chunks: the fp32 copy of all logits is ~4 GB at 32k tokens
                 model.kd_logp = torch.cat([F.log_softmax(c_.float(), -1).to(torch.bfloat16) for c_ in tz_.split(4096)]); del tz_
             _areg.clear()
@@ -4588,6 +4605,10 @@ def main():
             with torch.profiler.record_function("model.bwd"):   # includes the fused TTF updates (ttf.update)
                 (loss * sc_ / tc.grad_accum).backward()  # triggers BitLinear fused updates (--spike_test S:F: x F at step S)
             model.kd_logp = None
+            if args.hid_kd:
+                model.hid_t = None
+                if micro == 0 and step % 50 == 0:
+                    print(f"hid_kd: step {step} block-update error {model.hid_last:.4f}", flush=True)
             if getattr(model, "local_h", None) is not None:
                 model.local_h = None
                 if step + 1 == args.local_kd:   # the local phase ends: free its buffers before the KD logits arrive

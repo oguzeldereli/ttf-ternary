@@ -267,6 +267,9 @@ class BitTransformer(nn.Module):
         return (1 - a) * F.nll_loss(lp, tgt, ignore_index=-1, reduction="sum") + a * kl
 
     local_h = None        # --local_kd: the teacher's residual stream at every block boundary for this batch
+    hid_t = None          # --hid_kd: the same, matched along the student's own path during global training
+    hid_w = 0.0
+    hid_last = 0.0
 
     @torch.no_grad()
     def hiddens(self, idx):
@@ -292,12 +295,18 @@ class BitTransformer(nn.Module):
         tot = 0.0
         for i, layer in enumerate(self.layers):
             out = layer(hs[i].detach(), fc, ckpt=ckpt)
-            ds, dt = (out - hs[i]).float(), (hs[i + 1] - hs[i]).float()
-            ms, mt = ds.mean((0, 1)), dt.mean((0, 1))
-            cs, ct = ds - ms, dt - mt
-            tot = tot + (ms - mt).pow(2).sum() / mt.pow(2).sum().clamp_min(1e-6) \
-                + (cs - ct).pow(2).mean() / ct.pow(2).mean().clamp_min(1e-6)
+            tot = tot + self._rel_update_err(out - hs[i], hs[i + 1] - hs[i])
         return tot / len(self.layers)
+
+    @staticmethod
+    def _rel_update_err(ds, dt):
+        """a block's update d = h_out - h_in against the teacher's, in two parts, each relative to the teacher's: the mean
+        over tokens (the constant offset the fp stream carries) and the varying rest"""
+        ds, dt = ds.float(), dt.float()
+        ms, mt = ds.mean((0, 1)), dt.mean((0, 1))
+        cs, ct = ds - ms, dt - mt
+        return (ms - mt).pow(2).sum() / mt.pow(2).sum().clamp_min(1e-6) \
+            + (cs - ct).pow(2).mean() / ct.pow(2).mean().clamp_min(1e-6)
 
     def forward(self, idx, targets=None):
         if self.local_h is not None and targets is not None:
@@ -311,8 +320,12 @@ class BitTransformer(nn.Module):
         fc = self.freqs_cis.to(h.device)
         ckpt = self.grad_checkpoint and self.training
         n_ck = len(self.layers) - self.ckpt_skip
+        ht, hid = self.hid_t, 0.0
         for i, layer in enumerate(self.layers):
+            h_in = h
             h = layer(h, fc, ckpt=ckpt and i < n_ck)
+            if ht is not None and targets is not None:   # --hid_kd: this block's update on the student's own path
+                hid = hid + self._rel_update_err(h - h_in, ht[i + 1] - ht[i])   # against the teacher block's
         h = self.norm(h)
         w = self.tok_emb.weight if self.lm_head is None else self.lm_head.weight
         if targets is None:
@@ -334,6 +347,9 @@ class BitTransformer(nn.Module):
             total = total + (checkpoint(self._loss_chunk, hc, w, tc, use_reentrant=False)
                              if ckpt else self._loss_chunk(hc, w, tc))
         loss = total / (tf != -1).sum().clamp_min(1)
+        if ht is not None:
+            self.hid_last = float(hid) / len(self.layers)
+            loss = loss + self.hid_w * hid / len(self.layers)
         aux = [l.ffn.aux_loss for l in self.layers if getattr(l.ffn, "aux_loss", None) is not None]
         if aux and self.moe_aux_w:
             loss = loss + self.moe_aux_w * torch.stack(aux).mean()

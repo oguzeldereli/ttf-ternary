@@ -87,9 +87,10 @@ case $ARM in
   gptqc_ts0_kd0) F="$DATA $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF" ;;   # labels only
   # compute tests (17 Oct): the same recipe (gptqc_ts0_kd075) through micro-batches as the 27B runs it, then each change
   # (--int8_dx, --ts_factored) against it; dx8: int8 input gradients at the plain 16 x 1 batch
-  spd_ref|spd_ref_s2|spd_dx8|spd_fact*) B4="${DATA/--batch_size 16 --grad_accum 1/--batch_size 4 --grad_accum 4} --ts_micro"
+  spd_ref|spd_ref_s2|spd_dx8|spd_fact*|spd_hkd*|spd_ffire*) B4="${DATA/--batch_size 16 --grad_accum 1/--batch_size 4 --grad_accum 4} --ts_micro"
     F="$B4 $TTF $(echo $CONV | sed "s/method gptq /method gptqc /; s/--ts_start 400/--ts_start 0/") --init_hf $HF --distill $HF --distill_w 0.75"
-    case $ARM in spd_ref_s2) F="$F --seed 2" ;; spd_dx8) F="$F --int8_dx" ;; spd_fact*) F="$F --ts_factored ${ARM#spd_fact}" ;; esac ;;
+    case $ARM in spd_ref_s2) F="$F --seed 2" ;; spd_dx8) F="$F --int8_dx" ;; spd_fact*) F="$F --ts_factored ${ARM#spd_fact}" ;;
+      spd_ffire*) F="$F --ts_factored ${ARM#spd_ffire} --ts_fire_fused" ;; spd_hkd*) F="$F --hid_kd ${ARM#spd_hkd}" ;; esac ;;   # hid_kd: block-update KD
   # --init_mag_svd (17 Oct): the rounding error's best rank-R part (input-covariance norm) in the float adapter at the
   # start, vs the adapter of the same rank at 0 (zR); training-free 110M: R 16 / 64 / 256 take the start 2.879 -> 2.794 /
   # 2.729 / 2.630 (fp 2.575)

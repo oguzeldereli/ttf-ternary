@@ -179,9 +179,12 @@ def main():
             m = re.search(r"seed(\d+)", res["run"])
             seed = a.seed if a.seed is not None else (int(m.group(1)) if m else 1337)
             cv = np.memmap(a.check_val, dtype=np.uint16, mode="r") if a.check_val else wiki
-            res["train_protocol_loss"] = train_protocol_loss(model, cv, seed, device)
             log = os.path.join(run, "train.log")
-            fin = re.findall(r"FINAL val loss ([\d.]+)", open(log).read()) if os.path.exists(log) else []
+            lt = open(log).read() if os.path.exists(log) else ""
+            it_ = re.findall(r"--eval_iters (\d+)", lt)      # the run's own number of val batches (the check compared
+            res["check_iters"] = int(it_[-1]) if it_ else 30   # 30 with runs that logged 8: a false 'not rebuilt')
+            res["train_protocol_loss"] = train_protocol_loss(model, cv, seed, device, iters=res["check_iters"])
+            fin = re.findall(r"FINAL val loss ([\d.]+)", lt)
             res["logged_final"] = float(fin[-1]) if fin else None
             res["check_diff"] = None if not fin else res["train_protocol_loss"] - float(fin[-1])
             if res["check_diff"] is not None and abs(res["check_diff"]) > 1e-3:   # the model was not rebuilt as trained

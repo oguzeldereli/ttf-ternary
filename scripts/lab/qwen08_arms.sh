@@ -30,6 +30,10 @@ fi
 run() { [ -n "$ONLY" ] && [ "$1" != "$ONLY" ] && return; N=$1; shift; mkdir -p checkpoints/$N; python -m bitnet.train $F --steps 400 --no_final_save "$@" --out_dir checkpoints/$N > logs/$N.txt 2>&1
         echo "$(date '+%T') $N: $(grep 'val loss' logs/$N.txt | tr -s ' ' | cut -d' ' -f4 | tr '\n' ' ') $(grep -c Traceback logs/$N.txt) tracebacks"; }
 run q08_gqc_ts0 --init_hf_method gptqc --ts_start 0
+# 17 Oct: the float adapters from the rounding error (--init_mag_svd R) vs the same rank at 0 (ONLY=... runs one)
+run q08_gqc_ts0_msvd16 --init_hf_method gptqc --ts_start 0 --init_mag_svd 16
+run q08_gqc_ts0_msvd64 --init_hf_method gptqc --ts_start 0 --lowrank_mag add:64 --init_mag_svd 64
+run q08_gqc_ts0_z64 --init_hf_method gptqc --ts_start 0 --lowrank_mag add:64
 run q08_gq_ts0 --init_hf_method gptq --ts_start 0
 run q08_gq_s120 --init_hf_method gptq --ts_start 120
 echo Q08_DONE
