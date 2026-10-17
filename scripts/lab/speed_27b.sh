@@ -7,6 +7,7 @@ N=$1; X=${2:-}; T=/tmp/oguzelde; S=$T/tern; [ -x $S/env/bin/python ] || S=$T/ter
 source $S/env.sh; R=$T/speed/code; mkdir -p $R $T/speed/$N; rsync -a --delete --exclude __pycache__ ~/ternary-LLM/bitnet ~/ternary-LLM/scripts $R/
 cd $R; export PYTHONPATH=$R HF_HUB_OFFLINE=1
 D=$T/speed/$N; ln -sf $T/stage/qw27_rel_ckpt.pt $D/ckpt.pt
+while pgrep -f "[p]ython -m bitnet.train" > /dev/null; do sleep 30; done   # never beside another trainer (OOM)
 for p in $(pgrep -f "[t]eacher_lab4s[.]sh"); do kill $p; done; for p in $(pgrep -f "[t]eacher_topk[.]py"); do kill $p; done
 sleep 15     # the teacher holds ~8.6 GB: it is stopped for the test (its unfinished shard stays claimed: teacher_gaps.sh)
 env TERN_TIME=1 ${PROF:+TERN_PROF=$D} timeout 3000 python -m bitnet.train --init_hf $T/hf27 --init_hf_method gptq --init_stream --resume \
