@@ -1,6 +1,6 @@
 #!/bin/bash
 # Rented box: continue the 27B run (qw27_rel, step 1350) with the 17 Oct compute changes (--ts_factored 128,
-# --ts_fire_fused, --lean_batched) on the mix4s teacher cache (kd4s shards from index 0 at step 1351). Saves every
+# --ts_fire_fused, --lean_batched, --fused_scales, --fused_norm) on the mix4s teacher cache (kd4s shards from index 0 at step 1351). Saves every
 # SAVE_SECS (the puller on the lab side copies each new checkpoint off, train27_pull.sh). Settings by environment:
 #   STEPS (last step, default 2650), THETA (64), ACC (accumulator scale on resume: THETA / 64 when theta changes),
 #   KD (distill weight, 0.5), LRF (rewarm to LRF x the run's peak 5e-4, 0.5), MINLR (5e-5), RW (rewarm steps, 50),
@@ -21,5 +21,6 @@ TERN_TIME=${TIME_STEPS:-0} python -m bitnet.train --init_hf $W/tern/qw27 --init_
   --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --mode kernel --int8 --dw_mode dense --ts --ts_theta ${THETA:-64} \
   --ts_start 400 --ts_tau 1000 --ts_anneal 0.75 --ts_tau_anneal --ts_nomom --ts_fused --gemm int8mm --lowrank 256 \
   --ts_rank_s 256 --ts_vdiag --ts_vdiag_every 50 --ts_store_a fp12s --lean_tail --lean_batched --loss_chunk 512 \
-  --ts_factored 128 --ts_fire_fused --ts_acc_scale ${ACC:-1.0} --mem_cap_gib $CAP ${X:-} --out_dir $D >> $D/train.log 2>&1
+  --ts_factored 128 --ts_fire_fused --fused_scales --fused_norm --ts_acc_scale ${ACC:-1.0} --mem_cap_gib $CAP ${X:-} \
+  --out_dir $D >> $D/train.log 2>&1
 echo "$(date '+%F %T') exit $? $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/box.log
