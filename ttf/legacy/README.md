@@ -23,3 +23,7 @@ The September runs did not keep their full command lines: the flags above are th
 docs/FORMULAS.md (sections 2, 2a, 4, 5), checked on 17 Oct to run (30 steps each on a lab PC). They reproduce the
 method, not necessarily every number to the last digit; the exact code of each historical run is in the git history,
 its recorded results in the results database (`python scripts/results.py show NAME`).
+
+Known issue (found 17 Oct, fixed in the core, kept here as it was): with `--ts_fire_fused` the firing kernel writes the
+packed trits in place without bumping the tensor's version, so each layer's cached beta (1 / sqrt(K rho)) is not
+recomputed after moves until the model is reloaded. Runs with `--ts_fire_fused` trained with the beta of their start.

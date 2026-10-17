@@ -67,3 +67,9 @@ def test_options_map_is_current():
     t = open(p).read()
     for f in A._LEGACY:
         assert f in t, f
+
+
+def test_from_legacy_restored_options():
+    a = A.parse(A.from_legacy(shlex.split(OLD_TTF + " --ts_offload --ts_offload_async --w_cache int8 --dw_fp32")))
+    assert a.ttf_offload == "async" and a.w_cache == "int8" and a.dw_precision == "fp32"
+    assert A.parse(A.from_legacy(shlex.split(OLD_TTF + " --ts_offload_async"))).ttf_offload == "async"

@@ -106,9 +106,9 @@ def _load_pair_(t):
 
 
 def _ts_on_host(args, i, n):
-    """--ttf-offload host with --ttf-offload-keep F: layer i of n (module order) keeps its state in host memory unless
-    it is among the first round(F n)"""
-    return args.ttf_offload == "host" and i >= round(args.ttf_offload_keep * n)
+    """--ttf-offload host | async with --ttf-offload-keep F: layer i of n (module order) keeps its state in host memory
+    unless it is among the first round(F n)"""
+    return args.ttf_offload != "none" and i >= round(args.ttf_offload_keep * n)
 
 
 class _PinnedPool:
@@ -145,6 +145,73 @@ class _PinnedPool:
 _PINNED = _PinnedPool()
 
 
+class _AsyncOffload:
+    """--ttf-offload async: the --ttf-offload host copies on two side streams (host-to-device prefetch, device-to-host
+    write-back), so the PCIe traffic overlaps with the backward pass instead of stalling it. The order in which the
+    update reads its states (v, m, accumulator per layer) is recorded during the first step that reads them and repeats
+    every step; from then on, reading state j prefetches states j+1 .. j+AHEAD (wrapping into the next step). Each
+    write-back records an event that the next fetch of the same state waits for; tensors used on another stream than the
+    one they were allocated on are marked with record_stream, so the caching allocator cannot hand them out early.
+    Host buffers are read by the host only in save_ckpt, which synchronizes first."""
+    AHEAD = 3                                     # one layer's states
+
+    def __init__(self):
+        self.up = self.down = None
+        self.order, self.idx, self.pre, self.done, self.fixed = [], {}, {}, {}, False
+
+    def _fetch(self, d, k, dev):
+        tag = (id(d), k)
+        with torch.cuda.stream(self.up):
+            if tag in self.done:
+                self.up.wait_event(self.done[tag])
+            y = tuple(x.to(dev, non_blocking=True) for x in d[k])
+            ev = self.up.record_event()
+        return y, ev
+
+    def get(self, d, k, dev):
+        if self.up is None:
+            self.up, self.down = torch.cuda.Stream(dev), torch.cuda.Stream(dev)
+        cur, tag = torch.cuda.current_stream(dev), (id(d), k)
+        if not self.fixed:
+            if tag in self.idx:
+                self.fixed = True
+            else:
+                self.idx[tag] = len(self.order); self.order.append((d, k))
+        y, ev = self.pre.pop(tag, None) or self._fetch(d, k, dev)
+        cur.wait_event(ev)
+        for x in y:
+            x.record_stream(cur)
+        if self.fixed and tag in self.idx:
+            n, j = len(self.order), self.idx[tag]
+            for a in range(1, min(self.AHEAD, n - 1) + 1):
+                d2, k2 = self.order[(j + a) % n]
+                if (id(d2), k2) not in self.pre and k2 in d2:
+                    self.pre[(id(d2), k2)] = self._fetch(d2, k2, dev)
+        return y
+
+    def put(self, d, k, v):
+        dev = v[0].device
+        if self.up is None:
+            self.up, self.down = torch.cuda.Stream(dev), torch.cuda.Stream(dev)
+        cur, tag = torch.cuda.current_stream(dev), (id(d), k)
+        self.pre.pop(tag, None)                   # a prefetch issued before this write would be stale
+        self.down.wait_stream(cur)
+        old = d.get(k)
+        with torch.cuda.stream(self.down):
+            if (old is not None and len(old) == len(v) and all(o.device.type == "cpu" and o.shape == x.shape and
+                                                               o.dtype == x.dtype and _PINNED.owns(o) for o, x in zip(old, v))):
+                for o, x in zip(old, v):
+                    o.copy_(x, non_blocking=True)
+            else:
+                d[k] = tuple(_PINNED.empty(x.shape, x.dtype).copy_(x, non_blocking=True) for x in v)
+            for x in v:
+                x.record_stream(self.down)
+            self.done[tag] = self.down.record_event()
+
+
+_OFFLOAD = _AsyncOffload()
+
+
 def _host_get(d, k, dev, off):
     with torch.profiler.record_function("ttf.store"):
         return _host_get_(d, k, dev, off)
@@ -153,6 +220,8 @@ def _host_get(d, k, dev, off):
 def _host_get_(d, k, dev, off):
     """--ttf-offload host: a state tuple kept in pinned host memory, copied to the GPU for this layer's update (the copy is
     queued on the current stream, so it is ordered before the kernels that read it; no host sync)"""
+    if off == "async":
+        return _OFFLOAD.get(d, k, dev)
     v = d[k]
     return tuple(x.to(dev, non_blocking=True) for x in v) if off else v
 
@@ -168,6 +237,8 @@ def _host_put_(d, k, v, off):
     if not off:
         d[k] = v
         return
+    if off == "async":
+        return _OFFLOAD.put(d, k, v)
     old = d.get(k)
     if (old is not None and len(old) == len(v) and all(o.device.type == "cpu" and o.shape == x.shape and o.dtype == x.dtype
                                                        and _PINNED.owns(o) for o, x in zip(old, v))):
@@ -471,6 +542,7 @@ def _ts_layer_factored(l, fg, state, c):
     if FIRE_FUSED[0] and dev.type == "cuda":   # --fire fused: A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
         DV, nf = ttf_fire(U, V, l.wpacked, l.K, theta)
+        l._invalidate()        # the kernel writes the trits in place (no version bump): beta and --w-cache recompute
         U = U - c["spend"] * (theta * DV); del DV
     else:
         A = U @ V.T

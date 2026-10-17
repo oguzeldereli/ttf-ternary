@@ -88,7 +88,9 @@ def build_parser():
     g.add_argument("--ttf-store", default="fp32", choices=["fp32", "bf16", "fp16", "fp16s", "fp12s", "fp8", "int8",
                                                             "int8det"],
                    help="storage of U and V (fp12s: 1.5 bytes per value)")
-    g.add_argument("--ttf-offload", default="none", choices=["none", "host"], help="host: the state in pinned host memory")
+    g.add_argument("--ttf-offload", default="none", choices=["none", "host", "async"],
+                   help="host: the state in pinned host memory, copied per layer; async: the copies on side streams, "
+                        "prefetched in the update's order (overlapping the backward; the same values)")
     g.add_argument("--ttf-offload-keep", type=float, default=0.0, help="--ttf-offload host: this share of the layers "
                    "(module order) keeps its state on the GPU")
     g.add_argument("--ttf-vdiag", type=int, default=0, help="every N steps log g^2 / v (0: off)")
@@ -96,6 +98,8 @@ def build_parser():
                    help="factored: the update from the gradient's factors (gy, x), the dense weight gradient never "
                         "formed (equal loss to dense at 110M)")
     g.add_argument("--dw-sketch", type=int, default=256, help="--dw factored: sketch size for the sums of g^2")
+    g.add_argument("--dw-precision", default="bf16", choices=["bf16", "fp32"],
+                   help="--dw dense: the weight gradient's GEMM output (fp32: no bf16 rounding)")
     g.add_argument("--fire", default="fused", choices=["fused", "torch"], help="--dw factored: the firing in one kernel")
 
     g = ap.add_argument_group("kernels and memory")
@@ -105,6 +109,9 @@ def build_parser():
                    "activations")
     g.add_argument("--dx", default="bf16", choices=["bf16", "int8"], help="the input gradient's GEMM")
     g.add_argument("--fused-scales", action=ON, default=True, help="the scales' and adapter's elementwise work fused")
+    g.add_argument("--w-cache", default="off", choices=["off", "int8"],
+                   help="int8: each layer's unpacked trits kept between updates (1 byte per weight more; the same "
+                        "values; faster with --gemm int8mm / cublas where memory allows)")
     g.add_argument("--fused-norm", action=ON, default=True, help="Qwen: RMSNorm in one kernel each way")
     g.add_argument("--tf32", action=ON, default=False, help="TF32 for fp32 matmuls")
     g.add_argument("--ckpt", default="layer", choices=["layer", "block"],
@@ -213,7 +220,8 @@ _LEGACY = {
     "--ts_micro": _FLAG("--ttf-accum", "micro"), "--ckpt_block": _FLAG("--ckpt", "block"),
     "--no_final_save": _FLAG("--no-final-save", None), "--mem_snapshot": _SAME("--mem-snapshot"),
     "--eval_first_n": _SAME("--eval-first-n"), "--mem_report": _FLAG("--mem-report", None),
-    "--ts_offload": _FLAG("--ttf-offload", "host"), "--ts_offload_keep": _SAME("--ttf-offload-keep"),
+    "--ts_offload": _FLAG("--ttf-offload", "host"), "--ts_offload_async": None, "--dw_fp32": _FLAG("--dw-precision", "fp32"),
+    "--w_cache": _SAME("--w-cache"), "--ts_offload_keep": _SAME("--ttf-offload-keep"),
     "--ts_fused": _FLAG("--ttf-update", "fused"), "--ts_anneal": _SAME("--ttf-step-p"),
     "--ts_tau_anneal_pow": _SAME("--ttf-leak-pow"), "--ts_tau_anneal": _FLAG("--ttf-leak", "annealed"),
     "--ts_tau": _SAME("--ttf-tau"), "--ts_b2": _SAME("--ttf-b2"), "--tf32": _FLAG("--tf32", None),
@@ -246,7 +254,8 @@ _OLD_DEFAULTS = [("--mode", ["--mode", "ttf"]), ("--gemm", ["--gemm", "triton"])
 _OLD_BOOL = {"--qk_temp", "--ts", "--init_stream", "--data_u32", "--ts_vdiag", "--ts_nomom", "--lr_linear",
              "--lean_batched", "--lean_tail", "--ts_fire_fused", "--fused_norm", "--fused_scales", "--ts_micro",
              "--ckpt_block", "--no_final_save", "--mem_report", "--ts_offload", "--ts_fused", "--ts_tau_anneal", "--tf32",
-             "--int8", "--int8_dx", "--tail_fp32", "--track_flips", "--resume", "--rc_scale", "--compile", "--pipe"}
+             "--int8", "--int8_dx", "--tail_fp32", "--track_flips", "--resume", "--rc_scale", "--compile", "--pipe",
+             "--ts_offload_async", "--dw_fp32"}
 
 
 def from_legacy(argv):
@@ -273,6 +282,8 @@ def from_legacy(argv):
             out += [x for x in m(v) if x is not None]
     if vd[0]:
         out += ["--ttf-vdiag", str(vd[1] or 1)]
+    if "--ts_offload_async" in argv:
+        out += ["--ttf-offload", "async"]          # (with or without --ts_offload)
     for f, new in _OLD_OFF + _OLD_DEFAULTS:
         if f not in seen:
             out += new

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ttf-ternary"
+version = "0.2.0.dev0"
+description = "Two-timescale threshold flips (TTF): training and converting ternary language models without master weights"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "Özgür Güzeldereli"}]
+requires-python = ">=3.11"
+dependencies = ["torch>=2.13", "numpy", "safetensors"]
+
+[project.optional-dependencies]
+qwen = ["transformers==5.19.0", "flash-linear-attention==0.5.2"]   # Qwen3.5 / 3.8 conversion and evaluation
+data = ["datasets", "tokenizers", "pyarrow"]                        # scripts/data, scripts/quant/sft_mix.py
+test = ["pytest"]
+
+[project.scripts]
+ttf-train = "ttf.train:cli"
+
+[tool.setuptools.packages.find]
+include = ["ttf*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs a CUDA GPU (skipped without one)"]

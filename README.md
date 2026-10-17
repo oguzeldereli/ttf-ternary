@@ -67,9 +67,10 @@ is an early 60-step probe; a release model (about 40M tokens of recovery with di
 ## Memory
 
 - A 23.0B-parameter model (22.85B ternary) trains on one 16 GB GPU (11.1–11.6 GiB at ranks 256–1024, state in host memory with
-  asynchronous copies; measured with `scripts/lab/b27_lean.sh` at tag `pre-consolidation-2026-10-17`). At its leanest it
-  peaks at 9.73 GiB. The core keeps the host offload with synchronous copies (`--ttf-offload host`); the asynchronous
-  variant is in `ttf.legacy` (`--ts_offload_async`).
+  asynchronous copies, `--ttf-offload async`; measured with `scripts/lab/b27_lean.sh` at tag `pre-consolidation-2026-10-17`).
+  At its leanest it peaks at 9.73 GiB.
+- **Qwen3.8-27B on one 24 GB GPU** (RTX 3090 Ti): converted layer by layer and trained at 32k tokens per step (2 × 8 ×
+  2048) in 68.9 s per step, peak 19.7 GB (`recipes/convert-27b.toml`; the whole pipeline: [docs/CONVERT_27B.md](docs/CONVERT_27B.md)).
 - **Micro-batches without a dense gradient** (`--ttf-accum micro`, the default): each micro-batch's gradient enters the state and is
   discarded; 4 × 4 micro-batches match one pass of batch 16 over the full schedule (2.6733 vs 2.6728) at 3.1 instead of
   7.4 GiB.
@@ -80,7 +81,7 @@ is an early 60-step probe; a release model (about 40M tokens of recovery with di
 ## Quickstart
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[data]"          # ".[qwen]" for Qwen3.5 / 3.8, ".[test]" for pytest; the ttf-train command = python -m ttf.train
 python3 scripts/data/prep_wiki.py 4e8 --tokenizer llama --out_prefix data/wiki32k     # Wikipedia, 32k vocab
 python3 -m scripts.data.prep_fineweb 2e9 --out_prefix data/fwedu32k                    # FineWeb-Edu (optional)
 
@@ -99,6 +100,7 @@ python3 scripts/eval/zeroshot_tok.py && python scripts/eval/zeroshot.py runs/ttf
 # convert a pretrained model (Llama architecture or Qwen3.5 / 3.8)
 python -m ttf.train --recipe convert-110m --out-dir runs/convert
 python -m ttf.train --recipe convert-qwen --init-hf PATH/TO/Qwen3.5-0.8B-Base --out-dir runs/qwen
+python -m ttf.train --recipe convert-27b --init-hf PATH/TO/Qwen3.8-27B --kd-cache KD_DIR --out-dir runs/qw27   # docs/CONVERT_27B.md
 ```
 
 Add `--resume` to continue any run; any option on the command line overrides the recipe's. `python -m ttf.train
@@ -112,14 +114,14 @@ short momentum) run as `python -m ttf.legacy.train` ([ttf/legacy/README.md](ttf/
 | option | what |
 |---|---|
 | `--mode ttf / bitnet / fp32` | TTF; BitNet b1.58 (latent weights, STE, AdamW); the full-precision model |
-| `--recipe NAME` | defaults for a setting (`recipes/`: scratch-110m, convert-110m, convert-qwen, continue-27b) |
+| `--recipe NAME` | defaults for a setting (`recipes/`: scratch-110m, convert-110m, convert-qwen, convert-27b, continue-27b) |
 | `--ttf-rank R` | rank of each layer's accumulator (512) |
 | `--ttf-theta`, `--ttf-tau`, `--ttf-step-p P`, `--ttf-leak annealed / fixed` | threshold, leak, step scale ρ^P (ρ = lr / peak lr), leak scaled with the step |
 | `--ttf-update fused / after` | each layer's update inside its backward pass (one layer's gradient at a time) |
 | `--ttf-accum micro / sum` | with `--accum M`: the micro-batch update, no dense gradient |
 | `--dw factored / dense`, `--dw-sketch K` | the update from the gradient's factors, the dense weight gradient never formed |
 | `--ttf-store fp32 / fp12s / int8 / ...` | compressed accumulator |
-| `--ttf-offload host`, `--ttf-offload-keep F` | state in pinned host memory (all but the first share F of layers) |
+| `--ttf-offload host / async`, `--ttf-offload-keep F` | state in pinned host memory (all but the first share F of layers); async: copies overlapped with the backward |
 | `--adapter-rank R`, `--adapter-init zero / svd` | rank-R float adapter beside the trits (16) |
 | `--init-hf DIR`, `--convert gptqc / gptq / als / ...` | convert a pretrained model (Llama, Qwen3.5 / 3.8, layer by layer) |
 | `--teacher DIR`, `--kd-weight W`, `--kd-cache DIR` | distillation from the full-precision model, or from cached top-k targets |
@@ -142,7 +144,7 @@ ttf/          the package
   model.py, config.py   Llama-style transformer, presets (small = 110M, d1024_l24 = 340M, d2048_l24 = 1.3B, b27)
   results.py     the results database (results/runs.jsonl): runs, events, results, notes
   legacy/        the package as of 17 Oct 2026, frozen (the earlier update rules)
-recipes/       TOML defaults for the measured settings
+recipes/       TOML defaults for the measured settings (scratch-110m, convert-110m, convert-qwen, convert-27b, continue-27b)
 scripts/
   results.py     the database's command line (status, table, show, find, note, ingest, validate)
   infer/         ttf_run.py (our models), ttf_qwen.py + ttf_kernels.py (converted Qwen, 2-bit dp4a decode)
@@ -159,6 +161,8 @@ docs/          see below
   `show`, `find`); notes are kept outside the repository (`ttf/results.py`, `TTF_NOTES`).
 - [docs/FORMULAS.md](docs/FORMULAS.md): every update rule used, with its flag.
 - [docs/OPTIONS_MAP.md](docs/OPTIONS_MAP.md): the old flags and the current options.
+- [docs/CONVERT_27B.md](docs/CONVERT_27B.md): converting a 27B model on one 24 GB GPU (data, teacher cache, training,
+  packing, inference).
 - [docs/research/](docs/research/): early results summary, related work, analysis outputs (rank spectra, gaps,
   zero-shot).
 

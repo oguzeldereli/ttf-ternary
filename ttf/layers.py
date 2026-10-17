@@ -15,7 +15,7 @@ from .config import ModelConfig
 from .model import BitTransformer
 
 
-from .kernel import (pack_rows, unpack_rows, tern_gemm, tern_gemm_dx, trit_beta, trit_diff, popcount,
+from .kernel import (pack_rows, unpack_rows, unpack_fast, tern_gemm, tern_gemm_dx, trit_beta, trit_diff, popcount,
                      tern_gemm_i8, tern_gemm_dx_i8, act_quant_i8, act_quant_i8_fast)
 
 
@@ -70,6 +70,8 @@ class _AddRowFn(torch.autograd.Function):
 
 
 FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
+DW_FP32 = [False]            # --dw-precision fp32: dense weight gradients in fp32 from the GEMM (no bf16 rounding)
+WCACHE = {"mode": "off"}     # --w-cache int8: each layer's unpacked int8 trits kept between updates (1 byte / weight)
 
 
 class _KernelTernFn(torch.autograd.Function):
@@ -81,7 +83,8 @@ class _KernelTernFn(torch.autograd.Function):
             # on the s8 tensor cores, and the saved activation is 1 byte/element.
             xq, xs = (act_quant_i8_fast if x.is_cuda else act_quant_i8)(x.reshape(-1, layer.K), layer.act_bits)
             with _rf("tern.fwd"):
-                y = tern_gemm_i8(xq, xs, wpacked, layer.K, beta if beta is not None else 1.0)
+                y = tern_gemm_i8(xq, xs, wpacked, layer.K, beta if beta is not None else 1.0,
+                                 w8=layer._cached_w8(wpacked))
             y = y.view(*x.shape[:-1], layer.N)
             ctx.save_for_backward(xq, xs, wpacked)
         else:
@@ -121,7 +124,11 @@ class _KernelTernFn(torch.autograd.Function):
         if layer.int8:
             xq, xs, wpacked = ctx.saved_tensors
             with _rf("tern.dw"):
-                gw = gyf.transpose(0, 1) @ (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype))
+                if DW_FP32[0]:   # the weight gradient straight out of the GEMM in fp32 (no bf16 rounding, no copy)
+                    gw = torch.mm(gyf.transpose(0, 1), xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype),
+                                  out_dtype=torch.float32)
+                else:
+                    gw = gyf.transpose(0, 1) @ (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype))
         else:
             x, wpacked = ctx.saved_tensors
             xq = _act_quant_plain(x, layer.act_bits).reshape(-1, layer.K)
@@ -171,7 +178,7 @@ class _KernelTernFn(torch.autograd.Function):
 def _grad_x(layer, gyf, wpacked):
     if layer.int8 and layer.int8_dx:
         return tern_gemm_dx_i8(gyf, wpacked, layer.K)
-    return tern_gemm_dx(gyf, wpacked, layer.K)
+    return tern_gemm_dx(gyf, wpacked, layer.K, w8=layer._cached_w8(wpacked))
 
 
 class KernelTernaryLinear(nn.Module):
@@ -218,8 +225,18 @@ class KernelTernaryLinear(nn.Module):
             self._beta_val = trit_beta(wpacked, self.K); self._beta_key = k
         return self._beta_val
 
+    @torch.no_grad()
+    def _cached_w8(self, wpacked):
+        if WCACHE["mode"] != "int8":
+            return None
+        k = self._wkey(wpacked)
+        if getattr(self, "_w8_key", None) != k:
+            self._w8 = None
+            self._w8 = unpack_fast(wpacked, self.K); self._w8_key = k
+        return self._w8
+
     def _invalidate(self):
-        self._beta_key = None
+        self._beta_key = None; self._w8_key = None; self._w8 = None
 
     def enable_tracking(self):
         """Track per-step flip count and which trits have ever changed since init.

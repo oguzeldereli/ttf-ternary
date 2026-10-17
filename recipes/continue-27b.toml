@@ -1,5 +1,6 @@
-# Qwen3.8-27B (the released ternary checkpoint qw27_rel, step 1350) continued with KD from cached teacher top-k targets
-# on a 24-32 GB GPU (ttf-lab cloud/train27_box.sh sets the paths, the micro-batch and the memory cap per GPU).
+# Qwen3.8-27B (the released ternary checkpoint qw27_rel, step 1350) continued with KD from cached teacher top-k targets.
+# 2 x 8 micro-batches for a 24 GB GPU (68.9 s per step on a 3090 Ti); a 32 GB card (RTX 5090) takes --batch-size 4
+# --accum 4 (30.1 s per step) with --mem-cap-gib 30.6. ttf-lab cloud/train27_box.sh sets these per GPU.
 # Validation rose in the 17 Oct runs at theta 16 and 64 (under investigation): not a settled recipe.
 #   python -m ttf.train --recipe continue-27b --init-hf $W/qw27 --kd-cache $W/kd4s --resume --out-dir $W/run27
 mode = "ttf"
@@ -8,8 +9,8 @@ data = "data/mix4s_train.bin"
 val = "data/wikiq8_val.bin"
 data-dtype = "u32"
 seq-len = 2048
-batch-size = 4
-accum = 4
+batch-size = 2
+accum = 8
 kd-cache-start = 1350
 kd-weight = 0.5
 kd-cache-mode = "rest"
@@ -30,3 +31,4 @@ ttf-store = "fp12s"
 tail = "lean"
 loss-chunk = 512
 dw-sketch = 128
+mem-cap-gib = 22.4

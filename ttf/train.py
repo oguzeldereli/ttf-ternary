@@ -424,6 +424,8 @@ def main():
 
     def save_ckpt(step):
         # atomic: write tmp then rename, so a kill mid-save never corrupts ckpt.pt
+        if args.ttf_offload == "async" and torch.cuda.is_available():
+            torch.cuda.synchronize()      # the host copies of the state are written on a side stream
         tmp = ckpt_path + ".tmp"
         # flip-tracking masks are plain attributes (not state_dict buffers), so they
         # are saved alongside: otherwise "never flipped since init" silently resets
@@ -635,12 +637,12 @@ def main():
         _lays = [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]
         for i_, m_ in enumerate(_lays):   # --ttf-offload host(_keep): which layers' state lives in host memory
             m_._ts_host = _ts_on_host(args, i_, len(_lays))
-        if args.ttf_offload_keep and args.ttf_offload == "host":
+        if args.ttf_offload_keep and args.ttf_offload != "none":
             print(f"--ttf-offload-keep: state of {sum(not m_._ts_host for m_ in _lays)} of {len(_lays)} layers on the GPU",
                   flush=True)
         ts_cfg = dict(r=args.ttf_rank, lr_ratio=1.0, theta=args.ttf_theta, tau=args.ttf_tau, b2=args.ttf_b2, spend=args.ttf_spend,
                       tau_anneal=(args.ttf_leak_pow if args.ttf_leak == "annealed" else False), store_a=store,
-                      offload=args.ttf_offload == "host",
+                      offload={"none": False, "host": True, "async": "async"}[args.ttf_offload],
                       theta_sched=(tuple(float(x) for x in args.ttf_theta_sched.split(":")) if args.ttf_theta_sched else None),
                       progress=0.0, factored=args.factored_k)
     if ttf and args.ttf_update == "fused":         # --ttf-update fused: each layer's update inside its backward (ts_layer)
@@ -661,6 +663,10 @@ def main():
         if args.factored_k:
             assert args.micro or tc.grad_accum == 1, "--dw factored: 16 x 1 or --ttf-accum micro"
             print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
+    if args.w_cache != "off" or args.dw_precision == "fp32":
+        from .layers import WCACHE as _WC, DW_FP32 as _DF
+        _WC["mode"] = args.w_cache; _DF[0] = args.dw_precision == "fp32"
+        print(f"--w-cache {args.w_cache}, --dw-precision {args.dw_precision}", flush=True)
     if args.fused_scales:
         from .layers import FUSED_SCALES as _FSC
         _FSC[0] = True
@@ -921,7 +927,8 @@ def main():
 RUNLOG = [None]          # the run's results.RunLog (rank 0)
 
 
-if __name__ == "__main__":
+def cli():
+    """python -m ttf.train / the ttf-train command: main(), with a 'failed' event in the run's records on an error"""
     try:
         main()
     except SystemExit:
@@ -930,3 +937,7 @@ if __name__ == "__main__":
         if RUNLOG[0] is not None:
             RUNLOG[0].event("failed", reason=f"{type(e).__name__}: {str(e)[:300]}")
         raise
+
+
+if __name__ == "__main__":
+    cli()

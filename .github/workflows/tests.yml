@@ -1,0 +1,20 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: install (CPU torch; Triton for the kernel definitions, no GPU needed to import them)
+        run: |
+          pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install triton numpy safetensors pytest
+          pip install -e . --no-deps
+      - name: CPU tests (the GPU tests are skipped without CUDA)
+        run: pytest -q -m "not gpu" tests

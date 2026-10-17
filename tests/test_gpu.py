@@ -228,3 +228,36 @@ def test_train_resume_round_trip(tmp_path):
     assert len(a) == 8 and a == b, (a, b)
     recs = [json.loads(l) for l in open(tmp_path / "b" / "records.jsonl")]
     assert [r["type"] for r in recs].count("run") == 2 and recs[-1].get("status") == "finished"
+
+
+def test_beta_follows_fused_fire():
+    """the fused firing writes the packed trits in place: the layer's cached beta must follow (it was stale, 17 Oct)"""
+    from ttf import update as U
+    from ttf.kernel import trit_beta
+    N, K, T = 256, 320, 512
+    l = _layer(N, K, 3); l._ts_idx = 1; l.use_beta = True
+    b0 = float(l._cached_beta(l.wpacked))
+    U.FIRE_FUSED[0] = True
+    try:
+        gen = torch.Generator(device=dev).manual_seed(5); state = {}
+        for s in range(3):
+            gy = (torch.randn(T, N, device=dev, generator=gen)).to(torch.bfloat16)
+            x = torch.randn(T, K, device=dev, generator=gen).to(torch.bfloat16)
+            l._ts_final = True
+            U.ts_layer(l, (gy, x), state, _cfg(r=16, theta=1e-3, factored=64, step=10 + s))
+    finally:
+        U.FIRE_FUSED[0] = False
+    fresh = float(trit_beta(l.wpacked, K))
+    assert fresh != b0                                   # trits moved
+    assert abs(float(l._cached_beta(l.wpacked)) - fresh) < 1e-7
+
+
+@pytest.mark.parametrize("extra", [["--ttf-offload", "async"], ["--w-cache", "int8"]], ids=["offload_async", "w_cache"])
+def test_same_losses(tmp_path, extra):
+    """options that must not change the numbers: per-step losses identical to the plain run (deterministic mode)"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    base = ["--ttf-offload", "host"] if extra[0] == "--ttf-offload" else []
+    a = _train(str(tmp_path / "a"), base, 6, data)
+    b = _train(str(tmp_path / "b"), extra, 6, data)
+    assert a == b, (a, b)

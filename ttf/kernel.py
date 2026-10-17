@@ -254,11 +254,12 @@ def _dx_kernel(gy_ptr, w_ptr, gx_ptr, M, N, K, K5,
                  mask=(offm[:, None] < M) & (offkx[None, :] < K))
 
 
-def tern_gemm_dx(gy: torch.Tensor, wpacked: torch.Tensor, K: int) -> torch.Tensor:
+def tern_gemm_dx(gy: torch.Tensor, wpacked: torch.Tensor, K: int, w8=None) -> torch.Tensor:
     """grad_x = gy @ decode(wpacked), gy [M,N] -> [M,K]. Packed weight, no unpack (Triton); cuBLAS: unpacked to bf16
-    per call."""
+    per call, or cast from the cached int8 trits w8 (--w-cache)."""
     if GEMM_BACKEND[0] in ("cublas", "int8mm"):
-        return torch.mm(gy.contiguous().to(torch.bfloat16), _w_bf16(wpacked, K))
+        wb = w8.to(torch.bfloat16) if w8 is not None else _w_bf16(wpacked, K)
+        return torch.mm(gy.contiguous().to(torch.bfloat16), wb)
     M, N = gy.shape
     Nw, K5 = wpacked.shape
     gy = gy.contiguous().to(torch.bfloat16)
@@ -351,13 +352,15 @@ def _dev_scalar(v, device):
 
 
 def tern_gemm_i8(xq: torch.Tensor, xs: torch.Tensor, wpacked: torch.Tensor, K: int,
-                 beta=1.0) -> torch.Tensor:
+                 beta=1.0, w8=None) -> torch.Tensor:
     """int8 x [M,K] (codes) @ decode(wpacked)^T * xs[:,None] * beta -> bf16 [M,N].
-    beta: float or a 0-dim device tensor (read in the kernel, so no host sync)."""
+    beta: float or a 0-dim device tensor (read in the kernel, so no host sync). w8: the unpacked int8 trits [N, K] if
+    the caller holds them (--w-cache), else they are unpacked here."""
     if GEMM_BACKEND[0] == "int8mm":
         # --gemm int8mm: int8 activation codes x int8 trits on the int8 tensor cores (cuBLASLt via torch._int_mm),
         # int32 accumulation: exact; the trits are unpacked per call to int8 (1 byte per weight, half of bf16)
-        w8 = unpack_fast(wpacked, K)
+        if w8 is None:
+            w8 = unpack_fast(wpacked, K)
         M_, N_ = xq.shape[0], w8.shape[0]
         if M_ > 16 and K % 8 == 0 and N_ % 8 == 0:
             y32 = torch._int_mm(xq.contiguous(), w8.t())
