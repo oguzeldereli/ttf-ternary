@@ -36,6 +36,7 @@ C[ckblock]="--ckpt block --fire torch"
 C[svd]="--init-hf $HF --convert gptqc --adapter-init svd --calib 4"
 C[als]="--init-hf $HF --convert als --teacher $HF --kd-hidden 0.3"
 C[start]="--ttf-start 3 --ttf-spend 2"
+C[adsched]="--adapter-rank 32 --adapter-schedule 32:16:0.2:0.7:8 --tail lean"
 NAMES=${*:-${!C[@]}}
 ok=0; bad=0
 for n in $NAMES; do
@@ -51,4 +52,12 @@ python -m ttf.train $F --ttf-rank 48 --adapter-rank 24 --ttf-acc-scale 0.5 --res
   && grep -q "grew the accumulators" $O/resume.log && grep -q "adapters grown" $O/resume.log \
   && { ok=$((ok+1)); echo "ok   resume (rank and adapter growth, acc scale)"; } \
   || { bad=$((bad+1)); echo "FAIL resume: $(grep -E 'Error|error' $O/resume.log | tail -1 | cut -c1-160)"; }
+# resume inside an adapter schedule (8 steps: 32 -> 24 at step 4, 24 -> 16 at step 6): 5 steps, then resumed to 8,
+# which must continue from the checkpoint's rank 24
+rm -rf $O/resume_sched; F=$(echo $B --adapter-rank 32 --adapter-schedule 32:16:0.2:0.7:8)
+python -m ttf.train ${F/--stop-after 6/--stop-after 5} --out-dir $O/resume_sched > $O/resume_sched.log 2>&1 && \
+python -m ttf.train ${F/--stop-after 6/--stop-after 8} --resume --out-dir $O/resume_sched >> $O/resume_sched.log 2>&1 \
+  && grep -q "adapters 24 -> 16" $O/resume_sched.log && ! grep -q "adapters grown" $O/resume_sched.log \
+  && { ok=$((ok+1)); echo "ok   resume_sched (schedule continues from the checkpoint's rank)"; } \
+  || { bad=$((bad+1)); echo "FAIL resume_sched: $(grep -E 'Error|error|schedule' $O/resume_sched.log | tail -2 | cut -c1-160)"; }
 echo "smoke: $ok ok, $bad failed"

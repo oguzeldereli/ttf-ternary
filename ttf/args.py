@@ -63,6 +63,10 @@ def build_parser():
     g.add_argument("--adapter-init", default="zero", choices=["zero", "svd"],
                    help="svd (with --init-hf, --convert gptq / gptqc): A B^T starts as the best rank-R part of each "
                         "layer's rounding error in output space")
+    g.add_argument("--adapter-schedule", default="", help="R0:R1[:START:END[:STEP]]: the adapter rank goes from R0 "
+                   "(--adapter-rank) down to R1 between the fractions START and END of training (default 0.125:0.75), "
+                   "STEP at a time (default 8), each time to the best lower-rank part of A B^T (its optimizer state "
+                   "restarts)")
     g.add_argument("--adapter-wd", type=float, default=0.1)
     g.add_argument("--adapter-lr-mult", type=float, default=1.0)
 
@@ -186,6 +190,10 @@ def resolve(a):
     a.svd_rank = a.adapter_rank if a.adapter_init == "svd" else 0
     a.u32 = a.data_dtype == "u32"
     a.micro = a.ttf_accum == "micro"
+    if a.adapter_schedule:
+        f = a.adapter_schedule.split(":")
+        if len(f) < 2 or int(f[0]) != a.adapter_rank or int(f[1]) >= int(f[0]) or int(f[1]) < 1:
+            raise SystemExit(f"--adapter-schedule {a.adapter_schedule}: R0:R1 with R0 = --adapter-rank > R1 >= 1")
     if a.lr_schedule not in ("cosine", "linear") and not a.lr_schedule.startswith("wsd:"):
         raise SystemExit(f"--lr-schedule {a.lr_schedule}: cosine, linear or wsd:D")
     return a

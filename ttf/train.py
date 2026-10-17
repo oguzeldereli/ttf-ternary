@@ -475,6 +475,41 @@ def main():
         print(f"low-rank magnitude '{kind}' rank {r}: {sum(p.numel() for p in newp) / 1e6:.2f}M floats "
               f"(wd {args.adapter_wd}, lr x{args.adapter_lr_mult})", flush=True)
 
+    def adapter_rank_at(step):   # --adapter-schedule R0:R1[:START:END[:STEP]]: the target rank at this step
+        f = args.adapter_schedule.split(":") + [None] * 5
+        r0, r1 = int(f[0]), int(f[1])
+        s0, s1 = (float(f[2]) if f[2] else 0.125), (float(f[3]) if f[3] else 0.75)
+        st = int(f[4]) if f[4] else 8
+        u = min(max((step / max(1, tc.max_steps) - s0) / max(s1 - s0, 1e-9), 0.0), 1.0)
+        return max(r1, r0 - int(u * (r0 - r1) / st + 1e-9) * st)
+
+    @torch.no_grad()
+    def shrink_adapters(r_new):
+        """every adapter A B^T (rank above r_new) replaced by its best rank-r_new part (QR of A and B, SVD of the r x r
+        core, the singular values split evenly); the adapters' optimizer state restarts"""
+        from .master import MasterTernaryLinear
+        gi = next(i for i, g in enumerate(tail_opt.param_groups) if "lr_mult" in g)
+        old, new, err = tail_opt.param_groups[gi]["params"], [], []
+        for m in model.modules():
+            if isinstance(m, (KernelTernaryLinear, MasterTernaryLinear)) and getattr(m, "mag_A", None) is not None:
+                if m.mag_A.shape[1] > r_new:
+                    A, B = m.mag_A.float(), m.mag_B.float()
+                    Qa, Ra = torch.linalg.qr(A); Qb, Rb = torch.linalg.qr(B)
+                    U_, S_, Vh_ = torch.linalg.svd(Ra @ Rb.T)
+                    s_ = S_[:r_new].sqrt()
+                    err.append(float((S_[r_new:] ** 2).sum() / (S_ ** 2).sum().clamp_min(1e-30)))
+                    m.mag_A = nn.Parameter((Qa @ U_[:, :r_new] * s_).to(m.mag_A.dtype))
+                    m.mag_B = nn.Parameter((Qb @ Vh_[:r_new].T * s_).to(m.mag_B.dtype))
+                new += [m.mag_A, m.mag_B]
+        ids = {id(p) for p in old}
+        for p in old:
+            tail_opt.state.pop(p, None)
+        tail_opt.param_groups[gi]["params"] = new
+        tail[:] = [p for p in tail if id(p) not in ids] + new
+        if hasattr(tail_opt, "_flatbufs"):
+            tail_opt._flatbufs.clear()          # LeanAdam's batched buffers are keyed by the old parameters
+        return (sum(err) / len(err)) if err else 0.0
+
     start_step = 0
     _touched_origin = {"v": 0}
     _load_path = _resume_path
@@ -488,6 +523,8 @@ def main():
             raise SystemExit(f"checkpoint beta={blob.get('beta', False)} but run beta="
                              f"{use_beta}: forward differs, refusing to resume")
         if mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):
+            if args.adapter_schedule:   # the schedule continues from the checkpoint's rank (no growth back to R0)
+                mag = f"add:{next(v_.shape[1] for k_, v_ in blob['model'].items() if k_.endswith('mag_A'))}"
             _R = int(mag.split(":")[1]); _grown = 0
             for k_ in [k_ for k_ in blob["model"] if k_.endswith("mag_A")]:   # a larger 'add' rank than the checkpoint's:
                 A_, B_ = blob["model"][k_], blob["model"][k_[:-1] + "B"]      # new columns of A at 0 (the layer is
@@ -724,6 +761,14 @@ def main():
             if args.factored_k:
                 from .layers import FACTORED as _FCT
                 _FCT[0] = True          # (--ttf-vdiag reads its g^2 / v from the sketch)
+        if args.adapter_schedule and mag_on[0]:
+            r_t = adapter_rank_at(step)
+            r_c = next((m_.mag_A.shape[1] for m_ in model.modules() if getattr(m_, "mag_A", None) is not None), r_t)
+            if r_t < r_c:
+                e_ = shrink_adapters(r_t)
+                log_metrics({"step": step, "adapter_rank": r_t, "adapter_dropped_energy": e_})
+                print(f"--adapter-schedule: step {step}: adapters {r_c} -> {r_t} (dropped {e_:.4f} of their energy)",
+                      flush=True)
         STATE.lr = lr
         for g in tail_opt.param_groups:
             g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0)
