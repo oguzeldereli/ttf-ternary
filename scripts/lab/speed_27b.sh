@@ -10,7 +10,7 @@ D=$T/speed/$N; ln -sf $T/stage/qw27_rel_ckpt.pt $D/ckpt.pt
 while pgrep -f "[p]ython -m bitnet.train" > /dev/null; do sleep 30; done   # never beside another trainer (OOM)
 for p in $(pgrep -f "[t]eacher_lab4s[.]sh"); do kill $p; done; for p in $(pgrep -f "[t]eacher_topk[.]py"); do kill $p; done
 sleep 15     # the teacher holds ~8.6 GB: it is stopped for the test (its unfinished shard stays claimed: teacher_gaps.sh)
-env TERN_TIME=1 ${PROF:+TERN_PROF=$D} timeout 3000 python -m bitnet.train --init_hf $T/hf27 --init_hf_method gptq --init_stream --resume \
+env TERN_TIME=1 ${PROF:+TERN_PROF=$D} ${NOSTACK:+TERN_PROF_NOSTACK=1} timeout 3000 python -m bitnet.train --init_hf $T/hf27 --init_hf_method gptq --init_stream --resume \
   --data $T/stage/mix3_train.bin --val $T/stage/mix3_train.bin --data_u32 --seq_len 2048 --batch_size 2 --grad_accum 8 --ts_micro \
   --kd_cache $T/stage/kd --kd_cache_start 1350 --distill_w 0.5 --kd_mode rest --steps ${STEPS:-1352} --warmup 300 --tail_fp32 \
   --lr 5e-4 --min_lr 5e-5 --eval_interval 100000 --eval_iters 4 --save_secs 999999 --no_final_save --snap_every 0 --lookahead 0 \

@@ -4840,8 +4840,11 @@ def main():
                     ct = _ct(e)
                     _f.write(f"  {e.key:28s} calls {e.count:7d}  CUDA {ct / 1e6:9.3f} s  CPU {e.cpu_time_total / 1e6:9.3f} s\n")
             with open(os.path.join(_pd, f"prof_step{step}_stack.txt"), "w") as _f:   # by the Python line that launched it
-                _f.write(_prof.key_averages(group_by_stack_n=6).table(sort_by="self_cuda_time_total", row_limit=50,
-                                                                       max_name_column_width=60))
+                if os.environ.get("TERN_PROF_NOSTACK"):   # (that table takes ~20 min on a 27B step)
+                    _f.write("skipped (TERN_PROF_NOSTACK)\n")
+                else:
+                    _f.write(_prof.key_averages(group_by_stack_n=6).table(sort_by="self_cuda_time_total", row_limit=50,
+                                                                           max_name_column_width=60))
             if os.environ.get("TERN_PROF_TRACE"):
                 _prof.export_chrome_trace(os.path.join(_pd, f"trace_step{step}.json"))
             print(f"TERN_PROF: step {step} profiled ({_pdt:.1f}s wall) -> {_pd}", flush=True)
