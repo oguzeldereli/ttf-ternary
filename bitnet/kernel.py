@@ -961,3 +961,78 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
         z_ = nz[c0:c0 + (1 << 16)]
         dU.index_add_(0, z_[:, 0], D[z_[:, 0], z_[:, 1]].float()[:, None] * V[z_[:, 1]])
     return dU, torch.tensor(nz.shape[0], device=U.device)
+
+
+@triton.jit
+def _pack12_kernel(x_ptr, s_ptr, o_ptr, N, n, np2, sxn, son, BN: tl.constexpr, BP: tl.constexpr):
+    """X [N, n] fp32 / scale [n] -> fp16 -> 12 bits (sign, 5 exponent, 6 mantissa; nearest, ties to even) -> two values
+    in 3 bytes: the integer operations of train._pack12, so the codes are identical"""
+    pr = tl.program_id(0); pj = tl.program_id(1)
+    rows = pr * BN + tl.arange(0, BN)
+    j = pj * BP + tl.arange(0, BP)
+    rm = rows[:, None] < N
+    c0 = 2 * j; c1 = 2 * j + 1
+    m0 = rm & (c0[None, :] < n); m1 = rm & (c1[None, :] < n)
+    x0 = tl.load(x_ptr + rows[:, None] * sxn + c0[None, :], mask=m0, other=0.0)
+    x1 = tl.load(x_ptr + rows[:, None] * sxn + c1[None, :], mask=m1, other=0.0)
+    s0 = tl.load(s_ptr + c0, mask=c0 < n, other=1.0); s1 = tl.load(s_ptr + c1, mask=c1 < n, other=1.0)
+    y0 = tl.where(m0, tl.math.div_rn(x0, s0[None, :]), 0.0).to(tl.float16)
+    y1 = tl.where(m1, tl.math.div_rn(x1, s1[None, :]), 0.0).to(tl.float16)
+    h0 = y0.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    h1 = y1.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    q0 = h0 & 0x7FFF; q0 = (q0 + 7 + ((q0 >> 4) & 1)) >> 4
+    q1 = h1 & 0x7FFF; q1 = (q1 + 7 + ((q1 >> 4) & 1)) >> 4
+    a = ((h0 >> 15) << 11) | q0
+    b = ((h1 >> 15) << 11) | q1
+    om = rm & (j[None, :] < np2)
+    base = o_ptr + rows[:, None] * son + 3 * j[None, :]
+    tl.store(base, (a & 0xFF).to(tl.uint8), mask=om)
+    tl.store(base + 1, ((a >> 8) | ((b & 0xF) << 4)).to(tl.uint8), mask=om)
+    tl.store(base + 2, (b >> 4).to(tl.uint8), mask=om)
+
+
+def pack12_scaled(X: torch.Tensor, sc: torch.Tensor) -> torch.Tensor:
+    """train._pack12((X / sc).to(fp16)) in one pass (X fp32 [N, n], sc [1, n] or [n]): identical codes"""
+    N, n = X.shape
+    np2 = (n + 1) // 2
+    X = X.contiguous(); s = sc.reshape(-1).float().contiguous()
+    out = torch.empty(N, 3 * np2, dtype=torch.uint8, device=X.device)
+    BN, BP = 32, 64
+    _pack12_kernel[(triton.cdiv(N, BN), triton.cdiv(np2, BP))](X, s, out, N, n, np2, X.stride(0), out.stride(0), BN=BN, BP=BP)
+    return out
+
+
+@triton.jit
+def _unpack12_kernel(p_ptr, s_ptr, o_ptr, N, n, np2, spn, son, BN: tl.constexpr, BP: tl.constexpr):
+    """inverse of _pack12_kernel times the per-column scale (train._decode of a 12-bit code): fp32 [N, n]"""
+    pr = tl.program_id(0); pj = tl.program_id(1)
+    rows = pr * BN + tl.arange(0, BN)
+    j = pj * BP + tl.arange(0, BP)
+    rm = rows[:, None] < N
+    pm = rm & (j[None, :] < np2)
+    base = p_ptr + rows[:, None] * spn + 3 * j[None, :]
+    p0 = tl.load(base, mask=pm, other=0).to(tl.int32)
+    p1 = tl.load(base + 1, mask=pm, other=0).to(tl.int32)
+    p2 = tl.load(base + 2, mask=pm, other=0).to(tl.int32)
+    a = p0 | ((p1 & 0xF) << 8)
+    b = (p1 >> 4) | (p2 << 4)
+    ha = ((a >> 11) << 15) | ((a & 0x7FF) << 4)
+    hb = ((b >> 11) << 15) | ((b & 0x7FF) << 4)
+    ya = ha.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+    yb = hb.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+    c0 = 2 * j; c1 = 2 * j + 1
+    s0 = tl.load(s_ptr + c0, mask=c0 < n, other=0.0); s1 = tl.load(s_ptr + c1, mask=c1 < n, other=0.0)
+    tl.store(o_ptr + rows[:, None] * son + c0[None, :], ya * s0[None, :], mask=rm & (c0[None, :] < n))
+    tl.store(o_ptr + rows[:, None] * son + c1[None, :], yb * s1[None, :], mask=rm & (c1[None, :] < n))
+
+
+def unpack12_scaled(P: torch.Tensor, sc: torch.Tensor) -> torch.Tensor:
+    """train._decode(P, sc) of 12-bit codes in one pass: fp32 [N, n] (n = sc's length), identical values"""
+    n = sc.shape[-1]
+    N = P.shape[0]
+    np2 = (n + 1) // 2
+    s = sc.reshape(-1).float().contiguous(); P = P.contiguous()
+    out = torch.empty(N, n, dtype=torch.float32, device=P.device)
+    BN, BP = 32, 64
+    _unpack12_kernel[(triton.cdiv(N, BN), triton.cdiv(np2, BP))](P, s, out, N, n, np2, P.stride(0), out.stride(0), BN=BN, BP=BP)
+    return out

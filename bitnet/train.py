@@ -388,7 +388,11 @@ def _store_codec(name):
             sc = cs(X, 32768); return ((X / sc).to(torch.float16), sc)
     elif name == "fp12s":     # fp16s with the low 4 mantissa bits rounded off: sign, 5 exponent, 6 mantissa bits
         def enc(X):
-            sc = cs(X, 32768); return (_pack12((X / sc).to(torch.float16)), sc)
+            sc = cs(X, 32768)
+            if X.is_cuda and X.dim() == 2 and CODEC_FUSED[0]:   # one kernel, identical codes (kernel.pack12_scaled)
+                from .kernel import pack12_scaled
+                return (pack12_scaled(X.float(), sc), sc)
+            return (_pack12((X / sc).to(torch.float16)), sc)
     elif name in ("fp16", "bf16"):
         dt = torch.float16 if name == "fp16" else torch.bfloat16
         def enc(X):
@@ -396,6 +400,9 @@ def _store_codec(name):
     else:
         raise ValueError(name)
     return enc
+
+
+CODEC_FUSED = [os.environ.get("TERN_CODEC_FUSED", "1") != "0"]   # fp12s through kernel.pack12_scaled / unpack12_scaled
 
 
 def _pack12(Y):
@@ -424,6 +431,9 @@ def _unpack12(P, n):
 
 def _decode(c, s):
     """stored codes (int8 / fp8 / fp16 / packed 12-bit) times their per-column scale"""
+    if c.dtype == torch.uint8 and c.is_cuda and c.dim() == 2 and CODEC_FUSED[0]:   # one kernel, identical values
+        from .kernel import unpack12_scaled
+        return unpack12_scaled(c, s)
     return (_unpack12(c, s.shape[-1]) if c.dtype == torch.uint8 else c).float() * s
 
 
