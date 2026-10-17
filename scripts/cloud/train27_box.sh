@@ -10,7 +10,7 @@
 set -u
 W=${W:-/workspace}; source $W/tern/env.sh; cd $W/tern/repo
 MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1); CAP=$(python -c "print(round($MEM / 1024 - 1.2, 1))")
-MB=${MB:-4}; GA=$(( 16 / MB )); D=$W/tern/run27; mkdir -p $D
+MB=${MB:-4}; GA=$(( 16 / MB )); D=${OUTD:-$W/tern/run27}; mkdir -p $D   # OUTD + NOFINAL: a timing test elsewhere
 [ -f $D/ckpt.pt ] || ln -f $W/tern/ckpt/qw27_rel_ckpt.pt $D/ckpt.pt
 echo "$(date '+%F %T') $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1), cap $CAP GiB, micro $MB x $GA" >> $D/box.log
 TERN_TIME=${TIME_STEPS:-0} python -m bitnet.train --init_hf $W/tern/qw27 --init_hf_method gptq --init_stream --resume \
@@ -22,5 +22,5 @@ TERN_TIME=${TIME_STEPS:-0} python -m bitnet.train --init_hf $W/tern/qw27 --init_
   --ts_start 400 --ts_tau 1000 --ts_anneal 0.75 --ts_tau_anneal --ts_nomom --ts_fused --gemm int8mm --lowrank 256 \
   --ts_rank_s 256 --ts_vdiag --ts_vdiag_every 50 --ts_store_a fp12s --lean_tail --lean_batched --loss_chunk 512 \
   --ts_factored 128 --ts_fire_fused --fused_scales --fused_norm --ts_acc_scale ${ACC:-1.0} --mem_cap_gib $CAP ${X:-} \
-  --out_dir $D >> $D/train.log 2>&1
+  ${NOFINAL:+--no_final_save} --out_dir $D >> $D/train.log 2>&1
 echo "$(date '+%F %T') exit $? $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/box.log
