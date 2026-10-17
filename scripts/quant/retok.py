@@ -1,7 +1,7 @@
 """Re-tokenize one of our token streams with another tokenizer, article by article (same text, same train / val split):
 decode with the source tokenizer, encode with the target's tokenizer.json, write uint32 with the target's end-of-text
 between articles.
-    python scripts/data/retok.py data/wiki32k_val.bin data/wikiqw_val.bin --target HF_DIR [--src llama] [--max_tokens N]
+    python scripts/quant/retok.py data/wiki32k_val.bin data/wikiqw_val.bin --target HF_DIR [--src llama] [--max_tokens N]
 """
 import argparse, json, os, time
 import numpy as np

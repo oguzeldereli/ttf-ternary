@@ -8,6 +8,7 @@
 # + 10:25: p 1 + floor 0.5 (floor 0.3 still leaves late steps below the base's)
 # + 10:45 : the exponent p decays over training (1 mid-training -> lower late)
 # + 11:00 : TTF's own step schedule: hold 1 until step 4000, then cosine to 0.32 / 0.5
+# + 11:20 : p high early (smaller steps), low late (larger steps): 1.3 -> peak at 3000 -> end value; A = the user's spec (end 0.5)
 sw512_p1_f03 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.3
 sw512_p1_f02 --lowrank 512 --ts_rank_s 512 --ts_anneal 1.0 --ts_anneal_floor 0.2
 sw192_p1_f03 --ts_anneal 1.0 --ts_anneal_floor 0.3
@@ -37,6 +38,15 @@ sw512_p075 --lowrank 512 --ts_rank_s 512 --ts_anneal 0.75
 sw512_tau2000 --lowrank 512 --ts_rank_s 512 --ts_tau 2000
 sw512_p05_f04 --lowrank 512 --ts_rank_s 512 --ts_anneal_floor 0.4
 sw512_ps1to05_s05 --lowrank 512 --ts_rank_s 512 --ts_anneal_sched 1:0.5:0.5
+sw512_pp_A --lowrank 512 --ts_rank_s 512 --ts_anneal_pts 0:1.3,3000:1.5,9155:0.5
+sw512_pp_B --lowrank 512 --ts_rank_s 512 --ts_anneal_pts 0:1.3,3000:1.5,9155:0.25
+sw512_pp_C --lowrank 512 --ts_rank_s 512 --ts_anneal_pts 0:1.3,3000:1.5,9155:0
+sw512_pp_D --lowrank 512 --ts_rank_s 512 --ts_anneal_pts 0:1.3,3000:2.0,9155:0.25
+sw512_pp_E --lowrank 512 --ts_rank_s 512 --ts_anneal_pts 0:1.0,3000:1.2,9155:0.25
+sw512_pp_F --lowrank 512 --ts_rank_s 512 --ts_anneal_pts 0:1.3,3000:1.5,6000:1.5,9155:0.25
+sw192_pp_A --ts_anneal_pts 0:1.3,3000:1.5,9155:0.5
+sw192_pp_B --ts_anneal_pts 0:1.3,3000:1.5,9155:0.25
+sw192_pp_D --ts_anneal_pts 0:1.3,3000:2.0,9155:0.25
 sw512_ps1to025_s06 --lowrank 512 --ts_rank_s 512 --ts_anneal_sched 1:0.25:0.6
 sw512_ps1to05 --lowrank 512 --ts_rank_s 512 --ts_anneal_sched 1:0.5
 sw512_ps1to025 --lowrank 512 --ts_rank_s 512 --ts_anneal_sched 1:0.25

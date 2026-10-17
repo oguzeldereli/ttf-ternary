@@ -7,7 +7,9 @@ cd "$(dirname "$0")/../.."
 h=$1; r=$2; shift 2
 J="ssh -o BatchMode=yes -o ConnectTimeout=15 -J oguzelde@knuckles.cs.ucl.ac.uk"
 [ -f checkpoints/live/$r/ckpt.pt ] || { echo "no backup for $r"; exit 1; }
-timeout 60 $J oguzelde@$h-l.cs.ucl.ac.uk "bash ~/ternary-LLM/scripts/lab/setup.sh > /dev/null 2>&1; mkdir -p /tmp/oguzelde/tern/repo/checkpoints/$r" || exit 1
+timeout 120 $J oguzelde@$h-l.cs.ucl.ac.uk bash -s <<EOS || exit 1
+bash ~/ternary-LLM/scripts/lab/setup.sh > /dev/null 2>&1; mkdir -p /tmp/oguzelde/tern/repo/checkpoints/$r
+EOS
 timeout 900 rsync -a -e "$J" checkpoints/live/$r/ckpt.pt checkpoints/live/$r/train.log checkpoints/live/$r/metrics.jsonl \
   oguzelde@$h-l.cs.ucl.ac.uk:/tmp/oguzelde/tern/repo/checkpoints/$r/ || exit 1
 timeout 60 $J oguzelde@$h-l.cs.ucl.ac.uk bash -s <<EOS
