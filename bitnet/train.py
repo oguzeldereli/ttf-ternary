@@ -4776,8 +4776,9 @@ def main():
                 _f.write("\n\nby CPU time\n" + _ka.table(sort_by="self_cpu_time_total", row_limit=30, max_name_column_width=70))
                 _rng = [e for e in _ka if e.key.split(".")[0] in ("tern", "ttf", "model", "loss")]   # the named ranges
                 _f.write("\n\nnamed ranges (CUDA total = everything inside them)\n")
-                for e in sorted(_rng, key=lambda e: -e.device_time_total if hasattr(e, "device_time_total") else -e.cuda_time_total):
-                    ct = getattr(e, "device_time_total", None) or e.cuda_time_total
+                _ct = lambda e: max(getattr(e, "device_time_total", 0) or 0, getattr(e, "self_device_time_total", 0) or 0)
+                for e in sorted(_rng, key=lambda e: -_ct(e)):   # (the GPU-side annotation of a range carries its time)
+                    ct = _ct(e)
                     _f.write(f"  {e.key:28s} calls {e.count:7d}  CUDA {ct / 1e6:9.3f} s  CPU {e.cpu_time_total / 1e6:9.3f} s\n")
             with open(os.path.join(_pd, f"prof_step{step}_stack.txt"), "w") as _f:   # by the Python line that launched it
                 _f.write(_prof.key_averages(group_by_stack_n=6).table(sort_by="self_cuda_time_total", row_limit=50,
