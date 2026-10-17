@@ -4185,7 +4185,22 @@ def main():
             raise SystemExit(f"checkpoint beta={blob.get('beta', False)} but run beta="
                              f"{use_beta}: forward differs, refusing to resume")
         if args.lowrank_mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):
+            _R = int(args.lowrank_mag.split(":")[1]); _grown = 0
+            for k_ in [k_ for k_ in blob["model"] if k_.endswith("mag_A")]:   # a larger 'add' rank than the checkpoint's:
+                A_, B_ = blob["model"][k_], blob["model"][k_[:-1] + "B"]      # new columns of A at 0 (the layer is
+                if A_.shape[1] < _R:                                           # unchanged), of B random as at init
+                    g_ = torch.Generator().manual_seed(17_000_000 + _grown)
+                    blob["model"][k_] = torch.cat([A_, torch.zeros(A_.shape[0], _R - A_.shape[1], dtype=A_.dtype)], 1)
+                    blob["model"][k_[:-1] + "B"] = torch.cat([B_, (torch.randn(B_.shape[0], _R - B_.shape[1], generator=g_)
+                                                                  * (1.0 / B_.shape[0]) ** 0.5).to(B_.dtype)], 1)
+                    _grown += 1
             enable_mag(int(blob.get("step", 0)) + 1)
+            if _grown and "opt" in blob:   # the adapters' optimizer state starts fresh (its shapes are the old rank's)
+                _gi = len(tail_opt.param_groups) - 1
+                for i_ in blob["opt"]["param_groups"][_gi]["params"]:
+                    blob["opt"]["state"].pop(i_, None)
+                print(f"--lowrank_mag {args.lowrank_mag}: {_grown} adapters grown from the checkpoint's rank "
+                      f"(new columns of A at 0; their optimizer state restarts)", flush=True)
         new_rc = args.rc_scale and not any(k.endswith("row_scale") for k in blob["model"])
         if new_rc:
             # branching a checkpoint trained without row/column scales: they start at 1 (the layer is unchanged)
