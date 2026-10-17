@@ -6,9 +6,9 @@
 4. reset_lock() reopens everything
 """
 import torch
-from ttf import flip as F
-from ttf.kernel import unpack_rows, popcount, trit_diff, expand_trit_mask
-from ttf.flip import KernelTernaryLinear
+from ttf.legacy import flip as F
+from ttf.legacy.kernel import unpack_rows, popcount, trit_diff, expand_trit_mask
+from ttf.legacy.flip import KernelTernaryLinear
 
 dev = "cuda"; K, N, M = 512, 768, 2048
 torch.manual_seed(0)

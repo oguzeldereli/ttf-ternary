@@ -4,7 +4,8 @@
 # per-step training losses and the final val of each and whether they are identical. REF2=1 runs the reference twice
 # (its own run-to-run spread: a configuration whose reference is not deterministic compares within that spread).
 # DET=1: both through scripts/tests/det_run.py (deterministic mode; flash attention's backward otherwise differs run
-# to run). CORE_FLAGS_FN (a file defining core_flags NAME) maps a configuration to the core's flags once they differ.
+# to run). CORE_FLAGS_FN (a file defining core_flags NAME FLAGS) maps a configuration to the core's flags once they
+# differ (scripts/tests/core_flags.sh). REUSE_REF=1 keeps reference runs already in the gate directory.
 #   bash scripts/tests/gate.sh [NAME ...]          (run from the repo copy on the lab PC)
 set -u
 S=${S:-/tmp/oguzelde/tern}; source $S/env.sh
@@ -29,7 +30,7 @@ C[master]="$B --mode master --rc_scale --steps 40"
 C[fp32]="$B --mode fp32 --steps 40"
 C[moe]="$B $TTF --moe 4:2:1024 --steps 40"
 C[tern_emb]="$B $TTF --tern_emb tied --steps 40"
-C[qwen]="--init_hf $Q --init_stream --init_hf_method gptqc --data data/wikiqw_train40.bin --val data/wikiqw_val.bin --data_u32
+C[qwen]="--init_hf $Q --init_stream --init_hf_method gptqc --data data/wikiqw_train.bin --val data/wikiqw_val.bin --data_u32
    --seq_len 512 --batch_size 2 --grad_accum 2 --ts_micro --warmup 5 --tail_fp32 --lr 5e-4 --min_lr 5e-5
    --eval_interval 1000 --eval_iters 2 --save_secs 99999 --snap_every 0 --no_final_save --lookahead 0 --rc_scale
    --lowrank_mag add:16 --mag_wd 0.1 --mode kernel --int8 --dw_mode dense --ts --ts_theta 16 --ts_tau 1000 --ts_anneal 0.75
@@ -44,13 +45,15 @@ for n in $NAMES; do
   F=$(echo ${C[$n]})
   run() { rm -rf $G/$n.$1; if [ -n "${DET:-}" ]; then L="python scripts/tests/det_run.py $2"; else L="python -m $2"; fi
           $L $3 --out_dir $G/$n.$1 > $G/$n.$1.log 2>&1 || echo "$n.$1: exit $? ($(grep -m1 -E 'Error|error' $G/$n.$1.log | cut -c1-120))"; }
-  run ref ttf.legacy.train "$F"
+  [ -n "${REUSE_REF:-}" ] && [ -s $G/$n.ref/metrics.jsonl ] || run ref ttf.legacy.train "$F"
   [ -n "${REF2:-}" ] && run ref2 ttf.legacy.train "$F"
   CF="$F"; type core_flags > /dev/null 2>&1 && CF=$(core_flags $n "$F")
   [ -z "${REFONLY:-}" ] && run core ttf.train "$CF"
   a=$(losses $G/$n.ref/metrics.jsonl); b=$([ -n "${REF2:-}" ] && losses $G/$n.ref2/metrics.jsonl); c=$([ -z "${REFONLY:-}" ] && losses $G/$n.core/metrics.jsonl)
   st="ref ${a:0:60}..."
+  [ -z "$(echo ${a%%|*})" ] && { echo "$n: REFERENCE MISSING (see $G/$n.ref.log)"; continue; }
   [ -n "${REF2:-}" ] && { [ "$a" = "$b" ] && st="$st | ref deterministic" || st="$st | REF NOT DETERMINISTIC"; }
-  [ -z "${REFONLY:-}" ] && { [ "$a" = "$c" ] && st="$st | core IDENTICAL" || st="$st | core DIFFERS (final ${c##*|})"; }
+  [ -z "${REFONLY:-}" ] && { [ -z "$(echo ${c%%|*})" ] && st="$st | CORE MISSING" || { [ "$a" = "$c" ] && st="$st | core IDENTICAL" ||
+                                st="$st | core DIFFERS (final ${c##*|})"; }; }
   echo "$n: $st"
 done

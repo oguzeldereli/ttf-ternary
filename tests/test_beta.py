@@ -9,7 +9,7 @@ from ttf import model as M
 torch.manual_seed(0)
 dev = "cuda"
 for K, N in [(512, 1408), (1408, 512), (768, 777)]:        # 777/768: exercise padding
-    lay = KernelTernaryLinear(K, N, beta=True, rate=0.0).to(dev)
+    lay = KernelTernaryLinear(K, N, beta=True).to(dev)
     w = unpack_rows(lay.wpacked, K).float()
     rho = (w != 0).float().mean()
     b = trit_beta(lay.wpacked, K)

@@ -254,19 +254,15 @@ def convert_seq_asym(path, data_path, n_seq=32, seq=2048, dev="cuda", damp=0.01,
     return out
 
 
-GPTQ_OPTS = {"zero_frac": None, "rot": "", "mag_svd": 0}   # --init_zero_frac, --init_rot, --init_mag_svd (train.py)
-_ROT_SETS = {"down": {"w_down"}, "out": {"wo", "w_down"}, "all": {"wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"}}
+GPTQ_OPTS = {"mag_svd": 0}   # --init_mag_svd (train.py)
 
 
 @torch.no_grad()
-def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2, zero_frac=None):
+def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2):
     """GPTQ (Frantar et al. 2022) onto the ternary grid {-a_i, 0, a_i} c_j: columns are rounded one at a time and each
     one's rounding error is pushed onto the not-yet-rounded columns through the inverse input second moment, so the
     trits minimise the layer's output error |X (W - a c T)^T| instead of |W - a c T|. The column scale c comes from
-    ALS (folded into the inputs), the row magnitude a is refitted in output space after each pass.
-    zero_frac: the rounding threshold is set apart from the magnitude, per row at that quantile of |W_i / c| (a weight
-    below it rounds to 0, above it to +-1, and the rest of its value goes on to the other columns as any rounding
-    error does), so about that fraction of trits is zero instead of the ~40% the magnitude's own threshold a / 2 gives."""
+    ALS (folded into the inputs), the row magnitude a is refitted in output space after each pass."""
     N, K = W.shape
     Wc = W / c[None, :]                                  # fold c into the input: X' = X c, H' = c H c
     Hc = H.to(W.device) * c[:, None] * c[None, :]
@@ -277,8 +273,6 @@ def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2, z
     perm = torch.argsort(torch.diagonal(Hc), descending=True) if act_order else torch.arange(K, device=W.device)
     inv = torch.argsort(perm)
     Wp, Hp = Wc[:, perm], Hc[perm][:, perm]
-    zero_frac = GPTQ_OPTS["zero_frac"] if zero_frac is None else zero_frac
-    thr = torch.quantile(Wp.abs(), zero_frac, dim=1) if zero_frac is not None else None
     L = torch.linalg.cholesky(Hp)
     Hinv = torch.cholesky_inverse(L)
     U = torch.linalg.cholesky(Hinv, upper=True)          # GPTQ's upper factor of H^-1
@@ -292,10 +286,7 @@ def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2, z
             Wb = Q[:, i1:i2].clone(); Ub = U[i1:i2, i1:i2]; E = torch.zeros_like(Wb)
             for j in range(i2 - i1):
                 w = Wb[:, j]
-                if thr is None:
-                    t = (w / ai[:, 0]).round().clamp(-1, 1)
-                else:
-                    t = torch.where(w.abs() > thr, torch.sign(w), torch.zeros_like(w))
+                t = (w / ai[:, 0]).round().clamp(-1, 1)
                 T[:, i1 + j] = t
                 e = (w - ai[:, 0] * t) / Ub[j, j]
                 Wb[:, j:] -= e[:, None] * Ub[j, j:][None, :]
@@ -336,30 +327,25 @@ def mag_svd_fit(lin, W, T, a, c, beta, Hc, r):
     return float((S[:r] ** 2).sum() / (S ** 2).sum().clamp_min(1e-300))
 
 
-def _mag_svd_init(lin, W, T, a, c, beta, hess, i, name, Q, method, r, dev):
-    """mag_svd_fit with the layer's calibration covariance from calib_hessians (rotated / centred as GPTQ used it)"""
+def _mag_svd_init(lin, W, T, a, c, beta, hess, i, name, method, r, dev):
+    """mag_svd_fit with the layer's calibration covariance from calib_hessians (centred as GPTQ used it)"""
     Hl = hess[(i, name)].to(dev).double()
-    if Q is not None:
-        Hl = Q.double() @ Hl @ Q.double().T
     if method == "gptqc":
         mu = hess[("mu", i, name)].to(dev).double()
-        if Q is not None:
-            mu = Q.double() @ mu
         Hl = Hl - torch.outer(mu, mu)
     return mag_svd_fit(lin, W, T, a, c, beta, Hl, r)
 
 
 @torch.no_grad()
-def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0, rank=0, clip=0.5, log=print, hess=None,
-                 res_rank=-1):
-    """copy / convert the checkpoint into model (built with model_config_from_hf); returns {layer: (U, V)} for
-    --init_acc (empty otherwise). method gptq needs hess = calib_hessians(...)"""
+def init_from_hf(model, path, mode, method="als", rc=False, log=print, hess=None):
+    """copy / convert the checkpoint into model (built with model_config_from_hf). method gptq / gptqc needs
+    hess = calib_hessians(...)"""
     from .flip import KernelTernaryLinear
     from .kernel import pack_rows, trit_beta
     from .master import MasterTernaryLinear
     if method == "scratch":       # the checkpoint's shape only, random init (the baseline for the same model)
         log(f"--init_hf {path}: scratch (shape only, weights not loaded)")
-        return {}
+        return
     sd = load_hf_tensors(path)
     c_ = model.c
     dev = next(model.parameters()).device
@@ -367,7 +353,7 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
     model.norm.weight.copy_(sd["model.norm.weight"])
     if model.lm_head is not None:
         model.lm_head.weight.copy_(sd.get("lm_head.weight", sd["model.embed_tokens.weight"]))
-    acc_state, errs, kept, oerrs = {}, [], [], []
+    errs, kept, oerrs = [], [], []
     for i, blk in enumerate(model.layers):
         p = f"model.layers.{i}."
         blk.attn_norm.weight.copy_(sd[p + "input_layernorm.weight"])
@@ -385,7 +371,7 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
             if not isinstance(lin, KernelTernaryLinear):        # fp32 mode: nn.Linear
                 lin.weight.copy_(W)
                 continue
-            if method == "native":         # --local_kd from a ternary-native start: the floats (embedding, norms, head)
+            if method == "native":         # a ternary-native start: the floats (embedding, norms, head)
                 continue                   # come from the checkpoint, the linears keep their random ternary init
             if method == "gptqs":          # precomputed by convert_seq_asym (sequential, error-aware, centred)
                 T, a, c, mu_, b_ = (t.to(dev) for t in hess[(i, name)])
@@ -395,27 +381,14 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
                 lin.enable_centering(mu_, b_)
                 errs.append(_rel_err(W, T, a, c))
                 continue
-            Q = None
-            if GPTQ_OPTS["rot"] and name in _ROT_SETS[GPTQ_OPTS["rot"]] and hess is not None and method in ("gptq", "gptqc"):
-                # --init_rot: a fixed random orthogonal Q on the layer's input (exact in fp: W x = (W Q^T)(Q x)); the
-                # trits are those of W Q^T and the layer rotates its input online (spreads each input's energy)
-                assert res_rank < 0, "--init_rot with --res_anneal: not supported"
-                g_ = torch.Generator().manual_seed(1000 * i + sorted(_ROT_SETS["all"]).index(name))
-                Q = torch.linalg.qr(torch.randn(W.shape[1], W.shape[1], generator=g_, dtype=torch.float64))[0].float().to(dev)
-                W = W @ Q.T
-                lin.enable_rotation(Q)
             T, a, c = ternarize(W, "als" if method in ("gptq", "gptqc") else method)
             if hess is not None and method != "zero":
                 Hl = hess[(i, name)].to(dev)
-                if Q is not None:
-                    Hl = Q @ Hl @ Q.T
                 e0 = _out_err(W, T, a, c, Hl)
                 if method == "gptq":
                     T, a, c = ternarize_gptq(W, Hl, a, c)
                 elif method == "gptqc":     # centred: GPTQ on the input covariance; the layer subtracts the input mean
                     mu = hess[("mu", i, name)].to(dev)  # before its activation quantisation and adds W mu back as a bias
-                    if Q is not None:
-                        mu = Q @ mu
                     T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)
                     lin.enable_centering(mu, W @ mu)
                 oerrs.append((e0, _out_err(W, T, a, c, Hl)))
@@ -423,11 +396,9 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
             if method != "zero":
                 errs.append(_rel_err(W, T, a, c))
             lin.wpacked.copy_(pack_rows(T))
-            if res_rank >= 0 and method != "zero":   # --res_anneal: keep the rounding residual (fixed) to fade out
-                lin.enable_res_anneal(W - a[:, None] * c[None, :] * T.float(), res_rank)
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
             if GPTQ_OPTS["mag_svd"] and hess is not None and method in ("gptq", "gptqc") and rc:
-                kept.append(_mag_svd_init(lin, W, T, a, c, beta, hess, i, name, Q, method, GPTQ_OPTS["mag_svd"], dev))
+                kept.append(_mag_svd_init(lin, W, T, a, c, beta, hess, i, name, method, GPTQ_OPTS["mag_svd"], dev))
             if method == "zero":     # the trits are all 0, so beta is that of an empty layer; use the density the
                 beta = 1.0 / (lin.K * 0.6) ** 0.5   # first firing will give (~0.6 nonzero), refined as trits move
             if rc and lin.row_scale is not None:
@@ -437,23 +408,6 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
             else:
                 raise SystemExit("--init_hf on kernel mode needs --rc_scale (the layer has no other scale to hold the "
                                  "weight's magnitude)")
-            if acc:
-                X = W / (a[:, None] * c[None, :])               # trit units
-                D_ = X - T.float()        # only a +-1 trit's outward excess can pass 1/2 (it cannot move further out)
-                if clip > 0 and method != "zero":
-                    D_.clamp_(-clip, clip)
-                A = (acc * 2 * theta) * (D_ if method != "zero" else X); del D_
-                r = min(rank or min(lin.N, lin.K), lin.N, lin.K)
-                if r < min(lin.N, lin.K):
-                    Uf, S, Vh = torch.linalg.svd(A, full_matrices=False)
-                    V = Vh[:r].T.contiguous(); U = Uf[:, :r] * S[:r]
-                    kept.append(float((S[:r] ** 2).sum() / (S ** 2).sum()))
-                    del Uf, S, Vh
-                else:
-                    Q, _ = torch.linalg.qr(A.T)       # full rank: V orthonormal K x N(<=K), U = A V
-                    V = Q[:, :r].contiguous(); U = A @ V; kept.append(1.0)
-                acc_state[lin] = (U.contiguous(), V)
-                del A, X
             del W
     if errs:
         log(f"--init_hf {path}: {method}, relative error |W - a c T| / |W| mean {sum(errs) / len(errs):.4f} "
@@ -465,7 +419,3 @@ def init_from_hf(model, path, mode, method="als", rc=False, acc=0.0, theta=16.0,
     if kept and GPTQ_OPTS["mag_svd"]:
         log(f"--init_mag_svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
             f"rounding error on average (min {min(kept):.3f}, max {max(kept):.3f}) over {len(kept)} layers")
-    elif kept:
-        log(f"--init_acc {acc}: rank {rank} keeps {sum(kept) / len(kept):.3f} of the accumulator's energy on average "
-            f"(min {min(kept):.3f})")
-    return acc_state

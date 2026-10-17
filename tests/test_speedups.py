@@ -57,7 +57,7 @@ print("lookahead_filter: identical to reference over 2 passes")
 def run(compile_=False, ckpt_skip=0):
     torch.manual_seed(0)
     m = build_kernel_transformer(PRESETS["small"], grad_checkpoint=True, beta=True,
-                                 int8=True, dw_mode="dense").to(dev).train()
+                                 int8=True).to(dev).train()
     m.ckpt_skip = ckpt_skip
     Ls = [l for l in m.modules() if isinstance(l, KernelTernaryLinear)]
     for l in Ls: l.capture = True                      # gradients only, no flips

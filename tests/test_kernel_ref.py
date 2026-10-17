@@ -67,7 +67,7 @@ for backend in ("triton", "cublas"):
 # the layer: forward and both gradients, int8 forward + dense weight gradient (the configuration of the runs)
 K.GEMM_BACKEND[0] = "triton"
 for (N, Kd) in ((768, 768), (2048, 768), (333, 1000)):
-    l = KernelTernaryLinear(Kd, N, 8, rate=0.0, beta=True, int8=True, dw_mode="dense").to(dev)
+    l = KernelTernaryLinear(Kd, N, 8, beta=True, int8=True).to(dev)
     captured = {}
     l.capture = True
     l.on_grad = lambda layer, g: captured.__setitem__("g", g.clone())

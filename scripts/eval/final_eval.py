@@ -24,10 +24,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+import importlib                                                  # noqa: E402
 from ttf.bitlinear import STATE                                   # noqa: E402
-from ttf.flip import build_kernel_transformer, enable_rc_scales, KernelTernaryLinear  # noqa: E402
-from ttf.master import build_master_transformer, MasterTernaryLinear  # noqa: E402
-from ttf.model import Attention                                   # noqa: E402
 
 BYTES_PER_TOKEN_WIKI = 3.569
 BYTES_PER_TOKEN_FW = 4.003
@@ -36,18 +34,26 @@ BYTES_PER_TOKEN_FW = 4.003
 def load_model(path, device, mag_kind="add"):
     ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)   # mmap: a 35 GB master checkpoint
     mc, mode, sd = ck["cfg"], ck["mode"], ck["model"]                         # need not fit in host memory
+    # checkpoints of features the core no longer has (boost planes, rotated inputs, ternary or multiplicative adapters,
+    # the low-rank latent baseline) are read by ttf.legacy, the code they were trained with
+    legacy = mag_kind != "add" or any(k.endswith((".bpacked", ".rot_Q", "mag_At.col_scale", "lora_B")) for k in sd)
+    P = "ttf.legacy" if legacy else "ttf"
+    FL, MA = importlib.import_module(P + ".flip"), importlib.import_module(P + ".master")
+    KernelTernaryLinear, MasterTernaryLinear = FL.KernelTernaryLinear, MA.MasterTernaryLinear
+    Attention = importlib.import_module(P + ".model").Attention
+    kw = dict(beta=ck.get("beta", False), int8=ck.get("int8", False), int8_dx=ck.get("int8_dx", False))
+    if legacy:
+        kw.update(rate=0.0, dw_mode=ck.get("dw_mode", "int8"), g_ref=ck.get("g_ref", 3.0))
     if mode == "kernel":
-        model = build_kernel_transformer(mc, grad_checkpoint=False, rate=0.0, beta=ck.get("beta", False),
-                                         int8=ck.get("int8", False), dw_mode=ck.get("dw_mode", "int8"),
-                                         int8_dx=ck.get("int8_dx", False), g_ref=ck.get("g_ref", 3.0))
+        model = FL.build_kernel_transformer(mc, grad_checkpoint=False, **kw)
     elif mode == "master":
         dt = next(v.dtype for k, v in sd.items() if k.endswith(".weight") and v.dim() == 2 and "tok_emb" not in k)
-        model = build_master_transformer(mc, grad_checkpoint=False, dtype=dt)
+        model = MA.build_master_transformer(mc, grad_checkpoint=False, dtype=dt)
     else:
         raise SystemExit(f"mode {mode} not supported")
     model = model.to(device)
     if "layers.0.ffn.router.weight" in sd:                   # --moe E:K:H (top-K from the run's arguments, else 2)
-        from ttf.model import enable_moe, BitTransformer
+        enable_moe = importlib.import_module(P + ".model").enable_moe
         E_ = sd["layers.0.ffn.router.weight"].shape[0]
         H_ = next(v.shape for k, v in sd.items() if k.startswith("layers.0.ffn.experts.0.w_gate.")
                   and k.split(".")[-1] in ("weight", "wpacked"))[0]
@@ -55,19 +61,16 @@ def load_model(path, device, mag_kind="add"):
         a_ = a_ if isinstance(a_, dict) else vars(a_)
         k_ = int(str(a_.get("moe") or f"{E_}:2").split(":")[1])
         mk = (lambda i, o: MasterTernaryLinear(i, o, mc.act_bits, dtype=dt).to(device)) if mode == "master" else \
-             (lambda i, o: KernelTernaryLinear(i, o, mc.act_bits, rate=0.0, beta=ck.get("beta", False),
-                                               int8=ck.get("int8", False), dw_mode=ck.get("dw_mode", "int8"),
-                                               int8_dx=ck.get("int8_dx", False), g_ref=ck.get("g_ref", 3.0)).to(device))
+             (lambda i, o: KernelTernaryLinear(i, o, mc.act_bits, **kw).to(device))
         enable_moe(model, f"{E_}:{k_}:{H_}", mk)
     if any(k.endswith(".bpacked") for k in sd):              # --ts_boost
-        from ttf.flip import enable_boost
-        enable_boost(model)
+        FL.enable_boost(model)
     if "tok_emb.table.wpacked" in sd:                         # --tern_emb tied_wide:M
-        from ttf.tern_emb import enable_tern_emb
+        enable_tern_emb = importlib.import_module(P + ".tern_emb").enable_tern_emb
         M_ = sd["tok_emb.table.col_scale"].numel() // sd["tok_emb.proj.row_scale"].numel()
         enable_tern_emb(model, f"tied_wide:{M_}", "kernel")
     elif "tok_emb.wpacked" in sd or "tok_emb.latent" in sd:     # --tern_emb
-        from ttf.tern_emb import enable_tern_emb
+        enable_tern_emb = importlib.import_module(P + ".tern_emb").enable_tern_emb
         enable_tern_emb(model, "untied" if ("lm_head.wpacked" in sd or "lm_head.latent" in sd) else "tied",
                         "master" if mode == "master" else "kernel")
     if any(k.endswith(".rot_Q") for k in sd):                # --init_rot: rotated inputs
@@ -88,7 +91,7 @@ def load_model(path, device, mag_kind="add"):
                 if isinstance(m, MasterTernaryLinear):
                     m.enable_rc_scale()
         else:
-            enable_rc_scales(model)
+            FL.enable_rc_scales(model)
     loras = [k for k in sd if k.endswith("lora_B")]       # --m_lora R: low-rank latent baseline
     if loras:
         r = sd[loras[0]].shape[1]
