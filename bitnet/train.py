@@ -1376,8 +1376,8 @@ def _ts_layer_factored(l, fg, state, c):
             _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
         a = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** t)).sqrt(); b = C.sqrt()
     del gS, Sg
-    ia = 1.0 / a.clamp_min(1e-30 + 1e-12 * float(a.max()))                # 1 / a_i, 1 / b_j (zero rows: g is zero there)
-    ib = 1.0 / b.clamp_min(1e-30 + 1e-12 * float(b.max()))
+    ia = 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30)                 # 1 / a_i, 1 / b_j (zero rows: g is zero there;
+    ib = 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)                 # device-side bounds: no host sync per call)
     fgb = (gy, x, ib)
     if c.get("start") and c.get("step", 0) < c["start"]:                  # --ts_start: frozen, v keeps learning
         return
@@ -4671,7 +4671,9 @@ def main():
             if args.tern_emb and args.mode != "master":   # the ternary embedding's TTF update (both of its gradients)
                 from .tern_emb import tern_emb_step
                 tern_emb_step(model, lr_state, ts_cfg, ts_layer)
-            last_loss = loss.item()
+            last_loss = loss.detach()          # read once after the last micro-batch (a .item() here synced every one)
+        if torch.is_tensor(last_loss):
+            last_loss = last_loss.item()
         if args.spike_dump:   # this step's mean loss against the median of the last 50 steps
             hl_ = spike_st.setdefault("hist", [])
             lm_ = float(last_loss)
