@@ -1331,6 +1331,8 @@ def _ts_layer_factored(l, fg, state, c):
             r0 = b2 * R0 / bc_ + (1 - b2) * r0; c0 = b2 * C0 / bc_ + (1 - b2) * c0; del R0, C0
         m_ = r0.mean().clamp_min(1e-30)
         PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (0, 0, 0, 0, 0, 0)
+        if torch.is_tensor(PS):    # the running sketch sums are held in bf16 between micro-batches (k (N + K) x 2 bytes
+            PS, SP = PS.float(), SP.float()   # per layer; their rounding, 2^-9, is far below the sketch's own noise)
         d1, d0 = rsq / l.K, csq / l.N
         rs = rs + d1 + (2.0 / l.K) * (gS * PS).sum(1) if torch.is_tensor(PS) else d1
         cs = cs + d0 + (2.0 / l.N) * (Sg * SP).sum(0) if torch.is_tensor(SP) else d0
@@ -1344,7 +1346,7 @@ def _ts_layer_factored(l, fg, state, c):
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
         else:
-            st[("mx", key)] = (PS, SP, rs, cs, ds, es)
+            st[("mx", key)] = (PS.to(torch.bfloat16), SP.to(torch.bfloat16), rs, cs, ds, es)
         del PS, SP
         a = (r0 / m_).sqrt_(); b = c0.sqrt()                              # sqrt(v_ij) = a_i b_j
     else:        # 16 x 1: v includes this step's g^2
