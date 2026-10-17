@@ -1346,6 +1346,9 @@ def _ts_layer_factored(l, fg, state, c):
             else:
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
+            if c.get("vdiag"):   # --ts_vdiag: this micro-batch's g^2 against v (the u extremes need the dense u: not kept)
+                sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** (t // M_))).clamp_min(1e-30))
+                _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
         else:
             st[("mx", key)] = (PS.to(torch.bfloat16), SP.to(torch.bfloat16), rs, cs, ds, es)
         del PS, SP
@@ -1356,6 +1359,9 @@ def _ts_layer_factored(l, fg, state, c):
         else:
             R, C = (1 - b2) * rsq / l.K, (1 - b2) * csq / l.N
         _host_put(st, ("v", key), (R, C), off)
+        if c.get("vdiag"):
+            sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** t)).clamp_min(1e-30))
+            _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
         a = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** t)).sqrt(); b = C.sqrt()
     del gS, Sg
     ia = 1.0 / a.clamp_min(1e-30 + 1e-12 * float(a.max()))                # 1 / a_i, 1 / b_j (zero rows: g is zero there)
@@ -3302,7 +3308,7 @@ def main():
                     "repack, the spend's D V) in one kernel (bitnet.kernel.ttf_fire): no [N, K] temporaries")
     ap.add_argument("--ts_factored", type=int, default=0, help="--ts --ts_nomom --ts_fused: K > 0: the TTF update from "
                     "the factors of the weight gradient (g = gy^T x is never formed; the sums of g^2 from a K-column "
-                    "sketch; see _ts_layer_factored). Dense on --ts_vdiag / --ts_diag steps")
+                    "sketch; see _ts_layer_factored). Dense on --ts_diag / --ts_qdiag steps; --ts_vdiag keeps only g^2 / v")
     ap.add_argument("--ts_micro", action="store_true", help="--ts_fused with --grad_accum M: the TTF update sees each "
                     "micro-batch's gradient (momentum and v step per micro-batch with beta^(1/M), v / M; accumulator, firing "
                     "and spend once per step), so no dense gradient is kept between micro-batches: activations shrink M-fold")
@@ -4450,7 +4456,7 @@ def main():
             ts_cfg["diag"] = bool(args.ts_diag) and step % args.ts_diag == 0
             if args.ts_factored:   # the dense path on the steps whose diagnostics read the dense gradient
                 from .flip import FACTORED as _FCT
-                _FCT[0] = not (ts_cfg["vdiag"] or ts_cfg["diag"] or ts_cfg["qdiag"])
+                _FCT[0] = not (ts_cfg["diag"] or ts_cfg["qdiag"])   # --ts_vdiag: its g^2 / v from the sketch
         rate_now = args.rate
         if args.rate_schedule != "const":
             prog = min(1.0, step / max(1, tc.max_steps))

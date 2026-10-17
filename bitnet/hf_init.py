@@ -321,11 +321,17 @@ def mag_svd_fit(lin, W, T, a, c, beta, Hc, r):
     cd = c.double().clamp_min(1e-12)
     Hp = cd[:, None] * Hc.double() * cd[None, :]
     Hp.diagonal().add_(1e-4 * Hp.diagonal().mean() + 1e-30)
-    L = torch.linalg.cholesky(Hp)
     G = (beta / a.double().clamp_min(1e-12))[:, None] * (W.double() - a.double()[:, None] * c.double()[None, :] * T.double()) / cd[None, :]
-    U, S, Vh = torch.linalg.svd(G @ L, full_matrices=False)
+    L, info = torch.linalg.cholesky_ex(Hp)
+    if int(info) == 0:
+        U, S, Vh = torch.linalg.svd(G @ L, full_matrices=False)
+        B = torch.linalg.solve_triangular(L.T, Vh[:r].T, upper=True)      # L^-T V_R: (x' @ B) = V_R^T L^-1 x'
+    else:                # numerically singular covariance: the symmetric square root, eigenvalues clamped
+        lam, Q = torch.linalg.eigh(Hp)
+        lam = lam.clamp_min(1e-6 * float(lam.max()))
+        U, S, Vh = torch.linalg.svd(G @ ((Q * lam.sqrt()) @ Q.T), full_matrices=False)
+        B = ((Q / lam.sqrt()) @ Q.T) @ Vh[:r].T
     A = U[:, :r] * S[:r]
-    B = torch.linalg.solve_triangular(L.T, Vh[:r].T, upper=True)          # L^-T V_R: (x' @ B) = V_R^T L^-1 x'
     lin._mag_init = (A.float().contiguous(), B.float().contiguous())
     return float((S[:r] ** 2).sum() / (S ** 2).sum().clamp_min(1e-300))
 
