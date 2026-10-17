@@ -48,3 +48,26 @@ for fused in (False, True):
 a, b = res[False], res[True]
 print(f"swiglu: y differ {float((a[0] != b[0]).float().mean()):.2e}, gg differ {float((a[1] != b[1]).float().mean()):.2e}, "
       f"gu differ {float((a[2] != b[2]).float().mean()):.2e} (shares of entries); time {a[3] * 1e3:.2f} -> {b[3] * 1e3:.2f} ms", flush=True)
+
+# the gated norm of the DeltaNet output (48 heads x 128), the gain in fp16 (--lean_tail) and in bf16
+from bitnet.kernel import gated_norm_qwen
+for wdt in (torch.float16, torch.bfloat16):
+    n = Q.Qwen3_5RMSNormGated(128, eps=1e-6).to(dev); n.weight.data = (1 + 0.1 * torch.randn(128, device=dev)).to(wdt)
+    x0 = (torch.randn(4096 * 48, 128, device=dev) * 0.5).to(torch.bfloat16); z0 = torch.randn(4096 * 48, 128, device=dev).to(torch.bfloat16)
+    g = torch.randn(4096 * 48, 128, device=dev).to(torch.bfloat16)
+    res = {}
+    for fused in (False, True):
+        x = x0.clone().requires_grad_(); z = z0.clone().requires_grad_(); n.weight.grad = None
+        y = gated_norm_qwen(x, z, n.weight, n.variance_epsilon) if fused else n(x, z)
+        y.backward(g); res[fused] = (y.detach().float(), x.grad.float(), z.grad.float(), n.weight.grad.float())
+        ts = []
+        for _ in range(5):
+            x = x0.clone().requires_grad_(); z = z0.clone().requires_grad_(); torch.cuda.synchronize(); t0 = time.time()
+            y = gated_norm_qwen(x, z, n.weight, n.variance_epsilon) if fused else n(x, z)
+            y.backward(g); torch.cuda.synchronize(); ts.append(time.time() - t0)
+        res[fused] += (min(ts),)
+    a, b = res[False], res[True]
+    dif = lambda u, v: float((u != v).float().mean())
+    print(f"gated norm (gain {wdt}): y {dif(a[0], b[0]):.1e} differ, gx {dif(a[1], b[1]):.1e}, gz {dif(a[2], b[2]):.1e}, "
+          f"gw rel {float((a[3] - b[3]).norm() / a[3].norm()):.1e}, max |y diff| {float((a[0] - b[0]).abs().max()):.2e}; "
+          f"time {a[4] * 1e3:.2f} -> {b[4] * 1e3:.2f} ms", flush=True)

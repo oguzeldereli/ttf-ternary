@@ -1194,3 +1194,78 @@ class SwiGLUFn(torch.autograd.Function):
 def swiglu(g, u):
     """silu(g) * u (bf16) in one kernel each way"""
     return SwiGLUFn.apply(g, u)
+
+
+@triton.jit
+def _gnorm_fwd_kernel(x_ptr, z_ptr, w_ptr, o_ptr, r_ptr, M, D, eps, RB: tl.constexpr, BD: tl.constexpr, WBF: tl.constexpr):
+    """Qwen3.5's gated RMSNorm on RB rows of length D: hb = bf16(x rsqrt(mean(x^2) + eps)); t = w * hb (fp32, or
+    rounded to bf16 when the gain is bf16: torch's type promotion); out = bf16(t * silu(z))"""
+    pid = tl.program_id(0)
+    rows = pid * RB + tl.arange(0, RB); d = tl.arange(0, BD)
+    m = (rows[:, None] < M) & (d[None, :] < D)
+    off = rows[:, None] * D + d[None, :]
+    x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
+    rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=1) / D + eps)
+    hb = (x * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(w_ptr + d, mask=d < D, other=0.0).to(tl.float32)
+    t = w[None, :] * hb
+    if WBF:
+        t = t.to(tl.bfloat16).to(tl.float32)
+    z = tl.load(z_ptr + off, mask=m, other=0.0).to(tl.float32)
+    tl.store(o_ptr + off, (t * (z / (1.0 + tl.exp(-z)))).to(tl.bfloat16), mask=m)
+    tl.store(r_ptr + rows, rstd, mask=rows < M)
+
+
+@triton.jit
+def _gnorm_bwd_kernel(x_ptr, z_ptr, w_ptr, r_ptr, g_ptr, gx_ptr, gz_ptr, gw_ptr, M, D,
+                      RB: tl.constexpr, BD: tl.constexpr, WBF: tl.constexpr):
+    """the backward with the unfused path's roundings: gt = g silu(z), gz = bf16(g t silu'(z)), ghb = bf16(gt w),
+    gx = bf16(rstd (ghb - xh mean(ghb xh))) with xh = x rstd; the gain's gradient sum(gt hb) per program"""
+    pid = tl.program_id(0)
+    rows = pid * RB + tl.arange(0, RB); d = tl.arange(0, BD)
+    m = (rows[:, None] < M) & (d[None, :] < D)
+    off = rows[:, None] * D + d[None, :]
+    x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
+    z = tl.load(z_ptr + off, mask=m, other=0.0).to(tl.float32)
+    g = tl.load(g_ptr + off, mask=m, other=0.0).to(tl.float32)
+    rstd = tl.load(r_ptr + rows, mask=rows < M, other=0.0)
+    xh = x * rstd[:, None]
+    hb = xh.to(tl.bfloat16).to(tl.float32)
+    w = tl.load(w_ptr + d, mask=d < D, other=0.0).to(tl.float32)
+    t = w[None, :] * hb
+    if WBF:
+        t = t.to(tl.bfloat16).to(tl.float32)
+    sig = 1.0 / (1.0 + tl.exp(-z))
+    gt = g * (z * sig)
+    tl.store(gz_ptr + off, (g * t * (sig * (1.0 + z * (1.0 - sig)))).to(tl.bfloat16), mask=m)
+    ghb = (gt * w[None, :]).to(tl.bfloat16).to(tl.float32)
+    c = tl.sum(ghb * xh, axis=1) / D
+    tl.store(gx_ptr + off, (rstd[:, None] * (ghb - xh * c[:, None])).to(tl.bfloat16), mask=m)
+    tl.store(gw_ptr + pid * D + d, tl.sum(gt * hb, axis=0), mask=d < D)
+
+
+class GatedNormFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, z, w, eps):
+        sh = x.shape; D = sh[-1]
+        x2 = x.reshape(-1, D).contiguous(); z2 = z.reshape(-1, D).contiguous(); M = x2.shape[0]
+        o = torch.empty(M, D, dtype=torch.bfloat16, device=x.device); r = torch.empty(M, dtype=torch.float32, device=x.device)
+        RB = 32; BD = triton.next_power_of_2(D); wbf = w.dtype == torch.bfloat16
+        _gnorm_fwd_kernel[(triton.cdiv(M, RB),)](x2, z2, w, o, r, M, D, float(eps), RB=RB, BD=BD, WBF=wbf)
+        ctx.save_for_backward(x2, z2, w, r); ctx.sh = sh; ctx.zsh = z.shape; ctx.wbf = wbf
+        return o.view(sh)
+
+    @staticmethod
+    def backward(ctx, g):
+        x2, z2, w, r = ctx.saved_tensors; M, D = x2.shape
+        g2 = g.reshape(M, D).contiguous()
+        gx = torch.empty_like(x2); gz = torch.empty_like(z2)
+        RB = 32; nb = triton.cdiv(M, RB); BD = triton.next_power_of_2(D)
+        gw = torch.empty(nb, D, dtype=torch.float32, device=x2.device)
+        _gnorm_bwd_kernel[(nb,)](x2, z2, w, r, g2, gx, gz, gw, M, D, RB=RB, BD=BD, WBF=ctx.wbf)
+        return gx.view(ctx.sh), gz.view(ctx.zsh), gw.sum(0).to(w.dtype), None
+
+
+def gated_norm_qwen(x, z, w, eps):
+    """Qwen3_5RMSNormGated(x, gate z) for bf16 x / z in one kernel each way"""
+    return GatedNormFn.apply(x, z, w, eps)

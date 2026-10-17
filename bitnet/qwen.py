@@ -47,6 +47,15 @@ def enable_fused_norm():
             return self.down_proj(self.act_fn(g) * u)
         return morig(self, x)
     Q.Qwen3_5MLP.forward = mlp
+    gorig = Q.Qwen3_5RMSNormGated.forward
+
+    def gnorm(self, hidden_states, gate):    # the DeltaNet output's gated norm in one kernel (bf16 inputs on the GPU)
+        if (hidden_states.is_cuda and FUSED_NORM[0] and hidden_states.dtype == torch.bfloat16 and gate.dtype == torch.bfloat16
+                and self.activation == "silu" and self.weight.dtype != torch.bfloat16):   # bf16 gains: not reproduced
+            from .kernel import gated_norm_qwen
+            return gated_norm_qwen(hidden_states, gate, self.weight, self.variance_epsilon)
+        return gorig(self, hidden_states, gate)
+    Q.Qwen3_5RMSNormGated.forward = gnorm
 
 
 def is_qwen35(path):
