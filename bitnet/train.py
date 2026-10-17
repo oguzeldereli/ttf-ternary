@@ -1318,6 +1318,8 @@ def _ts_layer_factored(l, fg, state, c):
     instead of the dense gradient's 2 T N K."""
     gy, x = fg                                # [T, N], [T, K] (bf16; products accumulate in fp32: _mmb)
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
+    if c.get("theta_sched"):
+        theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
     M_ = int(c.get("micro") or 1)
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True
     st = state.setdefault("_ts", {})
@@ -3318,6 +3320,8 @@ def main():
                     "covariance's norm) instead of 0: the lost precision moved into the float part (hf_init._mag_svd_init)")
     ap.add_argument("--ts_fire_fused", action="store_true", help="--ts_factored: the firing (A = U V^T, legal moves, "
                     "repack, the spend's D V) in one kernel (bitnet.kernel.ttf_fire): no [N, K] temporaries")
+    ap.add_argument("--ts_acc_scale", type=float, default=1.0, help="--resume: multiply every TTF accumulator by F (a "
+                    "run continued at theta F x its old theta keeps each entry's distance to the bar: no burst of moves)")
     ap.add_argument("--ts_factored", type=int, default=0, help="--ts --ts_nomom --ts_fused: K > 0: the TTF update from "
                     "the factors of the weight gradient (g = gy^T x is never formed; the sums of g^2 from a K-column "
                     "sketch; see _ts_layer_factored). Dense on --ts_diag / --ts_qdiag steps; --ts_vdiag keeps only g^2 / v")
@@ -4241,6 +4245,15 @@ def main():
                 if _ng:
                     print(f"--lowrank {args.lowrank}: grew the accumulators of {_ng} layers from the checkpoint's rank",
                           flush=True)
+            if args.ts and args.ts_acc_scale != 1.0:   # --ts_acc_scale F (a new theta = F x the run's): every accumulator x F,
+                _sa = _store_codec(args.ts_store_a or "")   # so each entry keeps its distance to the bar (no burst of moves)
+                for m in lays:
+                    if id(m) in lr_state and not m.wpacked.is_meta:
+                        U_, V_ = _load_pair(lr_state[id(m)]); dv_ = U_.device
+                        U_ = U_.to(device).float() * args.ts_acc_scale; V_ = V_.to(device).float()
+                        pr_ = _store_pair(_sa, U_, V_) if _sa else (U_, V_)
+                        lr_state[id(m)] = tuple(t.to(dv_) for t in pr_)
+                print(f"--ts_acc_scale {args.ts_acc_scale}: accumulators rescaled (theta now {args.ts_theta})", flush=True)
         if blob.get("ts_ranks"):
             for m, r_ in zip([m for m in model.modules() if isinstance(m, KernelTernaryLinear)], blob["ts_ranks"]):
                 m._ts_rank = r_
@@ -4375,7 +4388,7 @@ def main():
                 and int(args.ts_tiles or 1) == 1 and not args.ts_rank_sched and not args.ts_rsketch and not args.ts_locate \
                 and not args.ts_spend_table and not args.ts_global and not args.ts_fuse and not args.ts_decay \
                 and not args.ts_sgate and not args.ts_refresh and not args.ts_qfmt and not args.ts_int8 \
-                and not args.ts_qfmt_a and not args.ts_store_m and not args.ts_theta_sched and not args.ts_uclip \
+                and not args.ts_qfmt_a and not args.ts_store_m and not args.ts_uclip \
                 and not args.ts_move_cap and not args.ts_vbar and not args.ts_urms and not args.ts_theta_noise \
                 and not args.ts_boost and not TS_TUNNEL[0] and int(args.ts_orth_every or 1) == 1 and not args.ts_orth_defer \
                 and (args.ts_micro or tc.grad_accum == 1), "--ts_factored: the plain --ts --ts_nomom update only"
