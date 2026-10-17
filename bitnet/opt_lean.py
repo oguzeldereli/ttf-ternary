@@ -74,6 +74,79 @@ class LeanAdam(torch.optim.Optimizer):
                 torch._foreach_mul_(pl, 1 - lr * wd)
             torch._foreach_add_(pl, upd, alpha=-lr)
 
+    BATCHED = False       # --lean_batched: low-precision 1-D parameters as one flat pass, 2-D ones stacked by shape
+
+    def _flat_state(self, pl, names, init):
+        """the fp32 state tensors `names` of the parameters pl as views into one flat (1-D) or stacked (2-D) buffer per
+        name, built (from the existing per-parameter tensors, or init) when pl's states are not already views of it"""
+        key = (tuple(id(p) for p in pl), names)
+        bufs = getattr(self, "_flatbufs", {}).get(key)
+        ok = bufs is not None and all(self.state[p][n_].untyped_storage().data_ptr() == bufs[j].untyped_storage().data_ptr()
+                                      for j, n_ in enumerate(names) for p in pl)
+        if not ok:
+            bufs = []
+            for n_ in names:
+                parts = [self.state[p][n_] if n_ in self.state[p] else init(p, n_) for p in pl]
+                b = torch.stack(parts) if pl[0].dim() == 2 else torch.cat([t.reshape(-1) for t in parts])
+                bufs.append(b)
+                o = 0
+                for i_, p in enumerate(pl):
+                    if pl[0].dim() == 2:
+                        self.state[p][n_] = b[i_]
+                    else:
+                        self.state[p][n_] = b[o:o + p.numel()].view(p.shape); o += p.numel()
+            self.__dict__.setdefault("_flatbufs", {})[key] = bufs
+        return bufs
+
+    @torch.no_grad()
+    def _step_batched(self, grp, ps):
+        """the per-tensor updates below for many parameters at once: 1-D parameters of one dtype and step as one flat
+        vector, 2-D ones of one shape, dtype and step stacked; the same operations in the same order per element (the
+        2-D update's per-row and per-column means over the same axes), only the stochastic rounding draws its random
+        numbers in another order"""
+        b1, b2 = grp["betas"]
+        lr, eps, wd = grp["lr"], grp["eps"], grp["weight_decay"]
+        groups = {}
+        for p in ps:
+            st = self.state[p]
+            st["step"] = st.get("step", 0) + 1
+            groups.setdefault((p.dim(), tuple(p.shape) if p.dim() == 2 else (), p.dtype, st["step"]), []).append(p)
+        for (nd, shp, dt, t), pl in groups.items():
+            bc1, bc2 = 1 - b1 ** t, 1 - b2 ** t
+            if nd == 2:
+                n, k = shp
+                MQ, MS, R, C = self._flat_state(pl, ("mq", "ms", "R", "C"), lambda p, n_: {
+                    "mq": torch.zeros_like(p, dtype=torch.int8), "ms": torch.zeros(p.shape[0], 1, device=p.device),
+                    "R": torch.zeros(p.shape[0], device=p.device), "C": torch.zeros(p.shape[1], device=p.device)}[n_])
+                G = torch.stack([p.grad for p in pl]).float()
+                g2 = G * G
+                R.mul_(b2).add_(g2.mean(2), alpha=1 - b2)
+                C.mul_(b2).add_(g2.sum(1) / n, alpha=1 - b2)
+                del g2
+                rmean = R.mean(1, keepdim=True).clamp_min(1e-30)
+                m = (MQ.float() * MS).mul_(b1).add_(G, alpha=1 - b1)
+                sc = m.abs().amax(2, keepdim=True).clamp_min(1e-30) / 127
+                MQ.copy_((m / sc + torch.rand_like(m)).floor_().clamp_(-127, 127).to(torch.int8)); MS.copy_(sc)
+                v = R[:, :, None] * C[:, None, :] / rmean[:, :, None]
+                upd = (m / bc1) / ((v / bc2).sqrt_().add_(eps))
+                P = torch.stack([p.detach() for p in pl]).float()
+                if wd > 0:
+                    P.mul_(1 - lr * wd)
+                P.add_(upd, alpha=-lr)
+                torch._foreach_copy_([p.data for p in pl], list(stochastic_round(P, dt).unbind(0)))
+            else:
+                M, V = self._flat_state(pl, ("m", "v"), lambda p, n_: torch.zeros_like(p, dtype=torch.float32))
+                G = torch.cat([p.grad.reshape(-1) for p in pl]).float()
+                M.mul_(b1).add_(G, alpha=1 - b1)
+                V.mul_(b2).addcmul_(G, G, value=1 - b2)
+                upd = (M / bc1) / ((V / bc2).sqrt_().add_(eps))
+                P = torch.cat([p.detach().reshape(-1) for p in pl]).float()
+                if wd > 0:
+                    P.mul_(1 - lr * wd)
+                P.add_(upd, alpha=-lr)
+                new = stochastic_round(P, dt).split([p.numel() for p in pl])
+                torch._foreach_copy_([p.data.view(-1) for p in pl], list(new))
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = closure() if closure is not None else None
@@ -85,6 +158,12 @@ class LeanAdam(torch.optim.Optimizer):
             if fe:
                 self._step_foreach_1d(grp, fe)
             fe_ids = {id(p) for p in fe}
+            if self.BATCHED:
+                bt = [p for p in grp["params"] if p.grad is not None and id(p) not in fe_ids and p.is_cuda
+                      and (p.dim() == 1 or (p.dim() == 2 and p.numel() <= (1 << 22)))]
+                if bt:
+                    self._step_batched(grp, bt)
+                fe_ids |= {id(p) for p in bt}
             for p in grp["params"]:
                 if p.grad is None or id(p) in fe_ids:
                     continue

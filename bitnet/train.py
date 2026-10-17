@@ -3297,6 +3297,8 @@ def main():
     ap.add_argument("--two_stage", type=float, default=0.0, help="BitNet-b1.58-style schedule: stage 1 cosine from the "
                     "peak to half of it, at the midpoint restart at F x peak and cosine to min_lr; weight decay 0 in "
                     "stage 2 (F e.g. 0.4; 0: plain cosine)")
+    ap.add_argument("--lean_batched", action="store_true", help="--lean_tail: the low-precision 1-D parameters as one "
+                    "flat pass and the 2-D ones stacked by shape (the same arithmetic; ~10x fewer kernel launches)")
     ap.add_argument("--lean_tail", action="store_true", help="float tail in bf16 (embedding, adapter) / fp16 (gains, "
                     "scales) with LeanAdam: int8 first moment, factored second moment, stochastic-rounding updates")
     ap.add_argument("--ts_micro_basis", default="", choices=["", "last", "sum", "rot"], help="--ts_micro --ts_nomom: how "
@@ -3955,6 +3957,7 @@ def main():
         if rc:
             tail_groups.append({"params": rc, "weight_decay": 0.0, "rc_lr": args.rc_lr})
         tail_opt = LeanAdam(tail_groups, lr=tc.lr, betas=(tc.beta1, tc.beta2))
+        LeanAdam.BATCHED = bool(args.lean_batched)
         print(f"lean float tail: {sum(p.numel() for p in emb)/1e6:.1f}M bf16 + {sum(p.numel() for p in small)/1e3:.1f}k fp16, "
               f"LeanAdam (int8 m, factored v, stochastic rounding)", flush=True)
     elif args.tail_fp32:
