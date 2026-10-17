@@ -4189,6 +4189,28 @@ def main():
                 if uv is not None and not m.wpacked.is_meta:
                     lr_state[id(m)] = tuple(t.to(_sdev[id(m)]) for t in uv)
             print(f"resumed low-rank momentum for {len(lr_state)} layers", flush=True)
+            if args.ts and args.lowrank:   # a larger --lowrank than the checkpoint's: grow each accumulator (the --ts_micro
+                # path never resizes): V gains orthonormal columns outside its span, U zeros there, so A = U V^T is
+                # unchanged and the new directions start empty
+                _sa = _store_codec(args.ts_store_a or "")
+                _ng = 0
+                for i_, m in enumerate(lays):
+                    if id(m) not in lr_state or m.wpacked.is_meta:
+                        continue
+                    U_, V_ = _load_pair(lr_state[id(m)])
+                    ra_ = min(args.lowrank, m.N, m.K)
+                    if V_.shape[1] >= ra_:
+                        continue
+                    dv_ = V_.device; U_, V_ = U_.to(device).float(), V_.to(device).float()
+                    g_ = torch.Generator(device=device).manual_seed(9_000_001 + 2 * i_)
+                    X_ = torch.randn(m.K, ra_ - V_.shape[1], device=device, generator=g_)
+                    X_ = X_ - V_ @ (V_.T @ X_); X_ = X_ - V_ @ (V_.T @ X_)
+                    V2 = torch.cat([V_, _orth(X_)], 1); U2 = torch.cat([U_, torch.zeros(m.N, ra_ - V_.shape[1], device=device)], 1)
+                    pr_ = _store_pair(_sa, U2, V2) if _sa else (U2, V2)
+                    lr_state[id(m)] = tuple(t.to(dv_) for t in pr_); _ng += 1
+                if _ng:
+                    print(f"--lowrank {args.lowrank}: grew the accumulators of {_ng} layers from the checkpoint's rank",
+                          flush=True)
         if blob.get("ts_ranks"):
             for m, r_ in zip([m for m in model.modules() if isinstance(m, KernelTernaryLinear)], blob["ts_ranks"]):
                 m._ts_rank = r_
