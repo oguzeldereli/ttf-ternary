@@ -36,6 +36,17 @@ def enable_fused_norm():
     Q.Qwen3_5RMSNorm.forward = fwd
     Q.Qwen3_5RMSNorm._tern_fused = True
     FUSED_NORM[0] = True
+    morig = Q.Qwen3_5MLP.forward
+
+    def mlp(self, x):     # silu(gate) * up in one kernel (bf16 on the GPU, silu MLPs only)
+        if x.is_cuda and FUSED_NORM[0] and self.config.hidden_act == "silu":
+            from .kernel import swiglu
+            g, u = self.gate_proj(x), self.up_proj(x)
+            if g.dtype == torch.bfloat16 and u.dtype == torch.bfloat16:
+                return self.down_proj(swiglu(g, u))
+            return self.down_proj(self.act_fn(g) * u)
+        return morig(self, x)
+    Q.Qwen3_5MLP.forward = mlp
 
 
 def is_qwen35(path):

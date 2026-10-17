@@ -1147,3 +1147,50 @@ class RMSNormFn(torch.autograd.Function):
 def rms_norm_qwen(x, w, eps):
     """Qwen3.5 RMSNorm, (x / rms(x)) (1 + w) in fp32 cast to x's dtype, forward and backward in one kernel each"""
     return RMSNormFn.apply(x, w, eps)
+
+
+@triton.jit
+def _swiglu_fwd_kernel(g_ptr, u_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    """y = bf16(bf16(silu(g)) * u): torch's silu (fp32, rounded to bf16) then the product (rounded), in one pass"""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK); m = offs < n
+    g = tl.load(g_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    u = tl.load(u_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    s = (g / (1.0 + tl.exp(-g))).to(tl.bfloat16).to(tl.float32)
+    tl.store(y_ptr + offs, (s * u).to(tl.bfloat16), mask=m)
+
+
+@triton.jit
+def _swiglu_bwd_kernel(g_ptr, u_ptr, gy_ptr, gg_ptr, gu_ptr, n, BLOCK: tl.constexpr):
+    """the backward of y = silu(g) * u with the unfused path's roundings: gu = bf16(gy s), gs = bf16(gy u),
+    gg = bf16(gs silu'(g)) (s = bf16(silu(g)))"""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK); m = offs < n
+    g = tl.load(g_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    u = tl.load(u_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    gy = tl.load(gy_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    sig = 1.0 / (1.0 + tl.exp(-g))
+    s = (g * sig).to(tl.bfloat16).to(tl.float32)
+    tl.store(gu_ptr + offs, (gy * s).to(tl.bfloat16), mask=m)
+    gs = (gy * u).to(tl.bfloat16).to(tl.float32)
+    tl.store(gg_ptr + offs, (gs * (sig * (1.0 + g * (1.0 - sig)))).to(tl.bfloat16), mask=m)
+
+
+class SwiGLUFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, g, u):
+        g_, u_ = g.contiguous(), u.contiguous()
+        y = torch.empty_like(g_); n = g_.numel(); B = 2048
+        _swiglu_fwd_kernel[(triton.cdiv(n, B),)](g_, u_, y, n, BLOCK=B)
+        ctx.save_for_backward(g_, u_)
+        return y
+
+    @staticmethod
+    def backward(ctx, gy):
+        g_, u_ = ctx.saved_tensors
+        gy = gy.contiguous(); gg = torch.empty_like(g_); gu = torch.empty_like(u_); n = g_.numel(); B = 2048
+        _swiglu_bwd_kernel[(triton.cdiv(n, B),)](g_, u_, gy, gg, gu, n, BLOCK=B)
+        return gg, gu
+
+
+def swiglu(g, u):
+    """silu(g) * u (bf16) in one kernel each way"""
+    return SwiGLUFn.apply(g, u)
