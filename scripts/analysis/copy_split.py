@@ -7,7 +7,7 @@ how predictable the next token is from corpus bigram statistics alone, p(next | 
   python -m scripts.analysis.copy_split [only-run-substring]"""
 import os, sys, numpy as np, torch, torch.nn.functional as F
 from scripts.analysis.induction_heads import load
-from bitnet.train import get_batch
+from ttf.train import get_batch
 
 RUNS = [("master, 164M", "checkpoints/curve_master/ckpt_5000.pt", "master", ""),
         ("master, 98M", "checkpoints/curve_master/ckpt_3000.pt", "master", ""),

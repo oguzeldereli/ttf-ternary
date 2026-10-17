@@ -7,8 +7,8 @@ Arms: V0 plain, V2 move correction (gain 1), V1 and U1 (your design, gain 1) thr
 """
 import sys, math, types, numpy as np, torch
 from scripts.analysis.testbench import Bench, G_REF
-from bitnet.kernel import fused_flip, unpack_rows
-from bitnet.train import get_batch, mech_step
+from ttf.kernel import fused_flip, unpack_rows
+from ttf.train import get_batch, mech_step
 
 ARM, RUN, ST, MULT = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
 BETA, NT, K = 0.97, 64, 33

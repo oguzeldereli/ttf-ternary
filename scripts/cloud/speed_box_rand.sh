@@ -17,8 +17,8 @@ F="--init_hf $W/tern/qw27 --init_hf_method random --data data/wikiq8_val.bin --v
   --ts_store_a fp12s --lean_tail --loss_chunk 512 --mem_cap_gib $CAP --mem_report"
 for spec in "$@"; do
   N=${spec%%|*}; X=${spec#*|}; D=$O/$N; rm -rf $D ${D}_rank*; mkdir -p $D
-  RUN="python -m bitnet.train"
-  case $N in pp[0-9]*) G=${N#pp}; G=${G%%[!0-9]*}; RUN="python -m torch.distributed.run --nproc_per_node $G -m bitnet.train --pipe" ;; esac
+  RUN="python -m ttf.train"
+  case $N in pp[0-9]*) G=${N#pp}; G=${G%%[!0-9]*}; RUN="python -m torch.distributed.run --nproc_per_node $G -m ttf.train --pipe" ;; esac
   PR=; case $N in *_prof) PR=$D ;; esac
   TERN_TIME=1 TERN_PROF=$PR timeout 3000 $RUN $F $X --steps 4 --out_dir $D > $D/train.log 2>&1
   echo "$N [$X]: $(grep -o 'time step 3: forward+backward [0-9.]*s, update[^0-9]*[0-9.]*s' $D/train.log | tail -1) | peak $(grep -o 'peak in fwd+bwd [0-9.]*' $D/train.log | sort -t' ' -k4 -n | tail -1 | grep -o '[0-9.]*$') GiB | $(grep -c -i -E 'out of memory|Traceback' $D/train.log) errors" | tee -a $O/summary.txt

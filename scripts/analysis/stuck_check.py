@@ -6,7 +6,7 @@
 """
 import json, torch, numpy as np
 from scripts.analysis.testbench import OUT
-from bitnet.kernel import unpack_rows
+from ttf.kernel import unpack_rows
 dev = "cuda"
 meta = json.load(open(f"{OUT}/meta.json")); names = meta["ternary_layers"]
 b = torch.load(meta["ckpt"], map_location="cpu", weights_only=False)

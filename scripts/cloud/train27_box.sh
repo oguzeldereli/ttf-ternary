@@ -13,7 +13,7 @@ MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -
 MB=${MB:-4}; GA=$(( 16 / MB )); D=${OUTD:-$W/tern/run27}; mkdir -p $D   # OUTD + NOFINAL: a timing test elsewhere
 [ -f $D/ckpt.pt ] || ln -f $W/tern/ckpt/qw27_rel_ckpt.pt $D/ckpt.pt
 echo "$(date '+%F %T') $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1), cap $CAP GiB, micro $MB x $GA" >> $D/box.log
-TERN_TIME=${TIME_STEPS:-0} python -m bitnet.train --init_hf $W/tern/qw27 --init_hf_method gptq --init_stream --resume \
+TERN_TIME=${TIME_STEPS:-0} python -m ttf.train --init_hf $W/tern/qw27 --init_hf_method gptq --init_stream --resume \
   --data data/mix4s_train.bin --val data/wikiq8_val.bin --data_u32 --seq_len 2048 --batch_size $MB --grad_accum $GA \
   --ts_micro --kd_cache $W/tern/kd4s --kd_cache_start 1350 --distill_w ${KD:-0.5} --kd_mode rest \
   --steps ${STEPS:-2650} --warmup 300 --lr 5e-4 --min_lr ${MINLR:-5e-5} --lr_rewarm 1350:${RW:-50}:${LRF:-0.5} \

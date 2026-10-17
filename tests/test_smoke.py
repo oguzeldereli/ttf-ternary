@@ -1,8 +1,8 @@
 """Smoke test: proves master-free ternary training actually learns, in-place,
 with no full-precision weight copy of the BitLinear matrices."""
 import torch
-from bitnet import BitTransformer, ModelConfig, STATE
-from bitnet.bitlinear import BitLinear
+from ttf import BitTransformer, ModelConfig, STATE
+from ttf.bitlinear import BitLinear
 
 torch.manual_seed(0)
 dev = "cuda" if torch.cuda.is_available() else "cpu"

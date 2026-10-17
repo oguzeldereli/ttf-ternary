@@ -9,10 +9,10 @@ source $S/env.sh
 cd $REPO
 until grep -q "DONE magadd16_qk" checkpoints/remote_queue.log 2>/dev/null; do sleep 60; done
 sleep 240
-while pgrep -u "$USER" -f "python -m bitnet.train" >/dev/null; do sleep 60; done
+while pgrep -u "$USER" -f "python -m ttf.train" >/dev/null; do sleep 60; done
 N=all_fixes_full
 rm -rf checkpoints/$N; mkdir -p checkpoints/$N
-python -m bitnet.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
+python -m ttf.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
   --seq_len 2048 --batch_size 16 --grad_accum 1 --steps 9155 --warmup 305 --rate_schedule cosine \
   --rate 0.0 --rate_peak 0.02 --rate_warmup 30 --g_ref 3.0 --int8 --dw_mode dense --track_flips --tail_fp32 \
   --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 250 --eval_iters 30 --save_secs 3600 --snap_every 1000 \

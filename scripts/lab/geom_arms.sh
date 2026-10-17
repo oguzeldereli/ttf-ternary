@@ -116,7 +116,7 @@ esac
 F=$(echo $F)
 R=""; [ -f $D/ckpt.pt ] && R="--resume"
 echo "$(date '+%F %T') start $ARM on $(hostname -s): $F $R" >> $D/train.log
-python -m bitnet.train $F $R --out_dir $D >> $D/train.log 2>&1
+python -m ttf.train $F $R --out_dir $D >> $D/train.log 2>&1
 echo "$(date '+%F %T') train end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/train.log
 # analyses on the result (light): geometry against fp; losses of the roundings for the fp32 arms (trit_compare), fixed
 # windows for the ternary ones (final_eval)

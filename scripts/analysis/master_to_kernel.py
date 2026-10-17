@@ -7,10 +7,10 @@ state starts fresh. Prints master's and the converted model's held-out loss on t
   python -m scripts.analysis.master_to_kernel MASTER_CKPT OUT_DIR [--mag add:16] [--qk_temp]
 """
 import os, sys, numpy as np, torch
-import bitnet.model as BM
-from bitnet.master import build_master_transformer
-from bitnet.flip import build_kernel_transformer, KernelTernaryLinear, enable_rc_scales
-from bitnet.kernel import pack_rows
+import ttf.model as BM
+from ttf.master import build_master_transformer
+from ttf.flip import build_kernel_transformer, KernelTernaryLinear, enable_rc_scales
+from ttf.kernel import pack_rows
 
 src, out = sys.argv[1], sys.argv[2]
 mag = sys.argv[sys.argv.index("--mag") + 1] if "--mag" in sys.argv else ""

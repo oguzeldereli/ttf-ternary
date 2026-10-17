@@ -4,7 +4,7 @@ per-head temperatures if the run has them.
   python -m scripts.analysis.heads_over_time RUN_DIR [kernel|master]
 """
 import sys, glob, json, re, torch, numpy as np
-import bitnet.probe as P
+import ttf.probe as P
 from scripts.analysis.induction_heads import load, CAP, ON
 P._last_loss.__defaults__ = (16,)
 run, kind = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "kernel")

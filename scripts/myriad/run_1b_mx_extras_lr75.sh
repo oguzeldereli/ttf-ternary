@@ -22,5 +22,5 @@ F="--preset d2048_l24 --mode master --master_dtype fp32 --data data/wiki32k_trai
    --eval_iters 30 --save_secs 1800 --snap_every 1000 --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp --out_dir $D"
 F=$(echo $F)
 [ -f $D/ckpt.pt ] && F="$F --resume"
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train $F" >> $D/train.log 2>&1
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train $F" >> $D/train.log 2>&1
 echo "$(date '+%F %T') job end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/train.log

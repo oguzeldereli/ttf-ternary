@@ -137,7 +137,7 @@ def run_keep(name, width, fa, fs):
 
 
 def run(spec):
-    from bitnet.kernel import unpack_rows
+    from ttf.kernel import unpack_rows
     name, rest = spec.split("=", 1)
     parts = rest.split(":")
     width, fa, fb = parts[:3]

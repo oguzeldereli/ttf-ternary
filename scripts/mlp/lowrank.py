@@ -8,7 +8,7 @@ gradients over the next 200 steps (sum_g) and record master's trit change over t
   python -m scripts.mlp.lowrank
 """
 import math, numpy as np, torch, torch.nn.functional as F
-from bitnet.master import MasterTernaryLinear
+from ttf.master import MasterTernaryLinear
 from scripts.mlp.mlp_lab import MLPLM, windows
 
 dev, BATCH, LR, WARM, TOTAL, WIN = "cuda", 4096, 1.5e-3, 100, 6000, 200

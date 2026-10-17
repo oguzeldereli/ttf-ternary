@@ -10,9 +10,9 @@ held-out loss change of applying it.
   python -m scripts.analysis.filter_sqrt_n CKPT RATE [TRUTH]
 """
 import sys, json, math, numpy as np, torch
-from bitnet.flip import build_kernel_transformer, KernelTernaryLinear
-from bitnet.kernel import fused_flip, unpack_rows, pack_rows
-from bitnet.train import get_batch
+from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.kernel import fused_flip, unpack_rows, pack_rows
+from ttf.train import get_batch
 
 dev = "cuda"
 CKPT, RATE = sys.argv[1], float(sys.argv[2])

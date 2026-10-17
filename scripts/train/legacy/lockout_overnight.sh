@@ -22,7 +22,7 @@ screen() {  # screen <name> <lockout args...>
   [ -f $OUT/done ] && { say "screen $name already done ($(final_ppl $OUT.log))"; return 0; }
   rm -rf $OUT; mkdir -p $OUT
   say "START screen $name"
-  python -m bitnet.train $BASE "$@" --stop_after 1000 --eval_interval 100000 \
+  python -m ttf.train $BASE "$@" --stop_after 1000 --eval_interval 100000 \
       --save_secs 100000 --out_dir $OUT > $OUT.log 2>&1 && touch $OUT/done
   local LF=$(python - <<PY
 import json
@@ -61,7 +61,7 @@ mkdir -p $OUT
 say "START armA_cos_lockout ($BEST, 300M tokens)"
 for TRY in 1 2 3; do
   [ $TRY -gt 1 ] && say "RETRY $TRY (resuming)"
-  python -m bitnet.train $BASE $ARGS --eval_interval 1000 --save_secs 600 --resume \
+  python -m ttf.train $BASE $ARGS --eval_interval 1000 --save_secs 600 --resume \
       --out_dir $OUT >> $OUT.log 2>&1 && break
   sleep 30
 done

@@ -2,9 +2,9 @@
 27B extrapolation. Ternary matmuls run in bf16 here (unpack then F.linear), so
 throughput is compute-bound ~ 1/params, like any bf16 model."""
 import time, sys, torch
-from bitnet.config import ModelConfig
-from bitnet.flip import build_stateless_transformer
-from bitnet.opt8 import Adam8bit
+from ttf.config import ModelConfig
+from ttf.flip import build_stateless_transformer
+from ttf.opt8 import Adam8bit
 
 SEQ = 1024; BS = 1; dev = "cuda"
 # (name, dim, layers, heads, kv, hidden)

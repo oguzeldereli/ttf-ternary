@@ -24,5 +24,5 @@ F="--preset d2048_l24 --mode kernel --data data/wiki32k_train.bin --val data/wik
    --ts_tau 1000 --ts_tau_anneal --ts_anneal 0.75 --out_dir $D"
 F=$(echo $F)
 [ -f $D/ckpt.pt ] && F="$F --resume"
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train $F" >> $D/train.log 2>&1
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train $F" >> $D/train.log 2>&1
 echo "$(date '+%F %T') job end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/train.log

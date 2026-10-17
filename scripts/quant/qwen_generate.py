@@ -1,4 +1,4 @@
-"""Generate text with a ternarized Qwen3.5 / 3.8 checkpoint from our trainer (bitnet/qwen.py): transformers' model with the
+"""Generate text with a ternarized Qwen3.5 / 3.8 checkpoint from our trainer (ttf/qwen.py): transformers' model with the
 large linears replaced by our ternary layers (trits, row / column scales, beta, rank-16 float adapter, int8 activations),
 exactly as trained. Prompts from --prompts (one per line) or a few defaults; --chat applies the tokenizer's chat template.
     python scripts/quant/qwen_generate.py HF_DIR CKPT [--prompts FILE] [--max_new 128] [--temp 0.7] [--chat]
@@ -7,9 +7,9 @@ import argparse, os, sys, time
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet.qwen import build_qwen                                        # noqa: E402
-from bitnet.flip import KernelTernaryLinear, enable_rc_scales            # noqa: E402
-from bitnet.bitlinear import STATE                                        # noqa: E402
+from ttf.qwen import build_qwen                                        # noqa: E402
+from ttf.flip import KernelTernaryLinear, enable_rc_scales            # noqa: E402
+from ttf.bitlinear import STATE                                        # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("hf_dir"); ap.add_argument("ckpt")

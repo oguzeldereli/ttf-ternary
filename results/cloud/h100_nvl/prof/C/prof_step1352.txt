@@ -79,9 +79,9 @@ by CPU time
                                                         cuLaunchKernel         1.54%        1.035s         1.72%        1.153s     144.074us       0.000us         0.00%     906.149ms     113.269us          8000  
                                                       cuLaunchKernelEx         1.12%     751.535ms         1.48%     994.650ms     153.495us       0.000us         0.00%      66.262ms      10.226us          6480  
                                                        cudaMemsetAsync         0.75%     503.161ms         1.41%     947.940ms     116.612us       0.000us         0.00%      43.182ms       5.312us          8129  
-                                          bitnet/opt_lean.py(47): step         0.72%     480.800ms         5.35%        3.585s        3.585s       0.000us         0.00%     392.701ms     392.701ms             1  
+                                          ttf/opt_lean.py(47): step         0.72%     480.800ms         5.35%        3.585s        3.585s       0.000us         0.00%     392.701ms     392.701ms             1  
                                                    aten::empty_strided         0.46%     311.343ms         0.48%     323.834ms       3.845us       0.000us         0.00%       0.000us       0.000us         84216  
-                                        bitnet/train.py(822): ts_layer         0.42%     283.907ms        32.33%       21.682s      54.205ms       0.000us         0.00%        5.430s      13.575ms           400  
+                                        ttf/train.py(822): ts_layer         0.42%     283.907ms        32.33%       21.682s      54.205ms       0.000us         0.00%        5.430s      13.575ms           400  
                                        triton/runtime/jit.py(708): run         0.42%     279.551ms         0.66%     439.661ms     230.914us       0.000us         0.00%       0.000us       0.000us          1904  
                                                              aten::mul         0.39%     264.653ms         3.59%        2.406s      69.777us        7.020s        19.35%        8.176s     237.107us         34481  
                                                               aten::mm         0.36%     241.418ms         3.52%        2.362s     303.783us        8.786s        24.22%        8.889s       1.143ms          7776  
@@ -93,7 +93,7 @@ by CPU time
                                                           Unrecognized         0.23%     151.209ms         0.23%     151.209ms       2.016ms       7.274ms         0.02%       7.274ms      96.984us            75  
                                                              aten::add         0.19%     124.779ms         1.91%        1.278s      78.521us     867.897ms         2.39%     969.693ms      59.574us         16277  
                                                            aten::slice         0.19%     124.389ms         0.23%     151.462ms       3.662us       0.000us         0.00%       0.000us       0.000us         41362  
-                              bitnet/opt_lean.py(18): stochastic_round         0.18%     122.067ms         1.52%        1.020s     209.050us       0.000us         0.00%      90.306ms      18.502us          4881  
+                              ttf/opt_lean.py(18): stochastic_round         0.18%     122.067ms         1.52%        1.020s     209.050us       0.000us         0.00%      90.306ms      18.502us          4881  
                                                            aten::empty         0.16%     109.039ms         0.17%     110.967ms       4.220us       0.000us         0.00%       0.000us       0.000us         26296  
                                                              aten::sub         0.16%     106.065ms         0.43%     285.212ms      16.907us     235.174ms         0.65%     235.188ms      13.942us         16869  
                                                              aten::sum         0.14%      95.006ms         1.47%     988.809ms     130.055us     486.368ms         1.34%     601.210ms      79.075us          7603  

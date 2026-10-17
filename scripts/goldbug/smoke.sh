@@ -21,14 +21,14 @@ C="--preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k
    --ts_anneal 0.5 --ts_fused --stop_after 21"
 for g in triton cublas int8mm; do
   G=""; [ $g != triton ] && G="--gemm $g"
-  CUDA_VISIBLE_DEVICES=0 TERN_TIME=1 python -m bitnet.train $(echo $C) $G --out_dir $O/path_$g > $O/path_$g.log 2>&1
+  CUDA_VISIBLE_DEVICES=0 TERN_TIME=1 python -m ttf.train $(echo $C) $G --out_dir $O/path_$g > $O/path_$g.log 2>&1
   echo "path $g: $(grep -E '^step' $O/path_$g.log | tail -1 | cut -c1-60) $(grep -E 'time step' $O/path_$g.log | tail -1 | grep -oE 'forward\+backward [0-9.]+s') $(grep -m1 -E 'Error|error:' $O/path_$g.log | cut -c1-120)" >> $R
 done
 # throughput, laid out as start.sh runs the arms: every arm whose GPU field has no "+" at the same time (two arms on one
 # GPU share it, as in the real run), then the chained "GPU+" arms. Wall s/step = (time at step 40 - at step 20) / 20.
 tp() {   # tp GPU NAME FLAGS...
   local g=$1 n=$2; shift 2
-  CUDA_VISIBLE_DEVICES=$g TERN_TIME=1 python -m bitnet.train "$@" --stop_after 41 --eval_interval 1000000 \
+  CUDA_VISIBLE_DEVICES=$g TERN_TIME=1 python -m ttf.train "$@" --stop_after 41 --eval_interval 1000000 \
     --save_secs 100000000 --out_dir $O/tp_$n > $O/tp_$n.log 2>&1
   local t w
   t=$(grep -E 'time step' $O/tp_$n.log | tail -10 | grep -oE 'forward\+backward [0-9.]+' | awk '{s+=$2} END {if (NR) print s/NR}')

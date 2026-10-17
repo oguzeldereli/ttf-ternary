@@ -11,6 +11,6 @@ K="--preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k
 K=$(echo $K)
 for v in base cublas chol all; do x=""; [ $v = cublas ] && x="--gemm cublas"; [ $v = chol ] && x="--ts_orth chol"
   [ $v = all ] && x="--gemm cublas --ts_orth chol --ts_fused"
-  TERN_TIME=1 python -m bitnet.train $K $x --out_dir $O/$v > $O/$v.log 2>&1
+  TERN_TIME=1 python -m ttf.train $K $x --out_dir $O/$v > $O/$v.log 2>&1
   echo "$v: $(grep 'val loss' $O/$v.log | tr '\n' ' ' | cut -c1-80) | $(grep 'time step 150' $O/$v.log | cut -c15-200) $(grep -m1 -E 'Error|error' $O/$v.log)"; done
 echo speed done

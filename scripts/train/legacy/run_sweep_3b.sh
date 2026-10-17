@@ -21,7 +21,7 @@ for ACC in 1 4 16 64; do
   echo "=== acc ${ACC}: ${TPS} tok/step, ${STEPS} steps, warmup ${WARMUP} -> ${OUT}"
   [ -f "${OUT}/done" ] && { echo "already done, skipping"; continue; }
   mkdir -p $OUT
-  python -m bitnet.train $COMMON --grad_accum $ACC --steps $STEPS --warmup $WARMUP \
+  python -m ttf.train $COMMON --grad_accum $ACC --steps $STEPS --warmup $WARMUP \
       --out_dir $OUT > ${OUT}.log 2>&1 && touch ${OUT}/done
   grep -E "FINAL|Error|OutOfMemory" ${OUT}.log | tail -3
 done

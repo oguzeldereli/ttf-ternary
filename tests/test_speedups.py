@@ -4,10 +4,10 @@
 """
 import torch
 import torch.nn.functional as F
-from bitnet.kernel import pack_rows, unpack_rows, lookahead_filter, _P3
-from bitnet.config import PRESETS
-from bitnet.flip import build_kernel_transformer, KernelTernaryLinear
-from bitnet import model as M
+from ttf.kernel import pack_rows, unpack_rows, lookahead_filter, _P3
+from ttf.config import PRESETS
+from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf import model as M
 
 dev = "cuda"
 torch.manual_seed(0)

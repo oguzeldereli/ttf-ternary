@@ -12,9 +12,9 @@ EVAL_BATCHES fresh batches; a random subset of the proposal with the same count 
 the control (fewer flips alone is known to help).
 """
 import sys, numpy as np, torch
-from bitnet.flip import build_kernel_transformer, KernelTernaryLinear
-from bitnet.kernel import fused_flip, unpack_rows, pack_rows
-from bitnet.train import get_batch
+from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.kernel import fused_flip, unpack_rows, pack_rows
+from ttf.train import get_batch
 dev = "cuda"
 CKPT = "checkpoints/lr_ctl/ckpt.pt"
 BS, SEQ, EVAL_BATCHES, G_REF = 16, 2048, 16, 3.0

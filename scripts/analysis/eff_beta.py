@@ -6,7 +6,7 @@ memory 1 / (1 - f). A fixed beta at pure noise would sit at ||M|| / ||g|| = 1 / 
 """
 import sys, numpy as np, torch
 from scripts.analysis.testbench import Bench
-from bitnet.train import get_batch
+from ttf.train import get_batch
 
 RUN, ST = sys.argv[1], int(sys.argv[2]); D = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0303
 B = Bench(f"checkpoints/{RUN}/ckpt_{ST}.pt")

@@ -7,9 +7,9 @@
   python -m scripts.analysis.plateau RUN_DIR [kernel|master]"""
 import sys, glob, re, numpy as np, torch
 from scripts.analysis.induction_heads import load
-from bitnet.flip import KernelTernaryLinear
-from bitnet.kernel import unpack_rows
-from bitnet.train import get_batch
+from ttf.flip import KernelTernaryLinear
+from ttf.kernel import unpack_rows
+from ttf.train import get_batch
 
 run, kind = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "kernel")
 val = np.memmap("data/wiki32k_val.bin", dtype=np.uint16, mode="r")

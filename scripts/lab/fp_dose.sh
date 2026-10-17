@@ -8,7 +8,7 @@ set -u
 N=$1; S=/tmp/oguzelde/tern; source $S/env.sh; cd $S/repo
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 D=checkpoints/fpq$N; mkdir -p $D; W=$(( 305 * N / 9155 ))
-[ -f $D/ckpt.pt ] && grep -q "FINAL val" $D/train.log || python -m bitnet.train --preset small --mode fp32 \
+[ -f $D/ckpt.pt ] && grep -q "FINAL val" $D/train.log || python -m ttf.train --preset small --mode fp32 \
   --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16 --grad_accum 1 --steps $N \
   --warmup $W --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 250 --eval_iters 30 --save_secs 3600 --lookahead 0 \
   --out_dir $D >> $D/train.log 2>&1

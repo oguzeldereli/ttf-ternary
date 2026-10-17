@@ -8,8 +8,8 @@ to the instantaneous true gradient |T| at step S (rank correlation, sampled).
   python -m scripts.analysis.master_drift MASTER_CKPT_AT_A STEPS_TO_REPLAY
 """
 import sys, numpy as np, torch
-from bitnet.master import build_master_transformer
-from bitnet.train import split_params, get_batch
+from ttf.master import build_master_transformer
+from ttf.train import split_params, get_batch
 
 path, NREP = sys.argv[1], int(sys.argv[2])
 WIN = [w for w in (1000, 300, 100, 30, 10, 3, 1) if w <= NREP]

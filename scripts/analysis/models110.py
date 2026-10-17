@@ -7,8 +7,8 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eval"))
-from bitnet.model import BitTransformer                                          # noqa: E402
-from bitnet.hf_init import ternarize, ternarize_gptq                              # noqa: E402
+from ttf.model import BitTransformer                                          # noqa: E402
+from ttf.hf_init import ternarize, ternarize_gptq                              # noqa: E402
 
 LIN = [("attn", "wq"), ("attn", "wk"), ("attn", "wv"), ("attn", "wo"), ("ffn", "w_gate"), ("ffn", "w_up"), ("ffn", "w_down")]
 

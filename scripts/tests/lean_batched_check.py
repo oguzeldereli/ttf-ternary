@@ -7,7 +7,7 @@ parameters and states must agree to fp32 rounding; then the time of one step of 
 import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
-from bitnet.opt_lean import LeanAdam
+from ttf.opt_lean import LeanAdam
 
 dev = "cuda"
 

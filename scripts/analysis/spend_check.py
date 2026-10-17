@@ -9,7 +9,7 @@ from scripts.analysis.testbench import OUT
 dev = "cuda" if torch.cuda.mem_get_info()[0] > 3e9 else "cpu"
 b = torch.load(json.load(open(f"{OUT}/meta.json"))["ckpt"], map_location="cpu", weights_only=False)
 flips = torch.load(f"{OUT}/flips.pt")
-from bitnet.kernel import unpack_rows
+from ttf.kernel import unpack_rows
 import numpy as np
 G = torch.load(f"{OUT}/gbar.pt"); names = json.load(open(f"{OUT}/meta.json"))["ternary_layers"]
 sd = b["model"]

@@ -83,7 +83,7 @@ python3 scripts/data/prep_wiki.py 4e8 --tokenizer llama --out_prefix data/wiki32
 python3 -m scripts.data.prep_fineweb 2e9 --out_prefix data/fwedu32k                    # FineWeb-Edu (optional)
 
 # TTF, 110M, 300M tokens (the final recipe)
-python -m bitnet.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
+python -m ttf.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
     --seq_len 2048 --batch_size 16 --steps 9155 --warmup 305 --int8 --dw_mode dense --tail_fp32 \
     --lr 1.5e-3 --min_lr 1.5e-4 --lookahead 0 --ckpt_skip 2 --eval_interval 250 --eval_iters 30 \
     --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp \
@@ -91,7 +91,7 @@ python -m bitnet.train --preset small --mode kernel --data data/wiki32k_train.bi
     --ts_anneal 0.75 --ts_tau_anneal --out_dir checkpoints/ttf
 
 # master-weights reference with the same float extras
-python -m bitnet.train --preset small --mode master --master_dtype fp32 --data data/wiki32k_train.bin \
+python -m ttf.train --preset small --mode master --master_dtype fp32 --data data/wiki32k_train.bin \
     --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16 --steps 9155 --warmup 305 --lr 1.5e-3 \
     --min_lr 1.5e-4 --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp --out_dir checkpoints/master
 
@@ -101,7 +101,7 @@ python scripts/eval/compare.py checkpoints/ttf checkpoints/master --set fw
 python3 scripts/eval/zeroshot_tok.py && python scripts/eval/zeroshot.py checkpoints/ttf
 
 # convert a pretrained Llama-architecture model (the recipe; scripts/quant/recover_run.sh has the full command)
-python -m bitnet.train --init_hf PATH/TO/TinyLlama --init_hf_method gptq --ts_start 400 --ts_theta 64 ...
+python -m ttf.train --init_hf PATH/TO/TinyLlama --init_hf_method gptq --ts_start 400 --ts_theta 64 ...
 ```
 
 Add `--resume` to continue any run.
@@ -126,8 +126,8 @@ Add `--resume` to continue any run.
 ## Layout
 
 ```
-bitnet/          model, Triton kernels, TTF and other update rules, training loop
-  train.py       training entry point (python -m bitnet.train --help); ts_layer = the TTF update
+ttf/          model, Triton kernels, TTF and other update rules, training loop
+  train.py       training entry point (python -m ttf.train --help); ts_layer = the TTF update
   kernel.py      packed-ternary kernels (int8 / bf16 GEMMs, input gradient, packing)
   flip.py        ternary layers, gradient capture / fused hooks
   hf_init.py     conversion of pretrained Llama models (ALS, GPTQ onto the ternary grid, accumulator warm start)

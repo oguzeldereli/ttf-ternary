@@ -15,7 +15,7 @@ case $ARM in
 esac
 D=checkpoints/scr_t75_$ARM; mkdir -p $D
 R=""; [ -f $D/ckpt.pt ] && R="--resume"
-python -m bitnet.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 \
+python -m ttf.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 \
   --batch_size $B --grad_accum 1 --steps $ST --warmup $W --rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_warmup $RW \
   --g_ref 3.0 --int8 --dw_mode dense --track_flips --tail_fp32 --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval $EI --eval_iters $EN \
   --save_secs 1800 --snap_every 0 --lookahead 0 --ckpt_skip 2 --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp \

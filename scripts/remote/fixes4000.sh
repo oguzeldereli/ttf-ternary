@@ -13,7 +13,7 @@ SMOKE="--preset small --mode kernel --data data/wiki32k_train.bin --val data/wik
   --tail_fp32 --eval_iters 1 --eval_interval 100000 --save_secs 100000 --lowrank 16 --lookahead 2
   --lookahead_xbatch --stop_after 12"
 for f in "" "--lr_spend 2" "--lr_refresh 4 --lr_refresh_every 3" "--lr_gate"; do
-  python -m bitnet.train $SMOKE $f --out_dir $S/smoke_fix > $S/smoke_fix.log 2>&1 \
+  python -m ttf.train $SMOKE $f --out_dir $S/smoke_fix > $S/smoke_fix.log 2>&1 \
     || { echo "SMOKE FAILED for '$f'"; tail -20 $S/smoke_fix.log | tee checkpoints/fixes4000_smoke.err; exit 1; }
   rm -rf $S/smoke_fix
 done
@@ -28,14 +28,14 @@ BR="--preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32
 run() {
   local n=$1; shift
   rm -rf checkpoints/$n; mkdir -p checkpoints/$n; ln -s $S/ckpt_4000.pt checkpoints/$n/ckpt.pt
-  python -m bitnet.train $BR "$@" --out_dir checkpoints/$n > checkpoints/$n/train.log 2>&1
+  python -m ttf.train $BR "$@" --out_dir checkpoints/$n > checkpoints/$n/train.log 2>&1
   rm -f checkpoints/$n/ckpt.pt
   echo "$(date '+%F %T') DONE $n $(grep -oE 'FINAL val loss [0-9.]+' checkpoints/$n/train.log)"
 }
 run fix4000_base & run fix4000_spend2 --lr_spend 2 & wait
 run fix4000_refresh16 --lr_refresh 16 --lr_refresh_every 10 & run fix4000_gate --lr_gate & wait
 # resume the no-look-ahead run
-python -m bitnet.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
+python -m ttf.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
   --seq_len 2048 --batch_size 16 --grad_accum 1 --steps 9155 --warmup 305 --rate_schedule cosine \
   --rate 0.0 --rate_peak 0.02 --rate_warmup 30 --g_ref 3.0 --int8 --dw_mode dense --track_flips --tail_fp32 \
   --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 250 --eval_iters 30 --save_secs 3600 \

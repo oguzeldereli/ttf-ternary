@@ -18,7 +18,7 @@ D=checkpoints/$N; mkdir -p $D
 hostname >> $D/train.log; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader >> $D/train.log
 A="$(echo $F) --out_dir $D"
 [ -f $D/ckpt.pt ] && A="$A --resume"
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train $A" >> $D/train.log 2>&1
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train $A" >> $D/train.log 2>&1
 echo "$(date '+%F %T') job end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/train.log
 if grep -q "FINAL val loss" $D/train.log && [ ! -f $D/final_eval.json ]; then
   $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python scripts/eval/final_eval.py $D" > $D/final_eval.log 2>&1

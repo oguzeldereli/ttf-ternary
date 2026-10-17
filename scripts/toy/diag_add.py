@@ -6,8 +6,8 @@ groups (embedding, norm gains, mag_A, mag_B), which share one clip at 1.0.
 """
 import sys, numpy as np, torch
 from scripts.analysis.induction_heads import load
-from bitnet.flip import KernelTernaryLinear, _KernelTernFn
-from bitnet.train import get_batch
+from ttf.flip import KernelTernaryLinear, _KernelTernFn
+from ttf.train import get_batch
 
 run, steps = sys.argv[1], sys.argv[2:]
 data = np.memmap("data/toy_ind_v256_train.bin", dtype=np.uint16, mode="r")

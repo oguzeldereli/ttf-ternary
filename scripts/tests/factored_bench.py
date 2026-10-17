@@ -5,8 +5,8 @@ against --ts_factored (ts_layer on the factors), --ts_micro M = 8 (non-final and
 import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
-import bitnet.train as T
-from bitnet.flip import KernelTernaryLinear
+import ttf.train as T
+from ttf.flip import KernelTernaryLinear
 
 dev = "cuda"
 Tk, M = 4096, 8                                   # tokens per micro-batch (2 x 2048), micro-batches per step

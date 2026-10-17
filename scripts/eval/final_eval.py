@@ -24,10 +24,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet.bitlinear import STATE                                   # noqa: E402
-from bitnet.flip import build_kernel_transformer, enable_rc_scales, KernelTernaryLinear  # noqa: E402
-from bitnet.master import build_master_transformer, MasterTernaryLinear  # noqa: E402
-from bitnet.model import Attention                                   # noqa: E402
+from ttf.bitlinear import STATE                                   # noqa: E402
+from ttf.flip import build_kernel_transformer, enable_rc_scales, KernelTernaryLinear  # noqa: E402
+from ttf.master import build_master_transformer, MasterTernaryLinear  # noqa: E402
+from ttf.model import Attention                                   # noqa: E402
 
 BYTES_PER_TOKEN_WIKI = 3.569
 BYTES_PER_TOKEN_FW = 4.003
@@ -47,7 +47,7 @@ def load_model(path, device, mag_kind="add"):
         raise SystemExit(f"mode {mode} not supported")
     model = model.to(device)
     if "layers.0.ffn.router.weight" in sd:                   # --moe E:K:H (top-K from the run's arguments, else 2)
-        from bitnet.model import enable_moe, BitTransformer
+        from ttf.model import enable_moe, BitTransformer
         E_ = sd["layers.0.ffn.router.weight"].shape[0]
         H_ = next(v.shape for k, v in sd.items() if k.startswith("layers.0.ffn.experts.0.w_gate.")
                   and k.split(".")[-1] in ("weight", "wpacked"))[0]
@@ -60,14 +60,14 @@ def load_model(path, device, mag_kind="add"):
                                                int8_dx=ck.get("int8_dx", False), g_ref=ck.get("g_ref", 3.0)).to(device))
         enable_moe(model, f"{E_}:{k_}:{H_}", mk)
     if any(k.endswith(".bpacked") for k in sd):              # --ts_boost
-        from bitnet.flip import enable_boost
+        from ttf.flip import enable_boost
         enable_boost(model)
     if "tok_emb.table.wpacked" in sd:                         # --tern_emb tied_wide:M
-        from bitnet.tern_emb import enable_tern_emb
+        from ttf.tern_emb import enable_tern_emb
         M_ = sd["tok_emb.table.col_scale"].numel() // sd["tok_emb.proj.row_scale"].numel()
         enable_tern_emb(model, f"tied_wide:{M_}", "kernel")
     elif "tok_emb.wpacked" in sd or "tok_emb.latent" in sd:     # --tern_emb
-        from bitnet.tern_emb import enable_tern_emb
+        from ttf.tern_emb import enable_tern_emb
         enable_tern_emb(model, "untied" if ("lm_head.wpacked" in sd or "lm_head.latent" in sd) else "tied",
                         "master" if mode == "master" else "kernel")
     if any(k.endswith(".rot_Q") for k in sd):                # --init_rot: rotated inputs
@@ -195,7 +195,7 @@ def main():
         res["seconds"] = round(time.time() - t0, 1)
         json.dump(res, open(os.path.join(run, "final_eval.json"), "w"), indent=1)
         try:   # the results database: these numbers as result records of the run (<run>/records.jsonl)
-            from bitnet import results as RDB
+            from ttf import results as RDB
             rid, rp = RDB.run_of(run)
             ev = f"final_eval.py {RDB.git_commit() or ''}".strip()
             recs = [RDB.make("result", run=rid, metric="wiki_fixed", value=res["wiki_loss"], n=res["wiki_windows"],

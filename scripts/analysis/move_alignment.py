@@ -7,9 +7,9 @@ and cos(D, -R) (0 = unrelated; in ~1M dimensions a random direction gives ~0.001
 """
 import sys, numpy as np, torch
 import torch.nn.functional as F
-from bitnet.flip import build_kernel_transformer, KernelTernaryLinear
-from bitnet.kernel import unpack_rows
-from bitnet.train import get_batch
+from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.kernel import unpack_rows
+from ttf.train import get_batch
 
 dev = "cuda"
 A, B = sys.argv[1], sys.argv[2]

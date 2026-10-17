@@ -12,9 +12,9 @@ matched to A-kept's count (is fewer flips alone the effect?).
   python -m scripts.analysis.proposal_precision [ckpt] [K]
 """
 import sys, numpy as np, torch
-from bitnet.flip import build_kernel_transformer, KernelTernaryLinear
-from bitnet.kernel import fused_flip, unpack_rows, pack_rows
-from bitnet.train import get_batch
+from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.kernel import fused_flip, unpack_rows, pack_rows
+from ttf.train import get_batch
 
 dev = "cuda"
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/lm_lowrank256_xb2_diag/ckpt_340.pt"

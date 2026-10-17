@@ -1,7 +1,7 @@
 import time, torch
-from bitnet.config import ModelConfig
-from bitnet.flip import build_kernel_transformer
-from bitnet.opt8 import Adam8bit
+from ttf.config import ModelConfig
+from ttf.flip import build_kernel_transformer
+from ttf.opt8 import Adam8bit
 dev='cuda'
 # ~50M: dim512 L12 hidden1408, vocab32k
 c=ModelConfig(vocab_size=32000,dim=512,n_layers=12,n_heads=8,n_kv_heads=8,hidden_dim=1408,max_seq_len=512)

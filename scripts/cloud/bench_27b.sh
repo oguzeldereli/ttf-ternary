@@ -24,7 +24,7 @@ peak() { grep -o "peakVRAM [0-9.]*GiB" $1 | tail -1; }
 best=""; bestt=1e9
 for mb in ${MBS:-1 2 4 8 16}; do
   D=$B/b$mb; rm -rf $D; mkdir -p $D; ln -f $W/tern/ckpt/qw27_rel_ckpt.pt $D/ckpt.pt
-  timeout 3000 python -m bitnet.train $F --batch_size $mb --grad_accum $((16 / mb)) --out_dir $D > $D/train.log 2>&1
+  timeout 3000 python -m ttf.train $F --batch_size $mb --grad_accum $((16 / mb)) --out_dir $D > $D/train.log 2>&1
   t=$(rate $D/train.log); echo "1 GPU, micro-batch $mb x $((16 / mb)): $t s/step, $(peak $D/train.log) $(grep -c -i 'out of memory' $D/train.log) OOM" | tee -a $B/summary.txt
   [ "$t" = fail ] && break
   awk -v t=$t -v b=$bestt 'BEGIN{exit !(t < b)}' && { best=$mb; bestt=$t; }
@@ -32,7 +32,7 @@ done
 if [ $G -gt 1 ] && [ -n "$best" ]; then
   D=$B/dp$G; rm -rf $D; mkdir -p $D; ln -f $W/tern/ckpt/qw27_rel_ckpt.pt $D/ckpt.pt
   ga=$((16 / best / G)); [ $ga -lt 1 ] && ga=1
-  timeout 3000 torchrun --nproc_per_node $G -m bitnet.train $F --batch_size $best --grad_accum $ga --out_dir $D > $D/train.log 2>&1
+  timeout 3000 torchrun --nproc_per_node $G -m ttf.train $F --batch_size $best --grad_accum $ga --out_dir $D > $D/train.log 2>&1
   echo "$G GPUs data parallel, micro-batch $best x $ga each ($((best * ga * G)) sequences / step): $(rate $D/train.log) s/step" | tee -a $B/summary.txt
 fi
 echo "$(date '+%F %T') bench done" | tee -a $B/summary.txt

@@ -7,9 +7,9 @@ Printed per layer: the best head's prev / dup / ind score (chance ~ 1/t), for ea
   python -m scripts.analysis.induction_heads
 """
 import json, torch, numpy as np, torch.nn.functional as F
-import bitnet.model as BM
-from bitnet.master import build_master_transformer
-from bitnet.flip import build_kernel_transformer
+import ttf.model as BM
+from ttf.master import build_master_transformer
+from ttf.flip import build_kernel_transformer
 
 CAP = []
 ON = [False]                      # capture attention only while set (heads_over_time turns it on around one forward)
@@ -46,7 +46,7 @@ def load(path, kind):
     magA = [k for k in b["model"] if k.endswith("mag_A")]            # runs with --lowrank_mag (additive assumed
     if magA:                                                          # unless MAG_KIND=mul is set)
         import os
-        from bitnet.flip import KernelTernaryLinear
+        from ttf.flip import KernelTernaryLinear
         r = b["model"][magA[0]].shape[1]
         for l in m.modules():
             if isinstance(l, KernelTernaryLinear):
@@ -57,7 +57,7 @@ def load(path, kind):
             if isinstance(a, BM.Attention):
                 a.qk_logscale = torch.nn.Parameter(torch.zeros(a.n_heads))
     if any(k.endswith("row_scale") for k in b["model"]):          # runs with --rc_scale
-        from bitnet.flip import enable_rc_scales
+        from ttf.flip import enable_rc_scales
         enable_rc_scales(m)
     missing, unexpected = m.load_state_dict(b["model"], strict=False)
     assert not any(k.endswith(("qk_logscale", "mag_A", "mag_B", "row_scale", "col_scale")) for k in missing)

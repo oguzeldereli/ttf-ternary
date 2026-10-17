@@ -1,6 +1,6 @@
 """Full-precision reference on a run's own training-time validation windows.
 
-bitnet/train.py's evaluate() scores eval_iters batches of max(batch_size, 16) windows drawn by get_batch() with a
+ttf/train.py's evaluate() scores eval_iters batches of max(batch_size, 16) windows drawn by get_batch() with a
 generator seeded seed + 12345. This script draws the same windows and scores transformers' bf16 Qwen model on them
 (layers that do not fit the GPU stay in CPU memory), so a run's val curve can be read against full precision.
     python scripts/eval/fp_runval.py HF_DIR --val data/wikiq8_val.bin --eval_iters 4 [--seed 1337] [--check_first 8]

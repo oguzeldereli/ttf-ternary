@@ -23,7 +23,7 @@ for A in 0 0.1 0.01 0.03; do
   if [ -f $OUT/done ]; then say "probe alpha=$A already done ($(final_ppl $OUT.log))"; continue; fi
   rm -rf $OUT; mkdir -p $OUT
   say "START probe alpha=$A"
-  python -m bitnet.train $BASE --err_feedback --ef_alpha $A --stop_after 600 \
+  python -m ttf.train $BASE --err_feedback --ef_alpha $A --stop_after 600 \
       --eval_interval 100000 --save_secs 100000 --track_flips --out_dir $OUT > $OUT.log 2>&1 \
     && touch $OUT/done
   SPS=$(awk '/^step/{s=$2; t=$(NF-3)} END{sub("s","",t); if (s>0) printf "%.2f", t/s}' $OUT.log)
@@ -52,7 +52,7 @@ say "START armA_cos_ef (alpha=$ALPHA, 300M tokens)"
 # crash or reboot continues the run instead of restarting it; retry up to 3 times
 for TRY in 1 2 3 4; do
   [ $TRY -gt 1 ] && say "RETRY $TRY armA_cos_ef (resuming from last checkpoint)"
-  python -m bitnet.train $BASE --err_feedback --ef_alpha $ALPHA --eval_interval 1000 \
+  python -m ttf.train $BASE --err_feedback --ef_alpha $ALPHA --eval_interval 1000 \
       --save_secs 600 --track_flips --resume --out_dir $OUT >> $OUT.log 2>&1 && break
   sleep 30
 done

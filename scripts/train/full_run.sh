@@ -8,7 +8,7 @@ cd "$(dirname "$0")/../.."
 NAME=${1:?run name}; shift
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=.
 mkdir -p "checkpoints/$NAME"
-exec python -m bitnet.train --preset small --mode kernel \
+exec python -m ttf.train --preset small --mode kernel \
   --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
   --seq_len 2048 --batch_size 16 --grad_accum 1 --steps 9155 --warmup 305 \
   --rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_warmup 30 --g_ref 3.0 \

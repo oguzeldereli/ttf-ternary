@@ -3,8 +3,8 @@ layer type (mean | max over blocks), A/B rms, on one validation batch.
   MAG_KIND=add python -m scripts.analysis.adapter_diag RUN_DIR STEP [STEP ...]"""
 import sys, numpy as np, torch
 from scripts.analysis.induction_heads import load
-from bitnet.flip import KernelTernaryLinear, _KernelTernFn
-from bitnet.train import get_batch
+from ttf.flip import KernelTernaryLinear, _KernelTernFn
+from ttf.train import get_batch
 
 run, steps = sys.argv[1], sys.argv[2:]
 val = np.memmap("data/wiki32k_val.bin", dtype=np.uint16, mode="r")

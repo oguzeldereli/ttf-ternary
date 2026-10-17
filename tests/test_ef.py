@@ -7,9 +7,9 @@
 4. guards: evidence mode / grad accumulation are rejected
 """
 import torch
-from bitnet import flip as F
-from bitnet.flip import KernelTernaryLinear, set_err_feedback, build_kernel_transformer
-from bitnet.config import ModelConfig
+from ttf import flip as F
+from ttf.flip import KernelTernaryLinear, set_err_feedback, build_kernel_transformer
+from ttf.config import ModelConfig
 
 dev = "cuda"
 torch.manual_seed(0)

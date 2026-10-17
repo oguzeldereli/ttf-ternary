@@ -14,7 +14,7 @@ remain in tag pre-consolidation-2026-10-17).
 """
 import argparse, hashlib, os, re, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet import results as R   # noqa: E402
+from ttf import results as R   # noqa: E402
 
 MON = {m: i + 1 for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
 DATE = re.compile(r"\(~?(\d{1,2}) (Sep|Oct|Nov)\b")

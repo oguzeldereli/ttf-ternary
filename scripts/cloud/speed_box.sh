@@ -17,8 +17,8 @@ F="--init_hf $W/tern/qw27 --init_hf_method gptq --init_stream --resume --data da
   --loss_chunk 512 --mem_cap_gib $CAP --mem_report"
 for spec in "$@"; do
   N=${spec%%|*}; X=${spec#*|}; D=$O/$N; rm -rf $D ${D}_rank*; mkdir -p $D; ln -f $W/tern/ckpt/qw27_rel_ckpt.pt $D/ckpt.pt
-  RUN="python -m bitnet.train"
-  case $N in pp[0-9]*) G=${N#pp}; G=${G%%[!0-9]*}; RUN="python -m torch.distributed.run --nproc_per_node $G -m bitnet.train --pipe" ;; esac
+  RUN="python -m ttf.train"
+  case $N in pp[0-9]*) G=${N#pp}; G=${G%%[!0-9]*}; RUN="python -m torch.distributed.run --nproc_per_node $G -m ttf.train --pipe" ;; esac
   ST=1352; PR=; case $N in *_prof) ST=1353; PR=$D ;; esac
   TERN_TIME=1 TERN_PROF=$PR timeout 2400 $RUN $F $X --steps $ST --out_dir $D > $D/train.log 2>&1
   rm -f $D/ckpt.pt

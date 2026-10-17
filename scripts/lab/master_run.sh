@@ -7,7 +7,7 @@ S=/tmp/$USER/tern; source $S/env.sh || exit 1; cd $S/repo || exit 1   # never ru
 N=$1; shift
 pgrep -u "$USER" -f "scripts/lab/sync_out.sh" >/dev/null || setsid nohup bash $L/sync_out.sh >/dev/null 2>&1 &
 mkdir -p checkpoints/$N
-python -m bitnet.train --preset small --mode master --master_dtype fp32 --data data/wiki32k_train.bin \
+python -m ttf.train --preset small --mode master --master_dtype fp32 --data data/wiki32k_train.bin \
   --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16 --grad_accum 1 --steps 9155 --warmup 305 \
   --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 250 --eval_iters 30 --save_secs 1800 --snap_every 1000 --track_flips \
   "$@" $([ -f checkpoints/$N/ckpt.pt ] && echo --resume) --out_dir checkpoints/$N >> checkpoints/$N/train.log 2>&1

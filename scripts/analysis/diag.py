@@ -1,9 +1,9 @@
 """Diagnostic: does per-layer training transient scale with depth?
 Same 27B layer geometry, vary n_layers, measure peak VRAM for 1 fwd+bwd."""
 import torch
-from bitnet.config import ModelConfig
-from bitnet.flip import build_stateless_transformer
-from bitnet.opt8 import Adam8bit
+from ttf.config import ModelConfig
+from ttf.flip import build_stateless_transformer
+from ttf.opt8 import Adam8bit
 
 dev = "cuda"; SEQ = 1024
 for L in [4, 8, 16, 24]:

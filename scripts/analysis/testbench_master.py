@@ -11,8 +11,8 @@ cos(D, -gbar), held-out loss change of the whole step (latent weights and float 
 """
 import sys, os, json, math, copy, numpy as np, torch
 import torch.nn.functional as F
-from bitnet.master import build_master_transformer, split_params, MasterTernaryLinear
-from bitnet.train import get_batch
+from ttf.master import build_master_transformer, split_params, MasterTernaryLinear
+from ttf.train import get_batch
 
 dev = "cuda"
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/curve_master/ckpt_4000.pt"

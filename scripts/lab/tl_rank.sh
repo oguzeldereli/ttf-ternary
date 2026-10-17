@@ -14,5 +14,5 @@ F="--init_hf $M --init_hf_method gptqc --data data/wiki32k_train.bin --val data/
    --ts_start 0 --ts_tau 1000 --ts_anneal 0.75 --ts_tau_anneal --ts_nomom --ts_fused --gemm int8mm
    --lowrank $R --ts_rank_s $R"
 echo "$(date '+%F %T') start tlr$R on $(hostname -s): $(echo $F)" >> $D/train.log
-python -m bitnet.train $(echo $F) --out_dir $D >> $D/train.log 2>&1
+python -m ttf.train $(echo $F) --out_dir $D >> $D/train.log 2>&1
 echo "$(date '+%F %T') train end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/train.log

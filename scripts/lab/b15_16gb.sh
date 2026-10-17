@@ -14,7 +14,7 @@ echo "$(date '+%F %T') start on $(hostname) $(nvidia-smi --query-gpu=name,memory
 for r in 64 256; do
   nvidia-smi --query-gpu=memory.used --format=csv,noheader -l 1 > $O/smi_r$r.csv &
   SMI=$!
-  /usr/bin/time -v python -m bitnet.train $(echo $B) --lowrank $r --ts_rank_s $r --out_dir $O/r$r > $O/r$r.log 2>&1
+  /usr/bin/time -v python -m ttf.train $(echo $B) --lowrank $r --ts_rank_s $r --out_dir $O/r$r > $O/r$r.log 2>&1
   kill $SMI
   echo "ranks $r: $(grep 'memory (MiB)' $O/r$r.log | tail -1 | sed 's/  memory (MiB): //') | $(grep -E '^step ' $O/r$r.log | tail -1 | cut -c1-100) | smi max $(sort -n $O/smi_r$r.csv | tail -1) | host RSS $(grep 'Maximum resident' $O/r$r.log | grep -oE '[0-9]+$' | awk '{printf "%.1f GB", $1/1048576}') $(grep -m1 -E 'Error|out of memory' $O/r$r.log | cut -c1-120)" >> $R
 done

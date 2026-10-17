@@ -14,8 +14,8 @@ labels   the online selector's label vs the true one, for momentum's proposals a
 """
 import sys, math, numpy as np, torch
 from scripts.analysis.testbench import Bench, G_REF
-from bitnet.kernel import fused_flip, unpack_rows, pack_rows
-from bitnet.train import get_batch
+from ttf.kernel import fused_flip, unpack_rows, pack_rows
+from ttf.train import get_batch
 
 RUN, ST = sys.argv[1], int(sys.argv[2])
 BETA, NT = 0.97, 64

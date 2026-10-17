@@ -7,8 +7,8 @@ order); then the time of forward + backward of both.
 import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
-import bitnet.flip as FL
-from bitnet.flip import KernelTernaryLinear, enable_rc_scales
+import ttf.flip as FL
+from ttf.flip import KernelTernaryLinear, enable_rc_scales
 
 dev = "cuda"
 for (K, N, T) in ((512, 384, 1000), (5120, 17408, 4096), (17408, 5120, 4096)):

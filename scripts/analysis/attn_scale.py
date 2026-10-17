@@ -4,7 +4,7 @@ the attention logits q.k/sqrt(d), mean attention entropy, and the attention RMSN
   python -m scripts.analysis.attn_scale
 """
 import json, torch, numpy as np
-import bitnet.model as BM
+import ttf.model as BM
 from scripts.analysis.induction_heads import load
 CAP = []
 _orig = BM.Attention.forward

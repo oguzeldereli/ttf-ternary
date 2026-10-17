@@ -54,7 +54,7 @@ class StreamedFP:
 
     def __init__(self, hf_dir, dev="cuda"):
         from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
-        from bitnet.qwen import text_config, _safetensor_index
+        from ttf.qwen import text_config, _safetensor_index
         from safetensors import safe_open
         self.mq, self.dev = mq, dev
         t = text_config(hf_dir); t._attn_implementation = "sdpa"; self.t = t

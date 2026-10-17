@@ -3,9 +3,9 @@
 Verifies: weights stay in {-1,0,1}, the flip predictor receives gradient,
 flips actually happen, and the loss goes down."""
 import torch
-from bitnet.config import ModelConfig
-from bitnet.flip import build_flip_transformer, apply_flips, TernaryFlipLinear
-from bitnet.bitlinear import STATE  # unused knobs; imported for parity
+from ttf.config import ModelConfig
+from ttf.flip import build_flip_transformer, apply_flips, TernaryFlipLinear
+from ttf.bitlinear import STATE  # unused knobs; imported for parity
 
 torch.manual_seed(0)
 dev = "cuda" if torch.cuda.is_available() else "cpu"

@@ -24,7 +24,7 @@ steady-state 1/(1-beta)); otherwise momentum starts empty.
 import os
 import sys, json, numpy as np, torch
 from scripts.analysis.testbench import Bench, batches, G_REF
-from bitnet.kernel import fused_flip, unpack_rows
+from ttf.kernel import fused_flip, unpack_rows
 
 OUT = os.environ.get("BENCH_DIR", "checkpoints/testbench_4000")
 ARMS = (sys.argv[1] if len(sys.argv) > 1 else "V0,V1,V2,V3").split(",")

@@ -33,7 +33,7 @@ for v in "ts_base" "ts_every4 --ts_orth_every 4" "ts_defer --ts_orth_defer" "ts_
   set -- $v; n=$1; shift
   if [ $n = master ]; then F="$C --mode master --master_dtype fp32"; else F="$C $K $*"; fi
   F=$(echo $F)
-  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; TERN_TIME=1 python -m bitnet.train $F --out_dir $O/$n" > $O/$n.log 2>&1
+  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; TERN_TIME=1 python -m ttf.train $F --out_dir $O/$n" > $O/$n.log 2>&1
   python3 - $O/$n.log $n >> $R <<'PY'
 import re, sys
 t = [tuple(map(float, m)) for m in re.findall(r"forward\+backward ([\d.]+)s, update \(momentum step / AdamW\) ([\d.]+)s", open(sys.argv[1]).read())][5:]

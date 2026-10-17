@@ -1,4 +1,4 @@
-"""The results database from the command line (bitnet/results.py; default file results/runs.jsonl or $TTF_RESULTS).
+"""The results database from the command line (ttf/results.py; default file results/runs.jsonl or $TTF_RESULTS).
 
   python scripts/results.py status                          runs whose last event is queued / running (and failed lately)
   python scripts/results.py table --metric wiki_fixed [--runs PATTERN] [--metric fw_fixed ...]
@@ -12,7 +12,7 @@
 """
 import argparse, fnmatch, json, os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from bitnet import results as R   # noqa: E402
+from ttf import results as R   # noqa: E402
 
 
 def runs_matching(recs, key):

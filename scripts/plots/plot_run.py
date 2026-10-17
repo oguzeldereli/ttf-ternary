@@ -2,7 +2,7 @@
 
   python3 plot_run.py checkpoints/run [--out checkpoints/run/run.png]
 
-Reads metrics.jsonl written by bitnet/train.py --track_flips.
+Reads metrics.jsonl written by ttf/train.py --track_flips.
 """
 import argparse, json, sys
 import numpy as np

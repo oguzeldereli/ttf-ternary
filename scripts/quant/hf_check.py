@@ -15,10 +15,10 @@ import torch.nn as nn
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eval"))
 from final_eval import window_losses                                            # noqa: E402
-from bitnet.flip import build_kernel_transformer, enable_rc_scales               # noqa: E402
-from bitnet.master import build_master_transformer, MasterTernaryLinear         # noqa: E402
-from bitnet.model import BitTransformer                                          # noqa: E402
-from bitnet.hf_init import model_config_from_hf, init_from_hf, calib_hessians    # noqa: E402
+from ttf.flip import build_kernel_transformer, enable_rc_scales               # noqa: E402
+from ttf.master import build_master_transformer, MasterTernaryLinear         # noqa: E402
+from ttf.model import BitTransformer                                          # noqa: E402
+from ttf.hf_init import model_config_from_hf, init_from_hf, calib_hessians    # noqa: E402
 
 
 class _HF(nn.Module):

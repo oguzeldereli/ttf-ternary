@@ -25,8 +25,8 @@ run() {
   mkdir -p "$out"
   say "START $name"
   # retry once on crash: --resume picks up from the last checkpoint
-  python -m bitnet.train "$@" --out_dir "$out" >> "$out.log" 2>&1 \
-    || { say "RETRY $name after failure"; python -m bitnet.train "$@" --resume --out_dir "$out" >> "$out.log" 2>&1; }
+  python -m ttf.train "$@" --out_dir "$out" >> "$out.log" 2>&1 \
+    || { say "RETRY $name after failure"; python -m ttf.train "$@" --resume --out_dir "$out" >> "$out.log" 2>&1; }
   if [ $? -eq 0 ]; then
     touch "$out/done"; say "DONE $name -> ppl $(final_ppl $out.log)"
     python plot_run.py "$out" --title "$name" >> $LOG 2>&1 || true

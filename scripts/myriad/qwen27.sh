@@ -23,7 +23,7 @@ TOK="export HF_HOME=$HOME/Scratch/hf HF_HUB_OFFLINE=1 RAYON_NUM_THREADS=4;"
 [ -f data/wikiq8_val.bin ] || $RUN "source $S/env.sh; $TOK cd $HOME/Scratch/ternary-LLM; python scripts/quant/retok.py data/wiki32k_val.bin data/wikiq8_val.bin --target $M"
 [ -f data/wikiq8_train.bin ] || $RUN "source $S/env.sh; $TOK cd $HOME/Scratch/ternary-LLM; python scripts/quant/retok.py data/wiki32k_train.bin data/wikiq8_train.bin --target $M"
 [ -f logs/qwen27/ref.txt ] || $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python scripts/quant/qwen_check.py $M --data data/wikiq8_val.bin --n 16 --methods ''" > logs/qwen27/ref.txt 2>&1
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train --init_hf $M --init_hf_method gptq --init_stream \
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train --init_hf $M --init_hf_method gptq --init_stream \
   --data data/wikiq8_train.bin --val data/wikiq8_val.bin --data_u32 --seq_len 2048 --batch_size 4 --grad_accum 4 --ts_micro \
   --steps $STEPS --warmup 300 --tail_fp32 --lr 5e-4 --min_lr 5e-5 --eval_interval 100 --eval_iters 4 --save_secs $SAVE_SECS \
   --snap_every 0 --lookahead 0 --ckpt_skip 0 --rc_scale --lowrank_mag add:16 --mag_wd 0.1 \

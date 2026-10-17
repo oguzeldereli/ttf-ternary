@@ -18,7 +18,7 @@ import torch.nn as nn
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 torch.set_num_threads(4)
 import models110 as M                                                              # noqa: E402
-from bitnet.hf_init import ternarize, ternarize_gptq, _out_err                    # noqa: E402
+from ttf.hf_init import ternarize, ternarize_gptq, _out_err                    # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--fp", required=True); ap.add_argument("--train", default="data/wiki32k_train.bin")

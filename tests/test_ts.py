@@ -1,4 +1,4 @@
-"""TTF update (bitnet.train.ts_layer) invariants, on a GPU:
+"""TTF update (ttf.train.ts_layer) invariants, on a GPU:
   1. the fast path (--ts_fast) and the general path give the same trits and the same accumulator;
   2. the trits stay in {-1, 0, 1} and only entries with |A| >= theta move, by sign(A);
   3. at full rank (r >= min(N, K)) with N >= K (V square) the spend reduces each moved entry by exactly theta; with
@@ -11,9 +11,9 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from bitnet.flip import KernelTernaryLinear      # noqa: E402
-from bitnet.kernel import unpack_rows             # noqa: E402
-from bitnet import train as T                     # noqa: E402
+from ttf.flip import KernelTernaryLinear      # noqa: E402
+from ttf.kernel import unpack_rows             # noqa: E402
+from ttf import train as T                     # noqa: E402
 
 
 def cfg(**kw):

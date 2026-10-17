@@ -11,7 +11,7 @@ echo "$(date '+%F %T') start on $(hostname): $(nvidia-smi --query-gpu=name,memor
 for r in $RANKS; do
   nvidia-smi --query-gpu=timestamp,memory.used,utilization.gpu --format=csv,noheader -l 1 > $O/smi_r$r.csv &
   SMI=$!
-  TERN_TIME=1 /usr/bin/time -v python -m bitnet.train --preset b27 --mode kernel --data data/wiki32k_train.bin \
+  TERN_TIME=1 /usr/bin/time -v python -m ttf.train --preset b27 --mode kernel --data data/wiki32k_train.bin \
     --val data/wiki32k_val.bin --seq_len 2048 --batch_size 1 --grad_accum 1 --steps 9155 --warmup 305 \
     --rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_warmup 30 --g_ref 3.0 --int8 --dw_mode dense --tail_fp32 \
     --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 1000000 --eval_iters 1 --save_secs 1000000 --lookahead 0 --ckpt_skip 0 \

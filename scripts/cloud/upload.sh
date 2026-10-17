@@ -8,7 +8,7 @@ SSH=$1; N=${2:-40}; HOSTSPEC=${SSH##* }; W=${W:-/workspace}
 R="rsync -a --partial --info=progress2 -e"
 SSHCMD="${SSH% *}"
 $SSH "mkdir -p $W/tern/repo/data $W/tern/qw27 $W/tern/ckpt $W/tern/kd"
-$R "$SSHCMD" --exclude __pycache__ bitnet scripts $HOSTSPEC:$W/tern/repo/
+$R "$SSHCMD" --exclude __pycache__ ttf scripts $HOSTSPEC:$W/tern/repo/
 $R "$SSHCMD" models/qw27/{config.json,generation_config.json,tokenizer.json,tokenizer_config.json,chat_template.jinja,merges.txt,vocab.json} $HOSTSPEC:$W/tern/qw27/
 $R "$SSHCMD" data/m3/mix3_train.bin data/wikiq8_val.bin $HOSTSPEC:$W/tern/repo/data/
 $R "$SSHCMD" models/qw27_rel/qw27_rel_ckpt.pt models/qw27_rel/qw27_rel_ckpt.pt.sha256 $HOSTSPEC:$W/tern/ckpt/

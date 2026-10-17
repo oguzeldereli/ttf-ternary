@@ -1,10 +1,10 @@
-"""What holds GPU memory at the peak of a training step (from bitnet.train --mem_snapshot PATH:STEP).
+"""What holds GPU memory at the peak of a training step (from ttf.train --mem_snapshot PATH:STEP).
 
     python scripts/analysis/mem_snapshot.py SNAPSHOT.pickle [--top 30]
 
 Replays the recorded allocations and frees, finds the moment the allocated bytes peak (and the reserved bytes, which
 add the allocator's unused cached blocks: fragmentation), and groups the blocks alive then by the innermost frame in
-bitnet/ (file:line function), and also by the outermost bitnet/ frame (which phase of the step). Blocks that are still
+ttf/ (file:line function), and also by the outermost ttf/ frame (which phase of the step). Blocks that are still
 alive at the end of the trace are counted as persistent (trits, float tail, state), the rest as transient.
 """
 import argparse
@@ -15,7 +15,7 @@ GiB = 2 ** 30
 
 
 def site(frames, inner=True):
-    fs = [f for f in frames if "bitnet/" in f.get("filename", "")]
+    fs = [f for f in frames if "ttf/" in f.get("filename", "")]
     if not fs:
         fs = [f for f in frames if "torch/" not in f.get("filename", "")] or frames[:1]
     if not fs:
@@ -61,7 +61,7 @@ def main():
             live[e["addr"]] = (e["size"], i)
         elif e["action"] == "free_completed":
             live.pop(e["addr"], None)
-    for label, inner in (("innermost bitnet frame", True), ("outermost bitnet frame (phase)", False)):
+    for label, inner in (("innermost ttf frame", True), ("outermost ttf frame (phase)", False)):
         by = defaultdict(lambda: [0, 0, 0])
         for addr, (s, i) in live.items():
             g = by[site(tr[i].get("frames", []), inner)]

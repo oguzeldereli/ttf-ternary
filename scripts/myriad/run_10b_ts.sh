@@ -36,5 +36,5 @@ F="--preset b10 --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_v
 F=$(echo $F)
 [ -f $D/ckpt.pt ] && F="$F --resume"
 T=""; [ $MODE = test ] && T="TERN_TIME=1 "
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; ${T}python -m bitnet.train $F" >> $D/train.log 2>&1
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; ${T}python -m ttf.train $F" >> $D/train.log 2>&1
 echo "$(date '+%F %T') job end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/train.log

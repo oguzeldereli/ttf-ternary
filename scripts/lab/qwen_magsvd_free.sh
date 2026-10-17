@@ -11,7 +11,7 @@ python -c "import transformers, fla" 2>/dev/null || pip install --quiet --no-cac
 [ -f data/wikiqw_train40.bin ] || python scripts/quant/retok.py data/wiki32k_train.bin data/wikiqw_train40.bin --target $M --max_tokens 4e7
 for R in 0 16 64 256; do
   X="--lowrank_mag add:${R/#0/16}"; [ $R != 0 ] && X="$X --init_mag_svd $R"
-  python -m bitnet.train --init_hf $M --init_stream --init_hf_method $METH --data data/wikiqw_train40.bin --val data/wikiqw_val.bin \
+  python -m ttf.train --init_hf $M --init_stream --init_hf_method $METH --data data/wikiqw_train40.bin --val data/wikiqw_val.bin \
     --data_u32 --seq_len 2048 --batch_size 1 --grad_accum 1 --steps 1 --eval_first_n 16 --eval_interval 100000 --no_final_save \
     --save_secs 99999 --tail_fp32 --lookahead 0 --rc_scale --mode kernel --int8 --dw_mode dense --ts --ts_nomom --ts_fused \
     --gemm int8mm --lowrank 256 --ts_rank_s 256 $X --out_dir $O/${METH}_r$R > $O/${METH}_r$R.log 2>&1

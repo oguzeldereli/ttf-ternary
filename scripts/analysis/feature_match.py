@@ -20,8 +20,8 @@ import torch.nn as nn
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eval"))
 torch.set_num_threads(4)
-from bitnet.model import BitTransformer                                          # noqa: E402
-from bitnet.hf_init import ternarize, ternarize_gptq                              # noqa: E402
+from ttf.model import BitTransformer                                          # noqa: E402
+from ttf.hf_init import ternarize, ternarize_gptq                              # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", action="append", required=True, help="NAME=PATH")

@@ -1,4 +1,4 @@
-"""Checks for the streaming conversion (bitnet/qwen.py convert_qwen_streaming) on a small Qwen3.5:
+"""Checks for the streaming conversion (ttf/qwen.py convert_qwen_streaming) on a small Qwen3.5:
   1. stepping the decoder layer by layer with the captured per-layer arguments gives the model's own loss (fp)
   2. the streaming, sequential GPTQ conversion's loss before training (against the one-shot GPTQ of qwen_check.py)
     python scripts/quant/qwen_stream_check.py HF_DIR --data data/wikiqw_val.bin --calib_data data/wikiqw_train.bin
@@ -8,8 +8,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet.qwen import build_qwen, load_qwen, layer_inputs, convert_qwen_streaming   # noqa: E402
-from bitnet.flip import KernelTernaryLinear, enable_rc_scales                          # noqa: E402
+from ttf.qwen import build_qwen, load_qwen, layer_inputs, convert_qwen_streaming   # noqa: E402
+from ttf.flip import KernelTernaryLinear, enable_rc_scales                          # noqa: E402
 
 ap = argparse.ArgumentParser(); ap.add_argument("hf_dir"); ap.add_argument("--data", required=True)
 ap.add_argument("--calib_data", required=True); ap.add_argument("--n", type=int, default=16); ap.add_argument("--seq", type=int, default=2048)

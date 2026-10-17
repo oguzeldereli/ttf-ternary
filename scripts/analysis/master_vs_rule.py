@@ -7,9 +7,9 @@ flips. For master's changes: uphill share on T, |T| quartile, and how far the la
   python -m scripts.analysis.master_vs_rule MASTER_CKPT CONVERTED_KERNEL_CKPT
 """
 import sys, math, numpy as np, torch
-from bitnet.master import build_master_transformer
-from bitnet.train import split_params, get_batch
-from bitnet.kernel import unpack_rows
+from ttf.master import build_master_transformer
+from ttf.train import split_params, get_batch
+from ttf.kernel import unpack_rows
 from scripts.analysis.testbench import Bench
 
 mpath, kpath = sys.argv[1], sys.argv[2]

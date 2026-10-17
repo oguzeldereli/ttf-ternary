@@ -11,7 +11,7 @@ COMMON="--preset small --data data/wiki32k_train.bin --val data/wiki32k_val.bin 
 one() {
   local n=$1; shift
   rm -rf checkpoints/$n; mkdir -p checkpoints/$n
-  python -m bitnet.train $COMMON "$@" --out_dir checkpoints/$n > checkpoints/$n/train.log 2>&1
+  python -m ttf.train $COMMON "$@" --out_dir checkpoints/$n > checkpoints/$n/train.log 2>&1
   rm -f checkpoints/$n/ckpt.pt
   echo "$(date '+%F %T') DONE $n $(grep -oE 'FINAL val loss [0-9.]+' checkpoints/$n/train.log)"
 }

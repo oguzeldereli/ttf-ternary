@@ -27,7 +27,7 @@ M="--mode master --master_dtype fp32 --lr 5e-4 --min_lr 5e-5"
 F="--ts_fast --ts_orth scholqr3"
 one() {  # NAME PRESET BATCH FLAGS...
   n=$1; p=$2; b=$3; shift 3
-  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; timeout 330 python -m bitnet.train --preset $p --batch_size $b $(echo $C) $* --out_dir $TMPDIR/sp_$n" > $O/$n.log 2>&1
+  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; timeout 330 python -m ttf.train --preset $p --batch_size $b $(echo $C) $* --out_dir $TMPDIR/sp_$n" > $O/$n.log 2>&1
   r=$(grep -E '^step' $O/$n.log | awk '{x=$(NF-3); sub("s","",x); if ($2>=10) {if (!s0) {s0=$2; t0=x}; s1=$2; t1=x}} END {if (s1>s0) printf "%.2f s/step (%d steps measured), %.0f tokens/s", (t1-t0)/(s1-s0), s1-s0, '$b'*2048*(s1-s0)/(t1-t0); else print "no steady steps"}')
   pk=$(grep -E '^step' $O/$n.log | tail -1 | grep -o 'peakVRAM [0-9.]*GiB')
   oom=$(grep -c -i "out of memory" $O/$n.log)

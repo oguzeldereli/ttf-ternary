@@ -317,7 +317,7 @@ def lookahead_step(model, x, y, tail, device, step, iters=1, flip_seed=0, extra_
             gg = [F.cosine_similarity(grads[i].flatten().float(), l.gw.flatten().float(), 0).item()
                   for i, l in enumerate(layers)]
         for i, l in enumerate(layers):
-            # keep/revert straight on the packed bytes (bitnet.kernel.lookahead_filter)
+            # keep/revert straight on the packed bytes (ttf.kernel.lookahead_filter)
             lookahead_filter(saved[i], l.wpacked, grads[i], l.gw, cnt)
             l.gw = None
         if n_prop is None:
@@ -1432,7 +1432,7 @@ def _ts_layer_factored(l, fg, state, c):
 
 
 MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "64"))]   # sketch size (TERN_MICRO_K: tests only)
-FIRE_FUSED = [False]          # --ts_fire_fused (with --ts_factored): bitnet.kernel.ttf_fire
+FIRE_FUSED = [False]          # --ts_fire_fused (with --ts_factored): ttf.kernel.ttf_fire
 
 
 def _micro_sketch(l, dev, step):
@@ -3156,9 +3156,9 @@ def main():
                     "(memory-matched comparisons; 0: no cap)")
     ap.add_argument("--init_hf", default="", help="start from a pretrained Llama checkpoint in Hugging Face format (a "
                     "directory with config.json and safetensors); the model shape comes from its config (--preset is ignored). "
-                    "See bitnet/hf_init.py")
+                    "See ttf/hf_init.py")
     ap.add_argument("--init_hf_method", default="als", choices=["absmean", "row", "als", "gptq", "gptqc", "gptqs", "zero", "scratch", "native", "random"],
-                    help="--init_hf, kernel mode: how the weights become trits and scales (bitnet/hf_init.py)")
+                    help="--init_hf, kernel mode: how the weights become trits and scales (ttf/hf_init.py)")
     ap.add_argument("--distill", default="", help="a full-precision teacher (Hugging Face Llama dir): the loss is "
                     "(1 - W) CE + W KL(teacher || student) per token (--distill_w W)")
     ap.add_argument("--m_qmix", type=int, default=0, help="--mode master: homotopy onto the ternary grid, the forward "
@@ -3177,7 +3177,7 @@ def main():
     ap.add_argument("--kd_mode", default="renorm", choices=["rest", "renorm"], help="--kd_cache: rest = the top k plus one bucket for the teacher's remaining mass (the KL on that distribution); renorm = the top k renormalised (drops the tail)")
     ap.add_argument("--kd_cache_start", type=int, default=0, help="--kd_cache: the training step that reads window 0 (the step a run is resumed at when the cache is introduced)")
     ap.add_argument("--moe", default="", help="E:K[:H]: mixture-of-experts feed-forward, E ternary SwiGLU experts (hidden H, default "
-                    "the dense one), top-K routing (bitnet/model.py MoEFeedForward)")
+                    "the dense one), top-K routing (ttf/model.py MoEFeedForward)")
     ap.add_argument("--moe_aux", type=float, default=0.01, help="--moe: weight of the load-balancing loss")
     ap.add_argument("--init_stream", action="store_true", help="--init_hf (Qwen): convert layer by layer, sequentially, reading "
                     "each layer's weights from the safetensors (27B: no full-precision copy in memory)")
@@ -3222,7 +3222,7 @@ def main():
                     "and nothing fires; the floats and the second moment train): calibrate a converted model first")
     ap.add_argument("--ts_boost", type=float, default=0.0, help="--ts: S > 0 adds a boost plane per ternary layer, W = T + s B with s "
                     "learnable (init S): a trit at +-1 whose evidence passes theta again in its direction sets B, evidence back "
-                    "clears B before the trit moves (bitnet/flip.py enable_boost)")
+                    "clears B before the trit moves (ttf/flip.py enable_boost)")
     ap.add_argument("--ts_theta_noise", type=float, default=0.0, help="--ts: per layer, the fire bar is K x a ~100-step average of "
                     "the accumulator's rms (never below --ts_theta): a threshold set by the layer's own evidence spread")
     ap.add_argument("--ts_theta_noise_win", type=int, default=0, help="--ts_theta_noise: measure the bar once instead: each layer keeps evidence without firing for its first N active steps, then bar = max(theta, K x rms(A)), fixed")
@@ -3300,10 +3300,10 @@ def main():
                     "spent by the same moves (diagnostic: dense N x K per layer)")
     ap.add_argument("--tern_emb", default="", help="tied | untied: ternary token embedding (and output head) with "
                     "per-row / per-column float scales; kernel mode trains its trits with TTF after the backward, master "
-                    "mode keeps a float latent (STE) (bitnet/tern_emb.py)")
+                    "mode keeps a float latent (STE) (ttf/tern_emb.py)")
     ap.add_argument("--movediag", default="", help="EVERY[:NB[:WIN]]: every EVERY steps, measure what this step's trit moves "
                     "are worth: count, first-order gain on a true gradient from NB probe batches, direction precision, "
-                    "realized loss change on NB other probe batches, undo share (bitnet/movediag.py)")
+                    "realized loss change on NB other probe batches, undo share (ttf/movediag.py)")
     ap.add_argument("--lr_linear", action="store_true", help="after warmup, a linear decay from the peak lr to --min_lr "
                     "instead of the cosine (TTF's step scale follows it through the lr ratio)")
     ap.add_argument("--lr_wsd", type=int, default=0, help="warmup-stable-decay: the peak lr until step D (this), then a "
@@ -3323,7 +3323,7 @@ def main():
                     "float adapters start from the best rank-R part of each layer's rounding error (in the input "
                     "covariance's norm) instead of 0: the lost precision moved into the float part (hf_init._mag_svd_init)")
     ap.add_argument("--ts_fire_fused", action="store_true", help="--ts_factored: the firing (A = U V^T, legal moves, "
-                    "repack, the spend's D V) in one kernel (bitnet.kernel.ttf_fire): no [N, K] temporaries")
+                    "repack, the spend's D V) in one kernel (ttf.kernel.ttf_fire): no [N, K] temporaries")
     ap.add_argument("--ts_acc_scale", type=float, default=1.0, help="--resume: multiply every TTF accumulator by F (a "
                     "run continued at theta F x its old theta keeps each entry's distance to the bar: no burst of moves)")
     ap.add_argument("--fused_norm", action="store_true", help="Qwen: the RMSNorms (not the gated ones) through one fused "
@@ -3543,7 +3543,7 @@ def main():
                     help="float tail (embeddings, norm gains) in fp32 + AdamW, as in master "
                          "mode (default bf16 + 8-bit Adam freezes the norm gains at 1.0)")
     ap.add_argument("--probe", default="",
-                    help="probe schedule, e.g. '0-40:5,40-160:20' (bitnet/probe.py)")
+                    help="probe schedule, e.g. '0-40:5,40-160:20' (ttf/probe.py)")
     ap.add_argument("--seed", type=int, default=None,
                     help="run seed (init, data order, look-ahead batches); default TrainConfig.seed = 1337")
     ap.add_argument("--flip_seed", type=int, default=0,

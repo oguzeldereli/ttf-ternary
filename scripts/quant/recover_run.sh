@@ -15,8 +15,8 @@ for job in "$@"; do
   N=${job%%|*}; F=${job#*|}
   case "$F" in *"--mode master"*) B="--master_dtype fp32";; *) B=$TTF;; esac
   mkdir -p checkpoints/$N
-  while pgrep -f "[p]ython -m bitnet.train" >/dev/null; do sleep 60; done
-  python -m bitnet.train --init_hf $M --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 \
+  while pgrep -f "[p]ython -m ttf.train" >/dev/null; do sleep 60; done
+  python -m ttf.train --init_hf $M --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 \
     --batch_size 16 --grad_accum 1 --steps $STEPS --warmup 30 --tail_fp32 --lr 1.5e-3 --min_lr 1.5e-4 \
     --eval_interval 50 --eval_iters 10 --save_secs 99999 --snap_every 0 $NFS --lookahead 0 --ckpt_skip 2 \
     --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp $(echo $B) $F --out_dir checkpoints/$N \

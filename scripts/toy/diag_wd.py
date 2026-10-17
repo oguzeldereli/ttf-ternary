@@ -8,7 +8,7 @@ Compares add_la_wd01 with mom_add_la (no decay) and mom_la (no adapter) over sna
   python -m scripts.toy.diag_wd
 """
 import torch, math
-from bitnet.kernel import unpack_rows
+from ttf.kernel import unpack_rows
 
 RUNS = ("mom_la", "mom_add_la", "add_la_wd01")
 STEPS = (1000, 2000, 3000, 4000, 4500, 5000, 5500, 6000, 7000, 10000, 14000)

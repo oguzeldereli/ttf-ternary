@@ -19,7 +19,7 @@ job() {  # name, minutes needed, command...
   rm -f checkpoints/$n/ckpt.pt
   echo "$(date '+%F %T') DONE $n $(grep -oE 'FINAL val loss [0-9.]+' checkpoints/$n/train.log)"
 }
-BR="python -m bitnet.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin
+BR="python -m ttf.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin
   --seq_len 2048 --batch_size 16 --grad_accum 1 --steps 9155 --warmup 305 --rate_schedule cosine
   --rate 0.0 --rate_peak 0.02 --rate_warmup 30 --g_ref 3.0 --int8 --dw_mode dense --track_flips
   --track_reversals --tail_fp32 --lr 1.5e-3 --min_lr 1.5e-4 --stop_after 6544 --eval_iters 30

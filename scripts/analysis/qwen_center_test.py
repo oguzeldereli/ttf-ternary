@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 torch.set_num_threads(4)
 import ttf_qwen                                                                     # noqa: E402
-from bitnet.kernel import unpack_rows                                               # noqa: E402
+from ttf.kernel import unpack_rows                                               # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("hf_dir"); ap.add_argument("weights"); ap.add_argument("--data", required=True)

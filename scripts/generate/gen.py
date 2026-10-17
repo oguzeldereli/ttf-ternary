@@ -4,8 +4,8 @@
 """
 import argparse, torch
 from tokenizers import Tokenizer
-from bitnet.flip import build_kernel_transformer
-from bitnet.master import build_master_transformer
+from ttf.flip import build_kernel_transformer
+from ttf.master import build_master_transformer
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--ckpt", default="checkpoints/p3b_acc1/ckpt.pt")

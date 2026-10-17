@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet.kernel import tern_gemm_i8, trit_beta                    # noqa: E402
+from ttf.kernel import tern_gemm_i8, trit_beta                    # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ttf_kernels import act_quant_planes, tern_gemv_planes, tern_gemv2, repack_2bit, _UVA_TABLES, _gemv2_epi_kernel   # noqa: E402
 import triton                                                          # noqa: E402

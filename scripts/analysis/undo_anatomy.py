@@ -18,7 +18,7 @@ batches and random numbers for all; held-out change after the ten steps.
 """
 import sys, re, numpy as np, torch
 from scripts.analysis.testbench import Bench
-from bitnet.train import get_batch
+from ttf.train import get_batch
 
 RUN, ST = sys.argv[1], int(sys.argv[2])
 SPEND = float(sys.argv[3]) if len(sys.argv) > 3 else 3.0

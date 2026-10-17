@@ -5,8 +5,8 @@ codes and decoded values must be bit-identical; then the time of both (17 Oct).
 import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
-import bitnet.train as T
-from bitnet.kernel import pack12_scaled, unpack12_scaled
+import ttf.train as T
+from ttf.kernel import pack12_scaled, unpack12_scaled
 
 dev = "cuda"; torch.manual_seed(0)
 cs = lambda X, q: X.abs().amax(0, keepdim=True).clamp_min(1e-30) / q

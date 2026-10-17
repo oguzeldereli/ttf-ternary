@@ -23,7 +23,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from scripts.eval.final_eval import load_model                      # noqa: E402
-from bitnet.flip import KernelTernaryLinear                         # noqa: E402
+from ttf.flip import KernelTernaryLinear                         # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("ckpt", nargs="?"); ap.add_argument("--data")

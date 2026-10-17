@@ -13,7 +13,7 @@ ARGS="--preset small --mode kernel --data $REPO/data/wiki32k_train.bin --val $RE
 for tag in old new; do
   src=$REPO; [ $tag = old ] && src=$S/old
   mkdir -p $REPO/checkpoints/bench_$tag
-  (cd $src && PYTHONPATH=$src python -m bitnet.train $ARGS --out_dir $REPO/checkpoints/bench_$tag \
+  (cd $src && PYTHONPATH=$src python -m ttf.train $ARGS --out_dir $REPO/checkpoints/bench_$tag \
      > $REPO/checkpoints/bench_$tag/train.log 2>&1)
   python - $REPO/checkpoints/bench_$tag/train.log <<'P'
 import re, sys

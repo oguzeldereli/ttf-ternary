@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eval"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 torch.set_num_threads(4)
-from bitnet.kernel import unpack_rows                                             # noqa: E402
+from ttf.kernel import unpack_rows                                             # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", action="append", required=True, help="NAME=PATH")

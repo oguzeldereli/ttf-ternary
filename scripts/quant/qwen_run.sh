@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lab PC: TTF recovery of a converted Qwen3.5 / 3.8 model (bitnet/qwen.py), one job after another:
+# Lab PC: TTF recovery of a converted Qwen3.5 / 3.8 model (ttf/qwen.py), one job after another:
 #   [SAVE=1] qwen_run.sh MODEL STEPS "NAME|flags" ["NAME|flags" ...]
 # MODEL is a directory under /tmp/$USER/tern/hf/models; data: Wikipedia re-tokenized with its tokenizer
 # (scripts/quant/retok.py -> data/wikiqw_{train,val}.bin, uint32). TTF recipe as for TinyLlama (rank 256, p 0.75, annealed
@@ -13,8 +13,8 @@ TTF="--mode kernel --int8 --dw_mode dense --track_flips --ts --ts_tau 1000 --ts_
 for job in "$@"; do
   N=${job%%|*}; F=${job#*|}
   mkdir -p checkpoints/$N
-  while pgrep -f "[p]ython -m bitnet.train" >/dev/null; do sleep 60; done
-  python -m bitnet.train --init_hf $M --data data/wikiqw_train.bin --val data/wikiqw_val.bin --data_u32 --seq_len 2048 \
+  while pgrep -f "[p]ython -m ttf.train" >/dev/null; do sleep 60; done
+  python -m ttf.train --init_hf $M --data data/wikiqw_train.bin --val data/wikiqw_val.bin --data_u32 --seq_len 2048 \
     --batch_size 8 --grad_accum 2 --steps $STEPS --warmup 300 --tail_fp32 --lr 5e-4 --min_lr 5e-5 \
     --eval_interval 50 --eval_iters 10 --save_secs 99999 --snap_every 0 $NFS --lookahead 0 --ckpt_skip 0 \
     --rc_scale --lowrank_mag add:16 --mag_wd 0.1 $(echo $TTF) $F --out_dir checkpoints/$N \

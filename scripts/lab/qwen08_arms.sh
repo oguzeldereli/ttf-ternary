@@ -22,12 +22,12 @@ F="--init_hf $M --init_stream --data data/wikiqw_train40.bin --val data/wikiqw_v
 ONLY=${1:-}     # one arm name: run only it (no resume check)
 if [ -z "$ONLY" ]; then
 rm -rf checkpoints/q08_rescheck
-python -m bitnet.train $F --init_hf_method gptqc --ts_start 0 --steps 10 --out_dir checkpoints/q08_rescheck > logs/q08_rescheck_a.txt 2>&1
-python -m bitnet.train $F --init_hf_method gptqc --ts_start 0 --steps 20 --resume --out_dir checkpoints/q08_rescheck > logs/q08_rescheck_b.txt 2>&1
+python -m ttf.train $F --init_hf_method gptqc --ts_start 0 --steps 10 --out_dir checkpoints/q08_rescheck > logs/q08_rescheck_a.txt 2>&1
+python -m ttf.train $F --init_hf_method gptqc --ts_start 0 --steps 20 --resume --out_dir checkpoints/q08_rescheck > logs/q08_rescheck_b.txt 2>&1
 echo "RESCHECK: $(grep -E 'centred layers restored|^step +(10|20) ' logs/q08_rescheck_b.txt | tr '\n' ' ') $(grep -c Traceback logs/q08_rescheck_b.txt) tracebacks"
 rm -rf checkpoints/q08_rescheck
 fi
-run() { [ -n "$ONLY" ] && [ "$1" != "$ONLY" ] && return; N=$1; shift; mkdir -p checkpoints/$N; python -m bitnet.train $F --steps 400 --no_final_save "$@" --out_dir checkpoints/$N > logs/$N.txt 2>&1
+run() { [ -n "$ONLY" ] && [ "$1" != "$ONLY" ] && return; N=$1; shift; mkdir -p checkpoints/$N; python -m ttf.train $F --steps 400 --no_final_save "$@" --out_dir checkpoints/$N > logs/$N.txt 2>&1
         echo "$(date '+%T') $N: $(grep 'val loss' logs/$N.txt | tr -s ' ' | cut -d' ' -f4 | tr '\n' ' ') $(grep -c Traceback logs/$N.txt) tracebacks"; }
 run q08_gqc_ts0 --init_hf_method gptqc --ts_start 0
 # 17 Oct: the float adapters from the rounding error (--init_mag_svd R) vs the same rank at 0 (ONLY=... runs one)

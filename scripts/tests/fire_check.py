@@ -1,11 +1,11 @@
-"""bitnet.kernel.ttf_fire against the unfused firing (A = U V^T, legal moves, repack, D V) on random states (17 Oct):
+"""ttf.kernel.ttf_fire against the unfused firing (A = U V^T, legal moves, repack, D V) on random states (17 Oct):
 the packed trits must agree except where |A| is within rounding of theta, D V to fp32 rounding; then the time of both.
   python scripts/tests/fire_check.py
 """
 import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
-from bitnet.kernel import ttf_fire, pack_rows, unpack_rows
+from ttf.kernel import ttf_fire, pack_rows, unpack_rows
 
 dev = "cuda"
 torch.manual_seed(0)

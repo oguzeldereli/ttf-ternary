@@ -20,7 +20,7 @@ DEADLINE_GEN=${DEADLINE_GEN:-17:45}        # start no generation batch after thi
 cd $R; export PYTHONPATH=$R
 ts() { date +%H:%M:%S; }
 echo "$(ts) [1] waiting for the trainer to exit"
-[ "$DRY" = 1 ] || while pgrep -u "$USER" -f "[p]ython -m bitnet.train" > /dev/null; do sleep 30; done
+[ "$DRY" = 1 ] || while pgrep -u "$USER" -f "[p]ython -m ttf.train" > /dev/null; do sleep 30; done
 grep -E "^step|val loss|FINAL|checkpoint saved" $C/train.log | tail -6
 cp $C/train.log $C/metrics.jsonl $O/
 echo "$(ts) [2] pack + checksums"

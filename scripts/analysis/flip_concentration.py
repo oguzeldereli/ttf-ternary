@@ -3,7 +3,7 @@ trits per output row and per input column of every ternary matrix; report the sh
 the busiest 1% / 10% of rows and of columns (uniform spreading: 1% / 10%), pooled over layers.
   python -m scripts.analysis.flip_concentration RUN A B [kernel|master]"""
 import sys, torch
-from bitnet.kernel import unpack_rows
+from ttf.kernel import unpack_rows
 
 run, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
 kind = sys.argv[4] if len(sys.argv) > 4 else "kernel"

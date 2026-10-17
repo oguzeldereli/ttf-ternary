@@ -11,9 +11,9 @@ gradient vector"). Trit changes are in trit units; cosines are scale-free within
   python -m scripts.mlp.geometry
 """
 import math, os, numpy as np, torch, torch.nn.functional as F
-from bitnet.master import MasterTernaryLinear
-from bitnet.flip import KernelTernaryLinear, set_flip_rate
-from bitnet.kernel import unpack_rows
+from ttf.master import MasterTernaryLinear
+from ttf.flip import KernelTernaryLinear, set_flip_rate
+from ttf.kernel import unpack_rows
 from scripts.mlp.mlp_lab import MLPLM, windows
 
 dev, BATCH, LR, WARM, TOTAL, RATE, S0 = "cuda", 4096, 1.5e-3, 100, 6000, 0.02, 300
@@ -74,14 +74,14 @@ def run(mode):
             return gr, upd
         gr = None
         if mode == "xb2":
-            from bitnet.train import lookahead_step
+            from ttf.train import lookahead_step
             gr = [l.gw.float().clone() for l in Ls]
             lookahead_step(m, x, y, [p for p in m.parameters() if p.requires_grad], dev, s, 2, 0,
                            lambda: windows(train, BATCH, 8, gla, dev))
             torch.nn.utils.clip_grad_norm_([p for p in m.parameters() if p.requires_grad], 1.0); opt.step()
             return gr, None
         if record:
-            from bitnet.kernel import fused_flip
+            from ttf.kernel import fused_flip
             gr = [l.gw.float().clone() for l in Ls]
             for i, l in enumerate(Ls):
                 fused_flip(l.wpacked, l.gw, l.rate, l.g_ref, 10_000 + s * 97 + i,

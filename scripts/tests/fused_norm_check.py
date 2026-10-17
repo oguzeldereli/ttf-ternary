@@ -7,7 +7,7 @@ import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
 from transformers.models.qwen3_5 import modeling_qwen3_5 as Q
-from bitnet.kernel import rms_norm_qwen
+from ttf.kernel import rms_norm_qwen
 
 dev = "cuda"; torch.manual_seed(0)
 for shp, d in (((2, 2048, 5120), 5120), ((2, 2048, 24, 256), 256)):
@@ -30,7 +30,7 @@ for shp, d in (((2, 2048, 5120), 5120), ((2, 2048, 24, 256), 256)):
           f"gw rel {float((a[2] - b[2]).norm() / a[2].norm()):.1e}; time {a[3] * 1e3:.2f} -> {b[3] * 1e3:.2f} ms", flush=True)
 
 # SwiGLU (the MLP's silu(gate) * up), [2 x 2048, 17408]
-from bitnet.kernel import swiglu
+from ttf.kernel import swiglu
 import torch.nn.functional as F
 g0 = (torch.randn(4096, 17408, device=dev) * 2).to(torch.bfloat16); u0 = torch.randn(4096, 17408, device=dev).to(torch.bfloat16)
 gy = torch.randn(4096, 17408, device=dev).to(torch.bfloat16)
@@ -50,7 +50,7 @@ print(f"swiglu: y differ {float((a[0] != b[0]).float().mean()):.2e}, gg differ {
       f"gu differ {float((a[2] != b[2]).float().mean()):.2e} (shares of entries); time {a[3] * 1e3:.2f} -> {b[3] * 1e3:.2f} ms", flush=True)
 
 # the gated norm of the DeltaNet output (48 heads x 128), the gain in fp16 (--lean_tail) and in bf16
-from bitnet.kernel import gated_norm_qwen
+from ttf.kernel import gated_norm_qwen
 for wdt in (torch.float16, torch.bfloat16):
     n = Q.Qwen3_5RMSNormGated(128, eps=1e-6).to(dev); n.weight.data = (1 + 0.1 * torch.randn(128, device=dev)).to(wdt)
     x0 = (torch.randn(4096 * 48, 128, device=dev) * 0.5).to(torch.bfloat16); z0 = torch.randn(4096 * 48, 128, device=dev).to(torch.bfloat16)

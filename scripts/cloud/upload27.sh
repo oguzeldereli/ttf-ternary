@@ -10,7 +10,7 @@ cd "$(dirname "$0")/../.."
 IP=$1; PT=$2; W=${W:-/workspace}; R="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $PT root@$IP"
 [ -n "${SSH_AUTH_SOCK:-}" ] || { eval $(ssh-agent -s -t 14400) > /dev/null; ssh-add ~/.ssh/id_ed25519 < /dev/null; }
 $R "mkdir -p $W/tern/repo/data $W/tern/qw27 $W/tern/ckpt $W/tern/kd4s" || exit 1
-rsync -az -e "ssh -p $PT -o BatchMode=yes" --exclude __pycache__ bitnet scripts root@$IP:$W/tern/repo/
+rsync -az -e "ssh -p $PT -o BatchMode=yes" --exclude __pycache__ ttf scripts root@$IP:$W/tern/repo/
 rsync -az -e "ssh -p $PT -o BatchMode=yes" models/qw27/{config.json,generation_config.json,tokenizer.json,tokenizer_config.json,chat_template.jinja,merges.txt,vocab.json} root@$IP:$W/tern/qw27/
 rsync -az -e "ssh -p $PT -o BatchMode=yes" data/wikiq8_val.bin root@$IP:$W/tern/repo/data/
 echo "$(date +%T) code / config sent; big files from shoveler"

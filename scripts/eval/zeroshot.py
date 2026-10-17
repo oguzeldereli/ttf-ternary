@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bitnet.bitlinear import STATE                     # noqa: E402
+from ttf.bitlinear import STATE                     # noqa: E402
 from final_eval import load_model                      # noqa: E402
 
 

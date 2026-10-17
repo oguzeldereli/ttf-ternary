@@ -17,8 +17,8 @@ no-look-ahead snapshot (saved momentum, float tail frozen, plain momentum with t
 """
 import sys, math, numpy as np, torch
 from scripts.analysis.testbench import Bench, G_REF
-from bitnet.kernel import fused_flip
-from bitnet.train import get_batch
+from ttf.kernel import fused_flip
+from ttf.train import get_batch
 
 RUN, ST = sys.argv[1], int(sys.argv[2])
 NT, K = 32, int(__import__("os").environ.get("WAVE_K", "41"))
@@ -61,7 +61,7 @@ def keep(v):
     return v.half() if IDX is None else v[IDX].half().cpu()
 
 
-from bitnet.kernel import unpack_rows, pack_rows
+from ttf.kernel import unpack_rows, pack_rows
 NORM = os.environ.get("WAVE_NORM", "own")
 SIG = os.environ.get("WAVE_SIG", "plain"); VN, RR = {}, {}
 DRY = float(os.environ.get("WAVE_DRY", "0"))     # dry friction on the whole vector: ||M|| -= DRY x mean batch-gradient norm

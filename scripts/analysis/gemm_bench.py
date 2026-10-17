@@ -4,8 +4,8 @@ ternary matmuls (Amdahl: only the matmuls that touch trits get faster).
     python scripts/analysis/gemm_bench.py [preset]"""
 import sys, time, torch
 sys.path.insert(0, ".")
-from bitnet import kernel as K
-from bitnet.config import PRESETS
+from ttf import kernel as K
+from ttf.config import PRESETS
 
 c = PRESETS[sys.argv[1] if len(sys.argv) > 1 else "d2048_l24"]
 M = 16 * 2048

@@ -17,7 +17,7 @@ B="--preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k
    --no_final_save --lookahead 0 --ckpt_skip 2 --int8 --dw_mode dense --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp
    --ts --ts_theta 16 --ts_tau 1000 --ts_anneal 0.75 --ts_tau_anneal --ts_nomom --ts_fused --gemm int8mm --lowrank 512 --ts_rank_s 512"
 mkdir -p checkpoints/dp2_2gpu checkpoints/dp2_1gpu logs/dp2
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m torch.distributed.run --nproc_per_node 2 -m bitnet.train $B --batch_size 8 --out_dir checkpoints/dp2_2gpu" > logs/dp2/dp2_2gpu.txt 2>&1
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train $B --batch_size 16 --out_dir checkpoints/dp2_1gpu" > logs/dp2/dp2_1gpu.txt 2>&1
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m torch.distributed.run --nproc_per_node 2 -m ttf.train $B --batch_size 8 --out_dir checkpoints/dp2_2gpu" > logs/dp2/dp2_2gpu.txt 2>&1
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train $B --batch_size 16 --out_dir checkpoints/dp2_1gpu" > logs/dp2/dp2_1gpu.txt 2>&1
 grep -hE "data parallel|val loss|^step +(100|200|290) " logs/dp2/dp2_2gpu.txt | head -20 > logs/dp2/summary.txt
 grep -hE "val loss|^step +(100|200|290) " logs/dp2/dp2_1gpu.txt >> logs/dp2/summary.txt

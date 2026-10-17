@@ -15,8 +15,8 @@ running job) and reports per layer, averaged over layers:
 """
 import sys, numpy as np, torch
 import torch.nn.functional as F
-from bitnet.flip import build_kernel_transformer, KernelTernaryLinear
-from bitnet.train import get_batch
+from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.train import get_batch
 
 dev = "cuda"
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/lm_lowrank256_xb2_100M/ckpt.pt"

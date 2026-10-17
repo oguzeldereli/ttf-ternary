@@ -27,7 +27,7 @@ for cfg in ${CONFIGS:-A B C D}; do
   D=$P/$cfg; rm -rf $D; mkdir -p $D; ln -f $W/tern/ckpt/qw27_rel_ckpt.pt $D/ckpt.pt
   nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,power.draw,clocks.sm,clocks.mem,memory.used \
     --format=csv -l 1 > $D/smi.csv & SMI=$!
-  TERN_TIME=1 TERN_PROF=$D TERN_PROF_TRACE=$TR timeout 2400 python -m bitnet.train $F --batch_size $MB --grad_accum $((16 / MB)) $X \
+  TERN_TIME=1 TERN_PROF=$D TERN_PROF_TRACE=$TR timeout 2400 python -m ttf.train $F --batch_size $MB --grad_accum $((16 / MB)) $X \
     --out_dir $D > $D/train.log 2>&1
   kill $SMI
   t1=$(grep -o "time step 1351: forward+backward [0-9.]*s, update[^0-9]*[0-9.]*" $D/train.log | grep -o "[0-9.]*s\?$\|backward [0-9.]*" | tr '\n' ' ')

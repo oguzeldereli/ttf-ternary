@@ -1,8 +1,8 @@
 """Build 27B once, sweep seq lengths to find what fits on the local GPU."""
 import time, sys, torch
-from bitnet.config import ModelConfig
-from bitnet.flip import build_kernel_transformer as build_stateless_transformer
-from bitnet.opt8 import Adam8bit
+from ttf.config import ModelConfig
+from ttf.flip import build_kernel_transformer as build_stateless_transformer
+from ttf.opt8 import Adam8bit
 
 VOCAB = int(sys.argv[1]) if len(sys.argv) > 1 else 32000
 dev = "cuda"; MAXSEQ = 1024

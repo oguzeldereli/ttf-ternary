@@ -11,8 +11,8 @@ import os, sys
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from bitnet import kernel as K                                   # noqa: E402
-from bitnet.flip import KernelTernaryLinear                      # noqa: E402
+from ttf import kernel as K                                   # noqa: E402
+from ttf.flip import KernelTernaryLinear                      # noqa: E402
 
 dev = "cuda"
 torch.manual_seed(0)

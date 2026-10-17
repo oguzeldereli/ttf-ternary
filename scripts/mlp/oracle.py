@@ -16,7 +16,7 @@ k = number of oracle moves.
   python -m scripts.mlp.oracle
 """
 import copy, math, numpy as np, torch, torch.nn.functional as F
-from bitnet.master import MasterTernaryLinear
+from ttf.master import MasterTernaryLinear
 from scripts.mlp.mlp_lab import MLPLM, windows
 
 dev = "cuda"
@@ -30,7 +30,7 @@ class FixedTern(torch.nn.Module):
         super().__init__()
         self.W = torch.nn.Parameter((t.float() * gamma).clone()); self.gamma = gamma
     def forward(self, x):
-        from bitnet.bitlinear import _act_quant_ste
+        from ttf.bitlinear import _act_quant_ste
         return F.linear(_act_quant_ste(x, 8), self.W)
 
 

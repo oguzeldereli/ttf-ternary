@@ -12,7 +12,7 @@ B="--mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_
 echo "$(date '+%F %T') start on $(hostname)" > $R
 for cfg in "small 512" "small 128" "small 512 off" "d1024_l24 512" "d1024_l24 512 off" "d2048_l24 512" "d2048_l24 512 off"; do
   set -- $cfg; p=$1; r=$2; off=${3:-}; n=${p}_r${r}${off:+_off}
-  TERN_TIME=1 /usr/bin/time -v python -m bitnet.train --preset $p $(echo $B) --lowrank $r --ts_rank_s $r ${off:+--ts_offload} \
+  TERN_TIME=1 /usr/bin/time -v python -m ttf.train --preset $p $(echo $B) --lowrank $r --ts_rank_s $r ${off:+--ts_offload} \
     --out_dir $O/$n > $O/$n.log 2>&1
   echo "$n: $(grep 'memory (MiB)' $O/$n.log | tail -1 | sed 's/  memory (MiB): //') | $(grep -E 'time step 60:' $O/$n.log | grep -oE 'forward\+backward [0-9.]+s') | host RSS $(grep 'Maximum resident' $O/$n.log | grep -oE '[0-9]+$' | awk '{printf "%.0f MB", $1/1024}') $(grep -m1 -E 'Error|out of memory' $O/$n.log | cut -c1-120)" >> $R
 done

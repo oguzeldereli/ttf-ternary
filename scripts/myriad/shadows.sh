@@ -24,5 +24,5 @@ F="--preset $P --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_va
    --qk_temp --ts --ts_rank_s 512 --ts_theta 16 --ts_tau 1000 --ts_anneal 0.5 --ts_fused --gemm cublas
    --ts_shadows 64,128,512,0 --ts_diag 250 --ts_dump_steps 500,2000 --ts_dump_layers 0,6,$MID --stop_after $STOP --out_dir $D"
 F=$(echo $F)
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train $F" >> $D/train.log 2>&1
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train $F" >> $D/train.log 2>&1
 echo "$(date '+%F %T') job end" >> $D/train.log

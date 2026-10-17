@@ -14,7 +14,7 @@ batches, checkpoints/testbench_4000/gbar.pt).
 """
 import json, torch
 from scripts.analysis.testbench import Bench, batches, G_REF
-from bitnet.kernel import fused_flip
+from ttf.kernel import fused_flip
 
 OUT = "checkpoints/testbench_4000"
 BETA, R = 0.97, 256

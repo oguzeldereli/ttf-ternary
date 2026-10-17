@@ -23,9 +23,9 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eval"))
-from bitnet.model import BitTransformer                                          # noqa: E402
-from bitnet.hf_init import ternarize, ternarize_gptq, _out_err                    # noqa: E402
-from bitnet.kernel import unpack_rows                                             # noqa: E402
+from ttf.model import BitTransformer                                          # noqa: E402
+from ttf.hf_init import ternarize, ternarize_gptq, _out_err                    # noqa: E402
+from ttf.kernel import unpack_rows                                             # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--fp", required=True); ap.add_argument("--ttf", action="append", default=[])

@@ -25,8 +25,8 @@ TS="--ts --ts_rank_s 512 --ts_theta 16 --ts_tau 1000 --ts_tau_anneal --ts_anneal
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader > logs/profile_1b_gpu.txt; hostname >> logs/profile_1b_gpu.txt
 for cfg in "master:--mode master --master_dtype fp32" "old:$K $OLD" "ts:$K $TS"; do
   n=${cfg%%:*}; F=$(echo $C ${cfg#*:}); O=$TMPDIR/prof_$n
-  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; TERN_TIME=1 python -m bitnet.train $F --stop_after 31 --out_dir $O" \
+  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; TERN_TIME=1 python -m ttf.train $F --stop_after 31 --out_dir $O" \
     > logs/profile_1b_$n.txt 2>&1
-  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train $F --profile 5 --out_dir ${O}_p" \
+  $RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train $F --profile 5 --out_dir ${O}_p" \
     >> logs/profile_1b_$n.txt 2>&1
 done

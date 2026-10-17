@@ -80,9 +80,9 @@ by CPU time
                                                               aten::mm         0.98%     725.805ms         2.73%        2.023s      79.864us       10.153s        25.79%       10.204s     402.891us         25328  
                                                              aten::mul         0.88%     650.351ms         4.35%        3.227s      42.436us        7.027s        17.85%        7.769s     102.166us         76046  
                                                       cuLaunchKernelEx         0.86%     640.468ms         1.66%        1.227s      42.403us       0.000us         0.00%      34.968ms       1.208us         28944  
-                                        bitnet/train.py(822): ts_layer         0.84%     625.515ms        26.67%       19.766s      12.354ms       0.000us         0.00%        7.577s       4.736ms          1600  
+                                        ttf/train.py(822): ts_layer         0.84%     625.515ms        26.67%       19.766s      12.354ms       0.000us         0.00%        7.577s       4.736ms          1600  
                                                    aten::empty_strided         0.78%     574.985ms         0.80%     594.346ms       4.411us       0.000us         0.00%       0.000us       0.000us        134757  
-                                          bitnet/opt_lean.py(47): step         0.68%     502.926ms         4.96%        3.674s        3.674s       0.000us         0.00%     392.287ms     392.287ms             1  
+                                          ttf/opt_lean.py(47): step         0.68%     502.926ms         4.96%        3.674s        3.674s       0.000us         0.00%     392.287ms     392.287ms             1  
                                                            aten::copy_         0.60%     445.973ms         6.31%        4.677s      41.835us        6.023s        15.30%        6.779s      60.643us        111784  
                                                         aten::_to_copy         0.53%     389.958ms         7.00%        5.190s      57.660us       0.000us         0.00%        5.404s      60.038us         90011  
                                                            aten::empty         0.46%     338.692ms         0.46%     340.876ms       4.223us       0.000us         0.00%       0.000us       0.000us         80711  
@@ -91,11 +91,11 @@ by CPU time
                                                           Unrecognized         0.39%     289.285ms         0.39%     289.285ms       2.143ms       1.729ms         0.00%       1.729ms      12.806us           135  
                                                         cuLaunchKernel         0.38%     279.657ms         0.54%     402.532ms      36.043us       0.000us         0.00%     914.778ms      81.911us         11168  
                                                      aten::bitwise_and         0.33%     243.767ms         2.18%        1.615s      70.812us     128.822ms         0.33%     128.822ms       5.650us         22800  
-                                       bitnet/train.py(413): _unpack12         0.33%     241.167ms         5.67%        4.199s       1.312ms       0.000us         0.00%     321.387ms     100.434us          3200  
+                                       ttf/train.py(413): _unpack12         0.33%     241.167ms         5.67%        4.199s       1.312ms       0.000us         0.00%     321.387ms     100.434us          3200  
 <built-in method _record_function_enter_new of pybind11_builtins.py...         0.32%     235.762ms         0.32%     235.762ms      13.697us       0.000us         0.00%       0.000us       0.000us         17213  
-                                         bitnet/train.py(399): _pack12         0.32%     235.091ms         5.82%        4.314s       1.348ms       0.000us         0.00%     404.279ms     126.337us          3200  
+                                         ttf/train.py(399): _pack12         0.32%     235.091ms         5.82%        4.314s       1.348ms       0.000us         0.00%     404.279ms     126.337us          3200  
                                         triton/knobs.py(422): __call__         0.31%     231.457ms         0.31%     231.457ms      10.318us       0.000us         0.00%       0.000us       0.000us         22432  
-                                           bitnet/train.py(4285): main         0.31%     228.167ms        59.28%       43.936s       43.936s       0.000us         0.00%       12.537s       12.537s             1  
+                                           ttf/train.py(4285): main         0.31%     228.167ms        59.28%       43.936s       43.936s       0.000us         0.00%       12.537s       12.537s             1  
                                        triton/runtime/jit.py(708): run         0.30%     220.334ms         2.34%        1.732s     154.401us       0.000us         0.00%       0.000us       0.000us         11216  
                           torch/utils/checkpoint.py(1165): unpack_hook         0.26%     191.082ms         5.55%        4.111s     138.440us       0.000us         0.00%        8.894s     299.517us         29696  
             <built-in method to of Parameter object at 0x77ce6e0e35c0>         0.24%     177.815ms         2.59%        1.916s      49.505us       0.000us         0.00%        1.162s      30.015us         38704  

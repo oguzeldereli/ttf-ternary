@@ -10,7 +10,7 @@ for try in $(seq 0 8); do
   grep -q "FINAL val loss" $D/train.log 2>/dev/null && break
   R=""; [ -f $D/ckpt.pt ] && R="--resume"
   echo "$(date '+%F %T') $n start (try $try) $R" >> $L
-  python -m bitnet.train "$@" --out_dir $D $R >> $D/train.log 2>&1
+  python -m ttf.train "$@" --out_dir $D $R >> $D/train.log 2>&1
   echo "$(date '+%F %T') $n exited ($?)" >> $L
   grep -q "FINAL val loss" $D/train.log && break
   sleep 60

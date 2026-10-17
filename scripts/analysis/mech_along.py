@@ -15,8 +15,8 @@ gain 1; user with gain 0).
 """
 import sys, math, types, numpy as np, torch
 from scripts.analysis.testbench import Bench, G_REF
-from bitnet.kernel import fused_flip, unpack_rows
-from bitnet.train import get_batch, mech_step
+from ttf.kernel import fused_flip, unpack_rows
+from ttf.train import get_batch, mech_step
 
 ARM, RUN, STEPS = sys.argv[1], sys.argv[2], [int(s) for s in sys.argv[3].split(",")]
 import os

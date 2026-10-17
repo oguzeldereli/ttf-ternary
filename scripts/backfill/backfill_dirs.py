@@ -13,7 +13,7 @@ Qwen arm logs (logs/q08*.txt, no run directory) give run + val_train records too
 """
 import argparse, glob, hashlib, json, os, re, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet import results as R   # noqa: E402
+from ttf import results as R   # noqa: E402
 
 TS = re.compile(r"(20\d\d-\d\d-\d\d)[ T](\d\d:\d\d:\d\d)")
 START = re.compile(r"start (\S+) (?:seed \S+ )?on (\S+?):? (--.*?)(?: --resume)?\s*$")

@@ -32,5 +32,5 @@ D=checkpoints/$N; mkdir -p $D
 [ -e $D/ckpt.pt ] || ln -s ../$SRC/ckpt.pt $D/ckpt.pt
 hostname >> $D/train.log; echo "continuation of $SRC at its final lr to step 18310" >> $D/train.log
 F=$(echo $F --out_dir $D)
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train $F" >> $D/train.log 2>&1
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train $F" >> $D/train.log 2>&1
 echo "$(date '+%F %T') job end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/train.log

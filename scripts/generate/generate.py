@@ -5,9 +5,9 @@ Usage:
       --prompt "technology facilitated abuse" --tokens 80 --temp 0.8 --topk 40
 """
 import json, re, argparse, torch
-from bitnet.config import ModelConfig
-from bitnet.flip import build_kernel_transformer, build_stateless_transformer
-from bitnet.model import BitTransformer
+from ttf.config import ModelConfig
+from ttf.flip import build_kernel_transformer, build_stateless_transformer
+from ttf.model import BitTransformer
 
 PAT = re.compile(r"\w+|[^\w\s]")
 

@@ -10,8 +10,8 @@ Also: the whole signal's cosine with and without the recently flipped weights.
 """
 import sys, math, numpy as np, torch
 from scripts.analysis.testbench import Bench, G_REF
-from bitnet.kernel import fused_flip, unpack_rows
-from bitnet.train import get_batch
+from ttf.kernel import fused_flip, unpack_rows
+from ttf.train import get_batch
 
 RUN, ST = sys.argv[1], int(sys.argv[2])
 BETA, NT, K = 0.97, 64, 33

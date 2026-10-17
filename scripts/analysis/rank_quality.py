@@ -16,7 +16,7 @@ the other two quarters (so the estimate is not inflated by fitting the noise).
 """
 import sys, numpy as np, torch
 from scripts.analysis.testbench import Bench
-from bitnet.train import get_batch
+from ttf.train import get_batch
 
 val = np.memmap("data/wiki32k_val.bin", dtype=np.uint16, mode="r")
 tr = np.memmap("data/wiki32k_train.bin", dtype=np.uint16, mode="r")

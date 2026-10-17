@@ -5,7 +5,7 @@ output-space |X (W - a c T)^T|^2 / |X W^T|^2 (64 x 2048 calibration tokens), sor
 import argparse, os, sys
 import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet.hf_init import calib_hessians, load_hf_tensors, ternarize, ternarize_gptq, _rel_err, _out_err, _unpermute, _LIN, hf_config
+from ttf.hf_init import calib_hessians, load_hf_tensors, ternarize, ternarize_gptq, _rel_err, _out_err, _unpermute, _LIN, hf_config
 
 ap = argparse.ArgumentParser(); ap.add_argument("hf_dir"); ap.add_argument("--calib", type=int, default=64)
 ap.add_argument("--top", type=int, default=15); ap.add_argument("--data", default="data/wiki32k_train.bin")

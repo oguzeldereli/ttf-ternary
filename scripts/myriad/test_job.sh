@@ -23,5 +23,5 @@ C="--mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_
    --dw_mode dense --tail_fp32 --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 100000 --eval_iters 2 --lookahead 0 --ckpt_skip 2
    --rc_scale --lr_gate --lr_vnorm 0.99 --lowrank_mag add:16 --mag_wd 0.1 --qk_temp --lr_beta 1 --dry_vec 0.0303 --spend 3"
 C=$(echo $C)                         # one line: it is passed inside a bash -c string
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train --preset small $C --lowrank 512 --stop_after 40 --out_dir $TMPDIR/t110" 2>&1 | grep -E "params|step +(20|30|40) |Error|Traceback"
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train --preset d2048_l24 $C --lowrank 512 --stop_after 30 --out_dir $TMPDIR/t1b" 2>&1 | grep -E "params|step +(10|20|30) |Error|Traceback|memory"
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train --preset small $C --lowrank 512 --stop_after 40 --out_dir $TMPDIR/t110" 2>&1 | grep -E "params|step +(20|30|40) |Error|Traceback"
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train --preset d2048_l24 $C --lowrank 512 --stop_after 30 --out_dir $TMPDIR/t1b" 2>&1 | grep -E "params|step +(10|20|30) |Error|Traceback|memory"

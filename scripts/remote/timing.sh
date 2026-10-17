@@ -10,7 +10,7 @@ R="--mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_
 M="--mode master --master_dtype fp32 --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16
    --grad_accum 1 --steps 9155 --warmup 305 --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 100000 --eval_iters 2
    --save_secs 1000000 --stop_after 26"
-run() { n=$1; shift; TERN_TIME=1 timeout 1200 python -m bitnet.train "$@" --out_dir $O/$n > $O/$n.log 2>&1
+run() { n=$1; shift; TERN_TIME=1 timeout 1200 python -m ttf.train "$@" --out_dir $O/$n > $O/$n.log 2>&1
   python - $O/$n.log $n <<'PY'
 import re, sys
 t = [(float(a), float(b)) for a, b in re.findall(r"forward\+backward ([\d.]+)s, update \S+ \S+ \S+ \S+ ([\d.]+)s", open(sys.argv[1]).read())][5:]

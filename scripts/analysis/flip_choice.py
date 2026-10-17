@@ -10,8 +10,8 @@ different per-weight scores, taking the top n (fractions of a normal step), and 
 """
 import sys, math, numpy as np, torch
 from scripts.analysis.testbench import Bench
-from bitnet.kernel import unpack_rows, pack_rows
-from bitnet.train import get_batch
+from ttf.kernel import unpack_rows, pack_rows
+from ttf.train import get_batch
 
 RUN, ST = sys.argv[1], int(sys.argv[2])
 NT = 64

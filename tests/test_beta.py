@@ -1,10 +1,10 @@
 """beta = 1/sqrt(K*rho) on the kernel path: matches a dense reference (fwd, grad_x),
 restores unit output scale, and un-collapses attention on a fresh model."""
 import math, torch
-from bitnet.kernel import pack_rows, unpack_rows, trit_beta
-from bitnet.flip import KernelTernaryLinear, build_kernel_transformer, _act_quant_plain
-from bitnet.config import ModelConfig
-from bitnet import model as M
+from ttf.kernel import pack_rows, unpack_rows, trit_beta
+from ttf.flip import KernelTernaryLinear, build_kernel_transformer, _act_quant_plain
+from ttf.config import ModelConfig
+from ttf import model as M
 
 torch.manual_seed(0)
 dev = "cuda"

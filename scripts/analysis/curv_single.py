@@ -8,11 +8,11 @@ All quantities in flip units (weight = beta*q):  g = beta*dL/dW,  H = beta^2*d2L
 A lone flip helps iff d > 1/2 and is "right-sized" around d ~ 1.
 """
 import sys, numpy as np, torch, torch.nn as nn, torch.nn.functional as F
-from bitnet.flip import build_kernel_transformer, KernelTernaryLinear
-from bitnet.bitlinear import _act_quant_ste
-from bitnet.kernel import unpack_rows, trit_beta
-from bitnet.train import get_batch
-from bitnet.model import BitTransformer
+from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.bitlinear import _act_quant_ste
+from ttf.kernel import unpack_rows, trit_beta
+from ttf.train import get_batch
+from ttf.model import BitTransformer
 dev = "cuda"
 import os
 NOQ = os.environ.get("NOQ") == "1"

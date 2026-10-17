@@ -9,7 +9,7 @@ K="--preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k
    --int8 --dw_mode dense --track_flips --tail_fp32 --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 100000 --eval_iters 2
    --save_secs 1000000 --lookahead 0 --lowrank 1024 --ckpt_skip 2 --rc_scale --lr_gate --lr_vnorm 0.99 --lowrank_mag add:16
    --mag_wd 0.1 --qk_temp --lr_beta 1 --dry_vec 0.0303 --spend 3 --stop_after 21"
-t() { n=$1; shift; TERN_TIME=1 python -m bitnet.train "$@" --out_dir $O/$n > $O/$n.log 2>&1
+t() { n=$1; shift; TERN_TIME=1 python -m ttf.train "$@" --out_dir $O/$n > $O/$n.log 2>&1
   echo "$n: $(grep -E '^step +20 ' $O/$n.log | cut -c1-40) | $(grep 'time step 20' $O/$n.log | cut -d: -f2) | $(grep -m1 -E 'Error|error' $O/$n.log)"; }
 t plain $M
 t adamx $M --m_beta1 0.9

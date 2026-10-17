@@ -13,7 +13,7 @@ if [ ! -f checkpoints/$N/ckpt.pt ]; then
   cp $HOME/ternary-sync/inbox/master4000/metrics_4000.jsonl checkpoints/$N/metrics.jsonl
   echo "[branch of curve_master at step 4000 (131M): latent weights stored at $B bits]" > checkpoints/$N/train.log
 fi
-python -m bitnet.train --preset small --mode master --master_dtype fp32 --data data/wiki32k_train.bin \
+python -m ttf.train --preset small --mode master --master_dtype fp32 --data data/wiki32k_train.bin \
   --val data/wiki32k_val.bin --seq_len 2048 --batch_size 16 --grad_accum 1 --steps 9155 --warmup 305 \
   --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 250 --eval_iters 30 --save_secs 1800 --snap_every 1000 --track_flips \
   --master_bits $B --resume --out_dir checkpoints/$N >> checkpoints/$N/train.log 2>&1

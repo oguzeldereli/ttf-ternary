@@ -17,9 +17,9 @@ eval: scores flip sets against gbar: count, precision (share with D * gbar < 0),
 """
 import sys, os, json, numpy as np, torch
 import torch.nn.functional as F
-from bitnet.flip import build_kernel_transformer, KernelTernaryLinear
-from bitnet.kernel import fused_flip, unpack_rows, pack_rows
-from bitnet.train import get_batch
+from ttf.flip import build_kernel_transformer, KernelTernaryLinear
+from ttf.kernel import fused_flip, unpack_rows, pack_rows
+from ttf.train import get_batch
 
 dev = "cuda"
 OUT = "checkpoints/testbench_4000"
@@ -33,21 +33,21 @@ def load_model(ckpt):
     m = build_kernel_transformer(b["cfg"], grad_checkpoint=True, beta=b.get("beta", True),
                                  int8=b.get("int8", True), dw_mode=b.get("dw_mode", "dense"), g_ref=G_REF)
     if any(k.endswith("row_scale") for k in b["model"]):     # --rc_scale runs: learned row/column scales
-        from bitnet.flip import enable_rc_scales
+        from ttf.flip import enable_rc_scales
         enable_rc_scales(m)
     for p in m.float_tail_parameters():
         p.data = p.data.float()
     magA = [k for k in b["model"] if k.endswith("mag_A")]          # --lowrank_mag runs (additive unless MAG_KIND=mul)
     if magA:
         import os
-        from bitnet.flip import KernelTernaryLinear
+        from ttf.flip import KernelTernaryLinear
         r = b["model"][magA[0]].shape[1]
         for l in m.modules():
             if isinstance(l, KernelTernaryLinear):
                 l.enable_lowrank_mag(os.environ.get("MAG_KIND", "add"), r)
                 l.mag_cap = float(os.environ.get("MAG_CAP", 0))
     if any(k.endswith("qk_logscale") for k in b["model"]):          # --qk_temp runs
-        import bitnet.model as BM
+        import ttf.model as BM
         for a in m.modules():
             if isinstance(a, BM.Attention):
                 a.qk_logscale = torch.nn.Parameter(torch.zeros(a.n_heads))

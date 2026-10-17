@@ -6,7 +6,7 @@ S=/tmp/$USER/tern; source $S/env.sh || exit 1; cd $S/repo || exit 1
 mkdir -p logs
 for job in "mn_ref|--batch_size 16 --grad_accum 1" "mn_dense|--batch_size 4 --grad_accum 4" "mn_micro|--batch_size 4 --grad_accum 4 --ts_micro"; do
   N=${job%%|*}; F=${job#*|}; rm -rf checkpoints/$N; mkdir -p checkpoints/$N
-  python -m bitnet.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
+  python -m ttf.train --preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin \
     --seq_len 2048 --steps 600 --warmup 60 --tail_fp32 --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 100 --eval_iters 30 \
     --save_secs 99999 --snap_every 0 --no_final_save --lookahead 0 --ckpt_skip 2 --int8 --dw_mode dense --track_flips \
     --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp --ts --ts_theta 16 --ts_tau 1000 --ts_anneal 0.75 \

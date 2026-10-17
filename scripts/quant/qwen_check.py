@@ -1,4 +1,4 @@
-"""Conversion check for Qwen3.5 / 3.8 (bitnet/qwen.py), no training: mean loss on the first N windows of a uint32 token
+"""Conversion check for Qwen3.5 / 3.8 (ttf/qwen.py), no training: mean loss on the first N windows of a uint32 token
 stream for
   hf        transformers' own Qwen3_5ForCausalLM (bf16), the reference
   fp        our wrapper with every linear in float (must match hf)
@@ -15,8 +15,8 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet.qwen import build_qwen, load_qwen, calib_hessians_qwen        # noqa: E402
-from bitnet.flip import KernelTernaryLinear, enable_rc_scales             # noqa: E402
+from ttf.qwen import build_qwen, load_qwen, calib_hessians_qwen        # noqa: E402
+from ttf.flip import KernelTernaryLinear, enable_rc_scales             # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("hf_dir"); ap.add_argument("--data", required=True); ap.add_argument("--calib_data", default="")

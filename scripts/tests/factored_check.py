@@ -6,9 +6,9 @@ and how many moves agree, for sketch sizes K_s; as K_s grows the factored update
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
-import bitnet.train as T
-from bitnet.flip import KernelTernaryLinear
-from bitnet.kernel import unpack_rows
+import ttf.train as T
+from ttf.flip import KernelTernaryLinear
+from ttf.kernel import unpack_rows
 
 dev = "cuda"
 TH = [1e9]

@@ -32,7 +32,7 @@ def main():
     ap.add_argument("--part", default="0/1", help="R/N: only the shards with index %% N == R (N machines, one cache)")
     a = ap.parse_args()
     from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
-    from bitnet.qwen import text_config, _safetensor_index
+    from ttf.qwen import text_config, _safetensor_index
     from safetensors import safe_open
     dev = "cuda"
     os.makedirs(a.out, exist_ok=True)

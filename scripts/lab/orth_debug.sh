@@ -13,7 +13,7 @@ K="--preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k
    --ts --ts_rank_s 512 --ts_theta 16 --ts_tau 1000 --ts_anneal 0.5 --stop_after 301"
 echo "$(date '+%F %T') start on $(hostname)" > $R
 for v in $VARS; do
-  TERN_ORTHDBG=1 python -m bitnet.train $(echo $K) --ts_orth $v --out_dir $O/$v > $O/$v.log 2>&1
+  TERN_ORTHDBG=1 python -m ttf.train $(echo $K) --ts_orth $v --out_dir $O/$v > $O/$v.log 2>&1
   echo "$v: $(grep 'val loss' $O/$v.log | cut -c1-28 | tr '\n' ' ') $(grep -m1 -E 'Error' $O/$v.log)" >> $R
   grep orthdbg $O/$v.log | sed -n '1p;2p;3p;5p;10p;20p;30p' | sed "s/^/  $v /" >> $R
 done

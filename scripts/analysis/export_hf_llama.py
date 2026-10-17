@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet.model import BitTransformer                                  # noqa: E402
-from bitnet.hf_init import init_from_hf, model_config_from_hf, _LIN     # noqa: E402
+from ttf.model import BitTransformer                                  # noqa: E402
+from ttf.hf_init import init_from_hf, model_config_from_hf, _LIN     # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("ckpt"); ap.add_argument("out"); ap.add_argument("--val", default="data/wiki32k_val.bin")

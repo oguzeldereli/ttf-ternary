@@ -1,4 +1,4 @@
-"""Probe traces (bitnet/probe.py) for master vs the fast-ramp flip config, first ~5M tokens.
+"""Probe traces (ttf/probe.py) for master vs the fast-ramp flip config, first ~5M tokens.
 
   python3 plot_probes.py --out docs/probes.png
 """

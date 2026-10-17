@@ -9,7 +9,7 @@ cd $REPO
 pkill -u "$USER" -f "remote/night_4090.sh"
 pkill -u "$USER" -f "remote/nola_b48_now.sh"
 pkill -TERM -u "$USER" -f "out_dir checkpoints/nola_b48$"
-while pgrep -u "$USER" -f "python -m bitnet.train" >/dev/null; do sleep 5; done
+while pgrep -u "$USER" -f "python -m ttf.train" >/dev/null; do sleep 5; done
 mkdir -p checkpoints/nola_lab
 [ -f checkpoints/nola_lab/ckpt_5000.pt ] || cp $HOME/ternary-sync/inbox/nola5000/ckpt_5000.pt checkpoints/nola_lab/
 python -u -m scripts.analysis.flip_selector nola_lab 5000 2>&1 | grep --line-buffered -v Warn \

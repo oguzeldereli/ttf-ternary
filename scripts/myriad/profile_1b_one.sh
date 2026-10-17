@@ -30,7 +30,7 @@ F=$(echo $F $EXTRA)
 nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,power.draw,clocks.sm,temperature.gpu \
   --format=csv -l 1 > $O/nvsmi.csv &
 SMI=$!
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; TERN_TIME=1 python -m bitnet.train $F --profile 5 --out_dir $O/run" \
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; TERN_TIME=1 python -m ttf.train $F --profile 5 --out_dir $O/run" \
   > $O/train.txt 2>&1
 kill $SMI
 echo "$(date '+%F %T') done" >> $O/node.txt

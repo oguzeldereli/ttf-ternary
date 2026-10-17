@@ -20,10 +20,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from bitnet.model import RMSNorm
-from bitnet.master import MasterTernaryLinear
-from bitnet.flip import KernelTernaryLinear, set_flip_rate
-from bitnet.train import lookahead_step, gpu_temp
+from ttf.model import RMSNorm
+from ttf.master import MasterTernaryLinear
+from ttf.flip import KernelTernaryLinear, set_flip_rate
+from ttf.train import lookahead_step, gpu_temp
 
 
 class MLPLM(nn.Module):
@@ -142,7 +142,7 @@ def main():
     def lowrank_flip(s, x=None, y=None):
         """Flip from the rank-r momentum; with --lookahead, filter those proposals by
         look-ahead (the keep test uses this step's gradient g_A, as in lookahead_step)."""
-        from bitnet.kernel import fused_flip, lookahead_filter
+        from ttf.kernel import fused_flip, lookahead_filter
         saved = [l.wpacked.clone() for l in Ls] if a.lookahead else None
         gA = [l.gw.float().clone() for l in Ls] if a.lookahead else None
         propose(s)
@@ -163,7 +163,7 @@ def main():
 
     @torch.no_grad()
     def propose(s):
-        from bitnet.kernel import fused_flip
+        from ttf.kernel import fused_flip
         for i, l in enumerate(Ls):
             g = l.gw.float(); l.gw = None; l.capture = False
             U, V = LR_U[id(l)], LR_V[id(l)]
@@ -186,7 +186,7 @@ def main():
 
     @torch.no_grad()
     def sketch_flip(s):
-        from bitnet.kernel import fused_flip
+        from ttf.kernel import fused_flip
         for i, l in enumerate(Ls):
             g = l.gw.float(); l.gw = None; l.capture = False
             S = SK[id(l)]

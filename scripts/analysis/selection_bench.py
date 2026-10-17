@@ -14,9 +14,9 @@ the gate batch agrees, blocked at +-1):
         PER_STEP flips per step, default 180000; also reports one step's first-order gain, real cost and |T| shares)
 """
 import sys, numpy as np, torch
-from bitnet.master import build_master_transformer
-from bitnet.train import split_params, get_batch
-from bitnet.kernel import unpack_rows
+from ttf.master import build_master_transformer
+from ttf.train import split_params, get_batch
+from ttf.kernel import unpack_rows
 from scripts.analysis.testbench import Bench
 
 mpath, kpath = sys.argv[1], sys.argv[2]

@@ -24,5 +24,5 @@ A="--init_hf $HOME/Scratch/hf/models/$MODEL --data data/wiki32k_train.bin --val 
    --eval_interval 50 --eval_iters 10 --save_secs 99999 --snap_every 0 --no_final_save --lookahead 0 --ckpt_skip 2
    --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp $B $F --out_dir $D"
 A=$(echo $A)
-$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m bitnet.train $A" >> $D/train.log 2>&1
+$RUN "source $S/env.sh; cd $HOME/Scratch/ternary-LLM; python -m ttf.train $A" >> $D/train.log 2>&1
 echo "$(date '+%F %T') job end $(grep -oE 'FINAL val loss [0-9.]+' $D/train.log | tail -1)" >> $D/train.log

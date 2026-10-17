@@ -1,7 +1,7 @@
 # Formulas
 
 Every update rule used in this project: the current recipe first, then each mechanism that was tried, with its flag
-and result. Flags are `bitnet/train.py` arguments; results are final validation loss at 300M tokens (110M model,
+and result. Flags are `ttf/train.py` arguments; results are final validation loss at 300M tokens (110M model,
 from scratch) unless noted. Run details: [RUNS.md](RUNS.md), run list: [RUN_INDEX.md](RUN_INDEX.md).
 
 Notation, per ternary layer: trits $T\in\{-1,0,1\}^{N\times K}$; the batch gradient with respect to the trits
@@ -115,7 +115,7 @@ paper Appendix "Index of mechanisms and results" and docs/RUN_INDEX.md.
 | `--eval_first_n N` | before training, the loss over the first N val windows in order (as `scripts/quant/qwen_check.py`) |
 | `--lr_rewarm S:W:F` | re-warm a decayed run from step S over W steps to F times the peak |
 
-## 2b. What master cannot do without (master from scratch with one ingredient changed, `--m_*`, `bitnet/master_opt.py`)
+## 2b. What master cannot do without (master from scratch with one ingredient changed, `--m_*`, `ttf/master_opt.py`)
 
 | flag | change | final (master 2.7513) |
 |---|---|---|

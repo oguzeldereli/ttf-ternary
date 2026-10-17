@@ -1,6 +1,6 @@
 """Does GPTQ's calibration data make the converted model forget other domains? (16 Oct)
 
-Qwen3.5-0.8B-Base, streaming sequential conversion (bitnet/qwen.py convert_qwen_streaming), calibrated on each
+Qwen3.5-0.8B-Base, streaming sequential conversion (ttf/qwen.py convert_qwen_streaming), calibrated on each
 --calib set in turn (64 x 2048 tokens), then scored on every --eval set (first --n windows of each; fp first).
 Sets are NAME=path to uint32 Qwen3.5 token files; a calib entry may join two files with '+' (half the windows each),
 and NAME=als rounds without data (nearest-grid ALS, no GPTQ).
@@ -11,8 +11,8 @@ import argparse, json, os, sys, tempfile
 import numpy as np
 import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from bitnet.qwen import build_qwen, load_qwen, convert_qwen_streaming     # noqa: E402
-from bitnet.flip import KernelTernaryLinear, enable_rc_scales            # noqa: E402
+from ttf.qwen import build_qwen, load_qwen, convert_qwen_streaming     # noqa: E402
+from ttf.flip import KernelTernaryLinear, enable_rc_scales            # noqa: E402
 
 ap = argparse.ArgumentParser(); ap.add_argument("hf_dir"); ap.add_argument("--calib", required=True)
 ap.add_argument("--eval", required=True); ap.add_argument("--n", type=int, default=12); ap.add_argument("--seq", type=int, default=2048)

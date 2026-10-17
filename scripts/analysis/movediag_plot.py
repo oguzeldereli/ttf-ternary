@@ -1,4 +1,4 @@
-"""Plot the --movediag records (bitnet/movediag.py) of several runs against training step: why does the late-training
+"""Plot the --movediag records (ttf/movediag.py) of several runs against training step: why does the late-training
 gain of the trit moves shrink? The trit gain per step factors as
     realized gain per step = moves per step  x  first-order gain per move (true gradient)  x  survive
 and the first-order gain per move as |true gradient| at the moved entries x precision (direction). Each factor is a

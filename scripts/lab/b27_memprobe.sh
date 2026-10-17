@@ -10,7 +10,7 @@ OFF=""; [ $W = host ] && OFF="--ts_offload_async"; [ $W = split ] && OFF="--ts_o
 CAPF=""; [ "${CAP:-0}" != 0 ] && CAPF="--mem_cap_gib $CAP"; [ -n "${INPLACE:-}" ] && CAPF="$CAPF --ts_state_inplace"; [ "${CKB:-1}" = 1 ] && CAPF="$CAPF --ckpt_block"
 nvidia-smi --query-gpu=memory.used --format=csv,noheader -l 1 > $O/smi_$n.csv &
 SMI=$!
-python -m bitnet.train --preset b27 --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 \
+python -m ttf.train --preset b27 --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 2048 \
   --batch_size 1 --grad_accum 1 --steps 9155 --warmup 305 --rate_schedule cosine --rate 0.0 --rate_peak 0.02 \
   --rate_warmup 30 --g_ref 3.0 --int8 --dw_mode dense --lr 7.5e-4 --min_lr 7.5e-5 --eval_interval 1000000 --eval_iters 1 \
   --save_secs 100000000 --lookahead 0 --ckpt_skip 0 --loss_chunk 256 --rc_scale --lowrank_mag add:16 --mag_wd 0.1 --qk_temp \

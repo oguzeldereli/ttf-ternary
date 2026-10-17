@@ -176,7 +176,7 @@ def ttf_decode(x, col_scale, mag_B, mag_A, row_scale, wpacked, beta):
 def repack_2bit(wpacked, K, chunk=2048):
     """base-3 packed [N, K5] -> 2-bit [N, K4p] uint8 (4 trits per byte, code t + 1 in bits 2i), K4p a multiple of 16;
     padding codes are 1 (trit 0)"""
-    from bitnet.kernel import unpack_rows
+    from ttf.kernel import unpack_rows
     N = wpacked.shape[0]
     K4p = ((K + 3) // 4 + 15) // 16 * 16
     out = torch.full((N, K4p), 0x55, dtype=torch.uint8, device=wpacked.device)

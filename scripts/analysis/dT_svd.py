@@ -14,7 +14,7 @@ import re
 
 import torch
 
-from bitnet.kernel import unpack_rows
+from ttf.kernel import unpack_rows
 
 
 def trits(sd):

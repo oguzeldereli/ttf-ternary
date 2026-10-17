@@ -2,7 +2,7 @@
 #   python scripts/tests/test_compute_exact.py
 import sys, torch
 sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "..", ".."))
-from bitnet import kernel as Kn, flip as F
+from ttf import kernel as Kn, flip as F
 torch.manual_seed(0); dev = "cuda"
 Kn.GEMM_BACKEND[0] = "int8mm"
 for (N, K) in [(1024, 768), (680, 5120), (256, 333)]:
@@ -55,7 +55,7 @@ for (N_, K_) in [(5120, 3000), (17408, 5120)]:
     rs, cs = Kn.sq_sums(g); r0 = torch.linalg.vector_norm(g, dim=1).square(); c0 = (g * g).sum(0)
     print(N_, K_, "sq_sums max rel diff rows %.2e cols %.2e (fp32 eps 1.2e-7)" % (((rs - r0).abs() / r0).max().item(), ((cs - c0).abs() / c0).max().item()))
 # LeanAdam: the multi-tensor path for fp32 1-D parameters == the per-tensor loop, bit for bit, over 5 steps
-from bitnet.opt_lean import LeanAdam
+from ttf.opt_lean import LeanAdam
 torch.manual_seed(5)
 P0 = [torch.randn(n, device="cuda") for n in (5120, 17408, 7, 48, 1)]
 res = []

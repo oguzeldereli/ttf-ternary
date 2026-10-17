@@ -6,9 +6,9 @@ vs later gradients, flips per step, uphill share (and by |T| quartile), one-step
   MW_SUB=0.25 python -m scripts.analysis.master_wave RUN STEP
 """
 import os, sys, math, numpy as np, torch
-from bitnet.master import build_master_transformer, split_params, MasterTernaryLinear
-from bitnet.train import get_batch
-from bitnet.config import TrainConfig
+from ttf.master import build_master_transformer, split_params, MasterTernaryLinear
+from ttf.train import get_batch
+from ttf.config import TrainConfig
 
 RUN, ST = sys.argv[1], int(sys.argv[2])
 NT, K, SUB = 32, int(os.environ.get("MW_K", "41")), float(os.environ.get("MW_SUB", "0.25"))
