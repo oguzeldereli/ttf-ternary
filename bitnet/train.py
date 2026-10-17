@@ -3326,6 +3326,8 @@ def main():
                     "repack, the spend's D V) in one kernel (bitnet.kernel.ttf_fire): no [N, K] temporaries")
     ap.add_argument("--ts_acc_scale", type=float, default=1.0, help="--resume: multiply every TTF accumulator by F (a "
                     "run continued at theta F x its old theta keeps each entry's distance to the bar: no burst of moves)")
+    ap.add_argument("--fused_norm", action="store_true", help="Qwen: the RMSNorms (not the gated ones) through one fused "
+                    "kernel forward and one backward (the same formula in fp32; reduction order differs)")
     ap.add_argument("--fused_scales", action="store_true", help="kernel layers with row / column scales and the 'add' "
                     "adapter: the column scale's backward and the adapter add + row scale (forward and backward) in fused "
                     "kernels (the same per-element roundings; the scale gradients' sums in another order)")
@@ -4418,6 +4420,10 @@ def main():
     if args.fused_scales:
         from .flip import FUSED_SCALES as _FSC
         _FSC[0] = True
+    if args.fused_norm and _QWEN:
+        from .qwen import enable_fused_norm
+        enable_fused_norm()
+        print("--fused_norm: Qwen RMSNorm in one kernel each way", flush=True)
     movediag = None
     if args.movediag:
         from .movediag import MoveDiag

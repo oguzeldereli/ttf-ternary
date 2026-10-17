@@ -18,6 +18,24 @@ from torch.utils.checkpoint import checkpoint
 
 # linears kept in float (tiny, or gates whose rounding would be all error)
 _KEEP_FLOAT = ("in_proj_a", "in_proj_b")
+FUSED_NORM = [False]     # --fused_norm: Qwen3_5RMSNorm through kernel.rms_norm_qwen (one kernel forward, one backward)
+
+
+def enable_fused_norm():
+    """route every Qwen3_5RMSNorm (not the gated one) through the fused kernel when the input is on the GPU"""
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as Q
+    if getattr(Q.Qwen3_5RMSNorm, "_tern_fused", False):
+        return
+    orig = Q.Qwen3_5RMSNorm.forward
+
+    def fwd(self, x):
+        if x.is_cuda and FUSED_NORM[0]:
+            from .kernel import rms_norm_qwen
+            return rms_norm_qwen(x, self.weight, self.eps)
+        return orig(self, x)
+    Q.Qwen3_5RMSNorm.forward = fwd
+    Q.Qwen3_5RMSNorm._tern_fused = True
+    FUSED_NORM[0] = True
 
 
 def is_qwen35(path):

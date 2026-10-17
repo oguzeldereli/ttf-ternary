@@ -1086,3 +1086,64 @@ def scale_bwd(g, s_bf16, x):
     part = torch.empty(nb, N, dtype=torch.float32, device=g.device)
     _scale_bwd_kernel[(nb, triton.cdiv(N, BN))](g, s_bf16, x, gx, part, M, N, BM=BM, BN=BN)
     return gx, part.sum(0)
+
+
+@triton.jit
+def _rms_fwd_kernel(x_ptr, w_ptr, y_ptr, r_ptr, K, sx, sy, eps, BK: tl.constexpr):
+    """one row: y = (x * rsqrt(mean(x^2) + eps)) * (1 + w) in fp32, stored in y's dtype; rstd kept for the backward
+    (Qwen3.5's RMSNorm: the gain is 1 + w and the product is taken before the cast)"""
+    row = tl.program_id(0)
+    k = tl.arange(0, BK); m = k < K
+    x = tl.load(x_ptr + row * sx + k, mask=m, other=0.0).to(tl.float32)
+    rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / K + eps)
+    w = tl.load(w_ptr + k, mask=m, other=0.0).to(tl.float32)
+    tl.store(y_ptr + row * sy + k, (x * rstd * (1.0 + w)).to(y_ptr.dtype.element_ty), mask=m)
+    tl.store(r_ptr + row, rstd)
+
+
+@triton.jit
+def _rms_bwd_kernel(x_ptr, w_ptr, g_ptr, r_ptr, gx_ptr, gw_ptr, M, K, sx, sg, sgx, RPB: tl.constexpr, BK: tl.constexpr):
+    """RPB rows per program: gx = rstd (g' - xh mean(g' xh)), g' = g (1 + w), xh = x rstd; the gain's gradient
+    sum(g xh) over the program's rows, written per program (summed afterwards: deterministic)"""
+    pid = tl.program_id(0)
+    k = tl.arange(0, BK); m = k < K
+    w1 = 1.0 + tl.load(w_ptr + k, mask=m, other=0.0).to(tl.float32)
+    gw = tl.zeros((BK,), dtype=tl.float32)
+    for i in range(RPB):
+        row = pid * RPB + i
+        if row < M:
+            x = tl.load(x_ptr + row * sx + k, mask=m, other=0.0).to(tl.float32)
+            g = tl.load(g_ptr + row * sg + k, mask=m, other=0.0).to(tl.float32)
+            rstd = tl.load(r_ptr + row)
+            xh = x * rstd
+            gp = g * w1
+            c = tl.sum(gp * xh, axis=0) / K
+            tl.store(gx_ptr + row * sgx + k, (rstd * (gp - xh * c)).to(gx_ptr.dtype.element_ty), mask=m)
+            gw += g * xh
+    tl.store(gw_ptr + pid * K + k, gw, mask=m)
+
+
+class RMSNormFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w, eps):
+        sh = x.shape; x2 = x.reshape(-1, sh[-1]).contiguous(); M, K = x2.shape
+        y = torch.empty_like(x2); r = torch.empty(M, dtype=torch.float32, device=x.device)
+        BK = triton.next_power_of_2(K)
+        _rms_fwd_kernel[(M,)](x2, w, y, r, K, x2.stride(0), y.stride(0), float(eps), BK=BK)
+        ctx.save_for_backward(x2, w, r); ctx.sh = sh
+        return y.view(sh)
+
+    @staticmethod
+    def backward(ctx, g):
+        x2, w, r = ctx.saved_tensors; M, K = x2.shape
+        g2 = g.reshape(M, K).contiguous()
+        gx = torch.empty_like(x2)
+        RPB = 16; nb = triton.cdiv(M, RPB); BK = triton.next_power_of_2(K)
+        gw = torch.empty(nb, K, dtype=torch.float32, device=x2.device)
+        _rms_bwd_kernel[(nb,)](x2, w, g2, r, gx, gw, M, K, x2.stride(0), g2.stride(0), gx.stride(0), RPB=RPB, BK=BK)
+        return gx.view(ctx.sh), gw.sum(0).to(w.dtype), None
+
+
+def rms_norm_qwen(x, w, eps):
+    """Qwen3.5 RMSNorm, (x / rms(x)) (1 + w) in fp32 cast to x's dtype, forward and backward in one kernel each"""
+    return RMSNormFn.apply(x, w, eps)
