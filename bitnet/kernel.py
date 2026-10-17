@@ -907,62 +907,57 @@ def sq_sums(g: torch.Tensor):
 
 
 @triton.jit
-def _fire_digit(acc_unused, u_ptr, v_ptr, rows, k, N, K, R, sun, svk, RC: tl.constexpr, BN: tl.constexpr,
-                BK5: tl.constexpr):
-    """A[rows, k] = U[rows, :] . V[k, :] in fp32 (IEEE products, no TF32), r in chunks of RC"""
-    a = tl.zeros((BN, BK5), dtype=tl.float32)
-    for r0 in range(0, R, RC):
-        rr = r0 + tl.arange(0, RC)
-        u = tl.load(u_ptr + rows[:, None] * sun + rr[None, :], mask=(rows[:, None] < N) & (rr[None, :] < R), other=0.0)
-        v = tl.load(v_ptr + k[:, None] * svk + rr[None, :], mask=(k[:, None] < K) & (rr[None, :] < R), other=0.0)
-        a += tl.dot(u, tl.trans(v), input_precision="ieee")
-    return a
-
-
-@triton.jit
-def _fire_kernel(u_ptr, v_ptr, p_ptr, du_ptr, nf_ptr, N, K, K5, R, sun, svk, spn, sdn, theta,
-                 RC: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr):
+def _fire_kernel(u_ptr, v_ptr, p_ptr, d_ptr, N, K, K5, R, sun, svk, spn, sdn, theta,
+                 RC: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr, PREC: tl.constexpr):
+    """one tile of packed bytes: for each of the 5 trit digits, A = U V^T on those columns (fp32 accumulation; PREC
+    'tf32x3' keeps fp32 accuracy on the tensor cores), the legal moves applied to the digit, the moves written to D
+    (int8, the spend is applied from them sparsely), the bytes stored back"""
     pn = tl.program_id(0); pk = tl.program_id(1)
     rows = pn * BN + tl.arange(0, BN)
     k5 = pk * BK5 + tl.arange(0, BK5)
     pm = (rows[:, None] < N) & (k5[None, :] < K5)
     b = tl.load(p_ptr + rows[:, None] * spn + k5[None, :], mask=pm, other=0).to(tl.int32)
     nb = tl.zeros((BN, BK5), dtype=tl.int32)
-    nf = tl.zeros((BN, BK5), dtype=tl.int32)
     pw = 1
     for i in tl.static_range(5):
         k = k5 * 5 + i
         dig = (b // pw) % 3
-        a = _fire_digit(0, u_ptr, v_ptr, rows, k, N, K, R, sun, svk, RC, BN, BK5)
-        d = tl.where(a > 0, 1, tl.where(a < 0, -1, 0))
-        w0 = dig - 1
-        fire = (tl.abs(a) >= theta) & (tl.abs(w0 + d) <= 1) & (k[None, :] < K) & pm
-        dd = tl.where(fire, d, 0)
-        nb += (dig + dd) * pw
-        nf += fire.to(tl.int32)
-        # the spend's D V for this digit's columns, accumulated into dU (rows x r)
+        a = tl.zeros((BN, BK5), dtype=tl.float32)
         for r0 in range(0, R, RC):
             rr = r0 + tl.arange(0, RC)
+            u = tl.load(u_ptr + rows[:, None] * sun + rr[None, :], mask=(rows[:, None] < N) & (rr[None, :] < R), other=0.0)
             v = tl.load(v_ptr + k[:, None] * svk + rr[None, :], mask=(k[:, None] < K) & (rr[None, :] < R), other=0.0)
-            c = tl.dot(dd.to(tl.float32), v, input_precision="ieee")
-            tl.atomic_add(du_ptr + rows[:, None] * sdn + rr[None, :], c, mask=(rows[:, None] < N) & (rr[None, :] < R))
+            a += tl.dot(u, tl.trans(v), input_precision=PREC)
+        d = tl.where(a > 0, 1, tl.where(a < 0, -1, 0))
+        fire = (tl.abs(a) >= theta) & (tl.abs(dig - 1 + d) <= 1) & (k[None, :] < K) & pm
+        dd = tl.where(fire, d, 0)
+        nb += (dig + dd) * pw
+        tl.store(d_ptr + rows[:, None] * sdn + k[None, :], dd.to(tl.int8), mask=(rows[:, None] < N) & (k[None, :] < K))
         pw = pw * 3
     tl.store(p_ptr + rows[:, None] * spn + k5[None, :], nb.to(tl.uint8), mask=pm)
-    tl.atomic_add(nf_ptr, tl.sum(nf))
+
+
+FIRE_TILE = None          # ttf_fire tiles (rows, packed bytes of 5 columns, rank chunk); None: by rank
+FIRE_PREC = ["tf32x3"]     # ttf_fire's A: "tf32x3" (tensor cores, ~fp32 accuracy) or "ieee" (fp32 FMAs, slower)
 
 
 def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, theta: float):
-    """--ts firing in one pass: A = U V^T (fp32), every legal move (|A| >= theta, the trit stays in {-1, 0, 1}) applied
-    to the packed trits in place, and D V (D the moves, {-1, 0, 1}) returned for the spend, with the number of moves (a
-    device tensor). The [N, K] accumulator, the unpacked trits and D are never formed. Differences from the unfused
-    path: A's fp32 sums in another order (rounding level), so an entry within rounding of theta may decide otherwise."""
+    """--ts firing in one pass: A = U V^T (fp32 accumulation), every legal move (|A| >= theta, the trit stays in
+    {-1, 0, 1}) applied to the packed trits in place; returns D V (D the moves, {-1, 0, 1}; from the moves alone, a
+    sparse product) for the spend, and the number of moves (a device tensor). The fp32 [N, K] accumulator and the
+    unpacked trits are never formed (D is int8). Differences from the unfused path: A's sums in another order and
+    precision (rounding level), so an entry within rounding of theta may decide otherwise."""
     N, R = U.shape
     K5 = packed.shape[1]
     U = U.contiguous().float(); V = V.contiguous().float()
+    D = torch.empty(N, K, dtype=torch.int8, device=U.device)
+    BN, BK5, RC = FIRE_TILE if FIRE_TILE else ((64, 32, 32) if R <= 512 else (64, 64, 32))   # best measured (4070 Ti S)
+    _fire_kernel[(triton.cdiv(N, BN), triton.cdiv(K5, BK5))](U, V, packed, D, N, K, K5, R, U.stride(0), V.stride(0),
+                                                              packed.stride(0), D.stride(0), float(theta),
+                                                              RC=RC, BN=BN, BK5=BK5, PREC=FIRE_PREC[0])
+    nz = D.nonzero()                                                    # the moves (one host sync)
     dU = torch.zeros(N, R, dtype=torch.float32, device=U.device)
-    nf = torch.zeros(1, dtype=torch.int32, device=U.device)
-    BN, BK5, RC = 32, 32, 32
-    _fire_kernel[(triton.cdiv(N, BN), triton.cdiv(K5, BK5))](U, V, packed, dU, nf, N, K, K5, R, U.stride(0), V.stride(0),
-                                                              packed.stride(0), dU.stride(0), float(theta),
-                                                              RC=RC, BN=BN, BK5=BK5)
-    return dU, nf[0]
+    for c0 in range(0, nz.shape[0], 1 << 16):                          # in chunks: moves x r floats at a time
+        z_ = nz[c0:c0 + (1 << 16)]
+        dU.index_add_(0, z_[:, 0], D[z_[:, 0], z_[:, 1]].float()[:, None] * V[z_[:, 1]])
+    return dU, torch.tensor(nz.shape[0], device=U.device)
