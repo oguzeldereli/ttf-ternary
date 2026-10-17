@@ -40,6 +40,7 @@ run q08_gqc_ts0_th32 --init_hf_method gptqc --ts_start 0 --ts_theta 32
 run q08_gqc_ts0_th16 --init_hf_method gptqc --ts_start 0 --ts_theta 16
 run q08_gqc_ts0_th8 --init_hf_method gptqc --ts_start 0 --ts_theta 8
 run q08_gqc_ts0_msvd16_th16 --init_hf_method gptqc --ts_start 0 --init_mag_svd 16 --ts_theta 16   # the start gains together
+run q08_gqc_ts0_z64_th16 --init_hf_method gptqc --ts_start 0 --lowrank_mag add:64 --ts_theta 16   # what a continuation can use
 run q08_gq_ts0 --init_hf_method gptq --ts_start 0
 run q08_gq_s120 --init_hf_method gptq --ts_start 120
 echo Q08_DONE
