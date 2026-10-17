@@ -1,5 +1,5 @@
 """Superposition in the weights of 110M networks: how near-orthogonal are the directions each layer reads and writes?
-(16 Oct; the question whether ternary weights lose superposition precision)
+(16 Oct: do ternary weights lose superposition precision?)
 
 Per linear (effective weight W_eff = layer(I), scales and adapters included): the written directions (columns of the
 output and down projections, vectors in the residual stream) and the read directions (rows of q / k / v / gate / up,
@@ -11,7 +11,7 @@ vectors in the normed residual), k vectors in d dimensions. Reported, averaged o
   frame tightness: d * sum_ij (v_i . v_j)^2 / (sum_i |v_i|^2)^2 over the norm-weighted directions (1 = the directions
     spread the energy evenly over all d dimensions; large = they crowd into a few)
   python scripts/analysis/interference.py --model fp=checkpoints/fp32_baseline/ckpt.pt \
-      --model ttf0=checkpoints/final/ts16full_tau1000_s0/ckpt.pt --gptq_of fp --out docs/research/analysis/geom110/interference.json
+      --model ttf0=checkpoints/final/ts16full_tau1000_s0/ckpt.pt --gptq_of fp --out OUT.json
 """
 import argparse, json, math, os, sys
 import numpy as np

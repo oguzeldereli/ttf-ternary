@@ -204,7 +204,7 @@ Base for each row is noted. "sharp base" = gate + Adam step + sharp (2.9875).
 | undo | `--undo` | flip back last step's move $d$ where $d\ne0$, $d\,g>0$, $\operatorname{sign}M=d$ | inert with the gate (2% of flips); stopped |
 | speed reference | `--speed_ref 0.995` | $m\leftarrow$ slow EMA of mean$\lvert M\rvert$ | 3.1315 (no change) |
 | per-row speed reference | `--speed_row b` | $S_{i\cdot}\leftarrow S_{i\cdot}\,m/\text{EMA}(\overline{\lvert M_{i\cdot}\rvert})$ | swing test only |
-| the user's rule | `--lr_beta 1 --mom_ncap C --pfun_tanh 10` | cap $\|M\|\le C\,\text{EMA}\|g\|$; $p=\rho_t\tanh(\lvert M\rvert/(g_{\text{ref}}v_0))$, $v_0=10\,\text{EMA}(\overline{\lvert g\rvert})$ | cap 3 3.217; cap 1 ~3.83 (stopped) |
+| velocity rule with a speed limit | `--lr_beta 1 --mom_ncap C --pfun_tanh 10` | cap $\|M\|\le C\,\text{EMA}\|g\|$; $p=\rho_t\tanh(\lvert M\rvert/(g_{\text{ref}}v_0))$, $v_0=10\,\text{EMA}(\overline{\lvert g\rvert})$ | cap 3 3.217; cap 1 ~3.83 (stopped) |
 | asymmetric gravity | `--grav_up D` | $M\leftarrow\text{where}(\operatorname{sign}M\operatorname{sign}g<0,\,DM,\,bM)+g$ | 3.501; with gate + Adam 3.497 |
 | angle-scaled decay | `--lr_adapt` | $b_t=b\cos(g,M)$ | 10M screen only |
 | several decays | `--multibeta 0.8,0.95,0.99` | per layer the momentum that best predicted $g_t$ proposes | 3.193 (branch) |

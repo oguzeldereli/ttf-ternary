@@ -1,4 +1,4 @@
-> **Historical (to 25 Sep).** The current state is in [RUNS.md](RUNS.md) (headline), [RUN_INDEX.md](RUN_INDEX.md) and [FORMULAS.md](FORMULAS.md); this file keeps the systems result and the 25 Sep audit.
+> **Historical (to 25 Sep).** The current state is in the README, the results database (`python scripts/results.py`) and [FORMULAS.md](../FORMULAS.md); this file keeps the systems result and the 25 Sep audit. "RUNS.md" below is the run log of that time (tag `pre-consolidation-2026-10-17`).
 
 # Results
 

@@ -1,4 +1,4 @@
-"""Does ternary weight precision limit superposition? (16 Oct; the question)
+"""Does ternary weight precision limit superposition? (16 Oct)
 
 Toy model of Elhage et al. (2022), "Toy models of superposition": n sparse features x in [0, 1]^n (each present with
 probability 1 - S, importance I_i = 0.9^i), compressed to m < n dimensions and read back, x' = ReLU(W^T W x + b), loss
@@ -8,7 +8,7 @@ sum_i I_i (x_i - x'_i)^2. The weights W [m, n] are
   ternary-c ternary with a per-column (per-feature) scale as well, W = a_r c_j T (our layers' row x column scales)
 Reported per sparsity: features represented (|W_j| > 0.5 of the largest), the superposition count (sum over features of
 |W_j|^2 / ... as in Elhage: dimensions per feature), mean interference among represented features, and the loss.
-  python scripts/analysis/toy_superposition.py --n 80 --m 20 --out docs/research/analysis/toy_superposition.json
+  python scripts/analysis/toy_superposition.py --n 80 --m 20 --out OUT.json
 """
 import argparse, json
 import numpy as np

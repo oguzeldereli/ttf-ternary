@@ -12,7 +12,9 @@ Nothing is ever rewritten: a correction is a new record whose `supersedes` names
 
 Where records are written: every training run appends to `<out_dir>/records.jsonl` (it travels with the run, so many
 hosts never write one file); `ingest` merges such files (or any records file) into the central database
-(`results/runs.jsonl` of this repo, or $TTF_RESULTS), skipping ids it already holds.
+(`results/runs.jsonl` of this repo, or $TTF_RESULTS), skipping ids it already holds. Notes (free text: plans, reasoning)
+are kept apart from the measurements, in $TTF_NOTES (default ../ttf-private/results/notes.jsonl beside this repository
+when that folder exists, else results/notes.jsonl, which git ignores); reading without a path sees both files.
 """
 from __future__ import annotations
 import fcntl
@@ -26,8 +28,11 @@ import uuid
 TYPES = ("run", "event", "result", "note")
 STATUSES = ("queued", "running", "finished", "failed", "stopped")
 REQUIRED = {"run": ("name",), "event": ("run", "status"), "result": ("run", "metric", "value"), "note": ("text",)}
-DB = os.environ.get("TTF_RESULTS") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                                     "results", "runs.jsonl")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB = os.environ.get("TTF_RESULTS") or os.path.join(_ROOT, "results", "runs.jsonl")
+NOTES = os.environ.get("TTF_NOTES") or (
+    os.path.join(_ROOT, "..", "ttf-private", "results", "notes.jsonl") if os.path.isdir(os.path.join(_ROOT, "..", "ttf-private"))
+    else os.path.join(_ROOT, "results", "notes.jsonl"))
 
 
 def now():
@@ -102,9 +107,16 @@ def make(type_, **fields):
 
 
 def append(rec, path=None):
-    """append one record (or a list) to a records file, under an exclusive lock, flushed to disk; returns the id(s)"""
+    """append one record (or a list) to a records file, under an exclusive lock, flushed to disk; returns the id(s).
+    Without a path: notes to NOTES, the other records to DB."""
     recs = rec if isinstance(rec, list) else [rec]
-    path = path or DB
+    if path is None:
+        notes = [r for r in recs if r.get("type") == "note"]
+        rest = [r for r in recs if r.get("type") != "note"]
+        if notes and rest:
+            append(notes, NOTES); append(rest, DB)
+            return [r["id"] for r in recs] if isinstance(rec, list) else recs[0]["id"]
+        path = NOTES if notes else DB
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     for r in recs:
         e = validate(r)
@@ -125,8 +137,10 @@ def add(type_, path=None, **fields):
 
 
 def load(path=None):
-    """every record of a file, in order (a damaged last line from an interrupted write is skipped)"""
-    path = path or DB
+    """every record of a file, in order (a damaged last line from an interrupted write is skipped); without a path the
+    database and the notes"""
+    if path is None:
+        return load(DB) + (load(NOTES) if os.path.abspath(NOTES) != os.path.abspath(DB) else [])
     out = []
     if not os.path.exists(path):
         return out

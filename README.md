@@ -155,12 +155,12 @@ docs/          see below
 
 ## Docs
 
-- `results/runs.jsonl`, `python scripts/results.py`: every run with its configuration and results, and the notes
-  (the former QUEUE / RUNS / RUN_INDEX logs, up to 17 Oct 2026 in tag `pre-consolidation-2026-10-17`).
-- [docs/FORMULAS.md](docs/FORMULAS.md): every update rule used, with its flag; [docs/TTF_EXPLAINED.md](docs/TTF_EXPLAINED.md).
+- `results/runs.jsonl`, `python scripts/results.py`: every run with its configuration, events and results (`table`,
+  `show`, `find`); notes are kept outside the repository (`ttf/results.py`, `TTF_NOTES`).
+- [docs/FORMULAS.md](docs/FORMULAS.md): every update rule used, with its flag.
 - [docs/OPTIONS_MAP.md](docs/OPTIONS_MAP.md): the old flags and the current options.
-- [docs/research/](docs/research/): findings (conversion geometry, rank and conversion, early results, threats, related
-  work); [docs/history/](docs/history/): dated plans and summaries.
+- [docs/research/](docs/research/): early results summary, related work, analysis outputs (rank spectra, gaps,
+  zero-shot).
 
 ## License and patents
 

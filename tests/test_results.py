@@ -39,3 +39,13 @@ def test_runlog(tmp_path):
     recs = R.load(str(tmp_path / "records.jsonl"))
     assert [r["type"] for r in recs] == ["run", "event", "result", "event"]
     assert R.run_of(str(tmp_path))[0] == lg.id
+
+
+def test_notes_apart(tmp_path, monkeypatch):
+    """without a path, notes go to NOTES and the measurements to DB; load() reads both"""
+    monkeypatch.setattr(R, "DB", str(tmp_path / "runs.jsonl")); monkeypatch.setattr(R, "NOTES", str(tmp_path / "notes.jsonl"))
+    rid = R.add("run", name="z")
+    R.append([R.make("note", text="why", runs=[rid]), R.make("result", run=rid, metric="m", value=1.0)])
+    assert [r["type"] for r in R.load(R.DB)] == ["run", "result"]
+    assert [r["type"] for r in R.load(R.NOTES)] == ["note"]
+    assert len(R.load()) == 3
