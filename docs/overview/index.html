@@ -145,7 +145,7 @@ ul.plain{margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4
     <div class="ref"><span class="v">2.571</span><span class="l">1.3B, master weights (FineWeb 3.549; LAMBADA 0.138): TTF <b>−0.020 [−0.021, −0.018]</b>, FineWeb −0.048</span></div>
     <div><span class="v">2.627</span><span class="l">340M, TTF ranks 512 (training-time eval); 340M master 2.663; <b>340M master + extras 2.622</b> (ends 0.005 ahead after trailing by 0.075 at step 5000)</span></div>
   </div>
-  <p><b>What TTF is</b>: a short low-rank momentum (β 0.9) → Adam-normalised step → a long low-rank accumulator (leak ~1000 steps) → a ternary weight moves one level when its accumulated evidence crosses θ = 16, and the move is spent from the accumulator. Built from an ablation of master-weight training (2 Oct). <b>Checked 3 Oct</b>: rebuilt models reproduce their logged losses to &lt;6e-5; no val article in train; 69 kernel tests pass; master's lr 1.5e-3 is the best of four; master is the BitNet b1.58 recipe (a two-stage schedule did not improve it); a ternary Bop baseline is 0.38 behind; storage formats: 8-bit direction + 16-bit accumulator free (both seeds); the lean recipe (int8 / fp16 state, bf16 / fp16 float tail, update inside the backward) <b>2.7020 vs 2.7067</b>. Objections and evidence: <code>docs/THREATS.md</code>.</p>
+  <p><b>What TTF is</b>: a short low-rank momentum (β 0.9) → Adam-normalised step → a long low-rank accumulator (leak ~1000 steps) → a ternary weight moves one level when its accumulated evidence crosses θ = 16, and the move is spent from the accumulator. Built from an ablation of master-weight training (2 Oct). <b>Checked 3 Oct</b>: rebuilt models reproduce their logged losses to &lt;6e-5; no val article in train; 69 kernel tests pass; master's lr 1.5e-3 is the best of four; master is the BitNet b1.58 recipe (a two-stage schedule did not improve it); a ternary Bop baseline is 0.38 behind; storage formats: 8-bit direction + 16-bit accumulator free (both seeds); the lean recipe (int8 / fp16 state, bf16 / fp16 float tail, update inside the backward) <b>2.7020 vs 2.7067</b>. Objections and evidence: <code>docs/research/THREATS.md</code>.</p>
   <p><b>Memory, measured</b> (micro-batch 1–2 × 2048, lean): 110M 0.38–0.63 GiB, 340M 0.68–1.35, 1.3B 1.61–2.97 (state on host / on GPU), <b>10B 12.3 GiB</b> (16 GB card), <b>15B 17.0 GiB</b> (24 GB card), the 26.5B preset 14.1 GiB at ranks 256 on a 16 GB card (24.6 s/step). Master + AdamW: 16 bytes per parameter before activations.</p>
 </section>
 
@@ -160,7 +160,7 @@ ul.plain{margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4
     <tr><td>3 lab121 PCs</td><td class="mono">qm8af5 / af4 / af3, qm4a16</td><td>precision ladder: accumulator with 5 / 4 / 3 mantissa bits; int4 direction</td><td class="num">06:00–08:15</td></tr>
     <tr><td>tope / quillback</td><td class="mono">big_ts512an05, big_ts512la1000an05</td><td>340M late-training levers (steps × ratio^0.5, + scaled leak)</td><td class="num">02:45</td></tr>
   </table></div>
-  <p class="meh" style="font-size:13px">Kept current in <code>docs/QUEUE.md</code>; overnight plan in <code>docs/OVERNIGHT_PLAN_OCT4.md</code>.</p>
+  <p class="meh" style="font-size:13px">Kept current in <code>docs/QUEUE.md</code>; overnight plan in <code>docs/history/OVERNIGHT_PLAN_OCT4.md</code>.</p>
 </section>
 
 <section>

@@ -184,7 +184,14 @@ def main():
             cv = np.memmap(a.check_val, dtype=np.uint16, mode="r") if a.check_val else wiki
             log = os.path.join(run, "train.log")
             lt = open(log).read() if os.path.exists(log) else ""
-            it_ = re.findall(r"--eval_iters (\d+)", lt)      # the run's own number of val batches (the check compared
+            cfg_ = {}                                         # the run's options (records.jsonl), else its log's flags
+            if os.path.exists(os.path.join(run, "records.jsonl")):
+                for l_ in open(os.path.join(run, "records.jsonl")):
+                    r_ = json.loads(l_)
+                    if r_.get("type") == "run" and r_.get("config"):
+                        cfg_ = r_["config"]
+            it_ = [cfg_["eval_iters"]] if cfg_.get("eval_iters") else re.findall(r"--eval[_-]iters (\d+)", lt)   # the run's own
+            # number of val batches (the check compared
             res["check_iters"] = int(it_[-1]) if it_ else 30   # 30 with runs that logged 8: a false 'not rebuilt')
             res["train_protocol_loss"] = train_protocol_loss(model, cv, seed, device, iters=res["check_iters"])
             fin = re.findall(r"FINAL val loss ([\d.]+)", lt)

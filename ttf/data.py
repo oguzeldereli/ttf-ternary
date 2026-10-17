@@ -1,4 +1,4 @@
-"""Training batches: random windows of the token stream, and the precomputed teacher top-k windows (--kd_cache)."""
+"""Training batches: random windows of the token stream, and the precomputed teacher top-k windows (--kd-cache)."""
 from __future__ import annotations
 import os
 import time
@@ -10,7 +10,7 @@ _KD_SHARD = {}
 
 
 def _kd_window(args, idx):
-    """--kd_cache: (start, ids [seq, k], log-probs [seq, k]) of window idx of the precomputed teacher targets (shards
+    """--kd-cache: (start, ids [seq, k], log-probs [seq, k]) of window idx of the precomputed teacher targets (shards
     kd_00000.npz, ... of B windows each); waits for a shard that is still being written, wraps around once the cache
     is marked done."""
     import glob
@@ -28,7 +28,7 @@ def _kd_window(args, idx):
                 have = sorted(glob.glob(os.path.join(args.kd_cache, "kd_*.npz")))   # claimed but never written):
                 fn = have[sh % len(have)]; break                               # the existing shards, in order
             if waited % 600 == 0:
-                print(f"--kd_cache: waiting for {fn}", flush=True)
+                print(f"--kd-cache: waiting for {fn}", flush=True)
             time.sleep(30); waited += 30
         z = np.load(fn)
         _KD_SHARD.update(sh=sh, starts=z["starts"], ids=z["ids"], lp=z["lp"])
@@ -37,7 +37,7 @@ def _kd_window(args, idx):
 
 
 def _kd_cache_batch(args, idx, data, seq_len, device, bs=1):
-    """--kd_cache: micro-batch idx = windows idx * bs ... idx * bs + bs - 1 of the cache (bs 1: window idx, as before).
+    """--kd-cache: micro-batch idx = windows idx * bs ... idx * bs + bs - 1 of the cache (bs 1: window idx, as before).
     Returns x, y [bs, seq] and (ids [bs * seq, k], log-probs [bs * seq, k]) on device, rows in the order of x.flatten."""
     ws, ids_, lps_ = [], [], []
     for b in range(bs):

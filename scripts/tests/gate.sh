@@ -5,10 +5,12 @@
 # (its own run-to-run spread: a configuration whose reference is not deterministic compares within that spread).
 # DET=1: both through scripts/tests/det_run.py (deterministic mode; flash attention's backward otherwise differs run
 # to run). CORE_FLAGS_FN (a file defining core_flags NAME FLAGS) maps a configuration to the core's flags once they
-# differ (scripts/tests/core_flags.sh). REUSE_REF=1 keeps reference runs already in the gate directory.
+# differ (scripts/tests/core_flags.sh; CORE_OUT=--out-dir for the current options). REUSE_REF=1 keeps reference runs
+# already in the gate directory.
 #   bash scripts/tests/gate.sh [NAME ...]          (run from the repo copy on the lab PC)
 set -u
 S=${S:-/tmp/oguzelde/tern}; source $S/env.sh
+export PYTHONPATH=$PWD${PYTHONPATH:+:$PYTHONPATH}   # this copy's ttf, not the one env.sh puts on the path
 G=${GATE_DIR:-/tmp/oguzelde/gate}; mkdir -p $G
 MD=$S/models; Q=$S/hf/models/Qwen3.5-0.8B-Base
 B="--preset small --mode kernel --data data/wiki32k_train.bin --val data/wiki32k_val.bin --seq_len 512 --batch_size 4
@@ -44,11 +46,11 @@ print(' '.join('%.6f' % x['loss'] for x in d if 'loss' in x), '|', ' '.join('%.6
 for n in $NAMES; do
   F=$(echo ${C[$n]})
   run() { rm -rf $G/$n.$1; if [ -n "${DET:-}" ]; then L="python scripts/tests/det_run.py $2"; else L="python -m $2"; fi
-          $L $3 --out_dir $G/$n.$1 > $G/$n.$1.log 2>&1 || echo "$n.$1: exit $? ($(grep -m1 -E 'Error|error' $G/$n.$1.log | cut -c1-120))"; }
+          $L $3 ${4:---out_dir} $G/$n.$1 > $G/$n.$1.log 2>&1 || echo "$n.$1: exit $? ($(grep -m1 -E 'Error|error' $G/$n.$1.log | cut -c1-120))"; }
   [ -n "${REUSE_REF:-}" ] && [ -s $G/$n.ref/metrics.jsonl ] || run ref ttf.legacy.train "$F"
   [ -n "${REF2:-}" ] && run ref2 ttf.legacy.train "$F"
   CF="$F"; type core_flags > /dev/null 2>&1 && CF=$(core_flags $n "$F")
-  [ -z "${REFONLY:-}" ] && run core ttf.train "$CF"
+  [ -z "${REFONLY:-}" ] && run core ttf.train "$CF" ${CORE_OUT:---out_dir}
   a=$(losses $G/$n.ref/metrics.jsonl); b=$([ -n "${REF2:-}" ] && losses $G/$n.ref2/metrics.jsonl); c=$([ -z "${REFONLY:-}" ] && losses $G/$n.core/metrics.jsonl)
   st="ref ${a:0:60}..."
   [ -z "$(echo ${a%%|*})" ] && { echo "$n: REFERENCE MISSING (see $G/$n.ref.log)"; continue; }

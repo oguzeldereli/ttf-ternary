@@ -38,8 +38,8 @@ class MasterTernaryLinear(nn.Module):
         w = torch.empty(out_features, in_features, dtype=dtype)
         nn.init.normal_(w, std=1.0 / math.sqrt(in_features))
         self.weight = nn.Parameter(w)
-        self.row_scale = self.col_scale = None   # --rc_scale in master mode (the float extras our runs carry)
-        self.mag_A = None                        # --lowrank_mag add:R in master mode
+        self.row_scale = self.col_scale = None   # --rc-scale in master mode (the float extras our runs carry)
+        self.mag_A = None                        # --adapter-rank add:R in master mode
 
     def enable_rc_scale(self):
         dev = self.weight.device

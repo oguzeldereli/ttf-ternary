@@ -1,0 +1,25 @@
+# The 110M fp model (models/fp32_110m_hf, trained by --mode fp32 on the scratch-110m data) converted to ternary:
+# GPTQ on centred inputs, then TTF with KD from the fp model, 50M tokens (1526 steps x 16 x 2048).
+# g_gptqc_ts0_kd075 (16 Oct): fixed-window Wikipedia loss 2.7067.
+#   python -m ttf.train --recipe convert-110m --out-dir runs/convert-110m
+mode = "ttf"
+init-hf = "models/fp32_110m_hf"
+convert = "gptqc"
+teacher = "models/fp32_110m_hf"
+kd-weight = 0.75
+data = "data/wiki32k_train.bin"
+val = "data/wiki32k_val.bin"
+seq-len = 2048
+batch-size = 16
+accum = 1
+steps = 1526
+warmup = 300
+lr = 5e-4
+min-lr = 5e-5
+eval-interval = 100
+eval-iters = 8
+ckpt-skip = 2
+save-secs = 1800
+qk-temp = false
+ttf-rank = 512
+ttf-theta = 64

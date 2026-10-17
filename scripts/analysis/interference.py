@@ -11,7 +11,7 @@ vectors in the normed residual), k vectors in d dimensions. Reported, averaged o
   frame tightness: d * sum_ij (v_i . v_j)^2 / (sum_i |v_i|^2)^2 over the norm-weighted directions (1 = the directions
     spread the energy evenly over all d dimensions; large = they crowd into a few)
   python scripts/analysis/interference.py --model fp=checkpoints/fp32_baseline/ckpt.pt \
-      --model ttf0=checkpoints/final/ts16full_tau1000_s0/ckpt.pt --gptq_of fp --out docs/analysis/geom110/interference.json
+      --model ttf0=checkpoints/final/ts16full_tau1000_s0/ckpt.pt --gptq_of fp --out docs/research/analysis/geom110/interference.json
 """
 import argparse, json, math, os, sys
 import numpy as np

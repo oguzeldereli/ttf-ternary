@@ -5,7 +5,7 @@
 (b) the loss added when only that linear is rounded (GPTQ ternary, 32 calibration windows; the rest stays fp), on
 --n_eval fixed validation windows. Then, within each linear type (12 blocks each), the Spearman correlation of crowding
 with the added loss, and over all 84 a regression of the added loss on type + depth + crowding.
-  python scripts/analysis/layer_dose.py --fp models/fp32_baseline_slim/ckpt.pt --out docs/analysis/geom110/layer_dose.json
+  python scripts/analysis/layer_dose.py --fp models/fp32_baseline_slim/ckpt.pt --out docs/research/analysis/geom110/layer_dose.json
 """
 import argparse, json, math, os, sys
 import numpy as np

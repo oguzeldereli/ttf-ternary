@@ -1,6 +1,6 @@
 """The trainer: python -m ttf.train (options: ttf/args.py, python -m ttf.train --help).
 
-Data: a flat binary file of token ids (uint16, or uint32 with --data_u32) for train and another for val.
+Data: a flat binary file of token ids (uint16, or uint32 with --data-dtype u32) for train and another for val.
 Kernel mode: the ternary layers update inside their backward (TTF, ttf/update.py), so only the float tail (embedding,
 norms, scales, adapters) has an optimizer. Also the baselines: --mode master (BitNet b1.58) and --mode fp32.
 """
@@ -32,7 +32,7 @@ from .model import BitTransformer
 from .bitlinear import STATE
 from .master import build_master_transformer, split_params
 from .layers import KernelTernaryLinear, build_kernel_transformer, enable_flip_tracking, collect_flip_stats
-from .args import build_parser
+from .args import parse
 from .data import get_batch, _kd_cache_batch
 from .eval import evaluate
 from .schedule import lr_at, _ts_scale, LR_LINEAR, LR_REWARM, LR_WSD
@@ -46,7 +46,7 @@ def _tern_lays(model):
 
 
 def mem_report(model, tail_opt, lr_state):
-    """--mem_report: MiB held by each part of training (tensors counted by their own size; CUDA context excluded)"""
+    """--mem-report: MiB held by each part of training (tensors counted by their own size; CUDA context excluded)"""
     MB = 2 ** 20
     nbytes = lambda ts: sum(t.numel() * t.element_size() for t in ts if torch.is_tensor(t))
     trits = nbytes([b for n, b in model.named_buffers() if n.endswith("wpacked")])
@@ -70,8 +70,13 @@ def mem_report(model, tail_opt, lr_state):
 
 
 def main():
-    ap = build_parser()
-    args = ap.parse_args()
+    args = parse()
+    kmode = {"ttf": "kernel", "bitnet": "master", "fp32": "fp32"}[args.mode]   # the checkpoint's and hf_init's names
+    ttf = args.mode == "ttf"
+    te = args.tern_emb if args.tern_emb != "none" else ""            # the ternary embedding's kind ("": none)
+    mag = f"add:{args.adapter_rank}" if args.adapter_rank else ""     # the adapter ("": none)
+    store = args.ttf_store if args.ttf_store != "fp32" else ""      # the accumulator's codec ("": fp32)
+    i8, i8dx = args.fwd == "int8", args.dx == "int8"
     if os.environ.get("TERN_SYNCDBG"):   # report every host sync (location in the warning)
         torch.cuda.set_sync_debug_mode(1)
     if args.tf32:
@@ -79,8 +84,8 @@ def main():
     if args.gemm in ("cublas", "int8mm"):
         from . import kernel as _kmod
         _kmod.GEMM_BACKEND[0] = args.gemm
-    LR_WSD[0] = args.lr_wsd
-    LR_LINEAR[0] = args.lr_linear
+    LR_WSD[0] = int(args.lr_schedule.split(":")[1]) if args.lr_schedule.startswith("wsd:") else 0
+    LR_LINEAR[0] = args.lr_schedule == "linear"
     if args.lr_rewarm:
         _rw = args.lr_rewarm.split(":")
         LR_REWARM[:] = [int(_rw[0]), int(_rw[1])] + ([float(_rw[2])] if len(_rw) > 2 else [])
@@ -104,7 +109,7 @@ def main():
     if args.val: tc.val_path = args.val
     if args.steps: tc.max_steps = args.steps
     if args.batch_size: tc.batch_size = args.batch_size
-    if args.grad_accum is not None: tc.grad_accum = args.grad_accum
+    if args.accum is not None: tc.grad_accum = args.accum
     if args.seq_len: mc.max_seq_len = tc.seq_len = args.seq_len
     if args.out_dir: tc.out_dir = args.out_dir
     if args.lr: tc.lr = args.lr
@@ -113,6 +118,11 @@ def main():
     tc.min_lr = args.min_lr if args.min_lr is not None else tc.lr / 10
     if args.eval_interval: tc.eval_interval = args.eval_interval
     if args.eval_iters: tc.eval_iters = args.eval_iters
+    for k_, v_ in dict(steps=tc.max_steps, batch_size=tc.batch_size, accum=tc.grad_accum, seq_len=tc.seq_len, lr=tc.lr,
+                       min_lr=tc.min_lr, warmup=tc.warmup_steps, weight_decay=tc.weight_decay,
+                       eval_interval=tc.eval_interval, eval_iters=tc.eval_iters, seed=tc.seed, data=tc.data_path,
+                       val=tc.val_path, out_dir=tc.out_dir).items():
+        setattr(args, k_, v_)        # the resolved values (the run's records and checkpoint hold what was run)
 
     BitTransformer.loss_chunk = args.loss_chunk
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -120,7 +130,7 @@ def main():
     _RK = int(os.environ.get("RANK", "0"))
     _PP = (_RK, _WS) if args.pipe else None           # --pipe: (stage, stages); the data is then that of one GPU
     assert not args.pipe or _WS > 1, "--pipe: run under torchrun with several processes"
-    assert not args.pipe or not (args.distill or args.tern_emb), "--pipe: none of the per-micro-batch extras yet"
+    assert not args.pipe or not (args.teacher or te), "--pipe: none of the per-micro-batch extras yet"
     _base_out = args.out_dir
     if _WS > 1:
         import torch.distributed as _dist
@@ -137,20 +147,20 @@ def main():
             tc.out_dir = args.out_dir
     if _PP:
         _WS, _RK = 1, 0       # --pipe: no data-parallel reduction, every stage reads the same windows
-    if args.mem_cap_gib and device == "cuda":   # --mem_cap_gib G: PyTorch may use at most G GiB of this GPU (a 96 GB card
+    if args.mem_cap_gib and device == "cuda":   # --mem-cap-gib G: PyTorch may use at most G GiB of this GPU (a 96 GB card
         # standing in for a 24 GB one in memory-matched comparisons; allocations beyond it raise out-of-memory)
         tot_ = torch.cuda.get_device_properties(0).total_memory / 2**30
         torch.cuda.set_per_process_memory_fraction(min(1.0, args.mem_cap_gib / tot_))
-        print(f"--mem_cap_gib: PyTorch capped at {args.mem_cap_gib:.1f} of {tot_:.1f} GiB", flush=True)
-    if args.mem_snapshot and device == "cuda":   # --mem_snapshot PATH:STEP: every allocation with its Python stack
+        print(f"--mem-cap-gib: PyTorch capped at {args.mem_cap_gib:.1f} of {tot_:.1f} GiB", flush=True)
+    if args.mem_snapshot and device == "cuda":   # --mem-snapshot PATH:STEP: every allocation with its Python stack
         torch.cuda.memory._record_memory_history(enabled="all", stacks="python", max_entries=2_000_000)
     torch.manual_seed(tc.seed)
     print(mc.report())
-    use_beta = args.mode == "kernel"
+    use_beta = args.mode == "ttf"
 
     _qsw = {}
     if _QWEN:
-        assert args.mode == "kernel" and not args.tern_emb, "Qwen: kernel mode, no --tern_emb yet"
+        assert args.mode == "ttf" and not te, "Qwen: kernel mode, no --tern-emb yet"
         from .qwen import build_qwen, QwenTern
         QwenTern.loss_chunk = args.loss_chunk
         _own = None
@@ -162,21 +172,21 @@ def main():
                   f"{' + embedding' if _own[2] else ''}{' + norm, head and loss' if _own[3] else ''}", flush=True)
         model, _qsw = build_qwen(args.init_hf, "kernel", grad_checkpoint=tc.grad_checkpoint, device=device, own=_own,
                                  make_linear=lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, beta=use_beta,
-                                                                                 int8=args.int8, int8_dx=args.int8_dx))
+                                                                                 int8=i8, int8_dx=i8dx))
         if _PP:
             model.pp = {"rank": _PP[0], "n": _PP[1], "lo": _own[0], "hi": _own[1]}
-    elif args.mode == "kernel":
-        model = build_kernel_transformer(mc, grad_checkpoint=tc.grad_checkpoint, beta=use_beta, int8=args.int8,
-                                         int8_dx=args.int8_dx)
+    elif args.mode == "ttf":
+        model = build_kernel_transformer(mc, grad_checkpoint=tc.grad_checkpoint, beta=use_beta, int8=i8,
+                                         int8_dx=i8dx)
     elif args.mode == "fp32":
         # full-precision reference (no ternary, no activation quantization): plain nn.Linear,
         # fp32 weights + AdamW, bf16 autocast in the forward like every other mode
         model = BitTransformer(mc, grad_checkpoint=tc.grad_checkpoint,
                                make_linear=lambda i, o: nn.Linear(i, o, bias=False))
-    elif args.mode == "master":
+    elif args.mode == "bitnet":
         model = build_master_transformer(
             mc, grad_checkpoint=tc.grad_checkpoint,
-            dtype=torch.float32 if args.master_dtype == "fp32" else torch.bfloat16)
+            dtype=torch.float32 if args.bitnet_dtype == "fp32" else torch.bfloat16)
     model = model.to(device) if not _PP else model._apply(lambda t_: t_ if t_.is_meta else t_.to(device))   # --pipe: others' stay meta
     try:   # counted from the modules (mc.report() above is a formula: approximate for hybrid / HF models)
         n_t_ = sum(m_.N * m_.K for m_ in model.modules() if getattr(m_, "wpacked", None) is not None and hasattr(m_, "N"))
@@ -187,25 +197,25 @@ def main():
     if args.moe:      # --moe E:K[:H]: every feed-forward becomes a mixture of E ternary experts, top-K routing
         from .model import enable_moe
         from .master import MasterTernaryLinear as _MTL   # main() imports the name locally later on
-        _mk = (lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, beta=use_beta, int8=args.int8,
-                                                  int8_dx=args.int8_dx).to(device)) \
-            if args.mode == "kernel" else \
-            (lambda i_, o_: _MTL(i_, o_, mc.act_bits, dtype=torch.float32 if args.master_dtype == "fp32"
-                                                else torch.bfloat16).to(device)) if args.mode == "master" else \
+        _mk = (lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, beta=use_beta, int8=i8,
+                                                  int8_dx=i8dx).to(device)) \
+            if args.mode == "ttf" else \
+            (lambda i_, o_: _MTL(i_, o_, mc.act_bits, dtype=torch.float32 if args.bitnet_dtype == "fp32"
+                                                else torch.bfloat16).to(device)) if args.mode == "bitnet" else \
             (lambda i_, o_: nn.Linear(i_, o_, bias=False).to(device))   # master: ternary experts with latents, as its layers
         E_, k_, H_ = enable_moe(model, args.moe, _mk)
         BitTransformer.moe_aux_w = args.moe_aux
         print(f"--moe: {E_} experts of hidden {H_}, top-{k_} routing, load-balancing weight {args.moe_aux}", flush=True)
     model.train()
-    if args.tern_emb:
+    if te:
         from .tern_emb import enable_tern_emb
-        n_te = enable_tern_emb(model, args.tern_emb, "master" if args.mode == "master" else "kernel")
-        assert args.mode == "master" or (args.ts and args.ts_fused and tc.grad_accum == 1), \
-            "--tern_emb in kernel mode: --ts --ts_fused, grad_accum 1"
-        print(f"--tern_emb {args.tern_emb}: {n_te / 1e6:.1f}M ternary embedding weights (+ row / column scales)", flush=True)
+        n_te = enable_tern_emb(model, te, "master" if args.mode == "bitnet" else "kernel")
+        assert args.mode == "bitnet" or (ttf and args.ttf_update == "fused" and tc.grad_accum == 1), \
+            "--tern-emb in kernel mode: TTF --ttf-update fused, grad_accum 1"
+        print(f"--tern-emb {te}: {n_te / 1e6:.1f}M ternary embedding weights (+ row / column scales)", flush=True)
     if args.ckpt_skip:
         model.ckpt_skip = args.ckpt_skip
-    if args.ckpt_block:
+    if args.ckpt == "block":
         for b_ in model.layers:
             b_.ckpt_block = True
     if args.qk_temp:
@@ -216,7 +226,7 @@ def main():
         print("per-head attention temperature on (log-scale, init 0)", flush=True)
     if args.rc_scale:
         from .layers import enable_rc_scales
-        if args.mode == "master":
+        if args.mode == "bitnet":
             from .master import MasterTernaryLinear
             nrc = 0
             for m_ in model.modules():
@@ -229,10 +239,10 @@ def main():
         _resume_path = os.path.join(_base_out, "ckpt.pt")    # --pipe: a single-GPU checkpoint (or stage 0's) for all
     _resuming = args.resume and os.path.exists(_resume_path)
     if args.init_hf and _resuming:   # the checkpoint holds the converted model (trits, scales, float parts)
-        print(f"--init_hf: resuming from {tc.out_dir}/ckpt.pt, conversion skipped", flush=True)
+        print(f"--init-hf: resuming from {tc.out_dir}/ckpt.pt, conversion skipped", flush=True)
         if _QWEN:   # as the conversion leaves them: embedding and head frozen (the optimizer is built below)
             model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
-        if args.init_hf_method == "gptqc":   # centred layers: their buffers and bias
+        if args.convert == "gptqc":   # centred layers: their buffers and bias
             _ck = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)["model"]
             _nc = 0                                             # exist before the optimizer is built
             for n_, m_ in model.named_modules():
@@ -243,76 +253,75 @@ def main():
             del _ck
     if args.init_hf and not _resuming:
         from .hf_init import init_from_hf, GPTQ_OPTS as _GO
-        _GO["mag_svd"] = args.init_mag_svd
-        assert args.mode in ("kernel", "master", "fp32"), "--init_hf: kernel, master or fp32 mode"
+        _GO["mag_svd"] = args.svd_rank
         _hess = None
-        if _QWEN and args.init_hf_method == "random":   # speed measurements without the weights (no download):
+        if _QWEN and args.convert == "random":   # speed measurements without the weights (no download):
             with torch.no_grad():                         # the trits as built (random), float parts N(0, 0.02)
                 for p_ in model.parameters():
                     if not p_.is_meta:
                         p_.normal_(0, 0.02)
                 model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
-            print("--init_hf_method random: random trits and float parts (speed tests only)", flush=True)
-        elif _QWEN and args.init_stream:   # --init_stream: layer by layer, sequential (models too big for one fp copy)
+            print("--convert random: random trits and float parts (speed tests only)", flush=True)
+        elif _QWEN and args.convert_stream:   # --convert-stream: layer by layer, sequential (models too big for one fp copy)
             from .qwen import convert_qwen_streaming
-            convert_qwen_streaming(model, args.init_hf, _qsw, tc.data_path, method=args.init_hf_method,
-                                   n_seq=args.init_calib, seq=tc.seq_len, dev=device, dtype_u32=args.data_u32,
+            convert_qwen_streaming(model, args.init_hf, _qsw, tc.data_path, method=args.convert,
+                                   n_seq=args.calib, seq=tc.seq_len, dev=device, dtype_u32=args.u32,
                                    log=lambda m_: print(m_, flush=True))
         elif _QWEN:
             from .qwen import load_qwen, calib_hessians_qwen
-            if args.init_hf_method in ("gptq", "gptqc"):
-                _hess = calib_hessians_qwen(args.init_hf, tc.data_path, n_seq=args.init_calib, seq=tc.seq_len,
-                                            dev=device, dtype_u32=args.data_u32, log=lambda m_: print(m_, flush=True))
-            load_qwen(model, args.init_hf, _qsw, method=args.init_hf_method, rc=args.rc_scale, hess=_hess,
+            if args.convert in ("gptq", "gptqc"):
+                _hess = calib_hessians_qwen(args.init_hf, tc.data_path, n_seq=args.calib, seq=tc.seq_len,
+                                            dev=device, dtype_u32=args.u32, log=lambda m_: print(m_, flush=True))
+            load_qwen(model, args.init_hf, _qsw, method=args.convert, rc=args.rc_scale, hess=_hess,
                       log=lambda m_: print(m_, flush=True))
             _hess = None
-        elif args.init_hf_method == "gptqs":    # sequential, error-aware, centred GPTQ (training-free conversion)
+        elif args.convert == "gptqs":    # sequential, error-aware, centred GPTQ (training-free conversion)
             from .hf_init import convert_seq_asym
-            _hess = convert_seq_asym(args.init_hf, tc.data_path, n_seq=min(args.init_calib, 32), dev=device,
+            _hess = convert_seq_asym(args.init_hf, tc.data_path, n_seq=min(args.calib, 32), dev=device,
                                      log=lambda m_: print(m_, flush=True))
-        elif args.init_hf_method in ("gptq", "gptqc"):     # input second moments of the full-precision model (not the run's windows)
+        elif args.convert in ("gptq", "gptqc"):     # input second moments of the full-precision model (not the run's windows)
             from .hf_init import calib_hessians
-            _hess = calib_hessians(args.init_hf, tc.data_path, n_seq=args.init_calib, dev=device,
+            _hess = calib_hessians(args.init_hf, tc.data_path, n_seq=args.calib, dev=device,
                                    log=lambda m_: print(m_, flush=True))
         if not _QWEN:
-            init_from_hf(model, args.init_hf, args.mode, args.init_hf_method, rc=args.rc_scale, hess=_hess,
+            init_from_hf(model, args.init_hf, kmode, args.convert, rc=args.rc_scale, hess=_hess,
                          log=lambda m_: print(m_, flush=True))
     _teacher = None
     if args.kd_cache:  # precomputed teacher targets (scripts/quant/teacher_topk.py)
-        assert hasattr(model, "kd_topk"), "--kd_cache: Qwen models"
-        model.kd_w = args.distill_w
-        model.kd_mode = args.kd_mode
-        print(f"--kd_cache ({args.kd_mode})", flush=True)
-        print(f"--kd_cache {args.kd_cache}: from window 0 at step {args.kd_cache_start}, loss (1 - {args.distill_w}) CE "
-              f"+ {args.distill_w} KD to the teacher's top k", flush=True)
-    if args.distill and _QWEN:   # Qwen: transformers' own model in bf16 as the teacher (it must fit next to the student)
+        assert hasattr(model, "kd_topk"), "--kd-cache: Qwen models"
+        model.kd_w = args.kd_weight
+        model.kd_mode = args.kd_cache_mode
+        print(f"--kd-cache ({args.kd_cache_mode})", flush=True)
+        print(f"--kd-cache {args.kd_cache}: from window 0 at step {args.kd_cache_start}, loss (1 - {args.kd_weight}) CE "
+              f"+ {args.kd_weight} KD to the teacher's top k", flush=True)
+    if args.teacher and _QWEN:   # Qwen: transformers' own model in bf16 as the teacher (it must fit next to the student)
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM as _QT
-        _qt = _QT.from_pretrained(args.distill, dtype=torch.bfloat16).to(device).eval()
+        _qt = _QT.from_pretrained(args.teacher, dtype=torch.bfloat16).to(device).eval()
         for p_ in _qt.parameters():
             p_.requires_grad_(False)
         _teacher = lambda x_: (_qt(input_ids=x_).logits, None)
-        model.kd_w = args.distill_w
-        print(f"--distill {args.distill} (Qwen): teacher in bf16, loss (1 - {args.distill_w}) CE + {args.distill_w} KL", flush=True)
-    elif args.distill:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels
+        model.kd_w = args.kd_weight
+        print(f"--distill {args.teacher} (Qwen): teacher in bf16, loss (1 - {args.kd_weight}) CE + {args.kd_weight} KL", flush=True)
+    elif args.teacher:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels
         from .hf_init import model_config_from_hf as _mch, init_from_hf as _ifh
         from .model import BitTransformer as _BT
-        _teacher = _BT(_mch(args.distill, max_seq_len=tc.seq_len), grad_checkpoint=False,
+        _teacher = _BT(_mch(args.teacher, max_seq_len=tc.seq_len), grad_checkpoint=False,
                        make_linear=lambda i_, o_: nn.Linear(i_, o_, bias=False)).to(device)
-        _ifh(_teacher, args.distill, "fp32", log=lambda *_: None)
+        _ifh(_teacher, args.teacher, "fp32", log=lambda *_: None)
         _teacher = _teacher.eval()
         for p_ in _teacher.parameters():   # parameters only: Module.to(bf16) would also cast the complex RoPE table
             p_.data = p_.data.to(torch.bfloat16); p_.requires_grad_(False)   # to real (teacher CE 5.20 instead of 2.34)
-        model.kd_w = args.distill_w
-        print(f"--distill {args.distill}: teacher in bf16, loss (1 - {args.distill_w}) CE + {args.distill_w} KL", flush=True)
+        model.kd_w = args.kd_weight
+        print(f"--distill {args.teacher}: teacher in bf16, loss (1 - {args.kd_weight}) CE + {args.kd_weight} KL", flush=True)
     if args.compile:
         from .model import enable_compile
         enable_compile()
 
-    if args.mode in ("master", "fp32"):
+    if args.mode in ("bitnet", "fp32"):
         # the baseline keeps everything in fp32 with a standard AdamW: no bf16
         # rounding anywhere, so the ceiling is not limited by storage precision.
         master, emb, norms = split_params(model)
-        # the float extras (--rc_scale, --qk_temp) without weight decay, as in the kernel path's tail groups
+        # the float extras (--rc-scale, --qk-temp) without weight decay, as in the kernel path's tail groups
         xid = {id(p) for n, p in model.named_parameters() if n.endswith(("row_scale", "col_scale", "qk_logscale"))}
         norms = norms + [p for p in emb if id(p) in xid]; emb = [p for p in emb if id(p) not in xid]
         tail = master + emb + norms
@@ -322,10 +331,10 @@ def main():
              {"params": norms, "weight_decay": 0.0}],
             lr=tc.lr, betas=(tc.beta1, tc.beta2))
         print(f"master mode: {sum(p.numel() for p in master)/1e6:.1f}M latent "
-              f"({args.master_dtype}) + {sum(p.numel() for p in emb+norms)/1e6:.1f}M tail, "
+              f"({args.bitnet_dtype}) + {sum(p.numel() for p in emb+norms)/1e6:.1f}M tail, "
               f"AdamW fp32 states", flush=True)
-    elif args.lean_tail:
-        # --lean_tail: embedding (and the adapter, added later) in bf16, norm gains / row-column scales / attention
+    elif args.tail == "lean":
+        # --tail lean: embedding (and the adapter, added later) in bf16, norm gains / row-column scales / attention
         # temperature in fp16, LeanAdam (int8 first moment, factored second moment, stochastic-rounding write-back)
         from .opt_lean import LeanAdam
         tail = model.float_tail_parameters()
@@ -344,10 +353,10 @@ def main():
         if rc:
             tail_groups.append({"params": rc, "weight_decay": 0.0, "rc_lr": args.rc_lr})
         tail_opt = LeanAdam(tail_groups, lr=tc.lr, betas=(tc.beta1, tc.beta2))
-        LeanAdam.BATCHED = bool(args.lean_batched)
+        LeanAdam.BATCHED = bool(args.tail_batched)
         print(f"lean float tail: {sum(p.numel() for p in emb)/1e6:.1f}M bf16 + {sum(p.numel() for p in small)/1e3:.1f}k fp16, "
               f"LeanAdam (int8 m, factored v, stochastic rounding)", flush=True)
-    elif args.tail_fp32:
+    elif args.tail == "fp32":
         # float tail kept in fp32 with a standard AdamW, exactly like master mode. In
         # bf16 an Adam step (~lr <= 1.5e-3) on a norm gain of 1.0 is below half the
         # representable gap (2^-7) and always rounds away: the gains never train.
@@ -370,7 +379,7 @@ def main():
               f"{sum(p.numel() for p in norms)/1e3:.1f}k norm gains, AdamW fp32 states", flush=True)
     else:
         # float tail (embeddings + norms + flip predictor): bf16 params + 8-bit Adam.
-        # NOTE: norm gains cannot train in bf16 (see --tail_fp32).
+        # NOTE: norm gains cannot train in bf16 (see --tail fp32).
         from .opt8 import Adam8bit
         rc = [p for n, p in model.named_parameters() if n.endswith(("row_scale", "col_scale"))]
         rcid = {id(p) for p in rc}
@@ -393,7 +402,7 @@ def main():
 
     sampler = torch.Generator().manual_seed(tc.seed + 1_000_003 * _RK)   # data parallel: each rank its own batches
     lr_state = {}
-    _ddt = np.uint32 if args.data_u32 else np.uint16      # --data_u32: token ids above 65535 (Qwen's 248k vocabulary)
+    _ddt = np.uint32 if args.u32 else np.uint16      # --data-dtype u32: token ids above 65535 (Qwen's 248k vocabulary)
     train_data = np.memmap(tc.data_path, dtype=_ddt, mode="r")
     val_data = np.memmap(tc.val_path, dtype=_ddt, mode="r") if os.path.exists(tc.val_path) else train_data
 
@@ -427,20 +436,20 @@ def main():
         torch.save({"model": {k_: v_ for k_, v_ in model.state_dict().items() if not v_.is_meta},   # --pipe: own stage's
                     "opt": _opt_sd(), "pipe": (model.pp if _PP else None),
                     "touched": touched, "touched_origin": touched_origin,
-                    "cfg": mc, "step": step, "mode": args.mode, "beta": use_beta,
-                    "int8": args.int8, "int8_dx": args.int8_dx,
+                    "cfg": mc, "step": step, "mode": kmode, "beta": use_beta, "args": vars(args),
+                    "int8": i8, "int8_dx": i8dx,
                     "dw_mode": "dense",    # (read by the evaluation scripts of checkpoints before 17 Oct 2026)
                     # low-rank momentum (U, V) per ternary layer, in module order
                     "lowrank": [lr_state.get(id(m)) for m in model.modules()
                                 if isinstance(m, KernelTernaryLinear)] if lr_state else None,
-                    # --ts: the rest of the per-layer state (update count, factored v, short momentum), module order
+                    # TTF: the rest of the per-layer state (update count, factored v, short momentum), module order
                     "ts_state": [{k[0]: st_[k] for k in (("t", id(m)), ("v", id(m)), ("m", id(m))) if k in st_}
                                  for m in model.modules() if isinstance(m, KernelTernaryLinear)]
                                 if (st_ := lr_state.get("_ts")) else None,
-                    # --tern_emb: the ternary embedding matrices' TTF state (U V, update count, factored v)
+                    # --tern-emb: the ternary embedding matrices' TTF state (U V, update count, factored v)
                     "tern_emb_state": [(lr_state.get(id(m)), {k[0]: lr_state.get("_ts", {})[k] for k in
                                         (("t", id(m)), ("v", id(m))) if k in lr_state.get("_ts", {})})
-                                       for m in _tern_lays(model)] if args.tern_emb and lr_state else None}, tmp)
+                                       for m in _tern_lays(model)] if te and lr_state else None}, tmp)
         os.replace(tmp, ckpt_path)
 
     mag_on = [False]
@@ -448,21 +457,21 @@ def main():
         # the new parameters join the float tail (the look-ahead passes and the gradient clip treat them like the
         # tail) as their own AdamW group. Enabled after the resume when branching a checkpoint without them (so it
         # loads unchanged), before it when the checkpoint already has them (so they and their AdamW state load)
-        kind, r = args.lowrank_mag.split(":")
+        kind, r = mag.split(":")
         newp = []
         from .master import MasterTernaryLinear
         for m in model.modules():
             if isinstance(m, (KernelTernaryLinear, MasterTernaryLinear)):
                 newp += m.enable_lowrank_mag(kind, int(r))
-        if args.lean_tail:
+        if args.tail == "lean":
             for p_ in newp:
                 p_.data = p_.data.to(torch.bfloat16)
         tail.extend(newp)
-        tail_opt.add_param_group({"params": newp, "weight_decay": args.mag_wd, "lr_mult": args.mag_lr_mult,
-                                  "lr": lr_at(step0, tc) * args.mag_lr_mult})
+        tail_opt.add_param_group({"params": newp, "weight_decay": args.adapter_wd, "lr_mult": args.adapter_lr_mult,
+                                  "lr": lr_at(step0, tc) * args.adapter_lr_mult})
         mag_on[0] = True
         print(f"low-rank magnitude '{kind}' rank {r}: {sum(p.numel() for p in newp) / 1e6:.2f}M floats "
-              f"(wd {args.mag_wd}, lr x{args.mag_lr_mult})", flush=True)
+              f"(wd {args.adapter_wd}, lr x{args.adapter_lr_mult})", flush=True)
 
     start_step = 0
     _touched_origin = {"v": 0}
@@ -476,8 +485,8 @@ def main():
         if blob.get("beta", False) != use_beta:
             raise SystemExit(f"checkpoint beta={blob.get('beta', False)} but run beta="
                              f"{use_beta}: forward differs, refusing to resume")
-        if args.lowrank_mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):
-            _R = int(args.lowrank_mag.split(":")[1]); _grown = 0
+        if mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):
+            _R = int(mag.split(":")[1]); _grown = 0
             for k_ in [k_ for k_ in blob["model"] if k_.endswith("mag_A")]:   # a larger 'add' rank than the checkpoint's:
                 A_, B_ = blob["model"][k_], blob["model"][k_[:-1] + "B"]      # new columns of A at 0 (the layer is
                 if A_.shape[1] < _R:                                           # unchanged), of B random as at init
@@ -491,7 +500,7 @@ def main():
                 _gi = len(tail_opt.param_groups) - 1
                 for i_ in blob["opt"]["param_groups"][_gi]["params"]:
                     blob["opt"]["state"].pop(i_, None)
-                print(f"--lowrank_mag {args.lowrank_mag}: {_grown} adapters grown from the checkpoint's rank "
+                print(f"--adapter-rank {mag}: {_grown} adapters grown from the checkpoint's rank "
                       f"(new columns of A at 0; their optimizer state restarts)", flush=True)
         new_rc = args.rc_scale and not any(k.endswith("row_scale") for k in blob["model"])
         if new_rc:
@@ -530,16 +539,16 @@ def main():
                 if uv is not None and not m.wpacked.is_meta:
                     lr_state[id(m)] = tuple(t.to(_sdev[id(m)]) for t in uv)
             print(f"resumed low-rank momentum for {len(lr_state)} layers", flush=True)
-            if args.ts and args.lowrank:   # a larger --lowrank than the checkpoint's: grow each accumulator (the --ts_micro
+            if ttf and args.ttf_rank:   # a larger --lowrank than the checkpoint's: grow each accumulator (the --ttf-accum micro
                 # path never resizes): V gains orthonormal columns outside its span, U zeros there, so A = U V^T is
                 # unchanged and the new directions start empty
-                _sa = _store_codec(args.ts_store_a or "")
+                _sa = _store_codec(store)
                 _ng = 0
                 for i_, m in enumerate(lays):
                     if id(m) not in lr_state or m.wpacked.is_meta:
                         continue
                     U_, V_ = _load_pair(lr_state[id(m)])
-                    ra_ = min(args.lowrank, m.N, m.K)
+                    ra_ = min(args.ttf_rank, m.N, m.K)
                     if V_.shape[1] >= ra_:
                         continue
                     dv_ = V_.device; U_, V_ = U_.to(device).float(), V_.to(device).float()
@@ -550,17 +559,17 @@ def main():
                     pr_ = _store_pair(_sa, U2, V2) if _sa else (U2, V2)
                     lr_state[id(m)] = tuple(t.to(dv_) for t in pr_); _ng += 1
                 if _ng:
-                    print(f"--lowrank {args.lowrank}: grew the accumulators of {_ng} layers from the checkpoint's rank",
+                    print(f"--lowrank {args.ttf_rank}: grew the accumulators of {_ng} layers from the checkpoint's rank",
                           flush=True)
-            if args.ts and args.ts_acc_scale != 1.0:   # --ts_acc_scale F (a new theta = F x the run's): every accumulator x F,
-                _sa = _store_codec(args.ts_store_a or "")   # so each entry keeps its distance to the bar (no burst of moves)
+            if ttf and args.ttf_acc_scale != 1.0:   # --ttf-acc-scale F (a new theta = F x the run's): every accumulator x F,
+                _sa = _store_codec(store)   # so each entry keeps its distance to the bar (no burst of moves)
                 for m in lays:
                     if id(m) in lr_state and not m.wpacked.is_meta:
                         U_, V_ = _load_pair(lr_state[id(m)]); dv_ = U_.device
-                        U_ = U_.to(device).float() * args.ts_acc_scale; V_ = V_.to(device).float()
+                        U_ = U_.to(device).float() * args.ttf_acc_scale; V_ = V_.to(device).float()
                         pr_ = _store_pair(_sa, U_, V_) if _sa else (U_, V_)
                         lr_state[id(m)] = tuple(t.to(dv_) for t in pr_)
-                print(f"--ts_acc_scale {args.ts_acc_scale}: accumulators rescaled (theta now {args.ts_theta})", flush=True)
+                print(f"--ttf-acc-scale {args.ttf_acc_scale}: accumulators rescaled (theta now {args.ttf_theta})", flush=True)
         if blob.get("tern_emb_state"):
             st_ = lr_state.setdefault("_ts", {})
             for m, (uv, d_) in zip(_tern_lays(model), blob["tern_emb_state"]):
@@ -568,14 +577,14 @@ def main():
                     lr_state[id(m)] = tuple(t.to(device) for t in uv)
                 for k_, v_ in d_.items():
                     st_[(k_, id(m))] = tuple(x.to(device) for x in v_) if isinstance(v_, tuple) else v_
-            print(f"resumed --tern_emb TTF state for {len(blob['tern_emb_state'])} matrices", flush=True)
+            print(f"resumed --tern-emb TTF state for {len(blob['tern_emb_state'])} matrices", flush=True)
         if blob.get("ts_state"):
             lays = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
             st_ = lr_state.setdefault("_ts", {})
             for m, d_ in zip(lays, blob["ts_state"]):
                 for k_, v_ in (d_.items() if not m.wpacked.is_meta else ()):
                     st_[(k_, id(m))] = tuple(x.to(_sdev[id(m)]) for x in v_) if isinstance(v_, tuple) else v_
-            print(f"resumed --ts state (short momentum, v, step counts) for {len(lays)} layers", flush=True)
+            print(f"resumed TTF state (short momentum, v, step counts) for {len(lays)} layers", flush=True)
         tmask = blob.get("touched") or {}
         nres = 0
         for n, m in model.named_modules():
@@ -614,28 +623,27 @@ def main():
         RUNLOG[0].event("running", start_step)
 
     # after any resume, so 'net' counts from the weights this run starts at
-    if args.lowrank_mag and not mag_on[0]:
+    if mag and not mag_on[0]:
         enable_mag(start_step)
     t0 = time.time()
     last_save = time.time()
-    last_ = max(tc.max_steps, args.extend_to or 0)   # --extend_to N: keep training past the schedule (lr held at min_lr)
+    last_ = max(tc.max_steps, args.extend_to or 0)   # --extend-to N: keep training past the schedule (lr held at min_lr)
     end_step = last_ if args.stop_after is None else min(last_, args.stop_after)
     prof = None
     ts_cfg = None
-    if args.ts:
-        assert args.ts_nomom, "TTF with a short momentum lives in ttf.legacy (python -m ttf.legacy.train)"
+    if ttf:
         _lays = [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]
-        for i_, m_ in enumerate(_lays):   # --ts_offload(_keep): which layers' state lives in host memory
+        for i_, m_ in enumerate(_lays):   # --ttf-offload host(_keep): which layers' state lives in host memory
             m_._ts_host = _ts_on_host(args, i_, len(_lays))
-        if args.ts_offload_keep and args.ts_offload:
-            print(f"--ts_offload_keep: state of {sum(not m_._ts_host for m_ in _lays)} of {len(_lays)} layers on the GPU",
+        if args.ttf_offload_keep and args.ttf_offload == "host":
+            print(f"--ttf-offload-keep: state of {sum(not m_._ts_host for m_ in _lays)} of {len(_lays)} layers on the GPU",
                   flush=True)
-        ts_cfg = dict(r=args.lowrank, lr_ratio=1.0, theta=args.ts_theta, tau=args.ts_tau, b2=args.ts_b2, spend=args.ts_spend,
-                      tau_anneal=(args.ts_tau_anneal_pow if args.ts_tau_anneal else False), store_a=args.ts_store_a,
-                      offload=args.ts_offload,
-                      theta_sched=(tuple(float(x) for x in args.ts_theta_sched.split(":")) if args.ts_theta_sched else None),
-                      progress=0.0, factored=args.ts_factored)
-    if args.ts and args.ts_fused:         # --ts_fused: each layer's update inside its backward (ts_layer)
+        ts_cfg = dict(r=args.ttf_rank, lr_ratio=1.0, theta=args.ttf_theta, tau=args.ttf_tau, b2=args.ttf_b2, spend=args.ttf_spend,
+                      tau_anneal=(args.ttf_leak_pow if args.ttf_leak == "annealed" else False), store_a=store,
+                      offload=args.ttf_offload == "host",
+                      theta_sched=(tuple(float(x) for x in args.ttf_theta_sched.split(":")) if args.ttf_theta_sched else None),
+                      progress=0.0, factored=args.factored_k)
+    if ttf and args.ttf_update == "fused":         # --ttf-update fused: each layer's update inside its backward (ts_layer)
         for i_, m_ in enumerate([m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]):
             m_._ts_idx = i_
             if _WS > 1:   # data parallel: every rank's TTF update sees the mean gradient, so all ranks move the same trits
@@ -647,20 +655,20 @@ def main():
                     with torch.profiler.record_function("ttf.update"):
                         ts_layer(layer, g, lr_state, _c)
                 m_.on_grad = _og1
-            m_.ts_micro = bool(args.ts_micro)
-        print("--ts_fused: the update runs inside each layer's backward", flush=True)
-        FIRE_FUSED[0] = bool(args.ts_fire_fused)
-        if args.ts_factored:
-            assert args.ts_micro or tc.grad_accum == 1, "--ts_factored: 16 x 1 or --ts_micro"
-            print(f"--ts_factored {args.ts_factored}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
+            m_.ts_micro = bool(args.micro)
+        print("--ttf-update fused: the update runs inside each layer's backward", flush=True)
+        FIRE_FUSED[0] = args.fire == "fused"
+        if args.factored_k:
+            assert args.micro or tc.grad_accum == 1, "--dw factored: 16 x 1 or --ttf-accum micro"
+            print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
     if args.fused_scales:
         from .layers import FUSED_SCALES as _FSC
         _FSC[0] = True
     if args.fused_norm and _QWEN:
         from .qwen import enable_fused_norm
         enable_fused_norm()
-        print("--fused_norm: Qwen RMSNorm in one kernel each way", flush=True)
-    if args.eval_first_n:   # --eval_first_n N: the model as built or resumed (e.g. right after --init_hf), scored on
+        print("--fused-norm: Qwen RMSNorm in one kernel each way", flush=True)
+    if args.eval_first_n:   # --eval-first-n N: the model as built or resumed (e.g. right after --init-hf), scored on
         model.eval(); STATE.updates_enabled = False   # the first N val windows in order (qwen_check.py's windows)
         ls_ = []
         with torch.no_grad():
@@ -704,12 +712,12 @@ def main():
         if ts_cfg is not None:
             ts_cfg["lr_ratio"] = _ts_scale(args, step, tc, lr)
             ts_cfg["progress"] = step / max(1, tc.max_steps)
-            ts_cfg["step"] = step; ts_cfg["start"] = args.ts_start
-            ts_cfg["vdiag"] = args.ts_vdiag and step % max(args.ts_vdiag_every, 1) == 0   # diagnostics only
-            ts_cfg["micro"] = tc.grad_accum if args.ts_micro else 1
-            if args.ts_factored:
+            ts_cfg["step"] = step; ts_cfg["start"] = args.ttf_start
+            ts_cfg["vdiag"] = bool(args.ttf_vdiag) and step % args.ttf_vdiag == 0   # diagnostics only
+            ts_cfg["micro"] = tc.grad_accum if args.micro else 1
+            if args.factored_k:
                 from .layers import FACTORED as _FCT
-                _FCT[0] = True          # (--ts_vdiag reads its g^2 / v from the sketch)
+                _FCT[0] = True          # (--ttf-vdiag reads its g^2 / v from the sketch)
         STATE.lr = lr
         for g in tail_opt.param_groups:
             g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0)
@@ -717,7 +725,7 @@ def main():
         STATE.grad_scale = tc.grad_accum
         tail_opt.zero_grad(set_to_none=True)
         last_loss = 0.0
-        if args.lowrank:          # TTF: every ternary layer hands its gradient to the update (ts_layer)
+        if args.ttf_rank:          # TTF: every ternary layer hands its gradient to the update (ts_layer)
             for l in model.modules():
                 if isinstance(l, KernelTernaryLinear): l.capture = True
         if TIME: torch.cuda.synchronize(); _t0 = time.time()
@@ -737,7 +745,7 @@ def main():
                 _bt.append((x, y, kd_))
 
             def _pre_bwd(i_):
-                if args.ts and tc.grad_accum > 1:
+                if ttf and tc.grad_accum > 1:
                     for l_ in model.modules():
                         if isinstance(l_, KernelTernaryLinear):
                             l_.cap_accum = True; l_.cap_final = i_ == tc.grad_accum - 1
@@ -745,11 +753,11 @@ def main():
                                                                              dtype=torch.bfloat16)).item()
             del _bt
         for micro in range(0 if _PP else tc.grad_accum):
-            if args.ts and tc.grad_accum > 1:      # --ts with accumulation: sum the captured micro-batch gradients
+            if ttf and tc.grad_accum > 1:      # TTF with accumulation: sum the captured micro-batch gradients
                 for l_ in model.modules():
                     if isinstance(l_, KernelTernaryLinear):
                         l_.cap_accum = True; l_.cap_final = micro == tc.grad_accum - 1
-            if args.kd_cache:          # --kd_cache: the next precomputed window, its tokens and the teacher's top k
+            if args.kd_cache:          # --kd-cache: the next precomputed window, its tokens and the teacher's top k
                 # data parallel: each rank its own windows (rank 0 of 1 reads what a single run always read)
                 x, y, model.kd_topk = _kd_cache_batch(args, ((step - args.kd_cache_start) * tc.grad_accum + micro) * _WS + _RK,
                                                       train_data, tc.seq_len, device, bs=tc.batch_size)
@@ -757,8 +765,8 @@ def main():
                 x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
             if _teacher is not None:   # --distill: the full-precision model's next-token distribution for this batch
                 with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
-                    if args.hid_kd:      # --hid_kd: the teacher's stream at every block boundary too (one forward)
-                        model.hid_t = _teacher.hiddens(x); model.hid_w = args.hid_kd
+                    if args.kd_hidden:      # --kd-hidden: the teacher's stream at every block boundary too (one forward)
+                        model.hid_t = _teacher.hiddens(x); model.hid_w = args.kd_hidden
                         tz_ = F.linear(_teacher.norm(model.hid_t[-1]),
                                        _teacher.tok_emb.weight if _teacher.lm_head is None else _teacher.lm_head.weight)
                     else:
@@ -771,13 +779,13 @@ def main():
             with torch.profiler.record_function("model.bwd"):   # includes the fused TTF updates (ttf.update)
                 (loss / tc.grad_accum).backward()
             model.kd_logp = None
-            if args.hid_kd:
+            if args.kd_hidden:
                 model.hid_t = None
                 if micro == 0 and step % 50 == 0:
                     print(f"hid_kd: step {step} block-update error {model.hid_last:.4f}", flush=True)
             if args.kd_cache:
                 model.kd_topk = None
-            if args.tern_emb and args.mode != "master":   # the ternary embedding's TTF update (both of its gradients)
+            if te and args.mode != "bitnet":   # the ternary embedding's TTF update (both of its gradients)
                 from .tern_emb import tern_emb_step
                 tern_emb_step(model, lr_state, ts_cfg, ts_layer)
             last_loss = loss.detach()          # read once after the last micro-batch (a .item() here synced every one)
@@ -787,9 +795,9 @@ def main():
             torch.cuda.synchronize(); _t1 = time.time()
             _m1, _p1 = torch.cuda.memory_allocated() / 2**30, torch.cuda.max_memory_allocated() / 2**30
         _rfu = torch.profiler.record_function("step.update"); _rfu.__enter__()   # TERN_PROF: after the backward
-        if args.ts:
+        if ttf:
             with torch.profiler.record_function("ttf.step"):
-                rs_info = ts_step(model, lr_state, ts_cfg, fused=args.ts_fused)
+                rs_info = ts_step(model, lr_state, ts_cfg, fused=args.ttf_update == "fused")
         else:
             rs_info = None
         if _WS > 1:       # data parallel: the float tail's gradients are averaged before the clip and the step
@@ -871,12 +879,12 @@ def main():
                           f"| never {fs['never_frac_total']*100:.1f}% ")
             print(f"step {step:6d} | loss {last_loss:6.3f} | lr {lr:.2e} {extra}"
                   f"| {dt:6.1f}s | peakVRAM {mem:.2f}GiB", flush=True)
-            if args.ts and step in (10, 1000):
-                print(f"  --ts state: {_ts_state_bytes(lr_state) / 2**20:.1f} MiB stored", flush=True)
+            if ttf and step in (10, 1000):
+                print(f"  TTF state: {_ts_state_bytes(lr_state) / 2**20:.1f} MiB stored", flush=True)
             if args.mem_snapshot and device == "cuda" and step == int(args.mem_snapshot.rsplit(":", 1)[1]):
                 torch.cuda.memory._dump_snapshot(args.mem_snapshot.rsplit(":", 1)[0])    # scripts/analysis/mem_snapshot.py
                 torch.cuda.memory._record_memory_history(enabled=None)
-                print(f"--mem_snapshot: allocation history to step {step} in {args.mem_snapshot.rsplit(':', 1)[0]}", flush=True)
+                print(f"--mem-snapshot: allocation history to step {step} in {args.mem_snapshot.rsplit(':', 1)[0]}", flush=True)
             if args.mem_report and step in (10, 50, 100, 1000):
                 mr = mem_report(model, tail_opt, lr_state)
                 log_metrics({"step": step, **mr})
@@ -898,7 +906,7 @@ def main():
                 RUNLOG[0].event("stopped", step, "signal")
             raise SystemExit(0)
 
-    if not args.no_final_save:
+    if args.final_save:
         save_ckpt(end_step - 1)
     vl = evaluate(model, val_data, tc, device)
     log_metrics({"step": end_step, "val_loss": vl, "val_ppl": math.exp(vl),

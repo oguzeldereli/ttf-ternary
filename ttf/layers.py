@@ -1,6 +1,6 @@
 """The ternary layer of TTF: KernelTernaryLinear, pure trits packed 5 per byte, the forward on the packed-ternary GEMM.
 
-Its weight gradient is never applied here: with capture on (every TTF run) the backward hands it, or with --ts_factored
+Its weight gradient is never applied here: with capture on (every TTF run) the backward hands it, or with --dw factored
 its factors (gy, x), to the layer's on_grad hook (the fused TTF update, train.ts_layer), or keeps it in .gw for the
 update after the backward. The earlier rules that flipped trits inside this backward (the stateless stochastic flip,
 the evidence counter, lockout, error feedback, the flip predictor) are in ttf.legacy.flip.
@@ -27,7 +27,7 @@ def _act_quant_plain(x, bits=8):
     return (x * scale).round().clamp_(-qp - 1, qp) / scale
 
 
-FUSED_SCALES = [False]       # --fused_scales: the column scale's backward and the adapter add + row scale in fused kernels
+FUSED_SCALES = [False]       # --fused-scales: the column scale's backward and the adapter add + row scale in fused kernels
 
 
 class _ColScaleFn(torch.autograd.Function):
@@ -69,7 +69,7 @@ class _AddRowFn(torch.autograd.Function):
         return gt, gt, gr.to(rb.dtype).to(ctx.rdt)
 
 
-FACTORED = [False]           # --ts_factored: on for this step (off on --ts_vdiag steps, which read dense g)
+FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
 
 
 class _KernelTernFn(torch.autograd.Function):
@@ -105,7 +105,7 @@ class _KernelTernFn(torch.autograd.Function):
             gyf = gyf * beta.to(gyf.dtype)       # y = beta * x@W^T: both grads carry beta
         if (FACTORED[0] and layer.int8 and layer.capture and getattr(layer, "on_grad", None) is not None
                 and (getattr(layer, "ts_micro", False) or not getattr(layer, "cap_accum", False))):
-            # --ts_factored: no dense weight gradient; the TTF update gets its factors (gy, x), g = gy^T x
+            # --dw factored: no dense weight gradient; the TTF update gets its factors (gy, x), g = gy^T x
             xq, xs, wpacked = ctx.saved_tensors
             with _rf("tern.dx"):
                 gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
@@ -131,15 +131,15 @@ class _KernelTernFn(torch.autograd.Function):
         with _rf("tern.dx"):
             gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
         if getattr(layer, "cap_accum", False) and getattr(layer, "ts_micro", False):
-            # --ts_micro: the TTF update sees every micro-batch's gradient (momentum and v step per micro-batch; the
+            # --ttf-accum micro: the TTF update sees every micro-batch's gradient (momentum and v step per micro-batch; the
             # accumulator, firing and spend on the last one), so no dense gradient is kept across micro-batches
             layer._ts_final = getattr(layer, "cap_final", True)
             layer.on_grad(layer, gw.detach().float())
             del gw
             return gx.to(gy.dtype), None, None
         if getattr(layer, "cap_accum", False):
-            # gradient accumulation with a captured gradient (--ts, grad_accum > 1): sum the micro-batches (each
-            # loss is already divided by grad_accum); with --ts_fused the update runs on the last micro-batch only
+            # gradient accumulation with a captured gradient (TTF, grad_accum > 1): sum the micro-batches (each
+            # loss is already divided by grad_accum); with --ttf-update fused the update runs on the last micro-batch only
             g = gw.detach().float() if layer.gw is None else layer.gw + gw.float()
             del gw
             if getattr(layer, "on_grad", None) is not None and getattr(layer, "cap_final", True):
@@ -149,12 +149,12 @@ class _KernelTernFn(torch.autograd.Function):
                 layer.gw = g
             return gx.to(gy.dtype), None, None
         if getattr(layer, "on_grad", None) is not None:
-            # --ts_fused: the layer's update runs here, after its input gradient (gx) is computed, so this layer's
+            # --ttf-update fused: the layer's update runs here, after its input gradient (gx) is computed, so this layer's
             # trits are not needed again in this step (earlier layers recompute with their own, unchanged trits)
             layer.on_grad(layer, gw.detach().float())
             del gw
             return gx.to(gy.dtype), None, None
-        layer.gw = gw.detach().float()          # the update after the backward (ts_step without --ts_fused), diagnostics
+        layer.gw = gw.detach().float()          # the update after the backward (ts_step without --ttf-update fused), diagnostics
         if getattr(layer, "capture_stats", False):
             # per-input-channel and per-output-row RMS, for selection diagnostics
             xf2 = (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype)) if layer.int8 else xq
@@ -251,13 +251,13 @@ class KernelTernaryLinear(nn.Module):
 
     def enable_lowrank_mag(self, kind, r):
         """Low-rank float adapter beyond the trits: W = beta*T + A B^T, r (N + K) floats; A starts at 0 (the layer is
-        unchanged at first) unless --init_mag_svd set it"""
+        unchanged at first) unless --adapter-init svd set it"""
         dev = self.wpacked.device
         self.mag_kind = kind
-        assert kind == "add", "--lowrank_mag: add:R (the other kinds are in ttf.legacy)"
+        assert kind == "add", "the adapter is additive (the multiplicative and ternary kinds are in ttf.legacy)"
         mi_ = getattr(self, "_mag_init", None)
-        if mi_ is not None:      # --init_mag_svd: the rounding error's best rank-r part (hf_init._mag_svd_init)
-            assert kind == "add" and mi_[0].shape[1] == r, "--init_mag_svd R needs --lowrank_mag add:R"
+        if mi_ is not None:      # --adapter-init svd: the rounding error's best rank-r part (hf_init._mag_svd_init)
+            assert kind == "add" and mi_[0].shape[1] == r, "--adapter-init svd: the fitted rank must equal --adapter-rank"
             self.mag_A = nn.Parameter(mi_[0].to(dev).clone()); self.mag_B = nn.Parameter(mi_[1].to(dev).clone())
             del self._mag_init
             return [self.mag_A, self.mag_B]
@@ -267,7 +267,7 @@ class KernelTernaryLinear(nn.Module):
         return [self.mag_A, self.mag_B]
 
     def enable_centering(self, mu, bias):
-        """--init_hf_method gptqc: y = layer(x - mu) + bias, mu a fixed buffer, bias a float parameter (init W mu)"""
+        """--convert gptqc: y = layer(x - mu) + bias, mu a fixed buffer, bias a float parameter (init W mu)"""
         self.register_buffer("in_mean", mu.detach().clone().float())
         self.out_bias = nn.Parameter(bias.detach().clone().float())
 
@@ -279,7 +279,7 @@ class KernelTernaryLinear(nn.Module):
         # and the update's dL/dq comes out scaled by r_i * c_j per weight
         fz = (FUSED_SCALES[0] and x.is_cuda and x.dtype == torch.bfloat16 and self.col_scale is not None
               and self.row_scale is not None and getattr(self, "mag_A", None) is not None)
-        if fz:      # --fused_scales: the same layer, the elementwise work in fewer passes
+        if fz:      # --fused-scales: the same layer, the elementwise work in fewer passes
             x = _ColScaleFn.apply(x, self.col_scale)
             y = _KernelTernFn.apply(x, self.wpacked, self)
             a = (x @ self.mag_B.to(x.dtype)) @ self.mag_A.to(y.dtype).T

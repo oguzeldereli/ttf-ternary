@@ -1,5 +1,5 @@
 """Backfill the results database with the run logs kept as markdown (one-off, 17 Oct consolidation): every entry of
-docs/QUEUE.md, every section of docs/RUNS.md, every table row and paragraph of docs/RUN_INDEX.md (docs/RESULTS.md is a
+docs/QUEUE.md, every section of docs/RUNS.md, every table row and paragraph of docs/RUN_INDEX.md (docs/research/RESULTS.md is a
 summary, not a log: it stays a document)
 becomes a `note` record, verbatim, with
   time    the entry's own "HH:MM (DD Mon)" date, else the entry above it (QUEUE) or the nearest dated header, else

@@ -1,0 +1,21 @@
+# 110M Llama-style model from scratch on Wikipedia (Llama 32k tokens), 300M tokens = 9155 steps x 16 x 2048.
+# The paper's final TTF recipe (rank 512, step scale p 0.75, annealed leak, theta 16): sw512_t75, fixed-window
+# Wikipedia loss 2.6728 (3 seeds of rank 512: 2.6888); the options not set here are the trainer's defaults.
+#   python -m ttf.train --recipe scratch-110m --out-dir runs/scratch-110m
+mode = "ttf"
+preset = "small"
+data = "data/wiki32k_train.bin"
+val = "data/wiki32k_val.bin"
+seq-len = 2048
+batch-size = 16
+accum = 1
+steps = 9155
+warmup = 305
+lr = 1.5e-3
+min-lr = 1.5e-4
+eval-interval = 250
+eval-iters = 30
+ckpt-skip = 2
+save-secs = 1800
+ttf-rank = 512
+ttf-theta = 16

@@ -95,7 +95,7 @@ class Attention(nn.Module):
         k = self.wk(x).view(B, T, self.n_kv, self.head_dim)
         v = self.wv(x).view(B, T, self.n_kv, self.head_dim)
         if getattr(self, "qk_logscale", None) is not None:
-            # learnable per-head temperature (--qk_temp): logits scale by exp(s_h)
+            # learnable per-head temperature (--qk-temp): logits scale by exp(s_h)
             q = q * self.qk_logscale.exp().view(1, 1, -1, 1).to(q.dtype)
         q, k = apply_rope(q, k, freqs_cis)
         if self.rep > 1:
@@ -198,7 +198,7 @@ class Block(nn.Module):
         # outside retained two fp32 [B,T,d] tensors per sublayer (4.7 GiB at
         # 32k tokens/step, 12 layers) instead of recomputing them for free.
         if ckpt and getattr(self, "ckpt_block", False):
-            # --ckpt_block: one checkpoint per block (its input only): half the saved activations of the per-sublayer
+            # --ckpt block: one checkpoint per block (its input only): half the saved activations of the per-sublayer
             # checkpoints, for a larger recompute (attention + MLP of one block at once); for the ternary kernels,
             # which never build a dense weight
             x = checkpoint(self._block, x, freqs_cis, use_reentrant=False)
@@ -266,7 +266,7 @@ class BitTransformer(nn.Module):
             return kl
         return (1 - a) * F.nll_loss(lp, tgt, ignore_index=-1, reduction="sum") + a * kl
 
-    hid_t = None          # --hid_kd: the teacher's residual stream at every block boundary, matched along the student's path
+    hid_t = None          # --kd-hidden: the teacher's residual stream at every block boundary, matched along the student's path
     hid_w = 0.0
     hid_last = 0.0
 
@@ -307,7 +307,7 @@ class BitTransformer(nn.Module):
         for i, layer in enumerate(self.layers):
             h_in = h
             h = layer(h, fc, ckpt=ckpt and i < n_ck)
-            if ht is not None and targets is not None:   # --hid_kd: this block's update on the student's own path
+            if ht is not None and targets is not None:   # --kd-hidden: this block's update on the student's own path
                 hid = hid + self._rel_update_err(h - h_in, ht[i + 1] - ht[i])   # against the teacher block's
         h = self.norm(h)
         w = self.tok_emb.weight if self.lm_head is None else self.lm_head.weight

@@ -1,27 +1,22 @@
-"""Start a run from a pretrained full-precision Llama checkpoint (Hugging Face format): --init_hf DIR.
+"""Start a run from a pretrained full-precision Llama checkpoint (Hugging Face format): --init-hf DIR.
 
 The float parts (token embedding, output head, RMSNorm gains) are copied. Each linear is converted for the run's mode:
   fp32    the weight as is (sanity check: the loss should match the original model's)
   master  the latent is the weight (BitNet's absmean ternary in the forward, as published conversions do)
-  kernel  the weight is ternarized (--init_hf_method):
+  kernel  the weight is ternarized (--convert):
             gptqs    sequential, error-aware, centred GPTQ (convert_seq_asym): each layer calibrated on the partly
-                     converted model's inputs and aimed at the fp output; centred as gptqc (needs --rc_scale)
+                     converted model's inputs and aimed at the fp output; centred as gptqc (needs --rc-scale)
             gptqc    GPTQ on the input covariance instead of the second moment, the layer computing W_hat (x - mu) + W mu:
                      the input mean mu (fixed) is taken out before the activation quantisation and its product with
                      the fp weight is a float bias (trained); for fp models whose residual stream carries a large
                      constant offset (massive activations)
             absmean  T = round(clip(W / mean|W|)) per tensor, the output scale mean|W| (BitNet b1.58)
             row      a per-row scale a_i chosen from a grid to minimise |W_i - a_i T_i| (least-squares magnitude)
-            als      W ~ a_i c_j T_ij, row and column scales by alternating least squares (needs --rc_scale)
+            als      W ~ a_i c_j T_ij, row and column scales by alternating least squares (needs --rc-scale)
             scratch  nothing loaded, only the shape (the from-scratch baseline for the same model)
-            zero     every trit 0; the weight goes into the accumulator only (needs --ts and --init_acc), so the first
-                     update's firing does the rounding
-          the scales go into row_scale / col_scale (with --rc_scale) over the layer's beta = 1 / sqrt(K rho);
-          without --rc_scale only the per-tensor part is kept (row and column factors are averaged out).
---init_acc KAPPA (with --ts): the accumulator starts at each weight's position inside its bin, A = KAPPA 2 theta (x - T)
-with x = W / (a_i c_j) in trit units (x - T in [-1/2, 1/2]; a weight on a rounding boundary starts at |A| = KAPPA theta),
-kept at the run's rank by a truncated SVD. --init_acc_clip C caps |x - T| at C (default 1/2: drops the outward
-excess of weights far beyond their +-1 bin; 0 keeps it, so a large weight starts with evidence against being moved in). With --init_hf_method zero, A = KAPPA 2 theta x (all of the weight).
+            native   the float parts loaded, the linears keep their random ternary init
+          the scales go into row_scale / col_scale (with --rc-scale) over the layer's beta = 1 / sqrt(K rho);
+          without --rc-scale only the per-tensor part is kept (row and column factors are averaged out).
 
 HF Llama stores q / k rows permuted for rotate_half RoPE; this model rotates interleaved pairs (Meta layout), so the
 q / k rows are permuted back."""
@@ -118,8 +113,6 @@ def ternarize(W, method, iters=4):
     """W [N, K] -> (T int8, row a [N], col c [K]) with W ~ a_i c_j T_ij"""
     N, K = W.shape
     c = torch.ones(K, device=W.device)
-    if method == "zero":
-        return torch.zeros(N, K, dtype=torch.int8, device=W.device), W.abs().mean(1), c
     if method == "absmean":
         g = W.abs().mean().clamp_min(1e-12)
         T = (W / g).round_().clamp_(-1, 1)
@@ -192,7 +185,7 @@ def calib_hessians(path, data_path, n_seq=64, seq=2048, dev="cuda", log=print):
 
 @torch.no_grad()
 def convert_seq_asym(path, data_path, n_seq=32, seq=2048, dev="cuda", damp=0.01, log=print):
-    """--init_hf_method gptqs: sequential, error-aware, centred GPTQ (training-free). The linears are rounded in
+    """--convert gptqs: sequential, error-aware, centred GPTQ (training-free). The linears are rounded in
     network order (per block: q k v, o, gate up, down), each calibrated on the inputs x_hat of the partly converted
     model and aimed at the fp layer's output on the clean input x:
         min | W_hat (x_hat - mu_hat) + b - W x |   ->   GPTQ of W* = W C(x, x_hat) C(x_hat, x_hat)^-1 on C(x_hat, x_hat),
@@ -254,7 +247,7 @@ def convert_seq_asym(path, data_path, n_seq=32, seq=2048, dev="cuda", damp=0.01,
     return out
 
 
-GPTQ_OPTS = {"mag_svd": 0}   # --init_mag_svd (train.py)
+GPTQ_OPTS = {"mag_svd": 0}   # --adapter-init svd (train.py)
 
 
 @torch.no_grad()
@@ -302,7 +295,7 @@ def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2):
 
 @torch.no_grad()
 def mag_svd_fit(lin, W, T, a, c, beta, Hc, r):
-    """--init_mag_svd R: the rounding error, moved into the layer's float adapter instead of dropped. The layer computes
+    """--adapter-init svd R: the rounding error, moved into the layer's float adapter instead of dropped. The layer computes
     y = (a / beta) (beta T + A B^T) x' with x' = c o (x - mu), so the adapter that restores W exactly would be
     G = diag(beta / a) (W - a c T) diag(1 / c); of G, the rank-R part that matters most for the output is kept: the
     best rank-R fit in the input covariance's norm, |(G - A B^T) L|_F with L L^T = H' (H' the covariance of x'; Hc the
@@ -344,7 +337,7 @@ def init_from_hf(model, path, mode, method="als", rc=False, log=print, hess=None
     from .kernel import pack_rows, trit_beta
     from .master import MasterTernaryLinear
     if method == "scratch":       # the checkpoint's shape only, random init (the baseline for the same model)
-        log(f"--init_hf {path}: scratch (shape only, weights not loaded)")
+        log(f"--init-hf {path}: scratch (shape only, weights not loaded)")
         return
     sd = load_hf_tensors(path)
     c_ = model.c
@@ -382,7 +375,7 @@ def init_from_hf(model, path, mode, method="als", rc=False, log=print, hess=None
                 errs.append(_rel_err(W, T, a, c))
                 continue
             T, a, c = ternarize(W, "als" if method in ("gptq", "gptqc") else method)
-            if hess is not None and method != "zero":
+            if hess is not None:
                 Hl = hess[(i, name)].to(dev)
                 e0 = _out_err(W, T, a, c, Hl)
                 if method == "gptq":
@@ -393,29 +386,26 @@ def init_from_hf(model, path, mode, method="als", rc=False, log=print, hess=None
                     lin.enable_centering(mu, W @ mu)
                 oerrs.append((e0, _out_err(W, T, a, c, Hl)))
                 del Hl
-            if method != "zero":
-                errs.append(_rel_err(W, T, a, c))
+            errs.append(_rel_err(W, T, a, c))
             lin.wpacked.copy_(pack_rows(T))
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
             if GPTQ_OPTS["mag_svd"] and hess is not None and method in ("gptq", "gptqc") and rc:
                 kept.append(_mag_svd_init(lin, W, T, a, c, beta, hess, i, name, method, GPTQ_OPTS["mag_svd"], dev))
-            if method == "zero":     # the trits are all 0, so beta is that of an empty layer; use the density the
-                beta = 1.0 / (lin.K * 0.6) ** 0.5   # first firing will give (~0.6 nonzero), refined as trits move
             if rc and lin.row_scale is not None:
                 lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
             elif lin.row_scale is not None:
                 lin.row_scale.fill_(float(a.mean()) / beta); lin.col_scale.fill_(1.0)
             else:
-                raise SystemExit("--init_hf on kernel mode needs --rc_scale (the layer has no other scale to hold the "
+                raise SystemExit("--init-hf on kernel mode needs --rc-scale (the layer has no other scale to hold the "
                                  "weight's magnitude)")
             del W
     if errs:
-        log(f"--init_hf {path}: {method}, relative error |W - a c T| / |W| mean {sum(errs) / len(errs):.4f} "
+        log(f"--init-hf {path}: {method}, relative error |W - a c T| / |W| mean {sum(errs) / len(errs):.4f} "
             f"(min {min(errs):.4f}, max {max(errs):.4f}) over {len(errs)} layers")
     if oerrs:
         e0, e1 = zip(*oerrs)
-        log(f"--init_hf {method}: output-space relative error |X (W - a c T)^T|^2 / |X W^T|^2 mean {sum(e1) / len(e1):.4f}"
+        log(f"--init-hf {method}: output-space relative error |X (W - a c T)^T|^2 / |X W^T|^2 mean {sum(e1) / len(e1):.4f}"
             f" (als rounding {sum(e0) / len(e0):.4f}) over {len(e1)} layers")
     if kept and GPTQ_OPTS["mag_svd"]:
-        log(f"--init_mag_svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
+        log(f"--adapter-init svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
             f"rounding error on average (min {min(kept):.3f}, max {max(kept):.3f}) over {len(kept)} layers")

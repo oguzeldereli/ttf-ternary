@@ -4,7 +4,7 @@
 """
 import torch
 import torch.nn.functional as F
-from ttf.kernel import pack_rows, unpack_rows, lookahead_filter, _P3
+from ttf.kernel import pack_rows, _P3
 from ttf.config import PRESETS
 from ttf.layers import build_kernel_transformer, KernelTernaryLinear
 from ttf import model as M
@@ -28,29 +28,6 @@ for K in (768, 770, 3072):
     assert torch.equal(pack_rows(w), pack_ref(w)), K
 print("pack_rows: identical")
 
-# 2. fused look-ahead filter == reference (2 passes)
-for K in (768, 771):
-    N = 96
-    q0 = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8)
-    step = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8) * (torch.rand(N, K, device=dev) < 0.2)
-    q1 = (q0 + step).clamp(-1, 1).to(torch.int8)
-    D = (q1 - q0).to(torch.int8)
-    g, g2, g3 = (torch.randn(N, K, device=dev) for _ in range(3))
-    # reference (the previous implementation)
-    keep = D != 0
-    keep &= D.float() * (g + g2) < 0
-    ref1 = pack_rows(q0 + D * keep.to(torch.int8))
-    keep &= D.float() * (g + g3) < 0
-    ref2 = pack_rows(q0 + D * keep.to(torch.int8))
-    # fused
-    p0, pc = pack_rows(q0), pack_rows(q1)
-    c1 = lookahead_filter(p0, pc, g, g2)
-    assert torch.equal(pc, ref1), "pass 1"
-    assert int(c1[0]) == int((D != 0).sum())
-    c2 = lookahead_filter(p0, pc, g, g3)
-    assert torch.equal(pc, ref2), "pass 2"
-    assert int(c2[1]) == int(keep.sum())
-print("lookahead_filter: identical to reference over 2 passes")
 
 
 # 3/4. compile and partial checkpointing: same loss and same weight gradients

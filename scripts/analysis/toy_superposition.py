@@ -8,7 +8,7 @@ sum_i I_i (x_i - x'_i)^2. The weights W [m, n] are
   ternary-c ternary with a per-column (per-feature) scale as well, W = a_r c_j T (our layers' row x column scales)
 Reported per sparsity: features represented (|W_j| > 0.5 of the largest), the superposition count (sum over features of
 |W_j|^2 / ... as in Elhage: dimensions per feature), mean interference among represented features, and the loss.
-  python scripts/analysis/toy_superposition.py --n 80 --m 20 --out docs/analysis/toy_superposition.json
+  python scripts/analysis/toy_superposition.py --n 80 --m 20 --out docs/research/analysis/toy_superposition.json
 """
 import argparse, json
 import numpy as np

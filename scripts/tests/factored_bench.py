@@ -5,7 +5,7 @@ against --ts_factored (ts_layer on the factors), --ts_micro M = 8 (non-final and
 import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
-import ttf.train as T
+import ttf.update as T
 from ttf.layers import KernelTernaryLinear
 
 dev = "cuda"
@@ -13,7 +13,7 @@ Tk, M = 4096, 8                                   # tokens per micro-batch (2 x 
 
 
 def bench(N, K, r, ks):
-    l = KernelTernaryLinear(K, N, int8=True, dw_mode="dense").to(dev); l.track = False; l._ts_idx = 5; l._ts_host = False
+    l = KernelTernaryLinear(K, N, int8=True).to(dev); l.track = False; l._ts_idx = 5; l._ts_host = False
     state = {}
     c = dict(r=r, lr_ratio=1.0, theta=64.0, tau=1000, rank_s=r, b1=0.9, b2=0.95, gate=False, spend=1.0, tau_anneal=0.75,
              micro=M, factored=ks, store_a="fp12s", offload=False, nomom=True, start=0, step=10)

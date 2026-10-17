@@ -13,7 +13,7 @@ TS_FUSED_STATS = [True]          # TERN_FUSED_STATS=0: the TTF row / column sums
 
 
 def _store_codec(name):
-    """--ts_store_a: compressed storage of the accumulator's low-rank pair. Returns enc(X) -> tuple of stored tensors:
+    """--ttf-store: compressed storage of the accumulator's low-rank pair. Returns enc(X) -> tuple of stored tensors:
     int8 / int8det / fp8 / fp16s keep codes + a per-column fp32 scale (1 x r), fp16 / bf16 keep the tensor in that
     dtype."""
     if name in ("", "none", "fp32"):
@@ -106,13 +106,13 @@ def _load_pair_(t):
 
 
 def _ts_on_host(args, i, n):
-    """--ts_offload with --ts_offload_keep F: layer i of n (module order) keeps its state in host memory unless it is
-    among the first round(F n)"""
-    return bool(args.ts_offload) and i >= round(args.ts_offload_keep * n)
+    """--ttf-offload host with --ttf-offload-keep F: layer i of n (module order) keeps its state in host memory unless
+    it is among the first round(F n)"""
+    return args.ttf_offload == "host" and i >= round(args.ttf_offload_keep * n)
 
 
 class _PinnedPool:
-    """Page-locked host memory of exactly the requested size for the offloaded --ts state. torch's pinned allocator
+    """Page-locked host memory of exactly the requested size for the offloaded TTF state. torch's pinned allocator
     rounds every block up to a power of two (measured on the lab PCs, torch 2.13: 100 x 9 MiB took 1600 MiB, one 900 MiB
     block 1024 MiB), which at 27B ranks 1024 turns 21.3 GiB of state into 29.7 GiB. Here every tensor of at least
     BIG bytes gets its own ordinary host buffer, padded so that a page-aligned slice of the rounded size fits inside it,
@@ -151,7 +151,7 @@ def _host_get(d, k, dev, off):
 
 
 def _host_get_(d, k, dev, off):
-    """--ts_offload: a state tuple kept in pinned host memory, copied to the GPU for this layer's update (the copy is
+    """--ttf-offload host: a state tuple kept in pinned host memory, copied to the GPU for this layer's update (the copy is
     queued on the current stream, so it is ordered before the kernels that read it; no host sync)"""
     v = d[k]
     return tuple(x.to(dev, non_blocking=True) for x in v) if off else v
@@ -163,7 +163,7 @@ def _host_put(d, k, v, off):
 
 
 def _host_put_(d, k, v, off):
-    """--ts_offload: write a state tuple back to its pinned host buffers (reused across steps; the device-to-host copy
+    """--ttf-offload host: write a state tuple back to its pinned host buffers (reused across steps; the device-to-host copy
     is queued on the same stream after this step's kernels and before next step's host-to-device copy)"""
     if not off:
         d[k] = v
@@ -178,7 +178,7 @@ def _host_put_(d, k, v, off):
 
 
 def _ts_state_bytes(lr_state):
-    """bytes held by the --ts state (accumulator pairs, short momentum, factored v), counted per stored tensor"""
+    """bytes held by the TTF state (accumulator pairs, short momentum, factored v), counted per stored tensor"""
     n = 0
     for k, v in lr_state.items():
         if k == "_ts":
@@ -203,30 +203,30 @@ def _orth_(X):
 
 def ts_layer(l, g, state, c):
     """one layer of TTF (the no-momentum update): g is this layer's gradient (fp32), or its factors (gy, x) with
-    --ts_factored; c holds the settings and lr_ratio. Called from the layer's backward right after its input gradient
-    is computed (--ts_fused), so only one layer's fp32 gradient exists at a time.
+    --dw factored; c holds the settings and lr_ratio. Called from the layer's backward right after its input gradient
+    is computed (--ttf-update fused), so only one layer's fp32 gradient exists at a time.
     Per layer: v, the factored row x column EMA of g^2 (decay b2); u = -lr_ratio g / sqrt(v); A, the accumulator, rank
     r: A <- (1 - lr_ratio^p / tau) A + u projected on its basis (V turns with the evidence); a trit moves by sign(A_ij)
     when |A_ij| >= theta (and stays in {-1, 0, 1}), and the move spends theta: A -= theta D (kept low-rank: U -= theta
-    D V). With --ts_micro (grad_accum M) every micro-batch's u enters the accumulator, normalised by the v of the steps
+    D V). With --ttf-accum micro (grad_accum M) every micro-batch's u enters the accumulator, normalised by the v of the steps
     before; v, the basis turn, the firing and the spend once per step, on the last micro-batch."""
     from .kernel import unpack_rows, pack_rows
-    if not torch.is_tensor(g):           # --ts_factored: the backward passed (gy, x) instead of the dense gradient
+    if not torch.is_tensor(g):           # --dw factored: the backward passed (gy, x) instead of the dense gradient
         return _ts_layer_factored(l, g, state, c)
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
-    if c.get("theta_sched"):   # --ts_theta_sched T0:T1[:START]: the threshold moves linearly from T0 to T1
+    if c.get("theta_sched"):   # --ttf-theta-sched T0:T1[:START]: the threshold moves linearly from T0 to T1
         theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
-    M_ = int(c.get("micro") or 1)   # --ts_micro with --grad_accum M: the accumulator takes every micro-batch's u
+    M_ = int(c.get("micro") or 1)   # --ttf-accum micro with --accum M: the accumulator takes every micro-batch's u
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True   # firing and the spend only on the last one
     b2o = b2
     if M_ > 1:
         b2 = b2 ** (1.0 / M_)
-    sa = _store_codec(c.get("store_a", ""))                                            # --ts_store_a: real storage
+    sa = _store_codec(c.get("store_a", ""))                                            # --ttf-store: real storage
     st = state.setdefault("_ts", {})
-    off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device  # --ts_offload(_keep)
+    off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device  # --ttf-offload host(_keep)
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
     mic_nm = M_ > 1
-    if mic_nm:    # --ts_micro: the accumulator takes every micro-batch's u, normalised by the v of the steps before
+    if mic_nm:    # --ttf-accum micro: the accumulator takes every micro-batch's u, normalised by the v of the steps before
         # (this step's v needs all of its micro-batches); on the first step there is none, so each micro-batch uses its
         # own g^2 x M^2 (each g_i carries the loss / M). Firing and the spend once per step, on the last one. As Adam's
         # v includes the current gradient (which bounds a step at 1 / sqrt(1 - beta2) per weight), this micro-batch's
@@ -252,7 +252,7 @@ def ts_layer(l, g, state, c):
         del r0, c0
     fs_ = mic_nm and _rsq is not None and not c.get("vdiag")   # the fused sums stand in for g^2's means
     g2 = None if fs_ else g * g
-    if M_ > 1:    # --ts_micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
+    if M_ > 1:    # --ttf-accum micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
         # row / column means of (sum_i g_i)^2 = the micro-batches' own squares + 2 <g_i, sum of earlier g_i'>, the
         # cross terms through a k-dim random sketch of the running sum (unbiased; k (N + K) floats, held within the step)
         Sr, Sc = _micro_sketch(l, dev, (t - 1) // M_)
@@ -271,7 +271,7 @@ def ts_layer(l, g, state, c):
             else:
                 R, C = (1 - b2o) * rs, (1 - b2o) * cs
             _host_put(st, ("v", key), (R, C), off)
-            # the full [N, K] v only where it is read: --ts_vdiag (the micro-batch u uses the factored v of the steps before)
+            # the full [N, K] v only where it is read: --ttf-vdiag (the micro-batch u uses the factored v of the steps before)
             v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2o ** (t // M_)) if c.get("vdiag") else None
         else:
             st[("mx", key)] = (PS, SP, rs, cs, ds, es); v = None
@@ -283,7 +283,7 @@ def ts_layer(l, g, state, c):
             R, C = (1 - b2) * g2.mean(1), (1 - b2) * g2.mean(0)
         _host_put(st, ("v", key), (R, C), off)
         v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2 ** t)
-    if c.get("vdiag") and v is not None:   # --ts_vdiag: this step's g^2 against the second moment it is divided by
+    if c.get("vdiag") and v is not None:   # --ttf-vdiag: this step's g^2 against the second moment it is divided by
         sp_ = float(g2.mean() / v.mean().clamp_min(1e-30)); _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
     del g2
     # u: the full-rank Adam-normalised gradient (no short momentum: the accumulator's own rank-r projection filters the
@@ -300,12 +300,12 @@ def ts_layer(l, g, state, c):
         _ts_rec(st, "u_rms", float(ua_.pow(2).mean().sqrt())); m_ = float(ua_.max())
         _ts_rec(st, "u_max", m_); _ts_recmax(st, "u_max", m_)
         _ts_rec(st, "u_gt4", float((ua_ > 4).float().mean())); del ua_
-    if c.get("start") and c.get("step", 0) < c["start"]:   # --ts_start S: the trits stay frozen (no evidence kept,
+    if c.get("start") and c.get("step", 0) < c["start"]:   # --ttf-start S: the trits stay frozen (no evidence kept,
         del u, v                                             # nothing fires) until step S; v keeps learning
         return
     del v
     ra = min(r, l.N, l.K)
-    if mic_nm and key in state:   # --ts_micro: the basis stays fixed within the step (every micro-batch's u is projected
+    if mic_nm and key in state:   # --ttf-accum micro: the basis stays fixed within the step (every micro-batch's u is projected
         # on it: U += u_i V), and turns once, on the last micro-batch, from X = V (U^T U) + M u_M^T U (the last
         # micro-batch's, scaled: no memory beyond the state); turning it per micro-batch lets each micro-batch's noisier
         # u rotate the evidence away (110M r512: 5.64 vs 4.42 at 600 steps)
@@ -325,13 +325,13 @@ def ts_layer(l, g, state, c):
         U = u @ V
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
-        U = U * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)   # --ts_tau_anneal: memory in distance, not steps
+        U = U * (1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)   # --ttf-leak annealed: memory in distance, not steps
         X_ = V @ (U.T @ U) + u.T @ U
         Vn = _orth(X_); del X_
         uVn = u @ Vn
         U = U @ (V.T @ Vn) + uVn; V = Vn
         del uVn
-    if mic_nm and not final_:   # --ts_micro: not the last micro-batch: keep the accumulator, no firing
+    if mic_nm and not final_:   # --ttf-accum micro: not the last micro-batch: keep the accumulator, no firing
         _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
     del u
@@ -370,11 +370,11 @@ def _fg_mm_l(fg, a, W):
 
 
 def _ts_layer_factored(l, fg, state, c):
-    """--ts_factored K: the --ts --ts_nomom update (16 x 1 or --ts_micro) from the factors of the weight gradient,
+    """--dw factored K: the TTF  update (16 x 1 or --ttf-accum micro) from the factors of the weight gradient,
     g = gy^T x, which is never formed. Everything the update reads from g is a product with a thin matrix: the
     accumulator's projections u V and u^T U (u = -lr g / sqrt(v) with the factored v = a_i b_j, so u = -lr diag(1/a) g
     diag(1/b)), and v's row / column sums of g^2, estimated from a K-column random sketch g S (E[S S^T] = I; with
-    --ts_micro the same sketch the cross terms use, so the batch's sums are ||(sum_i g_i) S||^2). Differences from the
+    --ttf-accum micro the same sketch the cross terms use, so the batch's sums are ||(sum_i g_i) S||^2). Differences from the
     dense path: the sums of g^2 are sketch estimates (relative noise sqrt(2 / K) per row and step, before v's EMA), and
     the 1e-8 in sqrt(v) + 1e-8 is left out (a scale factor needs a product form). Cost per call 2 T (N + K)(K_s + 2 r)
     instead of the dense gradient's 2 T N K."""
@@ -398,7 +398,7 @@ def _ts_layer_factored(l, fg, state, c):
     gS = _mmb(gy.T, _mmb(x, Sr))                                          # g Sr  [N, k]
     Sg = _mmb(x.T, _mmb(gy, Sc.T)).T                                      # Sc g  [k, K]
     rsq, csq = gS.square().sum(1), Sg.square().sum(0)                     # ~ row / column sums of g^2
-    if M_ > 1:   # as ts_layer's --ts_micro --ts_nomom branch, with the sketched own squares
+    if M_ > 1:   # as ts_layer's --ttf-accum micro  branch, with the sketched own squares
         r0, c0 = rsq * (M_ * M_ / l.K), csq * (M_ * M_ / l.N)
         if ("v", key) in st and ts_ > 0:
             R0, C0 = _host_get(st, ("v", key), dev, off)
@@ -420,7 +420,7 @@ def _ts_layer_factored(l, fg, state, c):
             else:
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
-            if c.get("vdiag"):   # --ts_vdiag: this micro-batch's g^2 against v (the u extremes need the dense u: not kept)
+            if c.get("vdiag"):   # --ttf-vdiag: this micro-batch's g^2 against v (the u extremes need the dense u: not kept)
                 sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** (t // M_))).clamp_min(1e-30))
                 _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
         else:
@@ -441,7 +441,7 @@ def _ts_layer_factored(l, fg, state, c):
     ia = 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30)                 # 1 / a_i, 1 / b_j (zero rows: g is zero there;
     ib = 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)                 # device-side bounds: no host sync per call)
     fgb = (gy, x, ib)
-    if c.get("start") and c.get("step", 0) < c["start"]:                  # --ts_start: frozen, v keeps learning
+    if c.get("start") and c.get("step", 0) < c["start"]:                  # --ttf-start: frozen, v keeps learning
         return
     ra = min(r, l.N, l.K)
     if key not in state:
@@ -468,7 +468,7 @@ def _ts_layer_factored(l, fg, state, c):
         return
     from .kernel import unpack_rows, pack_rows
     before = l.wpacked.clone() if l.track else None
-    if FIRE_FUSED[0] and dev.type == "cuda":   # --ts_fire_fused: A, the moves, the repack and D V in one kernel
+    if FIRE_FUSED[0] and dev.type == "cuda":   # --fire fused: A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
         DV, nf = ttf_fire(U, V, l.wpacked, l.K, theta)
         U = U - c["spend"] * (theta * DV); del DV
@@ -489,11 +489,11 @@ def _ts_layer_factored(l, fg, state, c):
 
 
 MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "64"))]   # sketch size (TERN_MICRO_K: tests only)
-FIRE_FUSED = [False]          # --ts_fire_fused (with --ts_factored): ttf.kernel.ttf_fire
+FIRE_FUSED = [False]          # --fire fused (with --dw factored): ttf.kernel.ttf_fire
 
 
 def _micro_sketch(l, dev, step):
-    """--ts_micro: a layer's random maps (K x k, k x N; E[S S^T] = I) for the cross terms of the batch's v; fixed within
+    """--ttf-accum micro: a layer's random maps (K x k, k x N; E[S S^T] = I) for the cross terms of the batch's v; fixed within
     a step, new every step, so their errors are independent across steps and v's EMA averages them out"""
     k = MICRO_SKETCH[0]
     gen = torch.Generator(device=dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * step)
@@ -510,8 +510,8 @@ def _ts_recmax(st, name, x):
 
 
 def ts_step(model, state, c, fused=True):
-    """after the backward: with --ts_fused (every recipe) the layers have already updated inside their backward, so this
-    only collects the step's statistics (share of trits moved, --ts_vdiag means / maxima); without it each layer's
+    """after the backward: with --ttf-update fused (every recipe) the layers have already updated inside their backward, so this
+    only collects the step's statistics (share of trits moved, --ttf-vdiag means / maxima); without it each layer's
     captured gradient goes through ts_layer here"""
     st = state.setdefault("_ts", {})
     if not fused:
@@ -522,8 +522,8 @@ def ts_step(model, state, c, fused=True):
             del g
     nf, nt = st.pop("_nf", 0), st.pop("_nt", 0)
     info = {"ts_frac": float(nf) / max(nt, 1)}
-    for k_, (tot, n_) in st.pop("_dg", {}).items():      # --ts_vdiag: means over layers this step
+    for k_, (tot, n_) in st.pop("_dg", {}).items():      # --ttf-vdiag: means over layers this step
         info["dg_" + k_] = tot / max(n_, 1)
-    for k_, x_ in st.pop("_dgmax", {}).items():           # --ts_vdiag: maxima over layers this step
+    for k_, x_ in st.pop("_dgmax", {}).items():           # --ttf-vdiag: maxima over layers this step
         info["dgmax_" + k_] = x_
     return info

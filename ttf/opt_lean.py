@@ -1,12 +1,12 @@
-"""--lean_tail: AdamW for the float tail (embedding, adapter, norm gains, row / column scales) with low-precision storage.
+"""--tail lean: AdamW for the float tail (embedding, adapter, norm gains, row / column scales) with low-precision storage.
 
 - Parameters stay in their own low-precision dtype (bf16 for the embedding and the adapter, fp16 for gains and scales);
   the update is computed in fp32 and written back with stochastic rounding (uniform noise of one unit in the last place
   before rounding), so steps smaller than half a unit are kept on average instead of rounding away (the reason the
   bf16 tail once froze the norm gains at 1.0).
 - First moment: int8 codes with one fp32 scale per row (2-D) or per tensor (1-D), stochastic rounding; the step uses the
-  unrounded moment, the rounded one is stored (as the int8 short momentum of --ts).
-- Second moment: factored for 2-D parameters (row and column means of g^2, as --ts's v), fp32 for 1-D ones (tiny).
+  unrounded moment, the rounded one is stored (as the int8 short momentum of TTF).
+- Second moment: factored for 2-D parameters (row and column means of g^2, as TTF's v), fp32 for 1-D ones (tiny).
 Bytes per 2-D parameter: 2 (value) + 2 (gradient) + 1 (first moment) + ~0 (second moment), against 16 for fp32 AdamW.
 """
 from __future__ import annotations
@@ -74,7 +74,7 @@ class LeanAdam(torch.optim.Optimizer):
                 torch._foreach_mul_(pl, 1 - lr * wd)
             torch._foreach_add_(pl, upd, alpha=-lr)
 
-    BATCHED = False       # --lean_batched: low-precision 1-D parameters as one flat pass, 2-D ones stacked by shape
+    BATCHED = False       # --tail-batched: low-precision 1-D parameters as one flat pass, 2-D ones stacked by shape
 
     def _flat_state(self, pl, names, init):
         """the fp32 state tensors `names` of the parameters pl as views into one flat (1-D) or stacked (2-D) buffer per

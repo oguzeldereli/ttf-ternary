@@ -5,18 +5,18 @@ import math
 from .config import TrainConfig
 
 
-LR_LINEAR = [False]               # --lr_linear: linear decay after warmup instead of the cosine
-LR_WSD = [0]                      # --lr_wsd D: warmup, constant peak lr until step D, then a cosine to min_lr at the end
-LR_REWARM = [0, 0]                # --lr_rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
+LR_LINEAR = [False]               # --lr-schedule linear: linear decay after warmup instead of the cosine
+LR_WSD = [0]                      # --lr-schedule wsd D: warmup, constant peak lr until step D, then a cosine to min_lr at the end
+LR_REWARM = [0, 0]                # --lr-rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
 
 
 def _ts_scale(args, step, tc, lr):
-    """the TTF step scale (lr / peak lr)^p, p = --ts_anneal"""
-    return max((lr / tc.lr) ** args.ts_anneal, 0.0)
+    """the TTF step scale (lr / peak lr)^p, p = --ttf-step-p"""
+    return max((lr / tc.lr) ** args.ttf_step_p, 0.0)
 
 
 def _theta_at(sched, prog):
-    """--ts_theta_sched T0:T1[:START]: T0 until fraction START of training (default 0), then linear to T1 at the end"""
+    """--ttf-theta-sched T0:T1[:START]: T0 until fraction START of training (default 0), then linear to T1 at the end"""
     th0_, th1_, st_ = (tuple(sched) + (0.0,))[:3]
     prog = min(max(prog, 0.0), 1.0)
     return th0_ if prog <= st_ else th0_ + (th1_ - th0_) * (prog - st_) / max(1e-9, 1.0 - st_)
@@ -42,6 +42,6 @@ def lr_at(step, tc: TrainConfig):
         r = (step - LR_WSD[0]) / max(1, tc.max_steps - LR_WSD[0])
         return tc.min_lr + 0.5 * (tc.lr - tc.min_lr) * (1 + math.cos(math.pi * r))
     r = (step - tc.warmup_steps) / max(1, tc.max_steps - tc.warmup_steps)
-    if LR_LINEAR[0]:              # --lr_linear: a straight line from the peak to min_lr (to zero with --min_lr 0)
+    if LR_LINEAR[0]:              # --lr-schedule linear: a straight line from the peak to min_lr (to zero with --min-lr 0)
         return tc.min_lr + (tc.lr - tc.min_lr) * (1.0 - r)
     return tc.min_lr + 0.5 * (tc.lr - tc.min_lr) * (1 + math.cos(math.pi * r))

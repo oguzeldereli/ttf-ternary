@@ -13,7 +13,7 @@ from ttf.layers import KernelTernaryLinear, enable_rc_scales
 dev = "cuda"
 for (K, N, T) in ((512, 384, 1000), (5120, 17408, 4096), (17408, 5120, 4096)):
     torch.manual_seed(0)
-    l = KernelTernaryLinear(K, N, int8=True, dw_mode="dense").to(dev)
+    l = KernelTernaryLinear(K, N, int8=True).to(dev)
     l.row_scale = torch.nn.Parameter((torch.rand(N, device=dev) + 0.5).half())
     l.col_scale = torch.nn.Parameter((torch.rand(K, device=dev) + 0.5).half())
     l.enable_lowrank_mag("add", 16); l.mag_A.data.normal_(0, 0.02)

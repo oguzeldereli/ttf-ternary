@@ -1,0 +1,32 @@
+# Qwen3.8-27B (the released ternary checkpoint qw27_rel, step 1350) continued with KD from cached teacher top-k targets
+# on a 24-32 GB GPU (scripts/cloud/train27_box.sh sets the paths, the micro-batch and the memory cap per GPU).
+# Validation rose in the 17 Oct runs at theta 16 and 64 (under investigation): not a settled recipe.
+#   python -m ttf.train --recipe continue-27b --init-hf $W/qw27 --kd-cache $W/kd4s --resume --out-dir $W/run27
+mode = "ttf"
+convert = "gptq"
+data = "data/mix4s_train.bin"
+val = "data/wikiq8_val.bin"
+data-dtype = "u32"
+seq-len = 2048
+batch-size = 4
+accum = 4
+kd-cache-start = 1350
+kd-weight = 0.5
+kd-cache-mode = "rest"
+steps = 2650
+warmup = 300
+lr = 5e-4
+min-lr = 5e-5
+lr-rewarm = "1350:50:0.5"
+eval-interval = 100
+eval-iters = 4
+save-secs = 3600
+qk-temp = false
+ttf-rank = 256
+ttf-theta = 64
+ttf-start = 400
+ttf-vdiag = 50
+ttf-store = "fp12s"
+tail = "lean"
+loss-chunk = 512
+dw-sketch = 128

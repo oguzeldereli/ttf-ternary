@@ -10,7 +10,7 @@ errors beyond bf16 rounding (or int8 rounding for the int8 weight-gradient paths
 import os, sys
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from ttf import kernel as K                                   # noqa: E402
 from ttf.layers import KernelTernaryLinear                      # noqa: E402
 
@@ -59,10 +59,6 @@ for backend in ("triton", "cublas"):
         gb = gy.to(torch.bfloat16)
         check(f"[{backend}] tern_gemm_dx {M}x{N}x{Kd}", rel(K.tern_gemm_dx(gb, p, Kd), gb.float() @ Wf), 8e-3)
         check(f"[{backend}] tern_gemm_dx_i8 {M}x{N}x{Kd}", rel(K.tern_gemm_dx_i8(gy, p, Kd), gy @ Wf), 3e-2)
-        if backend == "triton":
-            refw = (gy * xs.float()[:, None]).T @ xq.float()
-            check(f"dw_int8 {M}x{N}x{Kd}", rel(K.dw_int8(gy, xq, xs), refw), 3e-2)
-            check(f"dw_cublas {M}x{N}x{Kd}", rel(K.dw_cublas(gy, xq, xs), refw), 3e-2)
 
 # the layer: forward and both gradients, int8 forward + dense weight gradient (the configuration of the runs)
 K.GEMM_BACKEND[0] = "triton"

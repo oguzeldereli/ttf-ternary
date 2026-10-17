@@ -6,7 +6,7 @@ and how many moves agree, for sketch sizes K_s; as K_s grows the factored update
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import torch
-import ttf.train as T
+import ttf.update as T
 from ttf.layers import KernelTernaryLinear
 from ttf.kernel import unpack_rows
 
@@ -22,7 +22,7 @@ def cfg(M, ks):
 
 def run(M, ks, steps=6, seed=0):
     torch.manual_seed(seed)
-    l = KernelTernaryLinear(K, N, int8=True, dw_mode="dense").to(dev); l.track = False; l._ts_idx = 3; l._ts_host = False
+    l = KernelTernaryLinear(K, N, int8=True).to(dev); l.track = False; l._ts_idx = 3; l._ts_host = False
     global W0
     W0 = unpack_rows(l.wpacked, K).clone()
     state = {}

@@ -6,7 +6,7 @@ W), lam = 0 (the natural, crowded solution) to large (spread). Each is then conv
 trits with row and column scales (W ~ a_r c_j T, alternating least squares on the grid), and recovered for a short
 straight-through fine-tune from that start. If crowding causes the rounding loss, the spread fp models lose less at the
 same fp loss. Ternary trained from scratch (same steps as fp + recovery) is the reference.
-  python scripts/analysis/toy_causal.py --out docs/analysis/toy_causal.json
+  python scripts/analysis/toy_causal.py --out docs/research/analysis/toy_causal.json
 """
 import argparse, json
 import numpy as np

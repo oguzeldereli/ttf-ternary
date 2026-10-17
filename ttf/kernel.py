@@ -578,7 +578,7 @@ FIRE_PREC = ["tf32x3"]     # ttf_fire's A: "tf32x3" (tensor cores, ~fp32 accurac
 
 
 def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, theta: float):
-    """--ts firing in one pass: A = U V^T (fp32 accumulation), every legal move (|A| >= theta, the trit stays in
+    """TTF firing in one pass: A = U V^T (fp32 accumulation), every legal move (|A| >= theta, the trit stays in
     {-1, 0, 1}) applied to the packed trits in place; returns D V (D the moves, {-1, 0, 1}; from the moves alone, a
     sparse product) for the spend, and the number of moves (a device tensor). The fp32 [N, K] accumulator and the
     unpacked trits are never formed (D is int8). Differences from the unfused path: A's sums in another order and

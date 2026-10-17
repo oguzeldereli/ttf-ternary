@@ -1,4 +1,4 @@
-"""--tern_emb tied|untied: a ternary token embedding (and output head), so only scales and norm gains stay float.
+"""--tern-emb tied|untied: a ternary token embedding (and output head), so only scales and norm gains stay float.
 
 The embedding matrix E [vocab, dim] is W_ij = s0 * r_i * c_j * T_ij: trits T (packed 5 per byte, like the ternary
 linear layers), learned per-row and per-column scales r, c (fp32, init 1) and a fixed base scale s0 that gives the float
@@ -80,7 +80,7 @@ class TernEmbed(nn.Module):
 
 
 class TernEmbedWide(nn.Module):
-    """--tern_emb tied_wide:M: a ternary embedding with the bytes of a float one. Packed trits cost 1.6 bits against 32
+    """--tern-emb tied_wide:M: a ternary embedding with the bytes of a float one. Packed trits cost 1.6 bits against 32
     for fp32, so a table of width M * dim (M = 20 matches fp32) holds the same memory; a ternary projection [dim, M dim]
     maps it to the model width. The effective embedding E = table @ proj^T [vocab, dim] is formed once per forward
     (dense, transient, bf16), used for the lookup and as the tied output head; both factors are TernEmbed matrices that
@@ -124,7 +124,7 @@ def enable_tern_emb(model, kind: str, mode: str):
     dev = model.tok_emb.weight.device
     if kind.startswith("tied_wide"):                 # tied_wide[:M], M = 20 by default (the bytes of an fp32 table)
         mult = int(kind.split(":")[1]) if ":" in kind else 20
-        assert model.lm_head is None, "--tern_emb tied_wide needs a tied model"
+        assert model.lm_head is None, "--tern-emb tied_wide needs a tied model"
         model.tok_emb = TernEmbedWide(V, d, mult, mode).to(dev)
         lays = tern_emb_layers(model)
         for i, m in enumerate(lays):
@@ -134,7 +134,7 @@ def enable_tern_emb(model, kind: str, mode: str):
     if kind == "untied":
         model.lm_head = TernEmbed(V, d, mode).to(dev)
     elif kind != "tied":
-        raise SystemExit(f"--tern_emb {kind}: tied | untied")
+        raise SystemExit(f"--tern-emb {kind}: tied | untied")
     lays = tern_emb_layers(model)
     for i, m in enumerate(lays):
         m._ts_idx = 10_000 + i

@@ -1,4 +1,4 @@
-"""Qwen3.5 / Qwen3.8 (model_type qwen3_5: Gated DeltaNet + gated full attention) with ternary linears, for --init_hf.
+"""Qwen3.5 / Qwen3.8 (model_type qwen3_5: Gated DeltaNet + gated full attention) with ternary linears, for --init-hf.
 
 The Hugging Face implementation (transformers >= 5.8, fla kernels for the delta rule) runs the model; every large
 linear of the text decoder becomes a KernelTernaryLinear, so TTF's update, the row / column scales and the low-rank
@@ -18,7 +18,7 @@ from torch.utils.checkpoint import checkpoint
 
 # linears kept in float (tiny, or gates whose rounding would be all error)
 _KEEP_FLOAT = ("in_proj_a", "in_proj_b")
-FUSED_NORM = [False]     # --fused_norm: Qwen3_5RMSNorm through kernel.rms_norm_qwen (one kernel forward, one backward)
+FUSED_NORM = [False]     # --fused-norm: Qwen3_5RMSNorm through kernel.rms_norm_qwen (one kernel forward, one backward)
 
 
 def enable_fused_norm():
@@ -108,7 +108,7 @@ class QwenTern(nn.Module):
         self.kd_logp = None
         self.kd_w = 1.0
         self.kd_mode = "renorm"
-        self.kd_topk = None      # --kd_cache: (ids [T, k] long, log-probs [T, k]) of the teacher's top k per token
+        self.kd_topk = None      # --kd-cache: (ids [T, k] long, log-probs [T, k]) of the teacher's top k per token
         self.pp = None           # --pipe: {"rank", "n", "lo", "hi"} (see _stage)
 
     def _head_w(self):
@@ -123,7 +123,7 @@ class QwenTern(nn.Module):
             self._skip_set = False
         elif not ckpt and m.gradient_checkpointing:
             self.hf.gradient_checkpointing_disable()
-        if ckpt and self.ckpt_skip and not getattr(self, "_skip_set", False):   # --ckpt_skip N: the last N decoder
+        if ckpt and self.ckpt_skip and not getattr(self, "_skip_set", False):   # --ckpt-skip N: the last N decoder
             n_ = len(m.layers) if self.pp is None else self.pp["hi"]             # layers (--pipe: of each stage) keep
             for i_, l_ in enumerate(m.layers):                                   # their activations (no recompute),
                 l_.gradient_checkpointing = i_ < n_ - self.ckpt_skip             # memory permitting
@@ -296,7 +296,7 @@ def _pp_bcast(t, src):
 def pp_split(n_layers, n_stages, spec=""):
     """layer ranges per stage: spec 'a,b,c,...' (layer counts, sum n_layers) or an even split (earlier stages one more)"""
     c = [int(v) for v in spec.split(",")] if spec else [n_layers // n_stages + (i < n_layers % n_stages) for i in range(n_stages)]
-    assert len(c) == n_stages and sum(c) == n_layers, f"--pipe_split {spec}: {n_stages} counts summing to {n_layers}"
+    assert len(c) == n_stages and sum(c) == n_layers, f"--pipe-split {spec}: {n_stages} counts summing to {n_layers}"
     lo = [sum(c[:i]) for i in range(n_stages)]
     return [(lo[i], lo[i] + c[i]) for i in range(n_stages)]
 
@@ -399,21 +399,21 @@ def load_qwen(m, path, swapped, method="als", rc=True, hess=None, log=print):
         if rc and lin.row_scale is not None:
             lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
         else:
-            raise SystemExit("Qwen conversion needs --rc_scale")
-        if GPTQ_OPTS["mag_svd"] and hess is not None and method in ("gptq", "gptqc"):   # --init_mag_svd
+            raise SystemExit("Qwen conversion needs --rc-scale")
+        if GPTQ_OPTS["mag_svd"] and hess is not None and method in ("gptq", "gptqc"):   # --adapter-init svd
             Hc = hess[name].to(W.device)
             if method == "gptqc":
                 mu = hess["mu:" + name].to(W.device); Hc = Hc - torch.outer(mu, mu)
             kept.append(mag_svd_fit(lin, W, T, a, c, beta, Hc, GPTQ_OPTS["mag_svd"])); del Hc
         del W
     if errs:
-        log(f"--init_hf {path}: {method}, {len(errs)} ternary linears, relative weight error mean "
+        log(f"--init-hf {path}: {method}, {len(errs)} ternary linears, relative weight error mean "
             f"{sum(errs) / len(errs):.4f} (max {max(errs):.4f})")
     if oerrs:
         e0, e1 = zip(*oerrs)
         log(f"  output-space error mean {sum(e1) / len(e1):.4f} (ALS rounding {sum(e0) / len(e0):.4f})")
     if kept:
-        log(f"  --init_mag_svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
+        log(f"  --adapter-init svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
             f"rounding error (min {min(kept):.3f}, max {max(kept):.3f}) over {len(kept)} linears")
 
 
@@ -582,7 +582,7 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
             lin.wpacked.copy_(pack_rows(T))
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
             lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
-            if GPTQ_OPTS["mag_svd"] and method in ("gptq", "gptqc"):          # --init_mag_svd
+            if GPTQ_OPTS["mag_svd"] and method in ("gptq", "gptqc"):          # --adapter-init svd
                 kept.append(mag_svd_fit(lin, W, T, a, c, beta, Hl - torch.outer(mu, mu) if method == "gptqc" else Hl,
                                         GPTQ_OPTS["mag_svd"]))
             setattr(parent, n.rsplit(".", 1)[1], lin)
@@ -597,7 +597,7 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
                 f"(ALS {sum(e0) / len(e0):.4f}), peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
     e0, e1 = zip(*oerrs)
     if kept:
-        log(f"--init_mag_svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
+        log(f"--adapter-init svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
             f"rounding error (min {min(kept):.3f}, max {max(kept):.3f}) over {len(kept)} linears")
-    log(f"--init_hf {path}: {method} (sequential, streaming), {len(errs)} ternary linears, weight error "
+    log(f"--init-hf {path}: {method} (sequential, streaming), {len(errs)} ternary linears, weight error "
         f"{sum(errs) / len(errs):.4f}, output-space error {sum(e1) / len(e1):.4f} (ALS {sum(e0) / len(e0):.4f})")
