@@ -310,23 +310,16 @@ def ternarize_gptq(W, H, a, c, block=128, damp=0.01, act_order=True, refits=2, z
 
 
 @torch.no_grad()
-def _mag_svd_init(lin, W, T, a, c, beta, hess, i, name, Q, method, r, dev):
+def mag_svd_fit(lin, W, T, a, c, beta, Hc, r):
     """--init_mag_svd R: the rounding error, moved into the layer's float adapter instead of dropped. The layer computes
     y = (a / beta) (beta T + A B^T) x' with x' = c o (x - mu), so the adapter that restores W exactly would be
     G = diag(beta / a) (W - a c T) diag(1 / c); of G, the rank-R part that matters most for the output is kept: the
-    best rank-R fit in the input covariance's norm, |(G - A B^T) L|_F with L L^T = H' (H' the covariance of x'),
-    = truncated SVD of G L, then B^T = V_R^T L^-1. Stored on the layer for enable_lowrank_mag ('add', same R).
-    Returns the share of the output error |G L|_F^2 it removes."""
-    Hl = hess[(i, name)].to(dev).double()
-    if Q is not None:
-        Hl = Q.double() @ Hl @ Q.double().T
-    if method == "gptqc":
-        mu = hess[("mu", i, name)].to(dev).double()
-        if Q is not None:
-            mu = Q.double() @ mu
-        Hl = Hl - torch.outer(mu, mu)
+    best rank-R fit in the input covariance's norm, |(G - A B^T) L|_F with L L^T = H' (H' the covariance of x'; Hc the
+    covariance of the layer's input as GPTQ rounded against: centred for gptqc), = truncated SVD of G L, then
+    B^T = V_R^T L^-1. Stored on the layer for enable_lowrank_mag ('add', same R). Returns the share of the output
+    error |G L|_F^2 it removes."""
     cd = c.double().clamp_min(1e-12)
-    Hp = cd[:, None] * Hl * cd[None, :]
+    Hp = cd[:, None] * Hc.double() * cd[None, :]
     Hp.diagonal().add_(1e-4 * Hp.diagonal().mean() + 1e-30)
     L = torch.linalg.cholesky(Hp)
     G = (beta / a.double().clamp_min(1e-12))[:, None] * (W.double() - a.double()[:, None] * c.double()[None, :] * T.double()) / cd[None, :]
@@ -335,6 +328,19 @@ def _mag_svd_init(lin, W, T, a, c, beta, hess, i, name, Q, method, r, dev):
     B = torch.linalg.solve_triangular(L.T, Vh[:r].T, upper=True)          # L^-T V_R: (x' @ B) = V_R^T L^-1 x'
     lin._mag_init = (A.float().contiguous(), B.float().contiguous())
     return float((S[:r] ** 2).sum() / (S ** 2).sum().clamp_min(1e-300))
+
+
+def _mag_svd_init(lin, W, T, a, c, beta, hess, i, name, Q, method, r, dev):
+    """mag_svd_fit with the layer's calibration covariance from calib_hessians (rotated / centred as GPTQ used it)"""
+    Hl = hess[(i, name)].to(dev).double()
+    if Q is not None:
+        Hl = Q.double() @ Hl @ Q.double().T
+    if method == "gptqc":
+        mu = hess[("mu", i, name)].to(dev).double()
+        if Q is not None:
+            mu = Q.double() @ mu
+        Hl = Hl - torch.outer(mu, mu)
+    return mag_svd_fit(lin, W, T, a, c, beta, Hl, r)
 
 
 @torch.no_grad()

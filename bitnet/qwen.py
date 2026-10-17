@@ -323,8 +323,9 @@ def build_qwen(path, mode, make_linear=None, grad_checkpoint=True, device="cuda"
 def load_qwen(m, path, swapped, method="als", rc=True, hess=None, log=print):
     """copy the float tensors; convert each swapped linear's weight to trits + row / column scales (hf_init.ternarize /
     ternarize_gptq); embedding and head are frozen"""
-    from .hf_init import ternarize, ternarize_gptq, _rel_err, _out_err
+    from .hf_init import ternarize, ternarize_gptq, _rel_err, _out_err, GPTQ_OPTS, mag_svd_fit
     from .kernel import pack_rows, trit_beta
+    kept = []
     sd = _text_state(path)
     hf = m.hf
     own = dict(hf.named_parameters())
@@ -361,6 +362,11 @@ def load_qwen(m, path, swapped, method="als", rc=True, hess=None, log=print):
             lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
         else:
             raise SystemExit("Qwen conversion needs --rc_scale")
+        if GPTQ_OPTS["mag_svd"] and hess is not None and method in ("gptq", "gptqc"):   # --init_mag_svd
+            Hc = hess[name].to(W.device)
+            if method == "gptqc":
+                mu = hess["mu:" + name].to(W.device); Hc = Hc - torch.outer(mu, mu)
+            kept.append(mag_svd_fit(lin, W, T, a, c, beta, Hc, GPTQ_OPTS["mag_svd"])); del Hc
         del W
     if errs:
         log(f"--init_hf {path}: {method}, {len(errs)} ternary linears, relative weight error mean "
@@ -368,6 +374,9 @@ def load_qwen(m, path, swapped, method="als", rc=True, hess=None, log=print):
     if oerrs:
         e0, e1 = zip(*oerrs)
         log(f"  output-space error mean {sum(e1) / len(e1):.4f} (ALS rounding {sum(e0) / len(e0):.4f})")
+    if kept:
+        log(f"  --init_mag_svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
+            f"rounding error (min {min(kept):.3f}, max {max(kept):.3f}) over {len(kept)} linears")
 
 
 @torch.no_grad()
@@ -479,8 +488,9 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
     ternary layers, and the activations go on through the converted layer. Peak: the model's ternary form + one layer
     in full precision + the calibration activations (n_seq x seq x d bf16)."""
     import numpy as np
-    from .hf_init import ternarize, ternarize_gptq, _rel_err, _out_err
+    from .hf_init import ternarize, ternarize_gptq, _rel_err, _out_err, GPTQ_OPTS, mag_svd_fit
     from .kernel import pack_rows, trit_beta
+    kept = []
     files = _safetensor_index(path)
     hf = m.hf
     sw = {k + ".weight" for k in swapped}
@@ -534,6 +544,9 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
             lin.wpacked.copy_(pack_rows(T))
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
             lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
+            if GPTQ_OPTS["mag_svd"] and method in ("gptq", "gptqc"):          # --init_mag_svd
+                kept.append(mag_svd_fit(lin, W, T, a, c, beta, Hl - torch.outer(mu, mu) if method == "gptqc" else Hl,
+                                        GPTQ_OPTS["mag_svd"]))
             setattr(parent, n.rsplit(".", 1)[1], lin)
             del W, Hl, T
         del fp, Hs, Ss
@@ -545,5 +558,8 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
             log(f"  layer {li}: {len(mine)} linears, output-space error {sum(e1) / len(e1):.4f} "
                 f"(ALS {sum(e0) / len(e0):.4f}), peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
     e0, e1 = zip(*oerrs)
+    if kept:
+        log(f"--init_mag_svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
+            f"rounding error (min {min(kept):.3f}, max {max(kept):.3f}) over {len(kept)} linears")
     log(f"--init_hf {path}: {method} (sequential, streaming), {len(errs)} ternary linears, weight error "
         f"{sum(errs) / len(errs):.4f}, output-space error {sum(e1) / len(e1):.4f} (ALS {sum(e0) / len(e0):.4f})")
