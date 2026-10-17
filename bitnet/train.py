@@ -64,14 +64,15 @@ def _kd_window(args, idx):
     if _KD_SHARD.get("sh") != sh:
         waited = 0
         while not os.path.exists(fn):
-            if os.path.exists(os.path.join(args.kd_cache, "done")):     # the cache ran out: wrap around
-                n = len(glob.glob(os.path.join(args.kd_cache, "kd_*.npz")))
-                sh = sh % n; fn = os.path.join(args.kd_cache, f"kd_{sh:05d}.npz"); break
+            if os.path.exists(os.path.join(args.kd_cache, "done")):     # the cache ran out (or has a gap: a shard
+                have = sorted(glob.glob(os.path.join(args.kd_cache, "kd_*.npz")))   # claimed but never written):
+                fn = have[sh % len(have)]; break                               # the existing shards, in order
             if waited % 600 == 0:
                 print(f"--kd_cache: waiting for {fn}", flush=True)
             time.sleep(30); waited += 30
         z = np.load(fn)
         _KD_SHARD.update(sh=sh, starts=z["starts"], ids=z["ids"], lp=z["lp"])
+    j = j % len(_KD_SHARD["starts"])                                    # a shorter (last) shard: wrap within it
     return int(_KD_SHARD["starts"][j]), _KD_SHARD["ids"][j], _KD_SHARD["lp"][j]
 
 
