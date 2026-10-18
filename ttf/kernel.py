@@ -10,6 +10,7 @@ weight transiently for one layer at a time (grad_x and the flip), which is
 already memory-bounded.
 """
 from __future__ import annotations
+import os
 import torch
 import triton
 import triton.language as tl
@@ -121,12 +122,20 @@ def trit_beta(wpacked: torch.Tensor, K: int, chunk: int = 4096) -> torch.Tensor:
     absent here): keeps rms(x @ W^T * beta) ~= rms(x). Padding trits (packed as
     -1 past K) are excluded. Returns a 0-dim float32 CUDA tensor (no host sync).
     """
+    return beta_from_nnz(trit_nnz(wpacked, K, chunk), wpacked.shape[0])
+
+
+def trit_nnz(wpacked: torch.Tensor, K: int, chunk: int = 4096) -> torch.Tensor:
+    """the number of nonzero trits (padding past K excluded), a 0-dim int64 device tensor"""
     N, K5 = wpacked.shape
     lut = _nz_lut(wpacked.device)
     nnz = torch.zeros((), dtype=torch.int64, device=wpacked.device)
     for r in range(0, N, chunk):
         nnz += lut[wpacked[r:r + chunk].long()].sum()
-    nnz -= N * (K5 * 5 - K)
+    return nnz - N * (K5 * 5 - K)
+
+
+def beta_from_nnz(nnz: torch.Tensor, N: int) -> torch.Tensor:
     return (nnz.float() / N).clamp_min(1.0).rsqrt()           # K*rho = nnz/N
 
 
@@ -436,6 +445,84 @@ def tern_gemm_dx_i8(gy: torch.Tensor, wpacked: torch.Tensor, K: int) -> torch.Te
     return gx
 
 
+# --dx int8x2: the input gradient on the int8 tensor cores without losing precision. gy (bf16) is split per row into
+# two int8 slices, q1 = round(gy / s) with s = max|gy_row| / 127 and q2 = round((gy - s q1) / (s / 254)), so that
+# gy = s (q1 + q2 / 254) to about 2^-15 of the row's largest entry; two exact int8 x trit GEMMs (int32) and one epilogue
+# give gx in fp32 before its bf16 rounding (relative error 4-7e-4 against 1.5e-3 for the bf16 GEMM, whose output is
+# rounded to bf16). The trits are unpacked straight into the [K, N] layout the int8 GEMM wants.
+@triton.jit
+def _slice2_kernel(g_ptr, q1_ptr, q2_ptr, s_ptr, N, sgm, sqm, BLOCK: tl.constexpr):
+    m = tl.program_id(0)
+    amax = tl.zeros((BLOCK,), tl.float32)
+    for n0 in range(0, N, BLOCK):
+        offs = n0 + tl.arange(0, BLOCK)
+        g = tl.load(g_ptr + m * sgm + offs, mask=offs < N, other=0.0).to(tl.float32)
+        amax = tl.maximum(amax, tl.abs(g))
+    s = tl.maximum(tl.max(amax, 0), 1e-30) / 127.0
+    for n0 in range(0, N, BLOCK):
+        offs = n0 + tl.arange(0, BLOCK)
+        g = tl.load(g_ptr + m * sgm + offs, mask=offs < N, other=0.0).to(tl.float32)
+        q1 = tl.extra.cuda.libdevice.rint(g / s)
+        q2 = tl.extra.cuda.libdevice.rint((g - q1 * s) / (s / 254.0))
+        tl.store(q1_ptr + m * sqm + offs, tl.minimum(tl.maximum(q1, -127.0), 127.0).to(tl.int8), mask=offs < N)
+        tl.store(q2_ptr + m * sqm + offs, tl.minimum(tl.maximum(q2, -127.0), 127.0).to(tl.int8), mask=offs < N)
+    tl.store(s_ptr + m, s)
+
+
+@triton.jit
+def _unpack_t_kernel(p_ptr, o_ptr, N, K, K5, spn, sok, BN: tl.constexpr, BK5: tl.constexpr):
+    """packed rows [N, K5] -> int8 trits transposed, [K, N] (row k holds column k of the weight)"""
+    offn = tl.program_id(0) * BN + tl.arange(0, BN)
+    offk5 = tl.program_id(1) * BK5 + tl.arange(0, BK5)
+    b = tl.load(p_ptr + offn[:, None] * spn + offk5[None, :], mask=(offn[:, None] < N) & (offk5[None, :] < K5),
+                other=0).to(tl.int32)
+    for j in tl.static_range(5):
+        t = ((b // (3 ** j)) % 3 - 1).to(tl.int8)
+        k = offk5 * 5 + j
+        tl.store(o_ptr + k[None, :] * sok + offn[:, None], t, mask=(offn[:, None] < N) & (k[None, :] < K))
+
+
+@triton.jit
+def _dx2_epi_kernel(y1_ptr, y2_ptr, s_ptr, o_ptr, M, K, BM: tl.constexpr, BK: tl.constexpr):
+    offm = tl.program_id(0) * BM + tl.arange(0, BM)
+    offk = tl.program_id(1) * BK + tl.arange(0, BK)
+    mk = (offm[:, None] < M) & (offk[None, :] < K)
+    idx = offm[:, None] * K + offk[None, :]
+    y1 = tl.load(y1_ptr + idx, mask=mk, other=0).to(tl.float32)
+    y2 = tl.load(y2_ptr + idx, mask=mk, other=0).to(tl.float32)
+    s = tl.load(s_ptr + offm, mask=offm < M, other=0.0)
+    tl.store(o_ptr + idx, ((y1 + y2 * (1.0 / 254.0)) * s[:, None]).to(tl.bfloat16), mask=mk)
+
+
+DX_I8X2_MIN_N = [int(os.environ.get("TTF_DX_I8X2_MIN_N", 4096))]   # below this summed width the overheads win: bf16
+
+
+def unpack_t_i8(wpacked: torch.Tensor, K: int) -> torch.Tensor:
+    """uint8 [N, K5] -> int8 {-1, 0, 1} [K, N], contiguous (the transposed trits)"""
+    N, K5 = wpacked.shape
+    out = torch.empty(K, N, dtype=torch.int8, device=wpacked.device)
+    grid = (triton.cdiv(N, 64), triton.cdiv(K5, 32))
+    _unpack_t_kernel[grid](wpacked, out, N, K, K5, wpacked.stride(0), out.stride(0), BN=64, BK5=32)
+    return out
+
+
+def tern_gemm_dx_i8x2(gy: torch.Tensor, wpacked: torch.Tensor, K: int) -> torch.Tensor:
+    """grad_x = gy @ decode(wpacked), gy [M, N] -> bf16 [M, K], on the int8 tensor cores with gy in two int8 slices
+    (--dx int8x2); shapes the int8 GEMM cannot take fall back to the bf16 path"""
+    M, N = gy.shape
+    if not (gy.is_cuda and M > 16 and N % 8 == 0 and K % 8 == 0 and N >= DX_I8X2_MIN_N[0]):
+        return tern_gemm_dx(gy, wpacked, K)
+    g = gy.contiguous()
+    q1 = torch.empty(M, N, dtype=torch.int8, device=g.device); q2 = torch.empty_like(q1)
+    sc = torch.empty(M, dtype=torch.float32, device=g.device)
+    _slice2_kernel[(M,)](g, q1, q2, sc, N, g.stride(0), q1.stride(0), BLOCK=1024)
+    wt = unpack_t_i8(wpacked, K).t()                     # [N, K], column-major: the layout torch._int_mm wants
+    y1 = torch._int_mm(q1, wt); y2 = torch._int_mm(q2, wt)
+    out = torch.empty(M, K, dtype=torch.bfloat16, device=g.device)
+    _dx2_epi_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](y1, y2, sc, out, M, K, BM=32, BK=128)
+    return out
+
+
 @triton.jit
 def _ttf_u_kernel(g_ptr, r_ptr, c_ptr, m_ptr, u_ptr, N, K, sgn, sun, lr, eps, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
@@ -599,7 +686,12 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     for c0 in range(0, nz.shape[0], 1 << 16):                          # in chunks: moves x r floats at a time
         z_ = nz[c0:c0 + (1 << 16)]
         dU.index_add_(0, z_[:, 0], D[z_[:, 0], z_[:, 1]].float()[:, None] * V[z_[:, 1]])
-    return dU, torch.tensor(nz.shape[0], device=U.device)
+    # the change of the nonzero count, from the moved entries alone (a move is one level: it ends on a nonzero trit
+    # (+1) or on zero (-1)), so the layer's beta follows exactly without a scan of all the trits
+    byte = packed[nz[:, 0], torch.div(nz[:, 1], 5, rounding_mode="floor")].long()
+    new_t = torch.div(byte, torch.pow(3, nz[:, 1] % 5), rounding_mode="floor") % 3 - 1
+    dnnz = 2 * (new_t != 0).sum() - nz.shape[0]
+    return dU, torch.tensor(nz.shape[0], device=U.device), dnnz
 
 
 @triton.jit

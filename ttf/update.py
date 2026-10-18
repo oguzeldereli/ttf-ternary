@@ -541,8 +541,8 @@ def _ts_layer_factored(l, fg, state, c):
     before = l.wpacked.clone() if l.track else None
     if FIRE_FUSED[0] and dev.type == "cuda":   # --fire fused: A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
-        DV, nf = ttf_fire(U, V, l.wpacked, l.K, theta)
-        l._invalidate()        # the kernel writes the trits in place (no version bump): beta and --w-cache recompute
+        DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta)
+        l._after_fire(dnnz)    # the kernel writes the trits in place (no version bump): beta follows the moves, --w-cache recomputes
         U = U - c["spend"] * (theta * DV); del DV
     else:
         A = U @ V.T

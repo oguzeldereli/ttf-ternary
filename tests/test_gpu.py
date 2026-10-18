@@ -80,7 +80,7 @@ def test_codec_fp12():
 
 
 def test_fire_fused():
-    from ttf.kernel import ttf_fire, pack_rows, unpack_rows
+    from ttf.kernel import ttf_fire, pack_rows, unpack_rows, trit_nnz
     for N, K, r in ((300, 203, 40), (1024, 777, 64)):
         Uu = torch.randn(N, r, device=dev); V = torch.linalg.qr(torch.randn(K, r, device=dev))[0]
         A = Uu @ V.T
@@ -88,10 +88,30 @@ def test_fire_fused():
         w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8); p = pack_rows(w)
         d = A.sign(); fire = (A.abs() >= theta) & ((w.float() + d).abs() <= 1)
         D = torch.where(fire, d, torch.zeros_like(d)); p_ref = pack_rows(w + D.to(torch.int8))
-        p2 = p.clone(); dU, nf = ttf_fire(Uu, V, p2, K, theta)
+        p2 = p.clone(); dU, nf, dnnz = ttf_fire(Uu, V, p2, K, theta)
+        assert int(trit_nnz(p2, K)) == int(trit_nnz(p, K)) + int(dnnz), (N, K, r)   # beta's count follows the moves
         near = int(((A.abs() - theta).abs() < 1e-5 * theta).sum())
         assert int((unpack_rows(p2, K) != unpack_rows(p_ref, K)).sum()) <= near
         assert float((dU - D @ V).norm() / (D @ V).norm().clamp_min(1e-30)) < 1e-5
+
+
+def test_dx_int8x2():
+    """--dx int8x2: gy in two int8 slices on the int8 tensor cores is at least as accurate as the bf16 GEMM (whose output
+    is rounded to bf16), deterministic, and shapes the int8 GEMM cannot take fall back to the bf16 path"""
+    import ttf.kernel as Kn
+    old = Kn.DX_I8X2_MIN_N[0]; Kn.DX_I8X2_MIN_N[0] = 0
+    try:
+        for M, N, K in ((512, 1024, 768), (300, 768, 2048), (40, 1000, 512)):
+            w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8); p = Kn.pack_rows(w)
+            assert torch.equal(Kn.unpack_t_i8(p, K), w.t().contiguous())
+            g = (torch.randn(M, N, device=dev) * torch.exp(2 * torch.randn(M, N, device=dev))).to(torch.bfloat16)
+            ref = g.double() @ w.double()
+            a, b = Kn.tern_gemm_dx(g, p, K), Kn.tern_gemm_dx_i8x2(g, p, K)
+            ea = float((a.double() - ref).norm() / ref.norm()); eb = float((b.double() - ref).norm() / ref.norm())
+            assert eb <= 1.25 * ea + 1e-6, (M, N, K, ea, eb)
+            assert torch.equal(b, Kn.tern_gemm_dx_i8x2(g, p, K))
+    finally:
+        Kn.DX_I8X2_MIN_N[0] = old
 
 
 def test_fused_scales():

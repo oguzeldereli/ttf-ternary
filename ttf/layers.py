@@ -15,8 +15,9 @@ from .config import ModelConfig
 from .model import BitTransformer
 
 
-from .kernel import (pack_rows, unpack_rows, unpack_fast, tern_gemm, tern_gemm_dx, trit_beta, trit_diff, popcount,
-                     tern_gemm_i8, tern_gemm_dx_i8, act_quant_i8, act_quant_i8_fast)
+from .kernel import (pack_rows, unpack_rows, unpack_fast, tern_gemm, tern_gemm_dx, trit_beta, trit_nnz, beta_from_nnz,
+                     trit_diff, popcount,
+                     tern_gemm_i8, tern_gemm_dx_i8, tern_gemm_dx_i8x2, act_quant_i8, act_quant_i8_fast)
 
 
 def _act_quant_plain(x, bits=8):
@@ -70,6 +71,7 @@ class _AddRowFn(torch.autograd.Function):
 
 
 FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
+DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices
 DW_FP32 = [False]            # --dw-precision fp32: dense weight gradients in fp32 from the GEMM (no bf16 rounding)
 WCACHE = {"mode": "off"}     # --w-cache int8: each layer's unpacked int8 trits kept between updates (1 byte / weight)
 
@@ -176,6 +178,8 @@ class _KernelTernFn(torch.autograd.Function):
 
 
 def _grad_x(layer, gyf, wpacked):
+    if DX_MODE[0] == "int8x2":
+        return tern_gemm_dx_i8x2(gyf, wpacked, layer.K)
     if layer.int8 and layer.int8_dx:
         return tern_gemm_dx_i8(gyf, wpacked, layer.K)
     return tern_gemm_dx(gyf, wpacked, layer.K, w8=layer._cached_w8(wpacked))
@@ -222,8 +226,17 @@ class KernelTernaryLinear(nn.Module):
         # beta is computed once per change of the trits (an update's copy_ bumps wpacked's version), not per forward
         k = self._wkey(wpacked)
         if getattr(self, "_beta_key", None) != k:
-            self._beta_val = trit_beta(wpacked, self.K); self._beta_key = k
+            self._nnz = trit_nnz(wpacked, self.K); self._beta_val = beta_from_nnz(self._nnz, self.N); self._beta_key = k
         return self._beta_val
+
+    def _after_fire(self, dnnz):
+        """after the fused firing (trits written in place, no version bump): the nonzero count moves by dnnz, so a
+        valid cached beta is updated exactly instead of recomputed from all the trits; the --w-cache copy recomputes"""
+        if getattr(self, "_beta_key", None) is not None and self._beta_key == self._wkey(self.wpacked):
+            self._nnz = self._nnz + dnnz; self._beta_val = beta_from_nnz(self._nnz, self.N)
+        else:
+            self._beta_key = None
+        self._w8_key = None; self._w8 = None
 
     @torch.no_grad()
     def _cached_w8(self, wpacked):

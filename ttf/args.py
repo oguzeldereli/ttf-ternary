@@ -111,7 +111,9 @@ def build_parser():
                    help="ternary GEMMs: int8 tensor cores (torch._int_mm), our Triton kernels, or cuBLAS bf16")
     g.add_argument("--fwd", default="int8", choices=["int8", "bf16"], help="int8: exact int32 forward on 8-bit "
                    "activations")
-    g.add_argument("--dx", default="bf16", choices=["bf16", "int8"], help="the input gradient's GEMM")
+    g.add_argument("--dx", default="bf16", choices=["bf16", "int8", "int8x2"], help="the input gradient's GEMM "
+                   "(int8x2: gy in two int8 slices on the int8 tensor cores, more accurate than bf16; int8: one slice, "
+                   "diverges)")
     g.add_argument("--fused-scales", action=ON, default=True, help="the scales' and adapter's elementwise work fused")
     g.add_argument("--w-cache", default="off", choices=["off", "int8"],
                    help="int8: each layer's unpacked trits kept between updates (1 byte per weight more; the same "

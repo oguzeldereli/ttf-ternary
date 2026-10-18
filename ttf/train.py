@@ -77,6 +77,8 @@ def main():
     mag = f"add:{args.adapter_rank}" if args.adapter_rank else ""     # the adapter ("": none)
     store = args.ttf_store if args.ttf_store != "fp32" else ""      # the accumulator's codec ("": fp32)
     i8, i8dx = args.fwd == "int8", args.dx == "int8"
+    from .layers import DX_MODE as _DXM
+    _DXM[0] = args.dx
     if os.environ.get("TERN_SYNCDBG"):   # report every host sync (location in the warning)
         torch.cuda.set_sync_debug_mode(1)
     if args.tf32:

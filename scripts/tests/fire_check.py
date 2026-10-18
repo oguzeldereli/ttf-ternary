@@ -23,7 +23,7 @@ for N, K, r in ((300, 203, 40), (5120, 17408, 256), (17408, 5120, 256), (17408, 
     torch.cuda.synchronize(); t_ref = time.time() - t0
     p2 = p.clone(); ttf_fire(U, V, p2, K, theta); torch.cuda.synchronize()     # warm-up (compile)
     p2 = p.clone(); torch.cuda.synchronize(); t0 = time.time()
-    dU, nf = ttf_fire(U, V, p2, K, theta); torch.cuda.synchronize(); t_f = time.time() - t0
+    dU, nf, _ = ttf_fire(U, V, p2, K, theta); torch.cuda.synchronize(); t_f = time.time() - t0
     near = ((A.abs() - theta).abs() < 1e-5 * theta).sum()
     nd = int((unpack_rows(p2, K) != unpack_rows(p_ref, K)).sum())
     pad_ok = bool((p2 // 1 == p2).all())
