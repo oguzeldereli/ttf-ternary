@@ -230,6 +230,19 @@ def test_train_resume_round_trip(tmp_path):
     assert [r["type"] for r in recs].count("run") == 2 and recs[-1].get("status") == "finished"
 
 
+def test_train_resume_fp32(tmp_path):
+    """--mode fp32 saved and resumed (also from step 0): the same per-step losses (the default adapter rank once added
+    an empty optimizer group that the resume could not match, 18 Oct)"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    fp = ["--mode", "fp32", "--no-qk-temp"]
+    a = _train(str(tmp_path / "a"), fp, 8, data)
+    _train(str(tmp_path / "b"), fp, 0, data)
+    _train(str(tmp_path / "b"), fp + ["--resume"], 4, data)
+    b = _train(str(tmp_path / "b"), fp + ["--resume"], 8, data)
+    assert len(a) == 8 and a == b[-8:], (a, b)
+
+
 def test_beta_follows_fused_fire():
     """the fused firing writes the packed trits in place: the layer's cached beta must follow (it was stale, 17 Oct)"""
     from ttf import update as U

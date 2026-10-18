@@ -465,6 +465,9 @@ def main():
         for m in model.modules():
             if isinstance(m, (KernelTernaryLinear, MasterTernaryLinear)):
                 newp += m.enable_lowrank_mag(kind, int(r))
+        if not newp:        # --mode fp32: no ternary layers to adapt (an empty group would break a later resume)
+            mag_on[0] = True
+            return
         if args.tail == "lean":
             for p_ in newp:
                 p_.data = p_.data.to(torch.bfloat16)
