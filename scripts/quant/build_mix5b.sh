@@ -12,11 +12,13 @@ set -u
 M=${MODEL:?HF model dir}; D=${OUT:?output dir (build_mix5.sh's)}; P=${PY:-python}
 export HF_HOME=${HF_HOME:-$D/hf_cache} HF_HUB_ENABLE_HF_TRANSFER=0 TOKENIZERS_PARALLELISM=false
 run() { nice -n 19 $P -u scripts/quant/sft_mix.py build $M $D/m5 --decon 13 "$@" > "$D/logs/b_$(echo "$*" | tr ' :-' '___').log" 2>&1; }
-run --source toucan:130e6 &
-run --source when2call:20e6 &
-run --source oci:88e6 --skip_files 4 &
-run --source ocr:77e6 --skip_files 6 &
-run --source tulu:if:63e6 &
+# each stream once (a restart after an interruption, e.g. the lab reboot, builds only what is missing; oci is rebuilt
+# larger than mix5's, so its marker is a separate file)
+[ -f $D/m5_toucan.bin ] || run --source toucan:130e6 &
+[ -f $D/m5_when2call.bin ] || run --source when2call:20e6 &
+[ -f $D/.oci5b ] || { run --source oci:88e6 --skip_files 4 && touch $D/.oci5b; } &
+[ -f $D/m5_ocr.bin ] || run --source ocr:77e6 --skip_files 6 &
+[ -f $D/m5_tulu_if.bin ] || run --source tulu:if:63e6 &
 wait
 ls -la $D/m5_*.bin
 $P scripts/quant/sft_mix.py mix $D/mix5b_train.bin 1000e6 $D/m5_wiki.bin:0.11 $D/m5_fineweb.bin:0.09 \
