@@ -11,7 +11,9 @@ DeepSeek-R1; SPLIT in chat, code, math, stem, tool), hermes (NousResearch/hermes
 toolace (Team-ACE/ToolACE, Apache-2.0), tulu:general / tulu:safety (allenai/tulu-3-sft-mixture, ODC-BY; safety = the
 WildJailbreak, WildGuardMix and CoCoNot subsets; the hard-coded identity answers are left out), ot3
 (open-thoughts/OpenThoughts3-1.2M, Apache-2.0, reasoning), ocr (nvidia/OpenCodeReasoning split_0, CC-BY-4.0, code
-reasoning), fineweb (HuggingFaceFW/fineweb-edu sample-10BT, ODC-BY, plain text with end-of-text between documents).
+reasoning), fineweb (HuggingFaceFW/fineweb-edu sample-10BT, ODC-BY, plain text with end-of-text between documents),
+swe_agent (nebius/SWE-agent-trajectories, CC-BY-4.0: multi-step coding-agent runs in a shell / file-editor interface, the
+resolved ones only), openhands (SWE-Gym/OpenHands-SFT-Trajectories, MIT: successful OpenHands agent runs).
 --decon N: drop a conversation sharing any N-word sequence (lower-cased \\w+ words) with the evaluation items
 (data/bench/*.jsonl, data/zeroshot/*.jsonl); word n-grams as in GPT-3's and Tulu-3's decontamination (token n-grams
 matched code boilerplate and number lists). Tulu-3 (ODC-BY) chat-only streams: chat_data.py."""
@@ -99,6 +101,35 @@ def toolace_rows(rng):
                  "content": m["value"]} for m in r["conversations"]]
         if conv and conv[-1]["role"] == "assistant":
             yield [{"role": "system", "content": r["system"]}] + conv, None, False
+
+
+def swe_agent_rows(rng, skip_files):
+    """nebius/SWE-agent-trajectories: the runs whose patch resolved the issue (target), as system / user / assistant turns
+    (the environment's observations are the user turns)"""
+    from huggingface_hub import list_repo_files
+    repo = "nebius/SWE-agent-trajectories"
+    fs = sorted(f for f in list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet"))
+    for r in _parquet_rows(repo, fs[skip_files:], ["trajectory", "target"], rng):
+        if not r["target"]:
+            continue
+        conv = []
+        for m in r["trajectory"]:
+            role = {"system": "system", "user": "user", "ai": "assistant", "assistant": "assistant"}.get(m["role"])
+            text = (m.get("system_prompt") or m.get("text") or "") if role == "system" else (m.get("text") or "")
+            if role and text:
+                conv.append({"role": role, "content": text})
+        if conv and conv[-1]["role"] == "assistant":
+            yield conv, None, False
+
+
+def openhands_rows(rng):
+    from huggingface_hub import list_repo_files
+    repo = "SWE-Gym/OpenHands-SFT-Trajectories"
+    fs = sorted(f for f in list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet"))
+    for r in _parquet_rows(repo, fs, ["messages"], rng):
+        conv = [{"role": m["role"], "content": m["content"]} for m in r["messages"] if m.get("content")]
+        if conv and conv[-1]["role"] == "assistant":
+            yield conv, None, False
 
 
 SAFETY = ("wildjailbreak", "wildguardmix", "coconot")
@@ -261,6 +292,10 @@ def build(a):
             it, tag = toolace_rows(rng), "toolace"
         elif name == "tulu":
             it, tag = tulu_rows(parts[1], rng), f"tulu_{parts[1]}"
+        elif name == "swe_agent":
+            it, tag = swe_agent_rows(rng, a.skip_files), "swe_agent"
+        elif name == "openhands":
+            it, tag = openhands_rows(rng), "openhands"
         elif name in ("ot3", "ocr", "fineweb", "oci"):
             it, tag = {"ot3": ot3_rows, "ocr": ocr_rows, "fineweb": fineweb_rows, "oci": oci_rows}[name](rng, a.skip_files), name
         else:
