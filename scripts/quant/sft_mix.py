@@ -13,7 +13,10 @@ WildJailbreak, WildGuardMix and CoCoNot subsets; the hard-coded identity answers
 (open-thoughts/OpenThoughts3-1.2M, Apache-2.0, reasoning), ocr (nvidia/OpenCodeReasoning split_0, CC-BY-4.0, code
 reasoning), fineweb (HuggingFaceFW/fineweb-edu sample-10BT, ODC-BY, plain text with end-of-text between documents),
 swe_agent (nebius/SWE-agent-trajectories, CC-BY-4.0: multi-step coding-agent runs in a shell / file-editor interface, the
-resolved ones only), openhands (SWE-Gym/OpenHands-SFT-Trajectories, MIT: successful OpenHands agent runs).
+resolved ones only), openhands (SWE-Gym/OpenHands-SFT-Trajectories, MIT: successful OpenHands agent runs), toucan
+(Agent-Ark/Toucan-1.5M SFT subset, Apache-2.0: multi-turn MCP tool use, much of it web search / crawling, re-rendered
+with the model's own tool-call format), when2call (nvidia/When2Call SFT, CC-BY-4.0: answering, asking back or declining
+when the given tools cannot do the job).
 --decon N: drop a conversation sharing any N-word sequence (lower-cased \\w+ words) with the evaluation items
 (data/bench/*.jsonl, data/zeroshot/*.jsonl); word n-grams as in GPT-3's and Tulu-3's decontamination (token n-grams
 matched code boilerplate and number lists). Tulu-3 (ODC-BY) chat-only streams: chat_data.py."""
@@ -137,6 +140,86 @@ def openhands_rows(rng):
         conv = [{"role": m["role"], "content": m["content"]} for m in r["messages"] if m.get("content")]
         if conv and conv[-1]["role"] == "assistant":
             yield conv, None, False
+
+
+def _tools_std(ts):
+    """tool schemas as the chat template wants them: [{"type": "function", "function": {...}}]"""
+    out = []
+    for t in ts or []:
+        if isinstance(t, str):                  # (When2Call: each schema a JSON string)
+            try:
+                t = json.loads(t)
+            except Exception:
+                continue
+        if isinstance(t, dict) and "function" not in t:
+            t = {"type": "function", "function": t}
+        out.append(t)
+    return out
+
+
+def toucan_rows(rng, skip_files):
+    """Toucan SFT: system (the Kimi tool declaration: dropped, the template writes its own from the tools), user,
+    assistant text and function_call turns (consecutive calls become one assistant turn with several tool calls), and
+    the tools' results as tool turns"""
+    from huggingface_hub import list_repo_files
+    repo = "Agent-Ark/Toucan-1.5M"
+    fs = sorted(f for f in list_repo_files(repo, repo_type="dataset") if f.startswith("SFT/") and f.endswith(".parquet"))
+    for r in _parquet_rows(repo, fs[skip_files:], ["messages", "tools"], rng):
+        try:
+            msgs = json.loads(r["messages"]) if isinstance(r["messages"], str) else r["messages"]
+            tools = _tools_std(json.loads(r["tools"]) if isinstance(r["tools"], str) else r["tools"])
+        except Exception:
+            continue
+        conv = []
+        for m in msgs:
+            role = m.get("role")
+            if role == "system":
+                continue
+            if role == "tool_call":                  # SFT subset: {'name': ..., 'arguments': '<json>'} as a Python literal
+                import ast
+                try:
+                    fc = ast.literal_eval(m["content"]) if isinstance(m["content"], str) else m["content"]
+                except Exception:
+                    try:
+                        fc = json.loads(m["content"])
+                    except Exception:
+                        conv = []; break
+                m = {"role": "assistant", "content": "", "function_call": fc}; role = "assistant"
+            if role == "tool_response":
+                role = "tool"
+            if role == "assistant" and m.get("function_call"):
+                fc = m["function_call"]; args = fc.get("arguments", "{}")
+                try:
+                    args = json.loads(args) if isinstance(args, str) else args
+                except Exception:
+                    pass
+                call = {"type": "function", "function": {"name": fc.get("name", ""), "arguments": args}}
+                if conv and conv[-1]["role"] == "assistant" and "tool_calls" in conv[-1]:
+                    conv[-1]["tool_calls"].append(call)
+                elif conv and conv[-1]["role"] == "assistant":
+                    conv[-1]["tool_calls"] = [call]
+                else:
+                    conv.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": [call]})
+            elif role in ("function", "tool"):
+                conv.append({"role": "tool", "content": m.get("content") or ""})
+            elif role in ("user", "assistant") and m.get("content"):
+                if role == "assistant" and conv and conv[-1]["role"] == "assistant" and "tool_calls" not in conv[-1]:
+                    conv[-1]["content"] += "\n\n" + m["content"]
+                else:
+                    conv.append({"role": role, "content": m["content"]})
+        if tools and conv and conv[-1]["role"] == "assistant" and any(m["role"] == "tool" for m in conv):
+            yield conv, tools, False
+
+
+def when2call_rows(rng):
+    from huggingface_hub import hf_hub_download
+    p = hf_hub_download("nvidia/When2Call", "train/when2call_train_sft.jsonl", repo_type="dataset")
+    rows = [json.loads(l) for l in open(p)]
+    rng.shuffle(rows)
+    for r in rows:
+        conv = [{"role": m["role"], "content": m["content"]} for m in r["messages"]]
+        if conv and conv[-1]["role"] == "assistant":
+            yield conv, (_tools_std(r.get("tools")) or None), False
 
 
 SAFETY = ("wildjailbreak", "wildguardmix", "coconot")
@@ -303,6 +386,10 @@ def build(a):
             it, tag = swe_agent_rows(rng, a.skip_files), "swe_agent"
         elif name == "openhands":
             it, tag = openhands_rows(rng), "openhands"
+        elif name == "toucan":
+            it, tag = toucan_rows(rng, a.skip_files), "toucan"
+        elif name == "when2call":
+            it, tag = when2call_rows(rng), "when2call"
         elif name in ("ot3", "ocr", "fineweb", "oci"):
             it, tag = {"ot3": ot3_rows, "ocr": ocr_rows, "fineweb": fineweb_rows, "oci": oci_rows}[name](rng, a.skip_files), name
         else:
