@@ -147,6 +147,9 @@ def main():
         if _RK > 0 and args.out_dir:
             args.out_dir = args.out_dir.rstrip("/") + f"_rank{_RK}"
             tc.out_dir = args.out_dir
+    if _WS > 1 and not _PP and args.dw == "factored":
+        raise SystemExit("data parallel with --dw factored: the TTF update gets the gradient's factors (gy, x), which the "
+                         "ranks cannot average cheaply; use --pipe or --dw dense")
     if _PP:
         _WS, _RK = 1, 0       # --pipe: no data-parallel reduction, every stage reads the same windows
     if args.mem_cap_gib and device == "cuda":   # --mem-cap-gib G: PyTorch may use at most G GiB of this GPU (a 96 GB card
@@ -237,8 +240,9 @@ def main():
         else:
             print(f"row/column scales: {enable_rc_scales(model) / 1e3:.1f}k floats", flush=True)
     _resume_path = os.path.join(tc.out_dir, "ckpt.pt")
-    if _PP and not os.path.exists(_resume_path) and os.path.exists(os.path.join(_base_out, "ckpt.pt")):
-        _resume_path = os.path.join(_base_out, "ckpt.pt")    # --pipe: a single-GPU checkpoint (or stage 0's) for all
+    if (_PP or _WS > 1) and not os.path.exists(_resume_path) and os.path.exists(os.path.join(_base_out, "ckpt.pt")):
+        _resume_path = os.path.join(_base_out, "ckpt.pt")    # --pipe: a single-GPU checkpoint (or stage 0's) for all;
+        # data parallel: every rank resumes from rank 0's (the only one saved: the ranks' states are identical)
     _resuming = args.resume and os.path.exists(_resume_path)
     if args.init_hf and _resuming:   # the checkpoint holds the converted model (trits, scales, float parts)
         print(f"--init-hf: resuming from {tc.out_dir}/ckpt.pt, conversion skipped", flush=True)
@@ -425,6 +429,8 @@ def main():
         return sd_
 
     def save_ckpt(step):
+        if _WS > 1 and _RK > 0:     # data parallel: rank 0 saves for all (same trits, state and optimizer on every rank)
+            return
         # atomic: write tmp then rename, so a kill mid-save never corrupts ckpt.pt
         if args.ttf_offload == "async" and torch.cuda.is_available():
             torch.cuda.synchronize()      # the host copies of the state are written on a side stream
@@ -951,7 +957,8 @@ def main():
             print(f"  ---- val loss {vl:.3f} | ppl {math.exp(vl):.1f}", flush=True)
         if args.snap_every and step > 0 and step % args.snap_every == 0:
             save_ckpt(step)
-            shutil.copyfile(ckpt_path, os.path.join(tc.out_dir, f"ckpt_{step}.pt"))
+            if not (_WS > 1 and _RK > 0):
+                shutil.copyfile(ckpt_path, os.path.join(tc.out_dir, f"ckpt_{step}.pt"))
         if time.time() - last_save >= args.save_secs:
             save_ckpt(step)
             last_save = time.time()
