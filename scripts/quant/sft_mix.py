@@ -88,6 +88,13 @@ def hermes_rows(rng):
                 if role == "tool":
                     c = c.replace("<tool_response>", "").replace("</tool_response>", "").strip()
                 conv.append({"role": role, "content": c})
+            if not tools and r.get("tools"):           # newer revisions: the schemas in their own column (JSON)
+                try:
+                    tools = json.loads(r["tools"]) if isinstance(r["tools"], str) else r["tools"]
+                    if tools and isinstance(tools[0], list):
+                        tools = tools[0]
+                except Exception:
+                    tools = None
             if tools and conv and conv[-1]["role"] == "assistant":
                 yield conv, [t if "type" in t else {"type": "function", "function": t} for t in tools], False
 
