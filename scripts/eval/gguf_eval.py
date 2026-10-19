@@ -21,6 +21,8 @@ ap.add_argument("--seq", type=int, default=2048); ap.add_argument("--out", defau
 a = ap.parse_args()
 
 proc = subprocess.Popen([a.tool, a.gguf, str(a.ngl), "4096"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+import atexit
+atexit.register(proc.kill)      # a failed run must not leave the model loaded on the GPU
 
 
 def score(seqs):
