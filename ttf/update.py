@@ -440,6 +440,17 @@ def _fg_mm_l(fg, a, W):
     return b[:, None] * _mmb(x.T, _mmb(gy, a[:, None] * W))
 
 
+DP_REDUCE = [None]     # data parallel (set by train.py): t -> the mean of t over the ranks, in place
+
+
+def _dpm(t):
+    """data parallel: every quantity the factored update reads from g is linear in g, so the ranks' products averaged
+    are the products of the mean gradient: each rank then runs the same update and moves the same trits"""
+    if DP_REDUCE[0] is not None:
+        DP_REDUCE[0](t)
+    return t
+
+
 def _ts_layer_factored(l, fg, state, c):
     """--dw factored K: the TTF  update (16 x 1 or --ttf-accum micro) from the factors of the weight gradient,
     g = gy^T x, which is never formed. Everything the update reads from g is a product with a thin matrix: the
@@ -466,8 +477,8 @@ def _ts_layer_factored(l, fg, state, c):
     gen = torch.Generator(device=dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
     Sr = torch.randn(l.K, k_, device=dev, generator=gen) / k_ ** 0.5
     Sc = torch.randn(k_, l.N, device=dev, generator=gen) / k_ ** 0.5
-    gS = _mmb(gy.T, _mmb(x, Sr))                                          # g Sr  [N, k]
-    Sg = _mmb(x.T, _mmb(gy, Sc.T)).T                                      # Sc g  [k, K]
+    gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                    # g Sr  [N, k]
+    Sg = _dpm(_mmb(x.T, _mmb(gy, Sc.T)).T.contiguous())                   # Sc g  [k, K]
     rsq, csq = gS.square().sum(1), Sg.square().sum(0)                     # ~ row / column sums of g^2
     if M_ > 1:   # as ts_layer's --ttf-accum micro  branch, with the sketched own squares
         r0, c0 = rsq * (M_ * M_ / l.K), csq * (M_ * M_ / l.N)
@@ -517,23 +528,23 @@ def _ts_layer_factored(l, fg, state, c):
     ra = min(r, l.N, l.K)
     if key not in state:
         g_ = torch.Generator(device=dev).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
-        V = _orth(-lr_ratio * _fg_mm_l(fgb, ia, torch.randn(l.N, ra, device=dev, generator=g_)))
-        U = -lr_ratio * _fg_mm_r(fgb, ia, V)
+        V = _orth(-lr_ratio * _dpm(_fg_mm_l(fgb, ia, torch.randn(l.N, ra, device=dev, generator=g_))))
+        U = -lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
     elif M_ > 1:   # basis fixed within the step, turned on the last micro-batch from M u_M^T U
         U, V = _load_pair(_host_get(state, key, dev, off))
         if (t - 1) % M_ == 0:
             U = U * lk
         if final_:
-            S_ = (-lr_ratio * M_) * _fg_mm_l(fgb, ia, U)
+            S_ = (-lr_ratio * M_) * _dpm(_fg_mm_l(fgb, ia, U))
             Vn = _orth(V @ (U.T @ U) + S_); del S_
-            U = (U - lr_ratio * _fg_mm_r(fgb, ia, V)) @ (V.T @ Vn); V = Vn
+            U = (U - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))) @ (V.T @ Vn); V = Vn
         else:
-            U = U - lr_ratio * _fg_mm_r(fgb, ia, V)
+            U = U - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         U = U * lk
-        Vn = _orth(V @ (U.T @ U) - lr_ratio * _fg_mm_l(fgb, ia, U))
-        U = U @ (V.T @ Vn) - lr_ratio * _fg_mm_r(fgb, ia, Vn); V = Vn
+        Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
+        U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
     if not final_:
         _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
@@ -542,6 +553,7 @@ def _ts_layer_factored(l, fg, state, c):
     if FIRE_FUSED[0] and dev.type == "cuda":   # --fire fused: A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
         DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta)
+        DV = _dpm(DV)          # data parallel: the spend's sparse sums (index_add_) are not bit-reproducible: one mean
         l._after_fire(dnnz)    # the kernel writes the trits in place (no version bump): beta follows the moves, --w-cache recomputes
         U = U - c["spend"] * (theta * DV); del DV
     else:

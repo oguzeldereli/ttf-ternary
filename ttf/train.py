@@ -147,9 +147,17 @@ def main():
         if _RK > 0 and args.out_dir:
             args.out_dir = args.out_dir.rstrip("/") + f"_rank{_RK}"
             tc.out_dir = args.out_dir
-    if _WS > 1 and not _PP and args.dw == "factored":
-        raise SystemExit("data parallel with --dw factored: the TTF update gets the gradient's factors (gy, x), which the "
-                         "ranks cannot average cheaply; use --pipe or --dw dense")
+    if _WS > 1 and not _PP and args.dw == "factored":    # data parallel, factored: the ranks average the thin products
+        from .update import DP_REDUCE as _DPR              # the update reads from g (sketches, basis projections)
+        _dp_bf16 = os.environ.get("TTF_DP_BF16", "") == "1"   # TTF_DP_BF16=1: sent in bf16 (half the traffic)
+
+        def _dp_mean(t_):
+            if _dp_bf16:
+                b_ = t_.to(torch.bfloat16); _dist.all_reduce(b_); t_.copy_(b_)
+            else:
+                _dist.all_reduce(t_)
+            t_.div_(_WS)
+        _DPR[0] = _dp_mean
     if _PP:
         _WS, _RK = 1, 0       # --pipe: no data-parallel reduction, every stage reads the same windows
     if args.mem_cap_gib and device == "cuda":   # --mem-cap-gib G: PyTorch may use at most G GiB of this GPU (a 96 GB card
@@ -698,7 +706,9 @@ def main():
             m_._ts_idx = i_
             if _WS > 1:   # data parallel: every rank's TTF update sees the mean gradient, so all ranks move the same trits
                 def _og(layer, g, _c=ts_cfg):
-                    _dist.all_reduce(g); g.div_(_WS); ts_layer(layer, g, lr_state, _c)
+                    if torch.is_tensor(g):     # dense: the mean gradient; factored (gy, x): the update averages its products
+                        _dist.all_reduce(g); g.div_(_WS)
+                    ts_layer(layer, g, lr_state, _c)
                 m_.on_grad = _og
             else:
                 def _og1(layer, g, _c=ts_cfg):

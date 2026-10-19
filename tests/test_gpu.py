@@ -294,3 +294,15 @@ def test_same_losses(tmp_path, extra):
     a = _train(str(tmp_path / "a"), base, 6, data)
     b = _train(str(tmp_path / "b"), extra, 6, data)
     assert a == b, (a, b)
+
+
+@pytest.mark.parametrize("fp32", ["1", "0"], ids=["fp32", "bf16"])
+def test_dp_factored(fp32):
+    """data parallel with the factored update: 2 ranks (sharing one GPU through gloo), each with its own gradient
+    factors, average the update's thin products and must hold what one process holds after the update from the mean
+    gradient (fp32 factors: to summation order; bf16: within bf16 rounding), and stay identical to each other"""
+    env = dict(os.environ, PYTHONPATH=ROOT, FP32=fp32)
+    r = subprocess.run([sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", "2",
+                        os.path.join(ROOT, "scripts", "tests", "dp_factored_check.py")], cwd=ROOT, env=env,
+                       capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
