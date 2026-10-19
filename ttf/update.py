@@ -409,14 +409,13 @@ def ts_layer(l, g, state, c):
     A = U @ V.T
     w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
     d = A.sign()
-    thr = _thresholds(l, w0, theta)           # (asymmetric firing: per-entry thresholds, the spend equal to each)
-    fire = (A.abs() >= (theta if thr is None else thr)) & ((w0.float() + d).abs() <= 1)
+    fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
     del A
     before = l.wpacked.clone() if l.track else None
     D = torch.where(fire, d, torch.zeros_like(d))
     nf = fire.sum()                           # a device tensor: no host sync per layer
     l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))   # int8 add: exact, no [N, K] fp32 temporary
-    U = U - c["spend"] * ((theta * (D @ V)) if thr is None else ((D * torch.nan_to_num(thr, posinf=0.0)) @ V))
+    U = U - c["spend"] * (theta * (D @ V))
     _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
     if before is not None:
@@ -442,19 +441,6 @@ def _fg_mm_l(fg, a, W):
 
 
 DP_REDUCE = [None]     # data parallel (set by train.py): t -> the mean of t over the ranks, in place
-
-
-def _thresholds(l, w0, theta):
-    """per-entry firing threshold: theta x l.fire_away for a trit at 0 (a move to +-1), theta x l.fire_toward for one
-    at +-1 (a move to 0); both 1 by default (then None: the plain scalar threshold). inf freezes that direction"""
-    fa, ft = getattr(l, "fire_away", 1.0), getattr(l, "fire_toward", 1.0)
-    if fa == 1.0 and ft == 1.0:
-        return None
-    return torch.where(w0 == 0, theta * fa, theta * ft).float()
-
-
-def _asym(l):
-    return getattr(l, "fire_away", 1.0) != 1.0 or getattr(l, "fire_toward", 1.0) != 1.0
 
 
 def _dpm(t):
@@ -564,7 +550,7 @@ def _ts_layer_factored(l, fg, state, c):
         return
     from .kernel import unpack_rows, pack_rows
     before = l.wpacked.clone() if l.track else None
-    if FIRE_FUSED[0] and dev.type == "cuda" and not _asym(l):   # --fire fused: A, the moves, the repack and D V in one kernel
+    if FIRE_FUSED[0] and dev.type == "cuda":   # --fire fused: A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
         DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta)
         DV = _dpm(DV)          # data parallel: the spend's sparse sums (index_add_) are not bit-reproducible: one mean
@@ -574,15 +560,12 @@ def _ts_layer_factored(l, fg, state, c):
         A = U @ V.T
         w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
         d = A.sign()
-        thr = _thresholds(l, w0, theta)
-        fire = (A.abs() >= (theta if thr is None else thr)) & ((w0.float() + d).abs() <= 1)
+        fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
         del A
         D = torch.where(fire, d, torch.zeros_like(d))
         nf = fire.sum()
         l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))
-        l._beta_key = None; l._w8_key = None; l._w8 = None    # (the moved trits: beta and the int8 cache recompute)
-        DV_ = (theta * (D @ V)) if thr is None else ((D * torch.nan_to_num(thr, posinf=0.0)) @ V)
-        U = U - c["spend"] * _dpm(DV_)
+        U = U - c["spend"] * (theta * (D @ V))
     _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
     if before is not None:
