@@ -50,6 +50,9 @@ def load_model(path, device, mag_kind="add"):
     elif mode == "master":
         dt = next(v.dtype for k, v in sd.items() if k.endswith(".weight") and v.dim() == 2 and "tok_emb" not in k)
         model = MA.build_master_transformer(mc, grad_checkpoint=False, dtype=dt)
+    elif mode == "fp32":                                     # the full-precision reference (--mode fp32)
+        model = importlib.import_module(P + ".model").BitTransformer(
+            mc, grad_checkpoint=False, make_linear=lambda i, o: nn.Linear(i, o, bias=False))
     else:
         raise SystemExit(f"mode {mode} not supported")
     model = model.to(device)
