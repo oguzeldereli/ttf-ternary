@@ -3,7 +3,8 @@ as the full-precision and TTF numbers:
   python scripts/eval/gguf_eval.py MODEL.gguf --tool ./llama_score --ppl data/wikiq8_val.bin:8,data/mixval12.bin:12
   python scripts/eval/gguf_eval.py MODEL.gguf --tool ./llama_score --runval data/wikiq8_val.bin     # train.py's 64 val windows
   python scripts/eval/gguf_eval.py MODEL.gguf --tool ./llama_score --zeroshot --hf_dir HF_DIR [--limit 2000]
---ppl: mean loss over the first N contiguous 2048-token windows (ttf_qwen.py --ppl); --runval: the windows of evaluate()
+--ppl: mean loss over the first N contiguous 2048-token windows (ttf_qwen.py --ppl; FILE:N:STRIDE: windows starting
+every STRIDE tokens, e.g. 2049 for a file of exported 2049-token windows such as ttf-lab wip/export_eval27.py's); --runval: the windows of evaluate()
 (fp_runval.py); --zeroshot: qwen_zeroshot.py's tokenisation and scoring (sum log-probability, acc_norm per byte, LAMBADA
 greedy). Token ids go to llama.cpp directly (no retokenisation).
 """
@@ -42,8 +43,9 @@ def windows(path, starts):
 res = {"model": a.gguf}
 t0 = time.time()
 for spec in filter(None, a.ppl.split(",")):
+    parts = spec.split(":"); stride = int(parts[2]) if len(parts) > 2 else a.seq; spec = ":".join(parts[:2])
     path, n = spec.rsplit(":", 1)
-    ls = windows(path, [i * a.seq for i in range(int(n))])
+    ls = windows(path, [i * stride for i in range(int(n))])
     res[os.path.basename(path)] = {"mean": float(np.mean(ls)), "losses": ls}
     print(f"{path}: mean loss {np.mean(ls):.4f} over {len(ls)} windows ({time.time() - t0:.0f} s): "
           + " ".join(f"{v:.4f}" for v in ls), flush=True)
