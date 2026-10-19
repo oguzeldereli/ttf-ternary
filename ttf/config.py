@@ -91,6 +91,8 @@ PRESETS = {
     # ~130M params. Fast to iterate / debug the pipeline.
     "small": ModelConfig(dim=768, n_layers=12, n_heads=12, n_kv_heads=12,
                          hidden_dim=2048),
+    # ~15M (6.4M in the linears + 8.2M tied 32k embedding): 300M tokens = 20 tokens per parameter (Chinchilla).
+    "s15": ModelConfig(dim=256, n_layers=8, n_heads=4, n_kv_heads=4, hidden_dim=704),
     # ~51M, GPT-2 BPE vocab (50257). For the master vs master-free study on Wiki.
     "s50": ModelConfig(vocab_size=50257, dim=512, n_layers=8, n_heads=8,
                        n_kv_heads=8, hidden_dim=1408, max_seq_len=512),
