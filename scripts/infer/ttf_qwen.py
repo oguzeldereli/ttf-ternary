@@ -2,7 +2,8 @@
 """ttf_qwen: run a TTF-ternarized Qwen3.5 / 3.8 model in its packed form (trits at 1.6 bits per weight, never expanded).
 
 Every large linear of the decoder is a TTF layer,
-    y = r * ( beta * (Q(c * x) @ T^T)  +  ((c * x) @ B) @ A^T )
+    y = r * ( beta * (Q(c * x) @ T^T)  +  ((c * x) @ B) @ A^T )  [+ b]
+(centred conversions, --convert gptqc: x - mu in place of x and a float bias b, both from the checkpoint)
 with trits T stored 5 per byte and re-packed at load to 2 bits each; a few tokens (decoding, short prompts) go through a
 dp4a int8 x trit GEMV with the scales and the low-rank adapter fused into its epilogue (ttf_kernels.py), longer prompts
 through a per-layer expansion to bf16. The rest of the model (Gated DeltaNet, gated attention, norms, embedding, head)
@@ -47,6 +48,16 @@ class PackedTLinear(nn.Module):
             self.beta = float(trit_beta(self.wpacked, self.K))
         shp = x.shape
         x2 = x.reshape(-1, self.K)
+        mu = getattr(self, "in_mean", None)
+        if mu is not None:                             # centred layer: y = layer(x - mu) + b (as the trainer's)
+            x2 = x2 - mu.to(x2.dtype)
+        return self._bias(self._fwd(x2, shp, x.device))
+
+    def _bias(self, y):
+        b = getattr(self, "out_bias", None)
+        return y if b is None else y + b.to(y.dtype)
+
+    def _fwd(self, x2, shp, device):
         if getattr(self, "w2", None) is not None and x2.shape[0] <= DECODE_M:   # decode: GEMV with the epilogue fused
             M_, K4p = x2.shape[0], self.w2.shape[1]
             xc = x2 * self.col_scale.to(x2.dtype)
@@ -58,7 +69,7 @@ class PackedTLinear(nn.Module):
             r = (xc.to(torch.bfloat16) @ self.mag_B).float().contiguous()
             xw = q.contiguous().view(torch.int32).view(M_, K4p)
             ww = self.w2.view(torch.int32)
-            y = torch.zeros(M_, self.N, dtype=torch.float32, device=x.device)
+            y = torch.zeros(M_, self.N, dtype=torch.float32, device=device)
             grid = lambda meta: (triton.cdiv(self.N, meta["BN"]), M_, meta["SPLIT"])
             _gemv2_epi_kernel[grid](xw, ww, y, sc, sumx, r, self.mag_A, self.row_scale, self.beta_t, self.N, K4p // 4,
                                     M_, self.mag_A.shape[1], xw.stride(0), ww.stride(0), y.stride(0),
@@ -71,7 +82,7 @@ class PackedTLinear(nn.Module):
             if x2.shape[0] <= DECODE_M:
                 acc = tern_gemv2(q, self.w2).float()
             else:
-                sh = torch.tensor([0, 2, 4, 6], device=x.device, dtype=torch.uint8)
+                sh = torch.tensor([0, 2, 4, 6], device=device, dtype=torch.uint8)
                 Wt = ((self.w2[:, :, None] >> sh) & 3).reshape(self.N, -1)[:, :self.K].to(torch.bfloat16) - 1
                 acc = (q.to(torch.bfloat16) @ Wt.t()).float()
                 del Wt
@@ -82,7 +93,7 @@ class PackedTLinear(nn.Module):
             y = (tern_gemv_planes(xp, self.wpacked).float() * (sc[:, None] * self.beta)).to(torch.bfloat16)
             x = x2 * self.col_scale.to(x2.dtype)
         else:
-            x = x2 * self.col_scale.to(x.dtype)
+            x = x2 * self.col_scale.to(x2.dtype)
             amax = x.abs().amax(-1, keepdim=True).clamp_min(1e-5).float()
             s = amax / 127.0
             q = (x.float() / s).round().clamp_(-128, 127).to(torch.int8)
@@ -162,6 +173,12 @@ def build(model_dir, weights, dev, emb_cpu):
     sd = torch.load(weights, map_location="cpu", weights_only=False, mmap=True)
     sd = sd.get("model", sd)
     sd = {k[3:]: v for k, v in sd.items() if k.startswith("hf.")}           # the trainer's QwenTern prefix
+    nc = 0
+    for name, mod in hf.named_modules():              # centred layers (gptqc): the input mean and the bias, fp32
+        if isinstance(mod, PackedTLinear) and name + ".in_mean" in sd:
+            mod.register_buffer("in_mean", torch.zeros(mod.K, dtype=torch.float32, device=dev))
+            mod.register_buffer("out_bias", torch.zeros(mod.N, dtype=torch.float32, device=dev))
+            nc += 1
     for k in [k for k in sd if k.endswith(".qmeta")]:  # pack_ttf.py: embedding / head in B-bit groups -> bf16
         from pack_ttf import dequant_groups
         b = k[:-len(".qmeta")]
@@ -192,8 +209,8 @@ def build(model_dir, weights, dev, emb_cpu):
                 mod.w2 = repack_2bit(mod.wpacked, mod.K)
                 mod.wpacked = torch.empty(0, dtype=torch.uint8, device=dev)
                 torch.cuda.empty_cache()
-    print(f"loaded {weights} in {time.time() - t0:.0f}s; missing {len(missing)} {missing[:4]}, unexpected "
-          f"{len(unexpected)} {unexpected[:4]}", file=sys.stderr)
+    print(f"loaded {weights} in {time.time() - t0:.0f}s; {nc} centred layers; missing {len(missing)} {missing[:4]}, "
+          f"unexpected {len(unexpected)} {unexpected[:4]}", file=sys.stderr)
     hf.eval()
     for p in hf.parameters():
         p.requires_grad_(False)
