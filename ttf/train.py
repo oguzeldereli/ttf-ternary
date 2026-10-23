@@ -31,7 +31,7 @@ from .config import ModelConfig, TrainConfig, PRESETS
 from .model import BitTransformer
 from .bitlinear import STATE
 from .master import build_master_transformer, split_params
-from .layers import KernelTernaryLinear, build_kernel_transformer, enable_flip_tracking, collect_flip_stats
+from .layers import KernelTernaryLinear, build_kernel_transformer, enable_flip_tracking, collect_flip_stats, _rf
 from .args import parse
 from .data import get_batch, _kd_cache_batch
 from .eval import evaluate
@@ -717,7 +717,7 @@ def main():
                 m_.on_grad = _og
             else:
                 def _og1(layer, g, _c=ts_cfg):
-                    with torch.profiler.record_function("ttf.update"):
+                    with _rf("ttf.update"):    # (a range per layer call: only while a profiler runs)
                         ts_layer(layer, g, lr_state, _c)
                 m_.on_grad = _og1
             m_.ts_micro = bool(args.micro)

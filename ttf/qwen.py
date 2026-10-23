@@ -8,6 +8,7 @@ projections), the q / k norms. Text only: the vision tower and the multi-token-p
 
 The wrapper takes the trainer's interface: forward(idx, targets) -> (None, mean loss), with the head and the
 cross-entropy in chunks of loss_chunk tokens (the logits of a 248k vocabulary are never all materialised)."""
+import contextlib
 import json
 import os
 
@@ -56,6 +57,21 @@ def enable_fused_norm():
             return gated_norm_qwen(hidden_states, gate, self.weight, self.variance_epsilon)
         return gorig(self, hidden_states, gate)
     Q.Qwen3_5RMSNormGated.forward = gnorm
+
+
+@contextlib.contextmanager
+def _no_packed_check():
+    """HF's causal-mask builder looks for packed sequences in position_ids and ends with `if (...).all()`: a host sync
+    on every forward (~75 ms on a 0.8B adapter micro-batch, the GPU queue drained each time). Our windows are never
+    packed (the model builds position_ids itself, an arange), so the check's answer is None: it is skipped while the
+    model runs"""
+    from transformers import masking_utils as mu
+    f = mu.find_packed_sequence_indices
+    mu.find_packed_sequence_indices = lambda position_ids: None
+    try:
+        yield
+    finally:
+        mu.find_packed_sequence_indices = f
 
 
 def is_qwen35(path):
@@ -134,7 +150,8 @@ class QwenTern(nn.Module):
         self._ckpt_setup()
         if self.pp is not None:
             return self._pp_forward(idx, targets)
-        h = m(input_ids=idx, use_cache=False).last_hidden_state
+        with _no_packed_check():
+            h = m(input_ids=idx, use_cache=False).last_hidden_state
         if targets is None:
             return F.linear(h, self._head_w().to(h.dtype)), None
         return None, self._head_loss(h, targets)

@@ -593,6 +593,19 @@ def _actq_kernel(x_ptr, q_ptr, s_ptr, K, sxm, sqm, qp, rqp, lo, BK: tl.constexpr
         tl.store(q_ptr + row * sqm + offs, q.to(tl.int8), mask=offs < K)
 
 
+_ACTQ_C = {}
+
+
+def _actq_consts(bits, dt):
+    """qp, the fp32 reciprocal torch multiplies by, and 1e-5 in x's dtype (clamp_min(1e-5) happens in x's dtype in
+    act_quant_i8); cached: two CPU tensors per call otherwise"""
+    k = (bits, dt)
+    if k not in _ACTQ_C:
+        qp = float(2 ** (bits - 1) - 1)
+        _ACTQ_C[k] = (qp, float(torch.tensor(1.0 / qp, dtype=torch.float32)), float(torch.tensor(1e-5, dtype=dt)))
+    return _ACTQ_C[k]
+
+
 def act_quant_i8_fast(x: torch.Tensor, bits: int = 8):
     """act_quant_i8 in one kernel per row (two passes over the row in registers / L2): the same amax, the same fp32
     scale (amax / qp), the same x / scale rounded half to even and clamped: bit-identical codes and scales"""
@@ -602,9 +615,7 @@ def act_quant_i8_fast(x: torch.Tensor, bits: int = 8):
     M, K = x2.shape
     q = torch.empty(M, K, dtype=torch.int8, device=x.device)
     sc = torch.empty(M, dtype=torch.float32, device=x.device)
-    qp = float(2 ** (bits - 1) - 1)
-    rqp = float(torch.tensor(1.0 / qp, dtype=torch.float32))   # the fp32 reciprocal torch multiplies by
-    lo = float(torch.tensor(1e-5, dtype=x.dtype))              # clamp_min(1e-5) happens in x's dtype in act_quant_i8
+    qp, rqp, lo = _actq_consts(bits, x.dtype)
     _actq_kernel[(M,)](x2, q, sc, K, x2.stride(0), q.stride(0), qp, rqp, lo, BK=1024)
     return q.view(*x.shape[:-1], K), sc.view(x.shape[:-1])
 
@@ -630,6 +641,87 @@ def sq_sums(g: torch.Tensor):
     cp = torch.empty(nrt, K, dtype=torch.float32, device=g.device)
     _sq_sums_kernel[(nrt, nkt)](g, rp, cp, N, K, g.stride(0), nkt, BR=BR, BK=BK)
     return rp.sum(1), cp.sum(0)
+
+
+@triton.jit
+def _msk_rows_kernel(g_ptr, p_ptr, sq_ptr, cr_ptr, n, k, sg, sp, HAS_P: tl.constexpr, BR: tl.constexpr, BK: tl.constexpr):
+    """rows of one sketch side G [n, k] (fp32) and its running sum P [n, k] (bf16, updated in place): sq = sum G^2,
+    cr = sum G P (P before this micro-batch), P <- bf16(P + G)"""
+    pr = tl.program_id(0)
+    rows = pr * BR + tl.arange(0, BR)
+    sq = tl.zeros([BR], dtype=tl.float32); cr = tl.zeros([BR], dtype=tl.float32)
+    for k0 in range(0, k, BK):
+        cols = k0 + tl.arange(0, BK)
+        m = (rows[:, None] < n) & (cols[None, :] < k)
+        g = tl.load(g_ptr + rows[:, None] * sg + cols[None, :], mask=m, other=0.0)
+        sq += tl.sum(g * g, axis=1)
+        if HAS_P:
+            p = tl.load(p_ptr + rows[:, None] * sp + cols[None, :], mask=m, other=0.0).to(tl.float32)
+            cr += tl.sum(g * p, axis=1)
+            g = p + g
+        tl.store(p_ptr + rows[:, None] * sp + cols[None, :], g.to(tl.bfloat16), mask=m)
+    tl.store(sq_ptr + rows, sq, mask=rows < n)
+    tl.store(cr_ptr + rows, cr, mask=rows < n)
+
+
+@triton.jit
+def _msk_vec_kernel(sq_ptr, cr_ptr, rs_ptr, ds_ptr, v_ptr, o_ptr, n, c_sq, c_d, c_cr, b2, bc,
+                    HAS_P: tl.constexpr, HAS_V: tl.constexpr, NORM: tl.constexpr, B: tl.constexpr):
+    """one program over a side's vector (n entries): r0 = sq c_sq (then the v EMA: b2 v / bc + (1 - b2) r0), the
+    scale a = sqrt(r0 / mean(r0)) (NORM) or sqrt(r0), o = 1 / max(a, max(a) 1e-12 + 1e-30); rs += sq / c_d + c_cr cr
+    and ds += sq / c_d (HAS_P; else both = sq / c_d), in place"""
+    offs = tl.arange(0, B)
+    tot = tl.zeros([B], dtype=tl.float32)
+    for i0 in range(0, n, B):                                   # pass 1: r0 (kept in o), its sum
+        i = i0 + offs; m = i < n
+        sq = tl.load(sq_ptr + i, mask=m, other=0.0)
+        r0 = sq * c_sq
+        if HAS_V:
+            r0 = b2 * tl.load(v_ptr + i, mask=m, other=0.0) / bc + (1 - b2) * r0
+        tl.store(o_ptr + i, r0, mask=m)
+        tot += tl.where(m, r0, 0.0)
+        d = sq / c_d
+        if HAS_P:
+            tl.store(rs_ptr + i, tl.load(rs_ptr + i, mask=m) + d + c_cr * tl.load(cr_ptr + i, mask=m), mask=m)
+            tl.store(ds_ptr + i, tl.load(ds_ptr + i, mask=m) + d, mask=m)
+        else:
+            tl.store(rs_ptr + i, d, mask=m)
+            tl.store(ds_ptr + i, d, mask=m)
+    mean = tl.maximum(tl.sum(tot, axis=0) / n, 1e-30)
+    amax = tl.zeros([B], dtype=tl.float32)
+    for i0 in range(0, n, B):                                   # pass 2: a (kept in o), its max
+        i = i0 + offs; m = i < n
+        r0 = tl.load(o_ptr + i, mask=m, other=0.0)
+        a = tl.sqrt(r0 / mean) if NORM else tl.sqrt(r0)
+        tl.store(o_ptr + i, a, mask=m)
+        amax = tl.maximum(amax, tl.where(m, a, 0.0))
+    lo = tl.max(amax, axis=0) * 1e-12 + 1e-30
+    for i0 in range(0, n, B):                                   # pass 3: the bounded reciprocal
+        i = i0 + offs; m = i < n
+        a = tl.load(o_ptr + i, mask=m, other=1.0)
+        tl.store(o_ptr + i, 1.0 / tl.maximum(a, lo), mask=m)
+
+
+def micro_sketch(G, P, rs, ds, v, M, n_other, b2, bc, norm):
+    """--ttf-accum micro, one side of the factored update's statistics in two kernels (instead of ~25 torch ops):
+    G [n, k] fp32, this micro-batch's sketch (g Sr, or (Sc g)^T); P [n, k] bf16, the running sum of the step's
+    sketches (None on its first micro-batch); rs, ds [n] fp32, the running cross-term and own-square sums (None with
+    P); v [n], the side's v (None before the first step). Returns (1 / a, rs, ds, P), P and rs / ds updated in place.
+    The same quantities as update._ts_layer_factored's torch path; sums in another order (not bit-identical)."""
+    n, k = G.shape
+    G = G.contiguous()
+    has_p = P is not None
+    if not has_p:
+        P = torch.empty(n, k, dtype=torch.bfloat16, device=G.device)
+        rs = torch.empty(n, dtype=torch.float32, device=G.device); ds = torch.empty_like(rs)
+    sq = torch.empty(n, dtype=torch.float32, device=G.device); cr = torch.empty_like(sq)
+    BR = 16
+    _msk_rows_kernel[(triton.cdiv(n, BR),)](G, P, sq, cr, n, k, G.stride(0), P.stride(0), HAS_P=has_p, BR=BR,
+                                            BK=min(256, triton.next_power_of_2(k)))
+    o = torch.empty_like(sq)
+    _msk_vec_kernel[(1,)](sq, cr, rs, ds, v if v is not None else sq, o, n, float(M * M / n_other), float(n_other),
+                          2.0 / n_other, float(b2), float(bc), HAS_P=has_p, HAS_V=v is not None, NORM=bool(norm), B=1024)
+    return o, rs, ds, P
 
 
 @triton.jit

@@ -5,7 +5,7 @@ import os
 import math
 import torch
 
-from .layers import KernelTernaryLinear
+from .layers import KernelTernaryLinear, _rf
 from .schedule import _theta_at
 
 
@@ -83,7 +83,7 @@ def _decode(c, s):
 
 
 def _store_pair(enc, U, V):
-    with torch.profiler.record_function("ttf.codec"):
+    with _rf("ttf.codec"):
         return _store_pair_(enc, U, V)
 
 
@@ -94,7 +94,7 @@ def _store_pair_(enc, U, V):
 
 
 def _load_pair(t):
-    with torch.profiler.record_function("ttf.codec"):
+    with _rf("ttf.codec"):
         return _load_pair_(t)
 
 
@@ -213,7 +213,7 @@ _OFFLOAD = _AsyncOffload()
 
 
 def _host_get(d, k, dev, off):
-    with torch.profiler.record_function("ttf.store"):
+    with _rf("ttf.store"):
         return _host_get_(d, k, dev, off)
 
 
@@ -227,7 +227,7 @@ def _host_get_(d, k, dev, off):
 
 
 def _host_put(d, k, v, off):
-    with torch.profiler.record_function("ttf.store"):
+    with _rf("ttf.store"):
         return _host_put_(d, k, v, off)
 
 
@@ -262,7 +262,7 @@ def _ts_state_bytes(lr_state):
 
 
 def _orth(X):
-    with torch.profiler.record_function("ttf.orth"):
+    with _rf("ttf.orth"):
         return _orth_(X)
 
 
@@ -451,6 +451,15 @@ def _dpm(t):
     return t
 
 
+def _layer_gen(l, dev):
+    """the layer's own random generator on dev, made once (a CUDA generator costs ~20 us to build; the callers re-seed it,
+    which resets its whole state, so the numbers are those of a fresh one)"""
+    g = getattr(l, "_ts_gen", None)
+    if g is None or g.device != dev:
+        g = l._ts_gen = torch.Generator(device=dev)
+    return g
+
+
 def _ts_layer_factored(l, fg, state, c):
     """--dw factored K: the TTF  update (16 x 1 or --ttf-accum micro) from the factors of the weight gradient,
     g = gy^T x, which is never formed. Everything the update reads from g is a product with a thin matrix: the
@@ -474,27 +483,24 @@ def _ts_layer_factored(l, fg, state, c):
     lk = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau
     k_ = int(c["factored"])
     ts_ = (t - 1) // M_
-    gen = torch.Generator(device=dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
+    gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
     Sr = torch.randn(l.K, k_, device=dev, generator=gen) / k_ ** 0.5
     Sc = torch.randn(k_, l.N, device=dev, generator=gen) / k_ ** 0.5
-    gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                    # g Sr  [N, k]
-    Sg = _dpm(_mmb(x.T, _mmb(gy, Sc.T)).T.contiguous())                   # Sc g  [k, K]
-    rsq, csq = gS.square().sum(1), Sg.square().sum(0)                     # ~ row / column sums of g^2
-    if M_ > 1:   # as ts_layer's --ttf-accum micro  branch, with the sketched own squares
-        r0, c0 = rsq * (M_ * M_ / l.K), csq * (M_ * M_ / l.N)
+    if MICRO_FUSED[0] and M_ > 1 and dev.type == "cuda" and not c.get("vdiag"):
+        # --ttf-accum micro on the GPU: each sketch side's statistics (its squares, the cross terms with the step's
+        # running sum, v's EMA, the scale and its bounded reciprocal) in two kernels (kernel.micro_sketch) instead of
+        # ~50 small ops; the running sum of the column side is kept as (Sc g)^T [K, k], so no transpose copy
+        from .kernel import micro_sketch
+        gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                # g Sr  [N, k]
+        SgT = _dpm(_mmb(x.T, _mmb(gy, Sc.T)))                             # (Sc g)^T  [K, k]
+        R0 = C0 = None
         if ("v", key) in st and ts_ > 0:
             R0, C0 = _host_get(st, ("v", key), dev, off)
-            bc_ = 1 - b2 ** ts_
-            r0 = b2 * R0 / bc_ + (1 - b2) * r0; c0 = b2 * C0 / bc_ + (1 - b2) * c0; del R0, C0
-        m_ = r0.mean().clamp_min(1e-30)
-        PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (0, 0, 0, 0, 0, 0)
-        if torch.is_tensor(PS):    # the running sketch sums are held in bf16 between micro-batches (k (N + K) x 2 bytes
-            PS, SP = PS.float(), SP.float()   # per layer; their rounding, 2^-9, is far below the sketch's own noise)
-        d1, d0 = rsq / l.K, csq / l.N
-        rs = rs + d1 + (2.0 / l.K) * (gS * PS).sum(1) if torch.is_tensor(PS) else d1
-        cs = cs + d0 + (2.0 / l.N) * (Sg * SP).sum(0) if torch.is_tensor(SP) else d0
-        ds, es = ds + d1, es + d0
-        PS, SP = PS + gS, SP + Sg
+        bc_ = 1 - b2 ** ts_ if ts_ > 0 else 1.0
+        PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (None,) * 6
+        ia, rs, ds, PS = micro_sketch(gS, PS, rs, ds, R0, M_, l.K, b2, bc_, True)
+        ib, cs, es, SP = micro_sketch(SgT, SP, cs, es, C0, M_, l.N, b2, bc_, False)
+        del gS, SgT, R0, C0
         if final_:
             rs, cs = torch.maximum(rs, ds / M_), torch.maximum(cs, es / M_)
             if ("v", key) in st:
@@ -502,26 +508,55 @@ def _ts_layer_factored(l, fg, state, c):
             else:
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
-            if c.get("vdiag"):   # --ttf-vdiag: this micro-batch's g^2 against v (the u extremes need the dense u: not kept)
-                sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** (t // M_))).clamp_min(1e-30))
-                _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
         else:
-            st[("mx", key)] = (PS.to(torch.bfloat16), SP.to(torch.bfloat16), rs, cs, ds, es)
+            st[("mx", key)] = (PS, SP, rs, cs, ds, es)
         del PS, SP
-        a = (r0 / m_).sqrt_(); b = c0.sqrt()                              # sqrt(v_ij) = a_i b_j
-    else:        # 16 x 1: v includes this step's g^2
-        if ("v", key) in st:
-            R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * rsq / l.K; C = b2 * C + (1 - b2) * csq / l.N
-        else:
-            R, C = (1 - b2) * rsq / l.K, (1 - b2) * csq / l.N
-        _host_put(st, ("v", key), (R, C), off)
-        if c.get("vdiag"):
-            sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** t)).clamp_min(1e-30))
-            _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
-        a = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** t)).sqrt(); b = C.sqrt()
-    del gS, Sg
-    ia = 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30)                 # 1 / a_i, 1 / b_j (zero rows: g is zero there;
-    ib = 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)                 # device-side bounds: no host sync per call)
+    else:
+        gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                    # g Sr  [N, k]
+        Sg = _dpm(_mmb(x.T, _mmb(gy, Sc.T)).T.contiguous())                   # Sc g  [k, K]
+        rsq, csq = gS.square().sum(1), Sg.square().sum(0)                     # ~ row / column sums of g^2
+        if M_ > 1:   # as ts_layer's --ttf-accum micro  branch, with the sketched own squares
+            r0, c0 = rsq * (M_ * M_ / l.K), csq * (M_ * M_ / l.N)
+            if ("v", key) in st and ts_ > 0:
+                R0, C0 = _host_get(st, ("v", key), dev, off)
+                bc_ = 1 - b2 ** ts_
+                r0 = b2 * R0 / bc_ + (1 - b2) * r0; c0 = b2 * C0 / bc_ + (1 - b2) * c0; del R0, C0
+            m_ = r0.mean().clamp_min(1e-30)
+            PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (0, 0, 0, 0, 0, 0)
+            if torch.is_tensor(PS):    # the running sketch sums are held in bf16 between micro-batches (k (N + K) x 2 bytes
+                PS, SP = PS.float(), SP.float()   # per layer; their rounding, 2^-9, is far below the sketch's own noise)
+            d1, d0 = rsq / l.K, csq / l.N
+            rs = rs + d1 + (2.0 / l.K) * (gS * PS).sum(1) if torch.is_tensor(PS) else d1
+            cs = cs + d0 + (2.0 / l.N) * (Sg * SP).sum(0) if torch.is_tensor(SP) else d0
+            ds, es = ds + d1, es + d0
+            PS, SP = PS + gS, SP + Sg
+            if final_:
+                rs, cs = torch.maximum(rs, ds / M_), torch.maximum(cs, es / M_)
+                if ("v", key) in st:
+                    R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * rs; C = b2 * C + (1 - b2) * cs
+                else:
+                    R, C = (1 - b2) * rs, (1 - b2) * cs
+                _host_put(st, ("v", key), (R, C), off)
+                if c.get("vdiag"):   # --ttf-vdiag: this micro-batch's g^2 against v (the u extremes need the dense u: not kept)
+                    sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** (t // M_))).clamp_min(1e-30))
+                    _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
+            else:
+                st[("mx", key)] = (PS.to(torch.bfloat16), SP.to(torch.bfloat16), rs, cs, ds, es)
+            del PS, SP
+            a = (r0 / m_).sqrt_(); b = c0.sqrt()                              # sqrt(v_ij) = a_i b_j
+        else:        # 16 x 1: v includes this step's g^2
+            if ("v", key) in st:
+                R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * rsq / l.K; C = b2 * C + (1 - b2) * csq / l.N
+            else:
+                R, C = (1 - b2) * rsq / l.K, (1 - b2) * csq / l.N
+            _host_put(st, ("v", key), (R, C), off)
+            if c.get("vdiag"):
+                sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** t)).clamp_min(1e-30))
+                _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
+            a = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** t)).sqrt(); b = C.sqrt()
+        del gS, Sg
+        ia = 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30)                 # 1 / a_i, 1 / b_j (zero rows: g is zero there;
+        ib = 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)                 # device-side bounds: no host sync per call)
     fgb = (gy, x, ib)
     if c.get("start") and c.get("step", 0) < c["start"]:                  # --ttf-start: frozen, v keeps learning
         return
@@ -574,6 +609,7 @@ def _ts_layer_factored(l, fg, state, c):
 
 MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "64"))]   # sketch size (TERN_MICRO_K: tests only)
 FIRE_FUSED = [False]          # --fire fused (with --dw factored): ttf.kernel.ttf_fire
+MICRO_FUSED = [os.environ.get("TERN_MICRO_FUSED", "0") == "1"]   # --ttf-accum micro: kernel.micro_sketch (default off until its real-run equivalence)
 
 
 def _micro_sketch(l, dev, step):

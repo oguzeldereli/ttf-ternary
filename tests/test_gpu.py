@@ -234,6 +234,37 @@ def test_factored_matches_dense():
     assert errs[1] < errs[0] / 2.5 and errs[1] < 0.1, errs          # 16 x the sketch: ~4 x smaller
 
 
+def test_micro_fused_matches_torch():
+    """--ttf-accum micro: kernel.micro_sketch (the sketch sides' statistics in four kernels) against the torch ops,
+    over 3 steps x 4 micro-batches (shapes that are not tile multiples): the accumulator and v agree to fp32 rounding
+    (the sums run in another order). fp32 factors: with bf16 ones the products round their right-hand side to bf16
+    (_mmb), so a 1e-7 difference in 1 / b flips some roundings and the two paths drift apart chaotically (~0.5% of A
+    after 12 micro-batches here), as any two summation orders do"""
+    from ttf import update as U
+    N, K, T, M = 200, 136, 384, 4
+
+    def run(fused):
+        U.MICRO_FUSED[0] = fused
+        l = _layer(N, K, 0); l._ts_idx = 2; state = {}
+        gen = torch.Generator(device=dev).manual_seed(7)
+        for s in range(3):
+            for i in range(M):
+                gy = torch.randn(T, N, device=dev, generator=gen) * 1e-3
+                x = torch.randn(T, K, device=dev, generator=gen) + 0.2
+                l._ts_final = i == M - 1
+                U.ts_layer(l, (gy, x), state, _cfg(r=24, theta=1e9, tau_anneal=0.75, factored=64, step=10 + s, micro=M))
+        Uu, V = U._load_pair(state[id(l)])
+        return Uu @ V.T, state["_ts"][("v", id(l))]
+    old = U.MICRO_FUSED[0]
+    try:
+        A0, v0 = run(False); A1, v1 = run(True)
+    finally:
+        U.MICRO_FUSED[0] = old
+    assert float((A1 - A0).norm() / A0.norm()) < 1e-5
+    for a, b in zip(v0, v1):
+        assert float(((a - b).abs() / a.abs().clamp_min(1e-30)).max()) < 1e-5
+
+
 def _run(out, extra, steps, data):
     cmd = [sys.executable, os.path.join(ROOT, "scripts", "tests", "det_run.py"), "ttf.train", "--preset", "small",
            "--data", data, "--val", data, "--seq-len", "128", "--batch-size", "2", "--accum", "2", "--steps", "8",

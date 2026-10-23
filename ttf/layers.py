@@ -6,13 +6,22 @@ update after the backward. The earlier rules that flipped trits inside this back
 the evidence counter, lockout, error feedback, the flip predictor) are in ttf.legacy.flip.
 """
 from __future__ import annotations
+import contextlib
 import math
 import torch
 import torch.nn as nn
-from torch.profiler import record_function as _rf      # named ranges for TERN_PROF (cheap when not profiling)
 
 from .config import ModelConfig
 from .model import BitTransformer
+
+_PROF_ON = torch._C._autograd._profiler_enabled
+_NULL = contextlib.nullcontext()
+
+
+def _rf(name):
+    """a named range for TERN_PROF. torch.profiler.record_function costs two dispatcher calls even with no profiler
+    running (~60k per 0.8B adapter step), so outside a profile it is a shared no-op context"""
+    return torch.profiler.record_function(name) if _PROF_ON() else _NULL
 
 
 from .kernel import (pack_rows, unpack_rows, unpack_fast, tern_gemm, tern_gemm_dx, trit_beta, trit_nnz, beta_from_nnz,
