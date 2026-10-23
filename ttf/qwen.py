@@ -542,6 +542,7 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
     hf.model.embed_tokens.weight.requires_grad_(False); hf.lm_head.weight.requires_grad_(False)
     for f_ in X_.having("begin"):
         f_(m, files, dev, log)
+    _prop_w = any(getattr(e, "propagate_wrapped", False) for e in X_.active())
     data = np.memmap(data_path, dtype=np.uint32 if dtype_u32 else np.uint16, mode="r")
     rng = np.random.default_rng(4321)
     starts = rng.integers(0, len(data) - seq - 1, n_seq)
@@ -598,7 +599,9 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
             if GPTQ_OPTS["mag_svd"] and method in ("gptq", "gptqc"):          # --adapter-init svd
                 kept.append(mag_svd_fit(lin, W, T, a, c, beta, Hl - torch.outer(mu, mu) if method == "gptqc" else Hl,
                                         GPTQ_OPTS["mag_svd"]))
-            setattr(parent, n.rsplit(".", 1)[1], lin)
+            # the calibration stream goes on through the bare ternary layer, unless a plug-in asks for the whole wrapper
+            # (ext attribute propagate_wrapped: the layers above are then rounded for the inputs they will see)
+            setattr(parent, n.rsplit(".", 1)[1], wrapped[n] if n in wrapped and _prop_w else lin)
             del W, Hl, T
         del fp, Hs, Ss
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):   # on through the converted layer
