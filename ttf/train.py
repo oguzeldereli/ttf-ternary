@@ -853,8 +853,9 @@ def main():
                                        _teacher.tok_emb.weight if _teacher.lm_head is None else _teacher.lm_head.weight)
                     else:
                         tz_, _ = _teacher(x)
-                tz_ = tz_.reshape(-1, tz_.shape[-1])   # in row chunks: the fp32 copy of all logits is ~4 GB at 32k tokens
-                model.kd_logp = torch.cat([F.log_softmax(c_.float(), -1).to(torch.bfloat16) for c_ in tz_.split(4096)]); del tz_
+                tz_ = tz_.reshape(-1, tz_.shape[-1])   # in row chunks of 512: one chunk's fp32 copy is 0.47 GiB at a 248k
+                # vocabulary (4096-row chunks made a 1.9 GiB transient, the 0.8B adapter step's memory peak); per-row ops: the same values
+                model.kd_logp = torch.cat([F.log_softmax(c_.float(), -1).to(torch.bfloat16) for c_ in tz_.split(512)]); del tz_
             with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16), \
                     torch.profiler.record_function("model.fwd"):
                 _, loss = model(x, y)
