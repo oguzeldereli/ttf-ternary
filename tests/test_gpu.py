@@ -80,6 +80,7 @@ def test_codec_fp12():
 
 
 def test_fire_fused():
+    from ttf import kernel as K_
     from ttf.kernel import ttf_fire, pack_rows, unpack_rows, trit_nnz
     for N, K, r in ((300, 203, 40), (1024, 777, 64)):
         Uu = torch.randn(N, r, device=dev); V = torch.linalg.qr(torch.randn(K, r, device=dev))[0]
@@ -88,11 +89,17 @@ def test_fire_fused():
         w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8); p = pack_rows(w)
         d = A.sign(); fire = (A.abs() >= theta) & ((w.float() + d).abs() <= 1)
         D = torch.where(fire, d, torch.zeros_like(d)); p_ref = pack_rows(w + D.to(torch.int8))
-        p2 = p.clone(); dU, nf, dnnz = ttf_fire(Uu, V, p2, K, theta)
-        assert int(trit_nnz(p2, K)) == int(trit_nnz(p, K)) + int(dnnz), (N, K, r)   # beta's count follows the moves
-        near = int(((A.abs() - theta).abs() < 1e-5 * theta).sum())
-        assert int((unpack_rows(p2, K) != unpack_rows(p_ref, K)).sum()) <= near
-        assert float((dU - D @ V).norm() / (D @ V).norm().clamp_min(1e-30)) < 1e-5
+        for spend in ("dense", "sparse"):                                # (dense: no host sync, the default since 23 Oct)
+            K_.FIRE_SPEND[0] = spend
+            p2 = p.clone(); dU, nf, dnnz = ttf_fire(Uu, V, p2, K, theta)
+            assert int(trit_nnz(p2, K)) == int(trit_nnz(p, K)) + int(dnnz), (N, K, r, spend)   # beta's count follows
+            near = int(((A.abs() - theta).abs() < 1e-5 * theta).sum())
+            moved = unpack_rows(p2, K) != unpack_rows(p, K)
+            assert int((unpack_rows(p2, K) != unpack_rows(p_ref, K)).sum()) <= near
+            assert int(nf) == int(moved.sum()), (int(nf), int(moved.sum()), spend)
+            Dk = (unpack_rows(p2, K).float() - unpack_rows(p, K).float())   # (the kernel's own moves)
+            assert float((dU - Dk @ V).norm() / (Dk @ V).norm().clamp_min(1e-30)) < 1e-5, spend
+        K_.FIRE_SPEND[0] = "dense"
 
 
 def test_dx_int8x2():

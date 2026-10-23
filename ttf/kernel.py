@@ -633,17 +633,18 @@ def sq_sums(g: torch.Tensor):
 
 
 @triton.jit
-def _fire_kernel(u_ptr, v_ptr, p_ptr, d_ptr, N, K, K5, R, sun, svk, spn, sdn, theta,
+def _fire_kernel(u_ptr, v_ptr, p_ptr, d_ptr, c_ptr, N, K, K5, R, sun, svk, spn, sdn, theta,
                  RC: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr, PREC: tl.constexpr):
     """one tile of packed bytes: for each of the 5 trit digits, A = U V^T on those columns (fp32 accumulation; PREC
     'tf32x3' keeps fp32 accuracy on the tensor cores), the legal moves applied to the digit, the moves written to D
-    (int8, the spend is applied from them sparsely), the bytes stored back"""
+    (int8), the bytes stored back; the tile's number of moves and change of the nonzero count added to c[0], c[1]"""
     pn = tl.program_id(0); pk = tl.program_id(1)
     rows = pn * BN + tl.arange(0, BN)
     k5 = pk * BK5 + tl.arange(0, BK5)
     pm = (rows[:, None] < N) & (k5[None, :] < K5)
     b = tl.load(p_ptr + rows[:, None] * spn + k5[None, :], mask=pm, other=0).to(tl.int32)
     nb = tl.zeros((BN, BK5), dtype=tl.int32)
+    nmv = tl.zeros((BN, BK5), dtype=tl.int32); dnz = tl.zeros((BN, BK5), dtype=tl.int32)
     pw = 1
     for i in tl.static_range(5):
         k = k5 * 5 + i
@@ -657,14 +658,21 @@ def _fire_kernel(u_ptr, v_ptr, p_ptr, d_ptr, N, K, K5, R, sun, svk, spn, sdn, th
         d = tl.where(a > 0, 1, tl.where(a < 0, -1, 0))
         fire = (tl.abs(a) >= theta) & (tl.abs(dig - 1 + d) <= 1) & (k[None, :] < K) & pm
         dd = tl.where(fire, d, 0)
+        nmv += tl.where(fire, 1, 0)
+        dnz += tl.where(fire, tl.where(dig - 1 + dd != 0, 1, 0) - tl.where(dig - 1 != 0, 1, 0), 0)
         nb += (dig + dd) * pw
         tl.store(d_ptr + rows[:, None] * sdn + k[None, :], dd.to(tl.int8), mask=(rows[:, None] < N) & (k[None, :] < K))
         pw = pw * 3
     tl.store(p_ptr + rows[:, None] * spn + k5[None, :], nb.to(tl.uint8), mask=pm)
+    tl.atomic_add(c_ptr, tl.sum(tl.sum(nmv, axis=1), axis=0))
+    tl.atomic_add(c_ptr + 1, tl.sum(tl.sum(dnz, axis=1), axis=0))
 
 
 FIRE_TILE = None          # ttf_fire tiles (rows, packed bytes of 5 columns, rank chunk); None: by rank
 FIRE_PREC = ["tf32x3"]     # ttf_fire's A: "tf32x3" (tensor cores, ~fp32 accuracy) or "ieee" (fp32 FMAs, slower)
+FIRE_SPEND = ["dense"]     # ttf_fire's D V: "dense" (no host sync: three bf16 GEMMs of the int8 moves against V split into
+                           # high / middle / low parts, ~fp32 accuracy) or "sparse" (the moves' indices: one host sync per
+                           # layer, which stalls the CPU's queue of launches; before 23 Oct)
 
 
 def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, theta: float):
@@ -677,10 +685,19 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     K5 = packed.shape[1]
     U = U.contiguous().float(); V = V.contiguous().float()
     D = torch.empty(N, K, dtype=torch.int8, device=U.device)
+    cnt = torch.zeros(2, dtype=torch.int32, device=U.device)          # (the number of moves, the change of nonzeros)
     BN, BK5, RC = FIRE_TILE if FIRE_TILE else ((64, 32, 32) if R <= 512 else (64, 64, 32))   # best measured (4070 Ti S)
-    _fire_kernel[(triton.cdiv(N, BN), triton.cdiv(K5, BK5))](U, V, packed, D, N, K, K5, R, U.stride(0), V.stride(0),
+    _fire_kernel[(triton.cdiv(N, BN), triton.cdiv(K5, BK5))](U, V, packed, D, cnt, N, K, K5, R, U.stride(0), V.stride(0),
                                                               packed.stride(0), D.stride(0), float(theta),
                                                               RC=RC, BN=BN, BK5=BK5, PREC=FIRE_PREC[0])
+    if FIRE_SPEND[0] == "dense":                                       # D V without the moves' indices (no host sync)
+        Vh = V.to(torch.bfloat16); r_ = V - Vh.float(); Vm = r_.to(torch.bfloat16); Vl = (r_ - Vm.float()).to(torch.bfloat16)
+        dU = torch.empty(N, R, dtype=torch.float32, device=U.device)
+        for a0 in range(0, N, 8192):                                   # (row chunks: the bf16 copy of D stays small)
+            Db = D[a0:a0 + 8192].to(torch.bfloat16)                    # (exact: D is -1 / 0 / 1)
+            dU[a0:a0 + 8192] = (torch.mm(Db, Vh, out_dtype=torch.float32) + torch.mm(Db, Vm, out_dtype=torch.float32)
+                                + torch.mm(Db, Vl, out_dtype=torch.float32))
+        return dU, cnt[0], cnt[1]
     nz = D.nonzero()                                                    # the moves (one host sync)
     dU = torch.zeros(N, R, dtype=torch.float32, device=U.device)
     for c0 in range(0, nz.shape[0], 1 << 16):                          # in chunks: moves x r floats at a time
