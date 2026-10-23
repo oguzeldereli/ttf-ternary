@@ -82,8 +82,8 @@ def build_parser():
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")
     g.add_argument("--ttf-spend", type=float, default=1.0, help="a move spends this x theta of the accumulator")
     g.add_argument("--ttf-start", type=int, default=0, help="trits frozen until this step (floats train)")
-    g.add_argument("--ttf-acc-scale", type=float, default=1.0, help="--resume: multiply the accumulators by F "
-                   "(continuing at theta F x the old one)")
+    g.add_argument("--ttf-acc-scale", type=float, default=None, help="--resume: multiply the accumulators by F "
+                   "(continuing at theta F x the old one); required when --ttf-theta differs from the checkpoint's")
     g.add_argument("--ttf-update", default="fused", choices=["fused", "after"],
                    help="fused: each layer's update inside its backward (one layer's gradient alive at a time)")
     g.add_argument("--ttf-accum", default="micro", choices=["micro", "sum"],

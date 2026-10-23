@@ -22,6 +22,24 @@ def _theta_at(sched, prog):
     return th0_ if prog <= st_ else th0_ + (th1_ - th0_) * (prog - st_) / max(1e-9, 1.0 - st_)
 
 
+def resume_acc_scale(old_theta, new_theta, acc_scale, old_sched=None, new_sched=None):
+    """the accumulator scale of a resume (--ttf-acc-scale): resuming at a threshold different from the checkpoint's
+    without rescaling fires, in its first update, every entry between the two thresholds at once (27B, theta 64 ->
+    16: val 2.25 -> 7.50 in one step; 17 Oct and 23 Oct). So a changed theta needs an explicit --ttf-acc-scale (new /
+    old keeps each entry's distance to the bar; 1 keeps the accumulators as they are); with a schedule on either side
+    the check is skipped. Returns (scale, message or None); raises SystemExit when the scale is missing."""
+    if acc_scale is not None:
+        msg = (f"--ttf-acc-scale {acc_scale:g}: accumulators x {acc_scale:g} (checkpoint theta {old_theta}, now "
+               f"{new_theta})" if acc_scale != 1.0 else None)
+        return float(acc_scale), msg
+    if old_sched or new_sched or old_theta is None or new_theta is None or float(old_theta) == float(new_theta):
+        return 1.0, None
+    raise SystemExit(f"resuming at --ttf-theta {new_theta:g} from a checkpoint trained at {float(old_theta):g}: the first "
+                     f"update would fire every accumulator entry between the two at once. Pass --ttf-acc-scale "
+                     f"{float(new_theta) / float(old_theta):g} (keeps each entry's distance to the bar) or "
+                     f"--ttf-acc-scale 1 (keeps the accumulators as they are).")
+
+
 def lr_at(step, tc: TrainConfig):
     if step < tc.warmup_steps:
         return tc.lr * (step + 1) / tc.warmup_steps

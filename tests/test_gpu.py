@@ -227,13 +227,17 @@ def test_factored_matches_dense():
     assert errs[1] < errs[0] / 2.5 and errs[1] < 0.1, errs          # 16 x the sketch: ~4 x smaller
 
 
-def _train(out, extra, steps, data):
+def _run(out, extra, steps, data):
     cmd = [sys.executable, os.path.join(ROOT, "scripts", "tests", "det_run.py"), "ttf.train", "--preset", "small",
            "--data", data, "--val", data, "--seq-len", "128", "--batch-size", "2", "--accum", "2", "--steps", "8",
            "--warmup", "2", "--eval-interval", "1000", "--eval-iters", "1", "--save-secs", "99999", "--ttf-rank", "16",
            "--out-dir", out, "--stop-after", str(steps)] + extra
     env = dict(os.environ, PYTHONPATH=ROOT)
-    r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=900)
+    return subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=900)
+
+
+def _train(out, extra, steps, data):
+    r = _run(out, extra, steps, data)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
     return [json.loads(l)["loss"] for l in open(os.path.join(out, "metrics.jsonl")) if '"loss"' in l]
 
@@ -248,6 +252,19 @@ def test_train_resume_round_trip(tmp_path):
     assert len(a) == 8 and a == b, (a, b)
     recs = [json.loads(l) for l in open(tmp_path / "b" / "records.jsonl")]
     assert [r["type"] for r in recs].count("run") == 2 and recs[-1].get("status") == "finished"
+
+
+def test_resume_new_theta_needs_acc_scale(tmp_path):
+    """a resume at a theta different from the checkpoint's is refused without --ttf-acc-scale (the burst of 17 / 23 Oct),
+    and runs with it, saying what it did"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    _train(str(tmp_path / "b"), [], 4, data)                           # (theta 16, the default)
+    r = _run(str(tmp_path / "b"), ["--resume", "--ttf-theta", "8"], 6, data)
+    assert r.returncode != 0 and "--ttf-acc-scale 0.5" in r.stdout + r.stderr, r.stdout[-1500:] + r.stderr[-1500:]
+    r = _run(str(tmp_path / "b"), ["--resume", "--ttf-theta", "8", "--ttf-acc-scale", "0.5"], 6, data)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    assert "accumulators x 0.5 (checkpoint theta 16.0, now 8.0)" in r.stdout, r.stdout[-1500:]
 
 
 def test_train_resume_fp32(tmp_path):
