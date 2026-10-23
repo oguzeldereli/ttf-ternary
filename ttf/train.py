@@ -71,6 +71,8 @@ def mem_report(model, tail_opt, lr_state):
 
 def main():
     args = parse()
+    from . import ext as _X
+    _X.load(args.ext)   # --ext plug-ins (ttf/ext.py), before the model is built
     kmode = {"ttf": "kernel", "bitnet": "master", "fp32": "fp32"}[args.mode]   # the checkpoint's and hf_init's names
     ttf = args.mode == "ttf"
     te = args.tern_emb if args.tern_emb != "none" else ""            # the ternary embedding's kind ("": none)
@@ -183,9 +185,12 @@ def main():
             _own = (*_rng[_PP[0]], _PP[0] == 0, _PP[0] == _PP[1] - 1)
             print(f"--pipe: stage {_PP[0]} of {_PP[1]}: decoder layers {_own[0]}..{_own[1] - 1} of {_rng[-1][1]}"
                   f"{' + embedding' if _own[2] else ''}{' + norm, head and loss' if _own[3] else ''}", flush=True)
+        _mkl = lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, beta=use_beta, int8=i8, int8_dx=i8dx)
         model, _qsw = build_qwen(args.init_hf, "kernel", grad_checkpoint=tc.grad_checkpoint, device=device, own=_own,
-                                 make_linear=lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, beta=use_beta,
-                                                                                 int8=i8, int8_dx=i8dx))
+                                 make_linear=_mkl)
+        from . import ext as _X
+        for f_ in _X.having("build"):    # --ext plug-ins: wrappers / extra layers (fresh start and resume alike)
+            _qsw = f_(model, _qsw, _mkl, lambda m_: print(m_, flush=True))
         if _PP:
             model.pp = {"rank": _PP[0], "n": _PP[1], "lo": _own[0], "hi": _own[1]}
     elif args.mode == "ttf":

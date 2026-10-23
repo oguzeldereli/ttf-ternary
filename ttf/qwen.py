@@ -545,15 +545,20 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
     import numpy as np
     from .hf_init import ternarize, ternarize_gptq, _rel_err, _out_err, GPTQ_OPTS, mag_svd_fit
     from .kernel import pack_rows, trit_beta
+    from . import ext as X_
     kept = []
     files = _safetensor_index(path)
     hf = m.hf
+    wrapped = {n: q for n, q in swapped.items() if X_.base(q) is not q}   # --ext wrappers: their ternary layer is rounded and
+    swapped = {n: X_.base(q) for n, q in swapped.items()}                 # carries the stream; the wrapper goes back at the end
     sw = {k + ".weight" for k in swapped}
     for k, p in hf.named_parameters():                  # the float parts
         src = k if k in files else ("model.embed_tokens.weight" if k == "lm_head.weight" else None)
         if src in files and k not in sw:
             p.copy_(_get(files, src, dev).to(p.dtype))
     hf.model.embed_tokens.weight.requires_grad_(False); hf.lm_head.weight.requires_grad_(False)
+    for f_ in X_.having("begin"):
+        f_(m, files, dev, log)
     data = np.memmap(data_path, dtype=np.uint32 if dtype_u32 else np.uint16, mode="r")
     rng = np.random.default_rng(4321)
     starts = rng.integers(0, len(data) - seq - 1, n_seq)
@@ -567,6 +572,8 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
         fp = {}                                         # this layer's full-precision linears, in place of the ternary ones
         for n, lin in mine.items():
             W = _get(files, n + ".weight", dev)
+            for f_ in X_.having("weight"):              # e.g. a residual-stream fold (rounded to bf16 with the rest)
+                W = f_(n, W.float(), li)
             f = nn.Linear(W.shape[1], W.shape[0], bias=False, device=dev, dtype=torch.bfloat16); f.weight.copy_(W)
             parent = layer.get_submodule(n[len(pre_):].rsplit(".", 1)[0]); setattr(parent, n.rsplit(".", 1)[1], f)
             fp[n] = (f, parent)
@@ -593,8 +600,14 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
             if method == "gptq":
                 T, a, c = ternarize_gptq(W, Hl, a, c)
             elif method == "gptqc":                     # centred (hf_init gptqc)
-                T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)
+                Hc_ = Hl - torch.outer(mu, mu)
+                T, a, c = ternarize_gptq(W, Hc_, a, c)
+                for f_ in X_.having("refine"):          # e.g. coordinate descent on the trits
+                    T, a, c = f_(n, W, Hc_, T, a, c)
                 lin.enable_centering(mu, W @ mu)
+                for f_ in X_.having("fitted"):          # e.g. adapters fitted to what the trits left
+                    f_(n, wrapped.get(n, lin), W, Hc_, mu, T, a, c)
+                del Hc_
             oerrs.append((e0, _out_err(W, T, a, c, Hl))); errs.append(_rel_err(W, T, a, c))
             lin.wpacked.copy_(pack_rows(T))
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
@@ -612,6 +625,11 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
             e0, e1 = zip(*oerrs[-len(mine):])
             log(f"  layer {li}: {len(mine)} linears, output-space error {sum(e1) / len(e1):.4f} "
                 f"(ALS {sum(e0) / len(e0):.4f}), peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
+    for n, q in wrapped.items():                         # the wrappers back in the tree
+        par, cn = n[len("model.layers."):].rsplit(".", 1)
+        setattr(hf.model.layers.get_submodule(par), cn, q)
+    for f_ in X_.having("end"):
+        f_(m, log)
     e0, e1 = zip(*oerrs)
     if kept:
         log(f"--adapter-init svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
