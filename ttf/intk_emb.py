@@ -46,13 +46,81 @@ class IntKMatrix(nn.Module):
         self._W = None
         if W is None or W.grad is None:
             return
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:   # data parallel: the codes
+            G_ = W.grad.float()                                    # move on the mean gradient (the same on every rank)
+            dist.all_reduce(G_); G_.div_(dist.get_world_size()); W.grad = G_
         gW = W.grad.float().reshape(self.N, self.K // self.g, self.g)
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()
         for p, gp in ((self.lo, gW.sum(-1)), (self.s, (gW * q).sum(-1))):
             p.grad = gp if p.grad is None else p.grad + gp
         gq = (gW * self.s.detach()[..., None]).reshape(self.N, self.K)
         del gW, q
-        ts_layer(self, gq, state, dict(c, micro=1))
+        if self.N * self.K > CHUNKED_ABOVE[0]:
+            ttf_rows(self, gq, state, c)
+        else:
+            ts_layer(self, gq, state, dict(c, micro=1))
+
+
+CHUNKED_ABOVE = [400_000_000]   # entries: larger matrices (27B: 248320 x 5120) take ttf_rows (bounded temporaries)
+
+
+@torch.no_grad()
+def ttf_rows(l, g, state, c, rows=16384):
+    """update.ts_layer's dense update (one call per step) for int-k codes in row chunks: the temporaries are
+    [rows, K] instead of [N, K] (at 27B's 248320 x 5120 the full ones were ~30 GB). The same steps: v = R C / mean R
+    (row / column EMAs of g^2, decay b2, bias-corrected), u = -lr g / (sqrt v + 1e-8), the rank-r accumulator A = U V^T
+    (leak, the basis turned from V (U^T U) + u^T U), a code moves one level where |A| >= theta (within 0 .. levels),
+    each move spends theta. V's first basis comes from a chunk-wise random projection (not ts_layer's single draw)."""
+    from .update import _orth
+    N, K = g.shape
+    lr, theta, tau, b2 = c["lr_ratio"], c["theta"], c["tau"], c["b2"]
+    st = state.setdefault("_ts", {}); key = id(l)
+    t = st.get(("t", key), 0) + 1; st[("t", key)] = t
+    R = torch.empty(N, device=g.device); Cs = torch.zeros(K, device=g.device)
+    for i in range(0, N, rows):
+        g2 = g[i:i + rows].square(); R[i:i + rows] = g2.mean(1); Cs += g2.sum(0); del g2
+    C = Cs / N
+    if ("v", key) in st:
+        R0, C0 = st[("v", key)]; R = b2 * R0 + (1 - b2) * R; C = b2 * C0 + (1 - b2) * C
+    else:
+        R, C = (1 - b2) * R, (1 - b2) * C
+    st[("v", key)] = (R, C)
+    rs = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** t)).sqrt(); cs = C.sqrt()   # sqrt(v_ij) = rs_i cs_j
+
+    def u_of(i):
+        return -g[i:i + rows] / (rs[i:i + rows, None] * cs[None, :] + 1e-8) * lr
+
+    ra = min(int(getattr(l, "ts_rank", None) or c["r"]), N, K)
+    if key not in state:
+        gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
+        X = torch.zeros(K, ra, device=g.device)
+        for i in range(0, N, rows):
+            u = u_of(i); X += u.T @ torch.randn(u.shape[0], ra, device=g.device, generator=gen); del u
+        V = _orth(X); U = torch.empty(N, ra, device=g.device)
+        for i in range(0, N, rows):
+            U[i:i + rows] = u_of(i) @ V
+    else:
+        U, V = state[key]
+        U = U * (1 - (lr ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)
+        X = V @ (U.T @ U)
+        for i in range(0, N, rows):
+            X += u_of(i).T @ U[i:i + rows]
+        Vn = _orth(X); del X
+        P = V.T @ Vn
+        for i in range(0, N, rows):
+            U[i:i + rows] = U[i:i + rows] @ P + u_of(i) @ Vn
+        V = Vn
+    nf = torch.zeros((), device=g.device, dtype=torch.long)
+    for i in range(0, N, rows):
+        A = U[i:i + rows] @ V.T; w0 = l.codes[i:i + rows]
+        d = A.sign(); nw = w0.float() + d
+        fire = (A.abs() >= theta) & (nw >= 0) & (nw <= l.levels); del A, nw
+        D = torch.where(fire, d, torch.zeros_like(d)); del d
+        w0.add_(D.to(torch.int8)); nf += fire.sum(); del fire
+        U[i:i + rows] -= c["spend"] * (theta * (D @ V)); del D
+    state[key] = (U, V)
+    st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + N * K
 
 
 class _Emb(nn.Module):

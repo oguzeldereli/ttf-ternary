@@ -484,3 +484,26 @@ def test_intk_codes_fire_in_range():
     assert int(m.codes.min()) >= 0 and int(m.codes.max()) <= 3
     assert int((m.codes != q0).sum()) > 0 and int((m.codes.int() - q0.int()).abs().max()) <= 3
     assert m.lo.grad is not None and m.s.grad is not None
+
+
+def test_intk_rows_matches_dense():
+    """intk_emb.ttf_rows (the chunked update for 27B-size matrices) against update.ts_layer's dense path: from the same
+    accumulator state the same v, the same turned basis span and the same moves (up to fp32 summation order)"""
+    from ttf import update as U
+    from ttf import intk_emb as IE
+    torch.manual_seed(0)
+    W = torch.randn(300, 128, device=dev)
+    a, b = IE.IntKMatrix(W, 3).to(dev), IE.IntKMatrix(W, 3).to(dev)
+    a._ts_idx = b._ts_idx = 3
+    sa, sb = {}, {}
+    c = _cfg(r=16, theta=0.3)
+    gs = [torch.randn(300, 128, device=dev) for _ in range(4)]
+    U.ts_layer(a, gs[0].clone(), sa, dict(c, micro=1))       # the first call: both start from ts_layer's state
+    sb[id(b)] = tuple(x.clone() for x in sa[id(a)]); sb["_ts"] = {k_ if k_[1] != id(a) else (k_[0], id(b)): (tuple(x.clone() for x in v_) if isinstance(v_, tuple) else v_)
+                                                              for k_, v_ in sa["_ts"].items() if isinstance(k_, tuple)}
+    b.codes.copy_(a.codes)
+    for g in gs[1:]:
+        U.ts_layer(a, g.clone(), sa, dict(c, micro=1)); IE.ttf_rows(b, g.clone(), sb, c, rows=64)
+    assert int((a.codes != b.codes).sum()) <= 3, int((a.codes != b.codes).sum())
+    Ua, Va = sa[id(a)]; Ub, Vb = sb[id(b)]
+    assert float((Ua @ Va.T - Ub @ Vb.T).norm() / (Ua @ Va.T).norm()) < 1e-3
