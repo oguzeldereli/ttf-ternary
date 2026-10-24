@@ -740,6 +740,10 @@ def main():
             m_.ts_micro = bool(args.micro)
         print("--ttf-update fused: the update runs inside each layer's backward", flush=True)
         FIRE_FUSED[0] = args.fire == "fused"
+        if args.ttf_orth != "qr":
+            from .update import ORTH as _OR
+            _OR[0] = args.ttf_orth
+            print(f"--ttf-orth {args.ttf_orth}", flush=True)
         if args.factored_k:
             assert args.micro or tc.grad_accum == 1, "--dw factored: 16 x 1 or --ttf-accum micro"
             print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)

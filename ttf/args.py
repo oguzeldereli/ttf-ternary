@@ -72,6 +72,8 @@ def build_parser():
 
     g = ap.add_argument_group("TTF (--mode ttf)")
     g.add_argument("--ttf-rank", type=int, default=512, help="rank of each layer's accumulator A = U V^T")
+    g.add_argument("--ttf-orth", default="qr", choices=["qr", "cholqr2"],
+                   help="the accumulator basis' orthonormalisation: Householder QR, or Cholesky QR twice (QR where it would fail)")
     g.add_argument("--ttf-theta", type=float, default=16.0, help="firing threshold (in units of the step)")
     g.add_argument("--ttf-theta-sched", default="", help="T0:T1[:START]: theta T0 until fraction START, then linear to T1")
     g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant (steps)")

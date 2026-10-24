@@ -266,10 +266,26 @@ def _orth(X):
         return _orth_(X)
 
 
+ORTH = ["qr"]   # --ttf-orth: qr (Householder) or cholqr2 (two Cholesky QR passes, QR where they would fail)
+
+
 def _orth_(X):
     """orthonormal basis of the columns of X (tall, K x r), Householder QR. Only the span matters to TTF
-    (A = U V^T does not depend on the basis chosen)."""
-    return torch.linalg.qr(X)[0]
+    (A = U V^T does not depend on the basis chosen). cholqr2: Q = X R^-1 with R^T R the Cholesky factorisation of
+    X^T X, twice (the second pass restores orthogonality to fp32 rounding when the first is within 0.1 of it, i.e.
+    cond(X) below ~1e3); otherwise (rank deficient, ill conditioned: Cholesky QR would lose directions) Householder QR.
+    One host sync per call for that check."""
+    if ORTH[0] == "qr" or X.dtype != torch.float32 or X.shape[0] < X.shape[1]:
+        return torch.linalg.qr(X)[0]
+    L1, i1 = torch.linalg.cholesky_ex(X.T @ X)
+    Q = torch.linalg.solve_triangular(L1.T, X, upper=True, left=False)
+    G2 = Q.T @ Q
+    L2, i2 = torch.linalg.cholesky_ex(G2)
+    G2.diagonal().sub_(1.0)
+    ok = (i1 == 0) & (i2 == 0) & (G2.abs().amax() < 0.1)
+    if not bool(ok):
+        return torch.linalg.qr(X)[0]
+    return torch.linalg.solve_triangular(L2.T, Q, upper=True, left=False)
 
 
 def ts_layer(l, g, state, c):
