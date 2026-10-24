@@ -152,6 +152,13 @@ class QwenTern(nn.Module):
         wc = w.to(hf_.dtype)      # the head in the activations' dtype once per forward, not once per chunk (same values)
         for i in range(0, hf_.shape[0], n):
             hc, tc = hf_[i:i + n], tf[i:i + n]
+            if self.head_fused and self.training and wc.requires_grad and self.kd_topk is None:
+                from .headloss import head_loss_train_chunk      # --head-fused, trained head: dL/dW accumulated in
+                if i == 0:                                       # the forward, returned once (headloss.py)
+                    _acc = {}
+                total = total + head_loss_train_chunk(hc, wc, tc, kd[i:i + n] if kd is not None else None,
+                                                      self.kd_w if kd is not None else 0.0, _acc)
+                continue
             if self.head_fused and self.training and not wc.requires_grad:
                 from .headloss import head_loss_chunk, head_loss_topk_chunk   # --head-fused: loss and dL/dh in one
                 if self.kd_topk is not None:                                   # pass (frozen head)

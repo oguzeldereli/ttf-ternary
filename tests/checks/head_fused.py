@@ -41,3 +41,18 @@ for mode in ("rest", "renorm"):
         print(f"topk {mode} a={a}: loss rel {el:.1e}, dL/dh rel to autograd {eg:.1e}")
         assert el < 1e-5 and eg < 2e-2, (mode, a)
 print("ok")
+# a trained head: dL/dW and dL/dh over 3 chunks summed and scaled, against autograd
+from ttf.headloss import head_loss_train_chunk
+wt = w.clone().float().requires_grad_()
+hs = [torch.randn(n, d, device=dev).to(torch.bfloat16) for _ in range(3)]
+h1 = [x.clone().requires_grad_() for x in hs]
+l1 = sum(BitTransformer._loss_chunk_kd(x, wt.to(torch.bfloat16), tgt, tlp, 0.75) for x in h1) / 1000.0; l1.backward()
+g1 = wt.grad.clone(); wt.grad = None
+h2 = [x.clone().requires_grad_() for x in hs]; acc = {}
+wc = wt.to(torch.bfloat16)
+l2 = sum(head_loss_train_chunk(x, wc, tgt, tlp, 0.75, acc) for x in h2) / 1000.0; l2.backward()
+g2 = wt.grad
+ew = float((g1 - g2).norm() / g1.norm()); eh = max(float((a.grad.float() - b.grad.float()).norm() / a.grad.float().norm()) for a, b in zip(h1, h2))
+print(f"trained head: loss rel {abs(float(l1 - l2)) / abs(float(l1)):.1e}, dW rel {ew:.1e}, dh rel {eh:.1e}, acc cleared {acc == {}}")
+assert ew < 2e-2 and eh < 2e-2 and acc == {}
+print("ok2")

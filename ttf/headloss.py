@@ -93,3 +93,59 @@ class _HeadLossTopkFn(torch.autograd.Function):
 def head_loss_topk_chunk(h, w, tgt, ids, tlp, a, mode="rest"):
     assert not w.requires_grad, "--head-fused: the head must be frozen (its gradient is not computed)"
     return _HeadLossTopkFn.apply(h, w, tgt, ids, tlp, float(a), mode)
+
+
+class _HeadLossTrainFn(torch.autograd.Function):
+    """as _HeadLossFn for a TRAINED head: the forward also adds this chunk's dL/dW = dz^T h into an fp32 accumulator
+    shared by all chunks of one loss (acc["dW"], vocab x d), and the first chunk backwarded returns acc * grad_out for W
+    (the others None). Exact only because every chunk's grad_out is the same scalar (the chunks are summed, then
+    divided by the token count): checked at each backward."""
+    @staticmethod
+    def forward(ctx, h, w, tgt, tlp, a, acc):
+        with torch.no_grad():
+            z = F.linear(h, w).float()
+            lp = F.log_softmax(z, -1)
+            ok = tgt != -1
+            nll = -lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0][ok].sum()
+            p = lp.exp()
+            if tlp is not None:
+                pt = tlp.float().exp()
+                kl = (pt * (tlp.float() - lp)).sum()
+                loss = kl if a >= 1.0 else (1 - a) * nll + a * kl
+                ca = 0.0 if a >= 1.0 else (1 - a)
+                dz = p * (ca * ok.float()[:, None] + a * pt.sum(-1, keepdim=True)) - a * pt
+            else:
+                loss, ca = nll, 1.0
+                dz = p * ok.float()[:, None]
+            if ca:
+                idx = tgt.clamp_min(0)[:, None]
+                dz.scatter_add_(1, idx, torch.full_like(idx, -ca, dtype=dz.dtype) * ok[:, None])
+            dzb = dz.to(h.dtype)
+            dh = torch.mm(dzb, w, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dzb @ w
+            dW = torch.mm(dzb.T, h, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dzb.T.float() @ h.float()
+            if acc.get("dW") is None:
+                acc["dW"] = dW
+            else:
+                acc["dW"].add_(dW)
+            acc["n"] = acc.get("n", 0) + 1
+        ctx.save_for_backward(dh); ctx.h_dtype, ctx.w_dtype, ctx.acc = h.dtype, w.dtype, acc
+        return loss
+
+    @staticmethod
+    def backward(ctx, go):
+        (dh,) = ctx.saved_tensors
+        acc = ctx.acc
+        g = float(go)
+        if "go" not in acc:
+            acc["go"] = g; gw = (acc["dW"] * go.float()).to(ctx.w_dtype)
+        else:
+            assert abs(acc["go"] - g) <= 1e-6 * abs(acc["go"]) + 1e-30, "--head-fused (trained head): unequal chunk scales"
+            gw = None
+        acc["left"] = acc.get("left", acc["n"]) - 1
+        if acc["left"] == 0:
+            acc.clear()                        # the accumulator freed after the last chunk's backward
+        return (dh * go.float()).to(ctx.h_dtype), gw, None, None, None, None
+
+
+def head_loss_train_chunk(h, w, tgt, tlp, a, acc):
+    return _HeadLossTrainFn.apply(h, w, tgt, tlp, float(a), acc)
