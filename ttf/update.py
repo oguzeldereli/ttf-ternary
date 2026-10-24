@@ -570,11 +570,14 @@ def _ts_layer_factored(l, fg, state, c):
         if (t - 1) % M_ == 0:
             U = U * lk
         if final_:
+            # data parallel: the earlier micro-batches' terms are linear in g and V is fixed within the step, so each
+            # rank summed its own and one mean here replaces a mean per micro-batch (N x r per layer: 16 x less traffic)
+            U = _dpm(U)
             S_ = (-lr_ratio * M_) * _dpm(_fg_mm_l(fgb, ia, U))
             Vn = _orth(V @ (U.T @ U) + S_); del S_
             U = (U - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))) @ (V.T @ Vn); V = Vn
         else:
-            U = U - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
+            U = U - lr_ratio * _fg_mm_r(fgb, ia, V)    # (data parallel: this rank's term, averaged on the last one)
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         U = U * lk
