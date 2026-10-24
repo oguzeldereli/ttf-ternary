@@ -136,6 +136,9 @@ def build_parser():
                    choices=["gptqc", "gptq", "gptqs", "als", "absmean", "row", "scratch", "native", "random"],
                    help="how the weights become trits and scales (gptqc: GPTQ on centred inputs)")
     g.add_argument("--convert-stream", action=ON, default=True, help="Qwen: convert layer by layer from the files")
+    g.add_argument("--head-fused", action=ON, default=False,
+                   help="Qwen, frozen head (conversion): each loss chunk's loss and dL/dh in one pass, no checkpoint "
+                        "recompute of the 248k-wide logits (ttf/headloss.py; same maths, not bit-identical)")
     g.add_argument("--ext", action="append", default=[], metavar="MODULE[:SPEC]",
                    help="a structure / conversion plug-in (ttf/ext.py), e.g. ttfconv.adapters:rank=0.2,alt=1; repeatable, in order")
     g.add_argument("--calib", type=int, default=64, help="calibration windows for gptq / gptqc")
