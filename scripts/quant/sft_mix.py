@@ -323,6 +323,21 @@ FW2_LANGS = ["cmn_Hani", "spa_Latn", "fra_Latn", "deu_Latn", "jpn_Jpan", "rus_Cy
              "arb_Arab", "tur_Latn", "nld_Latn", "pol_Latn", "vie_Latn", "ind_Latn", "hin_Deva"]
 
 
+def _parquet_rows_remote(repo, files, columns, rng):
+    """as _parquet_rows, reading row groups over HTTP range requests (HfFileSystem) instead of downloading each file:
+    FineWeb-2's files are ~4 GB and a language's share needs a few row groups of one"""
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+    fsys = HfFileSystem()
+    for f in files:
+        with fsys.open(f"datasets/{repo}/{f}", "rb", block_size=16 << 20) as fh:
+            pf = pq.ParquetFile(fh)
+            for g in range(pf.num_row_groups):
+                rows = pf.read_row_group(g, columns=columns).to_pylist()
+                rng.shuffle(rows)
+                yield from rows
+
+
 def fineweb2_rows(rng, skip_files):
     """HuggingFaceFW/fineweb-2 (ODC-BY), plain text, FW2_LANGS interleaved round-robin (equal documents per language;
     one train parquet file per language at a time)"""
@@ -333,7 +348,7 @@ def fineweb2_rows(rng, skip_files):
     for lang in FW2_LANGS:
         fs = sorted(f for f in allf if f.startswith(f"data/{lang}/train/") and f.endswith(".parquet"))
         if fs:
-            rng.shuffle(fs); its.append(_parquet_rows(repo, fs[skip_files:skip_files + 2], ["text"], rng))
+            rng.shuffle(fs); its.append(_parquet_rows_remote(repo, fs[skip_files:skip_files + 1], ["text"], rng))
     while its:
         for it in list(its):
             r = next(it, None)
