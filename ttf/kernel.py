@@ -1109,3 +1109,189 @@ class GatedNormFn(torch.autograd.Function):
 def gated_norm_qwen(x, z, w, eps):
     """Qwen3_5RMSNormGated(x, gate z) for bf16 x / z in one kernel each way"""
     return GatedNormFn.apply(x, z, w, eps)
+
+
+@triton.jit
+def _rbf(x):
+    """fp32 -> the nearest bf16 (ties to even), as fp32. x.to(tl.bfloat16).to(tl.float32) is not safe here: Triton
+    folds that cast pair away when arithmetic follows (seen with an add after it), which skips the rounding"""
+    b = x.to(tl.uint32, bitcast=True)
+    b = (b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF0000
+    return b.to(tl.float32, bitcast=True)
+
+
+# --fused-layer: a ternary layer's elementwise work around its int8 GEMMs in a few passes. Each kernel repeats the
+# unfused path's roundings in its order (every bf16 op rounds its fp32 result to bf16), so the layer's output and input
+# gradient are bit-identical; the scale and bias gradients' sums run in fp32 without the final bf16 rounding.
+@triton.jit
+def _pro_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, K, sxm, qp, rqp, lo, HAS_MU: tl.constexpr,
+                SAVE_XC: tl.constexpr, BK: tl.constexpr):
+    """xc = bf16(x - mu), xs = bf16(xc * c), then act_quant_i8 of xs (_actq_kernel's arithmetic); xs is not stored"""
+    row = tl.program_id(0)
+    amax = tl.zeros((BK,), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        offs = k0 + tl.arange(0, BK)
+        x = tl.load(x_ptr + row * sxm + offs, mask=offs < K, other=0.0).to(tl.float32)
+        if HAS_MU:
+            x = _rbf(x - tl.load(mu_ptr + offs, mask=offs < K, other=0.0).to(tl.float32))
+        x = _rbf(x * tl.load(c_ptr + offs, mask=offs < K, other=0.0).to(tl.float32))
+        amax = tl.maximum(amax, tl.abs(x))
+    a = tl.maximum(tl.max(amax, axis=0), lo)
+    scale = a * rqp
+    tl.store(s_ptr + row, scale)
+    for k0 in range(0, K, BK):
+        offs = k0 + tl.arange(0, BK)
+        x = tl.load(x_ptr + row * sxm + offs, mask=offs < K, other=0.0).to(tl.float32)
+        if HAS_MU:
+            x = _rbf(x - tl.load(mu_ptr + offs, mask=offs < K, other=0.0).to(tl.float32))
+            if SAVE_XC:
+                tl.store(xc_ptr + row * K + offs, x.to(tl.bfloat16), mask=offs < K)
+        x = _rbf(x * tl.load(c_ptr + offs, mask=offs < K, other=0.0).to(tl.float32))
+        q = tl.extra.cuda.libdevice.rint(tl.div_rn(x, scale))
+        q = tl.minimum(tl.maximum(q, -qp - 1.0), qp)
+        tl.store(q_ptr + row * K + offs, q.to(tl.int8), mask=offs < K)
+
+
+def fused_prologue(x2, mu_b, c_b, bits, save_xc):
+    """x2 [M, K] bf16 -> (int8 codes, fp32 row scales, xc = bf16(x - mu) if save_xc and mu_b is not None else None)"""
+    M, K = x2.shape
+    q = torch.empty(M, K, dtype=torch.int8, device=x2.device)
+    sc = torch.empty(M, dtype=torch.float32, device=x2.device)
+    xc = torch.empty(M, K, dtype=torch.bfloat16, device=x2.device) if (save_xc and mu_b is not None) else None
+    qp, rqp, lo = _actq_consts(bits, x2.dtype)
+    _pro_kernel[(M,)](x2, mu_b if mu_b is not None else c_b, c_b, q, sc, xc if xc is not None else q, K, x2.stride(0),
+                      qp, rqp, lo, HAS_MU=mu_b is not None, SAVE_XC=xc is not None, BK=1024)
+    return q, sc, xc
+
+
+@triton.jit
+def _epi_fwd_kernel(y_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, t_ptr, o_ptr, M, N, HAS_BIAS: tl.constexpr,
+                    HAS_ACC: tl.constexpr, SAVE_T: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    """t = bf16(y32 * xs * beta) (_i8_epi_kernel's order), o = bf16(t * r), o = bf16(o + bias), o = bf16(acc + o)"""
+    rows = tl.program_id(0) * BM + tl.arange(0, BM); cols = tl.program_id(1) * BN + tl.arange(0, BN)
+    m = (rows[:, None] < M) & (cols[None, :] < N)
+    off = rows[:, None] * N + cols[None, :]
+    y = tl.load(y_ptr + off, mask=m, other=0).to(tl.float32)
+    xs = tl.load(xs_ptr + rows, mask=rows < M, other=0.0)
+    t = _rbf((y * xs[:, None]) * tl.load(b_ptr))
+    if SAVE_T:
+        tl.store(t_ptr + off, t.to(tl.bfloat16), mask=m)
+    o = _rbf(t * tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)[None, :])
+    if HAS_BIAS:
+        o = _rbf(o + tl.load(bias_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)[None, :])
+    if HAS_ACC:
+        o = tl.load(acc_ptr + off, mask=m, other=0.0).to(tl.float32) + o
+    tl.store(o_ptr + off, o.to(tl.bfloat16), mask=m)
+
+
+def fused_epilogue(y32, xs, beta, r_b, bias_b, acc, save_t):
+    """the int32 GEMM result -> (t = the ternary product before the row scale if save_t, the layer's bf16 output)"""
+    M, N = y32.shape
+    o = torch.empty(M, N, dtype=torch.bfloat16, device=y32.device)
+    t = torch.empty_like(o) if save_t else None
+    BM, BN = 32, 128
+    _epi_fwd_kernel[(triton.cdiv(M, BM), triton.cdiv(N, BN))](
+        y32, xs, _dev_scalar(beta, y32.device), r_b, bias_b if bias_b is not None else r_b,
+        acc if acc is not None else o, t if t is not None else o, o, M, N, HAS_BIAS=bias_b is not None,
+        HAS_ACC=acc is not None, SAVE_T=save_t, BM=BM, BN=BN)
+    return t, o
+
+
+@triton.jit
+def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, pb_ptr, pr_ptr, M, N,
+                     SLICES: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    """from the output gradient g [M, N]: gyf = bf16(bf16(g * r) * bf16(beta)) (the GEMM's gradient, stored), the
+    column sums of g (bias) and of bf16(g * t) (row scale) per row block, and with SLICES gyf's two int8 slices
+    (_slice2_kernel's arithmetic)"""
+    pm = tl.program_id(0)
+    rows = pm * BM + tl.arange(0, BM)
+    bb = tl.load(bb_ptr).to(tl.float32)
+    amax = tl.zeros((BM,), tl.float32)
+    for n0 in range(0, N, BN):
+        cols = n0 + tl.arange(0, BN)
+        m = (rows[:, None] < M) & (cols[None, :] < N)
+        off = rows[:, None] * N + cols[None, :]
+        g = tl.load(g_ptr + off, mask=m, other=0.0).to(tl.float32)
+        t = tl.load(t_ptr + off, mask=m, other=0.0).to(tl.float32)
+        r = tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+        f = _rbf(_rbf(g * r[None, :]) * bb)
+        tl.store(f_ptr + off, f.to(tl.bfloat16), mask=m)
+        amax = tl.maximum(amax, tl.max(tl.abs(f), axis=1))
+        tl.store(pb_ptr + pm * N + cols, tl.sum(g, axis=0), mask=cols < N)
+        tl.store(pr_ptr + pm * N + cols, tl.sum(_rbf(g * t), axis=0), mask=cols < N)
+    if SLICES:
+        s = tl.maximum(amax, 1e-30) / 127.0
+        tl.store(s_ptr + rows, s, mask=rows < M)
+        for n0 in range(0, N, BN):
+            cols = n0 + tl.arange(0, BN)
+            m = (rows[:, None] < M) & (cols[None, :] < N)
+            off = rows[:, None] * N + cols[None, :]
+            g = tl.load(g_ptr + off, mask=m, other=0.0).to(tl.float32)
+            r = tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+            f = _rbf(_rbf(g * r[None, :]) * bb)
+            q1 = tl.extra.cuda.libdevice.rint(f / s[:, None])
+            q2 = tl.extra.cuda.libdevice.rint((f - q1 * s[:, None]) / (s[:, None] / 254.0))
+            tl.store(q1_ptr + off, tl.minimum(tl.maximum(q1, -127.0), 127.0).to(tl.int8), mask=m)
+            tl.store(q2_ptr + off, tl.minimum(tl.maximum(q2, -127.0), 127.0).to(tl.int8), mask=m)
+
+
+def fused_bwd_rows(g, t, r_b, beta_b, slices):
+    """-> (gyf bf16 [M, N], q1, q2, s (None without slices), bias gradient fp32 [N], row-scale gradient fp32 [N])"""
+    M, N = g.shape
+    f = torch.empty_like(g)
+    BM, BN = 16, 256
+    nb = triton.cdiv(M, BM)
+    pb = torch.empty(nb, N, dtype=torch.float32, device=g.device); pr = torch.empty_like(pb)
+    if slices:
+        q1 = torch.empty(M, N, dtype=torch.int8, device=g.device); q2 = torch.empty_like(q1)
+        s = torch.empty(M, dtype=torch.float32, device=g.device)
+    else:
+        q1 = q2 = s = None
+    _bwd_rows_kernel[(nb,)](g, t, r_b, beta_b, f, q1 if slices else f, q2 if slices else f, s if slices else pb,
+                            pb, pr, M, N, SLICES=slices, BM=BM, BN=BN)
+    return f, q1, q2, s, pb.sum(0), pr.sum(0)
+
+
+@triton.jit
+def _dx_col_kernel(y1_ptr, y2_ptr, s_ptr, c_ptr, x_ptr, gx_ptr, pc_ptr, M, K, BM: tl.constexpr, BK: tl.constexpr):
+    """g = bf16((y1 + y2 / 254) * s) (_dx2_epi_kernel), then the column scale's backward (_scale_bwd_kernel):
+    gx = bf16(g * c) and per row block the column sums of bf16(g * x)"""
+    pm = tl.program_id(0)
+    rows = pm * BM + tl.arange(0, BM); cols = tl.program_id(1) * BK + tl.arange(0, BK)
+    m = (rows[:, None] < M) & (cols[None, :] < K)
+    off = rows[:, None] * K + cols[None, :]
+    y1 = tl.load(y1_ptr + off, mask=m, other=0).to(tl.float32)
+    y2 = tl.load(y2_ptr + off, mask=m, other=0).to(tl.float32)
+    s = tl.load(s_ptr + rows, mask=rows < M, other=0.0)
+    g = _rbf((y1 + y2 * (1.0 / 254.0)) * s[:, None])
+    c = tl.load(c_ptr + cols, mask=cols < K, other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
+    tl.store(gx_ptr + off, (g * c[None, :]).to(tl.bfloat16), mask=m)
+    tl.store(pc_ptr + pm * K + cols, tl.sum(_rbf(g * x), axis=0), mask=cols < K)
+
+
+def fused_dx_col(y1, y2, s, c_b, x):
+    M, K = y1.shape
+    gx = torch.empty(M, K, dtype=torch.bfloat16, device=y1.device)
+    BM, BK = 64, 128
+    nb = triton.cdiv(M, BM)
+    pc = torch.empty(nb, K, dtype=torch.float32, device=y1.device)
+    _dx_col_kernel[(nb, triton.cdiv(K, BK))](y1, y2, s, c_b, x, gx, pc, M, K, BM=BM, BK=BK)
+    return gx, pc.sum(0)
+
+
+@triton.jit
+def _dq_kernel(q_ptr, s_ptr, o_ptr, M, K, BM: tl.constexpr, BK: tl.constexpr):
+    rows = tl.program_id(0) * BM + tl.arange(0, BM); cols = tl.program_id(1) * BK + tl.arange(0, BK)
+    m = (rows[:, None] < M) & (cols[None, :] < K)
+    off = rows[:, None] * K + cols[None, :]
+    s = _rbf(tl.load(s_ptr + rows, mask=rows < M, other=0.0))
+    tl.store(o_ptr + off, (tl.load(q_ptr + off, mask=m, other=0).to(tl.float32) * s[:, None]).to(tl.bfloat16), mask=m)
+
+
+def dequant_i8(q, s):
+    """bf16(bf16(q) * bf16(s)[:, None]), as xq.to(bf16) * xs[:, None].to(bf16)"""
+    M, K = q.shape
+    o = torch.empty(M, K, dtype=torch.bfloat16, device=q.device)
+    _dq_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](q, s, o, M, K, BM=32, BK=128)
+    return o

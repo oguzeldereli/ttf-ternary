@@ -757,6 +757,10 @@ def main():
     if args.fused_scales:
         from .layers import FUSED_SCALES as _FSC
         _FSC[0] = True
+    if args.fused_layer:
+        from .layers import FUSED_LAYER as _FLY
+        _FLY[0] = True
+        print("--fused-layer: each ternary layer's elementwise work fused around its int8 GEMMs", flush=True)
     if args.fused_norm and _QWEN:
         from .qwen import enable_fused_norm
         enable_fused_norm()

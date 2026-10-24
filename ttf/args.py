@@ -119,6 +119,11 @@ def build_parser():
                    "bf16; as accurate as bf16, the 110M conversion recipe 2.6675 vs 2.6672 with it on every layer; "
                    "int8: one slice, diverges)")
     g.add_argument("--fused-scales", action=ON, default=True, help="the scales' and adapter's elementwise work fused")
+    g.add_argument("--fused-layer", action=ON, default=False,
+                   help="int8 ternary layers with row / column scales: the centring, column scale and act-quant in one "
+                        "kernel, the GEMM's epilogue with the row scale, bias and the sum of a converted layer's parts, "
+                        "the backward's elementwise work in two kernels (output, input gradient and the TTF factors "
+                        "bit-identical; the scale / bias gradients summed in fp32)")
     g.add_argument("--w-cache", default="off", choices=["off", "int8"],
                    help="int8: each layer's unpacked trits kept between updates (1 byte per weight more; the same "
                         "values; faster with --gemm int8mm / cublas where memory allows)")

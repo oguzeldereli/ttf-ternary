@@ -364,3 +364,57 @@ def test_dp_factored(fp32):
                         os.path.join(ROOT, "scripts", "tests", "dp_factored_check.py")], cwd=ROOT, env=env,
                        capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+
+
+@pytest.mark.parametrize("K,N,dx", [(1024, 3584, "int8x2"), (3584, 1024, "int8x2"), (1024, 3584, "bf16"), (1024, 48, "int8x2")])
+def test_fused_layer(K, N, dx):
+    """--fused-layer against the unfused path on a centred layer with row / column scales and bias, plus a second layer
+    and a thin pair summed into it through acc (a converted site): output (with and without grad), input gradient and
+    the TTF factors bit-identical; the scales' / bias' gradients within bf16 rounding (fp32 sums)"""
+    import ttf.kernel as KN
+    import ttf.layers as L
+    from ttf.layers import KernelTernaryLinear
+    dev, T = "cuda", 512
+    old = (KN.GEMM_BACKEND[0], L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], KN.DX_I8X2_MIN_N[0])
+    KN.GEMM_BACKEND[0], L.DX_MODE[0], L.FACTORED[0], KN.DX_I8X2_MIN_N[0] = "int8mm", dx, True, 1024
+    try:
+        torch.manual_seed(0)
+
+        def mk(k, n):
+            l = KernelTernaryLinear(k, n, 8, beta=True, int8=True).to(dev); l.enable_rc_scale()
+            l.wpacked.copy_(KN.pack_rows(torch.randint(-1, 2, (n, k), device=dev, dtype=torch.int8)))
+            with torch.no_grad():
+                l.row_scale.uniform_(0.5, 1.5); l.col_scale.uniform_(0.5, 1.5)
+            return l
+        r = 64
+        a, b, d, u = mk(K, N), mk(K, N), mk(K, r), mk(r, N)
+        a.enable_centering(torch.randn(K, device=dev) * 0.3, torch.randn(N, device=dev) * 0.1)
+        ls = [a, b, d, u]; cap = {}
+        for i, m in enumerate(ls):
+            m.capture = True; m.ts_micro = True
+            m.on_grad = (lambda l_, g_, i=i: cap.setdefault(i, (g_[0].clone(), g_[1].clone())))
+        x0 = torch.randn(T, K, device=dev, dtype=torch.bfloat16) * 2
+        gy = torch.randn(T, N, device=dev, dtype=torch.bfloat16)
+        site = lambda x: u(d(x), acc=b(x, acc=a(x)))
+
+        def run(fused):
+            L.FUSED_LAYER[0] = fused; cap.clear()
+            for m in ls:
+                for p_ in m.parameters():
+                    p_.grad = None
+            x = x0.clone().requires_grad_(True)
+            with torch.no_grad():
+                y_ng = site(x0)
+            y = site(x); y.backward(gy)
+            return (y.detach(), y_ng, x.grad, [p_.grad.clone() for m in ls for p_ in m.parameters()],
+                    [cap[i] for i in range(4)])
+        A, B = run(False), run(True)
+        for i in range(3):
+            assert torch.equal(A[i], B[i]), i
+        assert torch.equal(B[0], B[1])
+        for ga, gb in zip(A[3], B[3]):
+            assert ((ga - gb).abs().max() / ga.abs().max().clamp_min(1e-30)).item() < 8e-3
+        for (ga, xa), (gb, xb) in zip(A[4], B[4]):
+            assert torch.equal(ga, gb) and torch.equal(xa, xb)
+    finally:
+        KN.GEMM_BACKEND[0], L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], KN.DX_I8X2_MIN_N[0] = old
