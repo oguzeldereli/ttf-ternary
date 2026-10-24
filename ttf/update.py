@@ -609,7 +609,7 @@ def _ts_layer_factored(l, fg, state, c):
 
 MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "64"))]   # sketch size (TERN_MICRO_K: tests only)
 FIRE_FUSED = [False]          # --fire fused (with --dw factored): ttf.kernel.ttf_fire
-MICRO_FUSED = [os.environ.get("TERN_MICRO_FUSED", "0") == "1"]   # --ttf-accum micro: kernel.micro_sketch (default off until its real-run equivalence)
+MICRO_FUSED = [os.environ.get("TERN_MICRO_FUSED", "1") == "1"]   # --ttf-accum micro: kernel.micro_sketch (TERN_MICRO_FUSED=0: the torch reference path)
 
 
 def _micro_sketch(l, dev, step):
