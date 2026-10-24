@@ -157,6 +157,9 @@ def build_parser():
     g.add_argument("--teacher", default="", help="full-precision teacher (Hugging Face dir): loss (1 - W) CE + W KL")
     g.add_argument("--kd-weight", type=float, default=0.75, help="W, the KL term's weight")
     g.add_argument("--kd-hidden", type=float, default=0.0, help="--teacher: + this x every block update's error")
+    g.add_argument("--train-emb", default="none", choices=["none", "head", "both"],
+                   help="Qwen: train the output head (head) or the head and the token embedding (both) in the float tail; "
+                        "the conversion leaves them frozen")
     g.add_argument("--kd-cache", default="", help="precomputed teacher top-k targets (scripts/quant/teacher_topk.py)")
     g.add_argument("--kd-cache-mode", default="renorm", choices=["renorm", "rest", "sample", "windows"],
                    help="renorm: KL on the top k renormalised; rest: top k plus one bucket for the remaining mass; sample: "

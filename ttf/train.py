@@ -345,6 +345,12 @@ def main():
     if args.compile:
         from .model import enable_compile
         enable_compile()
+    if _QWEN and args.train_emb != "none":   # --train-emb: the head (and the embedding) join the float tail (the
+        _te = [model.hf.lm_head.weight] + ([model.hf.model.embed_tokens.weight] if args.train_emb == "both" else [])
+        for p_ in _te:                        # conversion and the resume freeze them; 0.8B, 22 Oct, theta 64: -0.085 wiki)
+            p_.requires_grad_(True)
+        print(f"--train-emb {args.train_emb}: {sum(p_.numel() for p_ in _te) / 1e6:.0f}M embedding / head weights train"
+              f" (tied: {model.hf.lm_head.weight is model.hf.model.embed_tokens.weight})", flush=True)
 
     if args.mode in ("bitnet", "fp32"):
         # the baseline keeps everything in fp32 with a standard AdamW: no bf16
