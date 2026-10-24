@@ -434,6 +434,18 @@ def _fg_mm_r(fg, a, W):
     return a[:, None] * _mmb(gy.T, _mmb(x, b[:, None] * W))
 
 
+def _fg_add_r(U, fg, a, W, alpha):
+    """U + alpha (a * (gy^T (x (b W)))), the accumulator's term from one micro-batch: with bf16 factors in fewer passes
+    (b W written straight to bf16, x (b W) out of the GEMM in bf16, the scale and the add in one addcmul); the same
+    products, rounded at the same points, except the GEMM's bf16 output and addcmul's fp32 order"""
+    gy, x, b = fg
+    if gy.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
+        return U + alpha * _fg_mm_r(fg, a, W)
+    bw = torch.empty(W.shape, dtype=torch.bfloat16, device=W.device)
+    torch.mul(b[:, None], W, out=bw)
+    return torch.addcmul(U, a[:, None], torch.mm(gy.T, torch.mm(x, bw), out_dtype=torch.float32), value=alpha)
+
+
 def _fg_mm_l(fg, a, W):
     """u^T @ W (W is N x r) without g: -lr b * (x^T (gy (a W))) (the -lr is applied by the caller)"""
     gy, x, b = fg
@@ -577,7 +589,7 @@ def _ts_layer_factored(l, fg, state, c):
             Vn = _orth(V @ (U.T @ U) + S_); del S_
             U = (U - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))) @ (V.T @ Vn); V = Vn
         else:
-            U = U - lr_ratio * _fg_mm_r(fgb, ia, V)    # (data parallel: this rank's term, averaged on the last one)
+            U = _fg_add_r(U, fgb, ia, V, -lr_ratio)    # (data parallel: this rank's term, averaged on the last one)
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         U = U * lk
