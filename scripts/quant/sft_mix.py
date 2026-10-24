@@ -16,7 +16,8 @@ swe_agent (nebius/SWE-agent-trajectories, CC-BY-4.0: multi-step coding-agent run
 resolved ones only), openhands (SWE-Gym/OpenHands-SFT-Trajectories, MIT: successful OpenHands agent runs), toucan
 (Agent-Ark/Toucan-1.5M SFT subset, Apache-2.0: multi-turn MCP tool use, much of it web search / crawling, re-rendered
 with the model's own tool-call format), when2call (nvidia/When2Call SFT, CC-BY-4.0: answering, asking back or declining
-when the given tools cannot do the job).
+when the given tools cannot do the job), fineweb2 (HuggingFaceFW/fineweb-2, ODC-BY: 16 languages' web text, plain),
+smoltalk (HuggingFaceTB/smoltalk, Apache-2.0: general chat).
 --decon N: drop a conversation sharing any N-word sequence (lower-cased \\w+ words) with the evaluation items
 (data/bench/*.jsonl, data/zeroshot/*.jsonl); word n-grams as in GPT-3's and Tulu-3's decontamination (token n-grams
 matched code boilerplate and number lists). Tulu-3 (ODC-BY) chat-only streams: chat_data.py."""
@@ -318,6 +319,40 @@ def fineweb_rows(rng, skip_files):
         yield r["text"], None, None                     # plain text: no chat template
 
 
+FW2_LANGS = ["cmn_Hani", "spa_Latn", "fra_Latn", "deu_Latn", "jpn_Jpan", "rus_Cyrl", "por_Latn", "ita_Latn", "kor_Hang",
+             "arb_Arab", "tur_Latn", "nld_Latn", "pol_Latn", "vie_Latn", "ind_Latn", "hin_Deva"]
+
+
+def fineweb2_rows(rng, skip_files):
+    """HuggingFaceFW/fineweb-2 (ODC-BY), plain text, FW2_LANGS interleaved round-robin (equal documents per language;
+    one train parquet file per language at a time)"""
+    from huggingface_hub import list_repo_files
+    repo = "HuggingFaceFW/fineweb-2"
+    allf = list_repo_files(repo, repo_type="dataset")
+    its = []
+    for lang in FW2_LANGS:
+        fs = sorted(f for f in allf if f.startswith(f"data/{lang}/train/") and f.endswith(".parquet"))
+        if fs:
+            rng.shuffle(fs); its.append(_parquet_rows(repo, fs[skip_files:skip_files + 2], ["text"], rng))
+    while its:
+        for it in list(its):
+            r = next(it, None)
+            if r is None:
+                its.remove(it); continue
+            yield r["text"], None, None
+
+
+def smoltalk_rows(rng):
+    """HuggingFaceTB/smoltalk (Apache-2.0), the "all" config: general multi-turn chat, rewriting, summarisation,
+    everyday instruction following (the conversational share mix5b is thin on)"""
+    repo = "HuggingFaceTB/smoltalk"
+    fs = _files(repo, "data/all/"); fs = [f for f in fs if "train" in f]; rng.shuffle(fs)
+    for r in _parquet_rows(repo, fs, ["messages"], rng):
+        m = [{"role": x["role"], "content": x["content"]} for x in r["messages"]]
+        if m and m[-1]["role"] == "assistant":
+            yield m, None, False
+
+
 def _ngram_hashes(ids, n):
     """rolling uint64 hashes of every n-token window of ids"""
     x = np.asarray(ids, dtype=np.uint64)
@@ -390,6 +425,10 @@ def build(a):
             it, tag = toucan_rows(rng, a.skip_files), "toucan"
         elif name == "when2call":
             it, tag = when2call_rows(rng), "when2call"
+        elif name == "fineweb2":
+            it, tag = fineweb2_rows(rng, a.skip_files), "fineweb2"
+        elif name == "smoltalk":
+            it, tag = smoltalk_rows(rng), "smoltalk"
         elif name in ("ot3", "ocr", "fineweb", "oci"):
             it, tag = {"ot3": ot3_rows, "ocr": ocr_rows, "fineweb": fineweb_rows, "oci": oci_rows}[name](rng, a.skip_files), name
         else:
