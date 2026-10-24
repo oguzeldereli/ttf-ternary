@@ -345,6 +345,10 @@ def main():
     if args.compile:
         from .model import enable_compile
         enable_compile()
+    if _QWEN and args.intk_emb:              # --intk-emb: int-k code matrices for the embedding and head, TTF-trained
+        from .intk_emb import enable_intk_emb
+        assert args.train_emb == "none", "--intk-emb trains the embedding / head itself"
+        enable_intk_emb(model, args.intk_emb, log=lambda m_: print(m_, flush=True))
     if _QWEN and args.train_emb != "none":   # --train-emb: the head (and the embedding) join the float tail (the
         _te = [model.hf.lm_head.weight] + ([model.hf.model.embed_tokens.weight] if args.train_emb == "both" else [])
         for p_ in _te:                        # conversion and the resume freeze them; 0.8B, 22 Oct, theta 64: -0.085 wiki)
@@ -909,6 +913,10 @@ def main():
             if te and args.mode != "bitnet":   # the ternary embedding's TTF update (both of its gradients)
                 from .tern_emb import tern_emb_step
                 tern_emb_step(model, lr_state, ts_cfg, ts_layer)
+            if args.intk_emb and micro == tc.grad_accum - 1:   # --intk-emb: after the step's last backward
+                from .intk_emb import intk_layers
+                for m_ in intk_layers(model):
+                    m_.step(ts_layer, lr_state, ts_cfg)
             last_loss = loss.detach()          # read once after the last micro-batch (a .item() here synced every one)
         if torch.is_tensor(last_loss):
             last_loss = last_loss.item()

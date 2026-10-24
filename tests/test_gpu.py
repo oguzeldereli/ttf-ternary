@@ -468,3 +468,19 @@ def test_fused_layer(K, N, dx):
             assert torch.equal(ga, gb) and torch.equal(xa, xb)
     finally:
         KN.GEMM_BACKEND[0], L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], KN.DX_I8X2_MIN_N[0] = old
+
+
+def test_intk_codes_fire_in_range():
+    """--intk-emb: the dense TTF update moves int-k codes by one level where the accumulator reaches theta, never out
+    of 0 .. levels; the leaf's gradient reaches the group parameters"""
+    from ttf import update as U
+    from ttf.intk_emb import IntKMatrix
+    torch.manual_seed(0)
+    m = IntKMatrix(torch.randn(96, 128, device=dev), 2).to(dev); m._ts_idx = 7
+    q0 = m.codes.clone(); st = {}
+    for _ in range(3):
+        W = m.leaf(); (W * torch.randn_like(W)).sum().backward()
+        m.step(U.ts_layer, st, _cfg(r=16, theta=0.5))
+    assert int(m.codes.min()) >= 0 and int(m.codes.max()) <= 3
+    assert int((m.codes != q0).sum()) > 0 and int((m.codes.int() - q0.int()).abs().max()) <= 3
+    assert m.lo.grad is not None and m.s.grad is not None

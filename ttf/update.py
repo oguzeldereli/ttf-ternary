@@ -432,14 +432,22 @@ def ts_layer(l, g, state, c):
         return
     del u
     A = U @ V.T
-    w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
+    codes = getattr(l, "codes", None)         # int-k codes (intk_emb.IntKMatrix: levels 0 .. l.levels) instead of trits
+    w0 = codes if codes is not None else unpack_rows(l.wpacked, l.K).to(torch.int8)
     d = A.sign()
-    fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
+    if codes is not None:
+        nw = w0.float() + d
+        fire = (A.abs() >= theta) & (nw >= 0) & (nw <= l.levels); del nw
+    else:
+        fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
     del A
     before = l.wpacked.clone() if l.track else None
     D = torch.where(fire, d, torch.zeros_like(d))
     nf = fire.sum()                           # a device tensor: no host sync per layer
-    l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))   # int8 add: exact, no [N, K] fp32 temporary
+    if codes is not None:
+        codes.add_(D.to(torch.int8))
+    else:
+        l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))   # int8 add: exact, no [N, K] fp32 temporary
     U = U - c["spend"] * (theta * (D @ V))
     _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + fire.numel()
