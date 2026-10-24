@@ -13,7 +13,8 @@ w = (torch.randn(V, d, device=dev) * 0.02).to(torch.bfloat16)
 h0 = torch.randn(n, d, device=dev).to(torch.bfloat16)
 tgt = torch.randint(0, V, (n,), device=dev); tgt[:7] = -1
 tlp = F.log_softmax(torch.randn(n, V, device=dev) * 2, -1).to(torch.bfloat16)
-for name, ref, kd, a in (("kd0.75", lambda h: BitTransformer._loss_chunk_kd(h, w, tgt, tlp, 0.75), tlp, 0.75),
+for name, ref, kd, a in (("kd1.5", lambda h: BitTransformer._loss_chunk_kd(h, w, tgt, tlp, 1.5), tlp, 1.5),   # a > 1: KL alone
+                         ("kd0.75", lambda h: BitTransformer._loss_chunk_kd(h, w, tgt, tlp, 0.75), tlp, 0.75),
                          ("kd1", lambda h: BitTransformer._loss_chunk_kd(h, w, tgt, tlp, 1.0), tlp, 1.0),
                          ("ce", lambda h: _ce_chunk(h, w, tgt), None, 0.0)):
     h1 = h0.clone().requires_grad_(); l1 = ref(h1); (2.5 * l1).backward()
@@ -23,8 +24,8 @@ for name, ref, kd, a in (("kd0.75", lambda h: BitTransformer._loss_chunk_kd(h, w
     if kd is None:
         dz = lp.exp() * okm; dz[torch.arange(n, device=dev), tgt.clamp_min(0)] -= okm[:, 0]
     else:
-        pt = kd.double().exp(); ca = 0.0 if a >= 1 else 1 - a
-        dz = lp.exp() * (ca * okm + a * pt.sum(-1, keepdim=True)) - a * pt
+        pt = kd.double().exp(); ca = 0.0 if a >= 1 else 1 - a; ak = min(a, 1.0)
+        dz = lp.exp() * (ca * okm + ak * pt.sum(-1, keepdim=True)) - ak * pt
         dz[torch.arange(n, device=dev), tgt.clamp_min(0)] -= ca * okm[:, 0]
     g64 = 2.5 * (dz @ w.double())
     el = abs(float(l1 - l2)) / abs(float(l1))

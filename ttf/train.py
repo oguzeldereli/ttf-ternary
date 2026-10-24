@@ -73,6 +73,11 @@ def main():
     args = parse()
     from . import ext as _X
     _X.load(args.ext)   # --ext plug-ins (ttf/ext.py), before the model is built
+    if any(_X.having(h_) for h_ in ("begin", "weight", "refine", "fitted", "end")) and \
+            (args.convert != "gptqc" or not args.convert_stream):
+        raise SystemExit(f"--ext {args.ext}: these plug-ins hook the conversion, which runs them only in the centred "
+                         f"streaming conversion (--convert gptqc --convert-stream); got --convert {args.convert}"
+                         f"{'' if args.convert_stream else ' --no-convert-stream'}")
     kmode = {"ttf": "kernel", "bitnet": "master", "fp32": "fp32"}[args.mode]   # the checkpoint's and hf_init's names
     ttf = args.mode == "ttf"
     te = args.tern_emb if args.tern_emb != "none" else ""            # the ternary embedding's kind ("": none)
@@ -174,6 +179,8 @@ def main():
     use_beta = args.mode == "ttf"
 
     _qsw = {}
+    if args.head_fused and not _QWEN:
+        print("--head-fused: no effect on this model (Qwen only)", flush=True)
     if _QWEN:
         assert args.mode == "ttf" and not te, "Qwen: kernel mode, no --tern-emb yet"
         from .qwen import build_qwen, QwenTern
@@ -547,6 +554,10 @@ def main():
         if blob.get("beta", False) != use_beta:
             raise SystemExit(f"checkpoint beta={blob.get('beta', False)} but run beta="
                              f"{use_beta}: forward differs, refusing to resume")
+        _cx = (blob.get("args") or {}).get("ext")     # --ext: the structural plug-ins must match the checkpoint's
+        if _cx is not None and _X.structural(_cx) != _X.structural(args.ext):   # (None: written before --ext existed)
+            raise SystemExit(f"checkpoint was trained with --ext {_X.structural(_cx)} but this run has "
+                             f"{_X.structural(args.ext)}: the structure would differ, refusing to resume")
         if mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):
             if args.adapter_schedule:   # the schedule continues from the checkpoint's rank (no growth back to R0)
                 mag = f"add:{next(v_.shape[1] for k_, v_ in blob['model'].items() if k_.endswith('mag_A'))}"
@@ -734,7 +745,7 @@ def main():
             print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
             if args.dw_thin == "dense":   # thin layers (adapter factors): the dense gradient is cheaper than the factors
                 _thin = [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)
-                         and m_.N * m_.K < (m_.N + m_.K) * (args.factored_k + 2 * args.ttf_rank)]
+                         and m_.N * m_.K < (m_.N + m_.K) * (args.factored_k + 2 * min(args.ttf_rank, m_.N, m_.K))]
                 for m_ in _thin:
                     m_._dw_dense = True
                 print(f"--dw-thin dense: {len(_thin)} thin layers updated from the dense gradient "

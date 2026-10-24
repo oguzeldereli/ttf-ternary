@@ -7,8 +7,11 @@ backward is a scale: one 248k-wide GEMM pair per chunk instead of three, no save
 for the loss (1 - a) CE + a KL(p_t || softmax(z)) (p_t the teacher's distribution, its log-probabilities given), the
 same function as BitTransformer._loss_chunk_kd; a = 0 (no teacher): cross-entropy, as qwen._ce_chunk. Same maths, a
 different order of operations: not bit-identical to the autograd path (equivalence: tests/checks)."""
+import os
 import torch
 import torch.nn.functional as F
+
+_CHECK = os.environ.get("TERN_CHECK_HEAD") == "1"
 
 
 class _HeadLossFn(torch.autograd.Function):
@@ -17,15 +20,17 @@ class _HeadLossFn(torch.autograd.Function):
         with torch.no_grad():
             z = F.linear(h, w).float()
             lp = F.log_softmax(z, -1)
+            del z
             ok = tgt != -1
             nll = -lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0][ok].sum()
             p = lp.exp()
             if tlp is not None:
-                pt = tlp.float().exp()
-                kl = (pt * (tlp.float() - lp)).sum()
+                tl = tlp.float(); pt = tl.exp()
+                kl = (pt * (tl - lp)).sum(); del tl
                 loss = kl if a >= 1.0 else (1 - a) * nll + a * kl
                 ca = 0.0 if a >= 1.0 else (1 - a)
-                dz = p * (ca * ok.float()[:, None] + a * pt.sum(-1, keepdim=True)) - a * pt
+                ak = min(a, 1.0)                  # a >= 1: the loss is the KL alone, weight 1 (as _loss_chunk_kd)
+                dz = p * (ca * ok.float()[:, None] + ak * pt.sum(-1, keepdim=True)) - ak * pt
             else:
                 loss, ca = nll, 1.0
                 dz = p * ok.float()[:, None]
@@ -105,15 +110,17 @@ class _HeadLossTrainFn(torch.autograd.Function):
         with torch.no_grad():
             z = F.linear(h, w).float()
             lp = F.log_softmax(z, -1)
+            del z
             ok = tgt != -1
             nll = -lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0][ok].sum()
             p = lp.exp()
             if tlp is not None:
-                pt = tlp.float().exp()
-                kl = (pt * (tlp.float() - lp)).sum()
+                tl = tlp.float(); pt = tl.exp()
+                kl = (pt * (tl - lp)).sum(); del tl
                 loss = kl if a >= 1.0 else (1 - a) * nll + a * kl
                 ca = 0.0 if a >= 1.0 else (1 - a)
-                dz = p * (ca * ok.float()[:, None] + a * pt.sum(-1, keepdim=True)) - a * pt
+                ak = min(a, 1.0)                  # a >= 1: the loss is the KL alone, weight 1 (as _loss_chunk_kd)
+                dz = p * (ca * ok.float()[:, None] + ak * pt.sum(-1, keepdim=True)) - ak * pt
             else:
                 loss, ca = nll, 1.0
                 dz = p * ok.float()[:, None]
@@ -135,11 +142,11 @@ class _HeadLossTrainFn(torch.autograd.Function):
     def backward(ctx, go):
         (dh,) = ctx.saved_tensors
         acc = ctx.acc
-        g = float(go)
         if "go" not in acc:
-            acc["go"] = g; gw = (acc["dW"] * go.float()).to(ctx.w_dtype)
+            acc["go"] = go.detach(); gw = (acc["dW"] * go.float()).to(ctx.w_dtype)
         else:
-            assert abs(acc["go"] - g) <= 1e-6 * abs(acc["go"]) + 1e-30, "--head-fused (trained head): unequal chunk scales"
+            if _CHECK:                         # (a host sync: only when asked)
+                assert torch.allclose(acc["go"].float(), go.float(), rtol=1e-6), "--head-fused: unequal chunk scales"
             gw = None
         acc["left"] = acc.get("left", acc["n"]) - 1
         if acc["left"] == 0:

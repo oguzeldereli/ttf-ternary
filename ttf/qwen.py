@@ -169,7 +169,7 @@ class QwenTern(nn.Module):
         wc = w.to(hf_.dtype)      # the head in the activations' dtype once per forward, not once per chunk (same values)
         for i in range(0, hf_.shape[0], n):
             hc, tc = hf_[i:i + n], tf[i:i + n]
-            if self.head_fused and self.training and wc.requires_grad and self.kd_topk is None:
+            if self.head_fused and self.training and wc.requires_grad and self.kd_topk is None and self.pp is None:
                 from .headloss import head_loss_train_chunk      # --head-fused, trained head: dL/dW accumulated in
                 if i == 0:                                       # the forward, returned once (headloss.py)
                     _acc = {}
@@ -623,13 +623,14 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
                 for f_ in X_.having("refine"):          # e.g. coordinate descent on the trits
                     T, a, c = f_(n, W, Hc_, T, a, c)
                 lin.enable_centering(mu, W @ mu)
-                for f_ in X_.having("fitted"):          # e.g. adapters fitted to what the trits left
-                    f_(n, wrapped.get(n, lin), W, Hc_, mu, T, a, c)
-                del Hc_
             oerrs.append((e0, _out_err(W, T, a, c, Hl))); errs.append(_rel_err(W, T, a, c))
             lin.wpacked.copy_(pack_rows(T))
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
             lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
+            if method == "gptqc":
+                for f_ in X_.having("fitted"):          # e.g. adapters fitted to what the trits left (the layer written)
+                    f_(n, wrapped.get(n, lin), W, Hc_, mu, T, a, c)
+                del Hc_
             if GPTQ_OPTS["mag_svd"] and method in ("gptq", "gptqc"):          # --adapter-init svd
                 kept.append(mag_svd_fit(lin, W, T, a, c, beta, Hl - torch.outer(mu, mu) if method == "gptqc" else Hl,
                                         GPTQ_OPTS["mag_svd"]))
