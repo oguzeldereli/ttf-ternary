@@ -178,6 +178,7 @@ def main():
         assert args.mode == "ttf" and not te, "Qwen: kernel mode, no --tern-emb yet"
         from .qwen import build_qwen, QwenTern
         QwenTern.loss_chunk = args.loss_chunk
+        QwenTern.head_fused = args.head_fused
         _own = None
         if _PP:
             from .qwen import text_config, pp_split
