@@ -210,7 +210,7 @@ def _fused_ok(l, x):
     adapter; with capture on, only the factored TTF update (--dw factored, micro or 16 x 1) and no --dw-thin dense"""
     if not (FUSED_LAYER[0] and l.int8 and x.is_cuda and x.dtype == torch.bfloat16 and _K.GEMM_BACKEND[0] == "int8mm"
             and l.col_scale is not None and l.row_scale is not None and getattr(l, "mag_A", None) is None
-            and l.K % 8 == 0 and l.N % 8 == 0 and x.numel() // l.K > 16):
+            and l.K % 16 == 0 and l.N % 8 == 0 and x.numel() // l.K > 16):   # (K % 16: kernel.tern_gemm_i8)
         return False
     if l.capture and torch.is_grad_enabled():
         return (FACTORED[0] and getattr(l, "on_grad", None) is not None and not getattr(l, "_dw_dense", False)

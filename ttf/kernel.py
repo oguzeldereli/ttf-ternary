@@ -371,8 +371,8 @@ def tern_gemm_i8(xq: torch.Tensor, xs: torch.Tensor, wpacked: torch.Tensor, K: i
         if w8 is None:
             w8 = unpack_fast(wpacked, K)
         M_, N_ = xq.shape[0], w8.shape[0]
-        if M_ > 16 and K % 8 == 0 and N_ % 8 == 0:
-            y32 = torch._int_mm(xq.contiguous(), w8.t())
+        if M_ > 16 and K % 16 == 0 and N_ % 8 == 0:   # (K % 16: cuBLASLt int8 on Blackwell sm_120 refuses K 8 / 24
+            y32 = torch._int_mm(xq.contiguous(), w8.t())  # with N 48, the rank-8 adapters of in_proj_a / b; Ada took them)
             if y32.is_contiguous():
                 return i8_epilogue(y32, xs, beta)
             return (y32.float() * xs.float()[:, None] * beta).to(torch.bfloat16)
