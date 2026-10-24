@@ -265,8 +265,12 @@ def main():
         _resume_path = os.path.join(_base_out, "ckpt.pt")    # --pipe: a single-GPU checkpoint (or stage 0's) for all;
         # data parallel: every rank resumes from rank 0's (the only one saved: the ranks' states are identical)
     _resuming = args.resume and os.path.exists(_resume_path)
-    if args.init_hf and _resuming:   # the checkpoint holds the converted model (trits, scales, float parts)
-        print(f"--init-hf: resuming from {tc.out_dir}/ckpt.pt, conversion skipped", flush=True)
+    _init_ck = bool(args.init_ckpt) and not _resuming   # (a run started with --init-ckpt resumes from its own ckpt.pt)
+    _from_ckpt = _resuming or _init_ck
+    if _init_ck:   # --init-ckpt: a converted checkpoint's weights, a fresh run (step 0, no optimizer / TTF state)
+        _resume_path = args.init_ckpt
+    if args.init_hf and _from_ckpt:   # the checkpoint holds the converted model (trits, scales, float parts)
+        print(f"--init-hf: {'resuming from' if _resuming else '--init-ckpt'} {_resume_path}, conversion skipped", flush=True)
         if _QWEN:   # as the conversion leaves them: embedding and head frozen (the optimizer is built below)
             model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
         if args.convert == "gptqc":   # centred layers: their buffers and bias
@@ -278,7 +282,13 @@ def main():
                     m_.enable_centering(_ck[f"{n_}.in_mean"].to(_dv), _ck[f"{n_}.out_bias"].to(_dv)); _nc += 1
             print(f"resume: {_nc} centred layers restored", flush=True)
             del _ck
-    if args.init_hf and not _resuming:
+        if _init_ck:   # the weights now, before the optimizer and the embedding / head options (--intk-emb
+            _blob = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)   # quantizes these)
+            model.load_state_dict(_blob["model"])
+            print(f"--init-ckpt: weights of {_resume_path} (its step {_blob.get('step')}), a fresh run from step 0",
+                  flush=True)
+            del _blob
+    if args.init_hf and not _from_ckpt:
         from .hf_init import init_from_hf, GPTQ_OPTS as _GO
         _GO["mag_svd"] = args.svd_rank
         _hess = None
@@ -559,7 +569,7 @@ def main():
     _load_path = _resume_path
     if _PP and args.resume:
         print(f"--pipe: stage {_PP[0]} resumes from {_load_path}", flush=True)
-    if args.resume and os.path.exists(_load_path):
+    if _resuming and os.path.exists(_load_path):
         # to host memory: every piece is copied to its device below (on the GPU the whole checkpoint would sit next
         # to the model it is loaded into: the 27B's 10.5 GB did not fit)
         blob = torch.load(_load_path, map_location="cpu", weights_only=False, mmap=True)
