@@ -355,8 +355,11 @@ def test_same_losses(tmp_path, extra):
 def test_dp_factored(fp32):
     """data parallel with the factored update: 2 ranks (sharing one GPU through gloo), each with its own gradient
     factors, average the update's thin products and must hold what one process holds after the update from the mean
-    gradient (fp32 factors: to summation order; bf16: within bf16 rounding), and stay identical to each other"""
-    env = dict(os.environ, PYTHONPATH=ROOT, FP32=fp32)
+    gradient (fp32 factors: to summation order; bf16: within bf16 rounding), and stay identical to each other. The fp32
+    case runs the fused micro path (the default) and checks its data-parallel logic exactly; the bf16 case runs the torch
+    micro path, since the fused kernel's bf16 running sums round at other points than the one-process reference (3 of
+    61 moved trits differ in the micro-2 case, the ranks still identical; the fused path's quality: a 1k check at 0.8B)"""
+    env = dict(os.environ, PYTHONPATH=ROOT, FP32=fp32, **({} if fp32 == "1" else {"TERN_MICRO_FUSED": "0"}))
     r = subprocess.run([sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", "2",
                         os.path.join(ROOT, "scripts", "tests", "dp_factored_check.py")], cwd=ROOT, env=env,
                        capture_output=True, text=True, timeout=600)
