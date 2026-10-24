@@ -4,7 +4,7 @@ embedding, H for the head; e.g. 2:3), lo and s per group (fp32, trained in the f
 from the round-to-nearest codes of the (converted, folded) float matrices.
 
 TTF moves a code by one level when its accumulator reaches theta, as it moves a trit; the gradient it sees is dL/dq =
-dL/dW * s (one level is one step of s). The dequantized matrix is formed once per optimizer step as an fp32 leaf and
+dL/dW * s (one level is one step of s). The dequantized matrix is formed once per optimizer step as a bf16 leaf and
 reused by every micro-batch (the codes only change on the step's last micro-batch), so its gradient sums the step's
 micro-batches; the update runs after the last one, from that sum (one call per matrix per step).
 """
@@ -32,30 +32,38 @@ class IntKMatrix(nn.Module):
         return (self.lo[..., None] + self.s[..., None] * q).reshape(self.N, self.K)
 
     def leaf(self):
-        """the step's dequantized matrix (fp32): a leaf with its own gradient while training, else a plain tensor"""
+        """the step's dequantized matrix (bf16): a leaf while training, else a plain tensor. Each micro-batch's gradient
+        (bf16, rounded once) is moved by a post-accumulate hook into an fp32 sum (self._G), so the step's sum is fp32 and
+        no bf16 .grad accumulates (at 27B: 2.5 GB per matrix instead of an fp32 leaf's 5 GB plus a bf16 copy)"""
         if not torch.is_grad_enabled():
-            return self.dequant().detach()
+            return self.dequant().detach().to(torch.bfloat16)
         if self._W is None:
-            self._W = self.dequant().detach().requires_grad_(True)
+            self._W = self.dequant().detach().to(torch.bfloat16).requires_grad_(True)
+            self._G = None
+
+            def _acc(p):
+                g = p.grad.float()
+                self._G = g if self._G is None else self._G.add_(g)
+                p.grad = None
+            self._W.register_post_accumulate_grad_hook(_acc)
         return self._W
 
     @torch.no_grad()
     def step(self, ts_layer, state, c):
         """after the step's last backward: the group parameters' gradients and the TTF update of the codes"""
-        W = self._W
-        self._W = None
-        if W is None or W.grad is None:
+        G_ = getattr(self, "_G", None)
+        self._W = self._G = None
+        if G_ is None:
             return
         import torch.distributed as dist
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:   # data parallel: the codes
-            G_ = W.grad.float()                                    # move on the mean gradient (the same on every rank)
-            dist.all_reduce(G_); G_.div_(dist.get_world_size()); W.grad = G_
-        gW = W.grad.float().reshape(self.N, self.K // self.g, self.g)
+            dist.all_reduce(G_); G_.div_(dist.get_world_size())   # move on the mean gradient (the same on every rank)
+        gW = G_.reshape(self.N, self.K // self.g, self.g)
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()
         for p, gp in ((self.lo, gW.sum(-1)), (self.s, (gW * q).sum(-1))):
             p.grad = gp if p.grad is None else p.grad + gp
         gq = (gW * self.s.detach()[..., None]).reshape(self.N, self.K)
-        del gW, q
+        del gW, q, G_
         if self.N * self.K > CHUNKED_ABOVE[0]:
             ttf_rows(self, gq, state, c)
         else:
@@ -133,7 +141,7 @@ class _Emb(nn.Module):
         return self.m.leaf()
 
     def forward(self, idx):
-        return F.embedding(idx, self.m.leaf()).to(torch.bfloat16)
+        return F.embedding(idx, self.m.leaf())
 
 
 class _Head(nn.Module):
