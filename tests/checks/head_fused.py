@@ -3,7 +3,8 @@ BitTransformer._loss_chunk_kd) in loss and dL/dh, with ignored targets, at a 248
 import torch, torch.nn.functional as F
 from ttf.headloss import head_loss_chunk
 from ttf.model import BitTransformer
-from ttf.qwen import _ce_chunk
+from ttf.qwen import _ce_chunk, _kd_topk_chunk
+from ttf.headloss import head_loss_topk_chunk
 
 torch.manual_seed(0)
 dev = "cuda"
@@ -30,4 +31,13 @@ for name, ref, kd, a in (("kd0.75", lambda h: BitTransformer._loss_chunk_kd(h, w
     e1 = float((h1.grad.double() - g64).norm() / g64.norm()); e2 = float((h2.grad.double() - g64).norm() / g64.norm())
     print(f"{name}: loss rel {el:.1e}; dL/dh error vs fp64: autograd {e1:.1e}, fused {e2:.1e}")
     assert el < 1e-5 and e2 < 1.5 * e1 + 1e-4, name
+# the top-k cache losses: loss and dL/dh against the autograd chunk (fp64 reference not repeated: same roundings)
+ids = torch.topk(tlp.float(), 32, -1).indices; tk = tlp.gather(1, ids)
+for mode in ("rest", "renorm"):
+    for a in (0.75, 1.0):
+        h1 = h0.clone().requires_grad_(); l1 = _kd_topk_chunk(h1, w, tgt, ids, tk, a, mode); (2.5 * l1).backward()
+        h2 = h0.clone().requires_grad_(); l2 = head_loss_topk_chunk(h2, w, tgt, ids, tk, a, mode); (2.5 * l2).backward()
+        el = abs(float(l1 - l2)) / abs(float(l1)); eg = float((h1.grad.float() - h2.grad.float()).norm() / h1.grad.float().norm())
+        print(f"topk {mode} a={a}: loss rel {el:.1e}, dL/dh rel to autograd {eg:.1e}")
+        assert el < 1e-5 and eg < 2e-2, (mode, a)
 print("ok")
