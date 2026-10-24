@@ -234,6 +234,27 @@ def test_factored_matches_dense():
     assert errs[1] < errs[0] / 2.5 and errs[1] < 0.1, errs          # 16 x the sketch: ~4 x smaller
 
 
+def test_layer_ts_rank():
+    """a layer's own ts_rank (set by a plug-in, e.g. for thin adapter factors) replaces the configured rank, on the
+    dense and the factored path, micro and not; layers without it keep c["r"]"""
+    from ttf import update as U
+    N, K, T = 96, 64, 256
+    for fac, M in ((0, 1), (64, 1), (64, 4)):
+        for own in (None, 8):
+            l = _layer(N, K, 0); l._ts_idx = 1; state = {}
+            if own:
+                l.ts_rank = own
+            gen = torch.Generator(device=dev).manual_seed(5)
+            for i in range(M):
+                gy = (torch.randn(T, N, device=dev, generator=gen) * 1e-3).to(torch.bfloat16)
+                x = torch.randn(T, K, device=dev, generator=gen).to(torch.bfloat16)
+                l._ts_final = i == M - 1
+                g = (gy, x) if fac else (gy.T.float() @ x.float()).contiguous()
+                U.ts_layer(l, g, state, _cfg(r=24, theta=1e9, factored=fac, step=10, micro=M))
+            Uu, V = U._load_pair(state[id(l)])
+            assert Uu.shape[1] == V.shape[1] == (own or 24), (fac, M, own, Uu.shape, V.shape)
+
+
 def test_micro_fused_matches_torch():
     """--ttf-accum micro: kernel.micro_sketch (the sketch sides' statistics in four kernels) against the torch ops,
     over 3 steps x 4 micro-batches (shapes that are not tile multiples): the accumulator and v agree to fp32 rounding

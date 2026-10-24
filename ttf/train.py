@@ -623,7 +623,7 @@ def main():
                     if id(m) not in lr_state or m.wpacked.is_meta:
                         continue
                     U_, V_ = _load_pair(lr_state[id(m)])
-                    ra_ = min(args.ttf_rank, m.N, m.K)
+                    ra_ = min(getattr(m, "ts_rank", None) or args.ttf_rank, m.N, m.K)
                     if V_.shape[1] >= ra_:
                         continue
                     dv_ = V_.device; U_, V_ = U_.to(device).float(), V_.to(device).float()
@@ -745,7 +745,8 @@ def main():
             print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
             if args.dw_thin == "dense":   # thin layers (adapter factors): the dense gradient is cheaper than the factors
                 _thin = [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)
-                         and m_.N * m_.K < (m_.N + m_.K) * (args.factored_k + 2 * min(args.ttf_rank, m_.N, m_.K))]
+                         and m_.N * m_.K < (m_.N + m_.K) * (args.factored_k
+                                                          + 2 * min(getattr(m_, "ts_rank", None) or args.ttf_rank, m_.N, m_.K))]
                 for m_ in _thin:
                     m_._dw_dense = True
                 print(f"--dw-thin dense: {len(_thin)} thin layers updated from the dense gradient "
