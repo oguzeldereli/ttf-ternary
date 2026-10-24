@@ -272,6 +272,14 @@ def test_orth_cholqr2():
             assert float((Q.T @ Q - I).abs().max()) < 1e-4
         Q = U._orth_(X); Q0 = torch.linalg.qr(X)[0]
         assert float((Q @ (Q.T @ Q0) - Q0).abs().max()) < 1e-4          # same span
+        try:
+            import orth  # noqa: F401  (spanqr, when on PYTHONPATH)
+        except ImportError:
+            return
+        U.ORTH[0] = "spanqr"
+        for Y in (X, Xz, Xp):
+            Q = U._orth_(Y)
+            assert float((Q.T @ Q - torch.eye(Q.shape[1], device=dev)).abs().max()) < 1e-4
     finally:
         U.ORTH[0] = old
 

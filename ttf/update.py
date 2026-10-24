@@ -266,7 +266,8 @@ def _orth(X):
         return _orth_(X)
 
 
-ORTH = ["qr"]   # --ttf-orth: qr (Householder) or cholqr2 (two Cholesky QR passes, QR where they would fail)
+ORTH = ["qr"]   # --ttf-orth: qr (Householder), cholqr2 (two Cholesky QR passes, QR where they would fail), or spanqr
+_SPANQR = [None]  # (the spanqr package's orth: robust shifted Cholesky QR, no host sync; for r <= 512, cholqr2 above)
 
 
 def _orth_(X):
@@ -277,6 +278,13 @@ def _orth_(X):
     One host sync per call for that check."""
     if ORTH[0] == "qr" or X.dtype != torch.float32 or X.shape[0] < X.shape[1]:
         return torch.linalg.qr(X)[0]
+    if ORTH[0] == "spanqr" and X.shape[1] <= 512 and X.shape[1] % 32 == 0 and X.is_cuda:
+        # spanqr (github.com/oguzeldereli/spanqr) at the shapes it is fastest at (4080 laptop, 5120 x 256: 0.90 ms
+        # against cholqr2's 1.11 and Householder's 3.47; at r 1024 its own Cholesky is slower than cholqr2's)
+        if _SPANQR[0] is None:
+            from orth import orth as _o
+            _SPANQR[0] = _o
+        return _SPANQR[0](X.contiguous())
     L1, i1 = torch.linalg.cholesky_ex(X.T @ X)
     Q = torch.linalg.solve_triangular(L1.T, X, upper=True, left=False)
     G2 = Q.T @ Q
