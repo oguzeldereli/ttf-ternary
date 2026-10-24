@@ -31,9 +31,23 @@ def _kd_window(args, idx):
                 print(f"--kd-cache: waiting for {fn}", flush=True)
             time.sleep(30); waited += 30
         z = np.load(fn)
-        _KD_SHARD.update(sh=sh, starts=z["starts"], ids=z["ids"], lp=z["lp"])
+        _KD_SHARD.update(sh=sh, starts=z["starts"], ids=z["ids"], lp=z["lp"], sids=z["sids"] if "sids" in z else None)
     j = j % len(_KD_SHARD["starts"])                                    # a shorter (last) shard: wrap within it
+    if getattr(args, "kd_cache_mode", "") == "sample":
+        assert _KD_SHARD["sids"] is not None, f"--kd-cache-mode sample: {fn} has no tail samples (teacher_topk.py --tail)"
+        return int(_KD_SHARD["starts"][j]), *_kd_sampled(_KD_SHARD["ids"][j], _KD_SHARD["lp"][j], _KD_SHARD["sids"][j])
     return int(_KD_SHARD["starts"][j]), _KD_SHARD["ids"][j], _KD_SHARD["lp"][j]
+
+
+def _kd_sampled(ids, lp, sids):
+    """--kd-cache-mode sample: the top k (exact) plus the S tail samples, each with weight p_rest / S, as one id list
+    and log-weights [seq, k + S] that sum to 1 per position: the KD target is then an unbiased estimate of the teacher's
+    full distribution (duplicate samples add up in the loss's gather / scatter)"""
+    pk = np.exp(lp.astype(np.float32))
+    pr = np.clip(1.0 - pk.sum(-1, keepdims=True), 0.0, None)
+    S = sids.shape[-1]
+    lw = np.concatenate([np.log(np.maximum(pk, 1e-30)), np.broadcast_to(np.log(np.maximum(pr / S, 1e-30)), sids.shape)], -1)
+    return np.concatenate([ids, sids], -1), lw.astype(np.float32)
 
 
 def _kd_cache_batch(args, idx, data, seq_len, device, bs=1):

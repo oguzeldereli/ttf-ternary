@@ -317,7 +317,9 @@ def main():
     if args.kd_cache:  # precomputed teacher targets (scripts/quant/teacher_topk.py)
         assert hasattr(model, "kd_topk"), "--kd-cache: Qwen models"
         model.kd_w = args.kd_weight
-        model.kd_mode = args.kd_cache_mode
+        model.kd_mode = "renorm" if args.kd_cache_mode == "sample" else args.kd_cache_mode   # (sample: renorm's KL on
+        # the k + S ids with the loader's log-weights, which already sum to 1)
+        assert args.kd_cache_mode != "windows" or args.teacher, "--kd-cache-mode windows: the online teacher (--teacher)"
         print(f"--kd-cache ({args.kd_cache_mode})", flush=True)
         print(f"--kd-cache {args.kd_cache}: from window 0 at step {args.kd_cache_start}, loss (1 - {args.kd_weight}) CE "
               f"+ {args.kd_weight} KD to the teacher's top k", flush=True)
@@ -871,6 +873,8 @@ def main():
                 # data parallel: each rank its own windows (rank 0 of 1 reads what a single run always read)
                 x, y, model.kd_topk = _kd_cache_batch(args, ((step - args.kd_cache_start) * tc.grad_accum + micro) * _WS + _RK,
                                                       train_data, tc.seq_len, device, bs=tc.batch_size)
+                if args.kd_cache_mode == "windows":      # the cache's windows, the online teacher's targets
+                    model.kd_topk = None
             else:
                 x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
             if _teacher is not None:   # --distill: the full-precision model's next-token distribution for this batch

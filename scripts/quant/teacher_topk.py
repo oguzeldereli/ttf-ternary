@@ -6,7 +6,11 @@ memory and each decoder layer is copied to the GPU once per batch of windows, th
 
 Writes OUT_DIR/kd_00000.npz, kd_00001.npz, ... (each: starts [B] int64, ids [B, seq, k] int32, lp [B, seq, k] fp16:
 log-probabilities under the full softmax) and OUT_DIR/done when finished; restarts skip finished shards. Window starts
-are drawn uniformly (seed 1234) like the trainer's batches; the trainer's --kd-cache reads them in order."""
+are drawn uniformly (seed 1234) like the trainer's batches; the trainer's --kd-cache reads them in order.
+--tail S: also S tokens per position drawn with replacement from the teacher's distribution outside the top k (sids
+[B, seq, S] int32, slp their log-probabilities fp16; seeded per shard): with weight p_rest / S each they make the
+trainer's KD target an unbiased estimate of the full distribution (--kd-cache-mode sample), where 'rest' keeps only the
+tail's total mass."""
 import argparse
 import os
 import sys
@@ -23,6 +27,7 @@ def main():
     ap.add_argument("hf_dir"); ap.add_argument("data"); ap.add_argument("out")
     ap.add_argument("--windows", type=int, default=24000, help="0 with --sequential: all windows"); ap.add_argument("--batch", type=int, default=48)
     ap.add_argument("--k", type=int, default=32); ap.add_argument("--seq", type=int, default=2048)
+    ap.add_argument("--tail", type=int, default=0, help="S tail samples per position (0: top k only)")
     ap.add_argument("--mb", type=int, default=4, help="windows per layer call")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--sequential", action="store_true", help="every non-overlapping window once, shuffled (teacher_gguf.py)")
@@ -109,6 +114,10 @@ def main():
                 p.data = host[li][n]
         top_i = np.empty((len(st), a.seq, a.k), dtype=np.int32)
         top_l = np.empty((len(st), a.seq, a.k), dtype=np.float16)
+        if a.tail:
+            s_i = np.empty((len(st), a.seq, a.tail), dtype=np.int32)
+            s_l = np.empty((len(st), a.seq, a.tail), dtype=np.float16)
+            gen = torch.Generator(device=dev).manual_seed(a.seed * 1_000_003 + sh)
         with torch.no_grad():
             for b in range(len(st)):
                 hb = hf.model.norm(H[b])
@@ -117,9 +126,15 @@ def main():
                     lp = torch.log_softmax(lg, -1)
                     v, i = lp.topk(a.k, -1)
                     top_i[b, c0:c0 + 512] = i.int().cpu().numpy(); top_l[b, c0:c0 + 512] = v.half().cpu().numpy()
+                    if a.tail:
+                        pt = lp.exp().scatter_(1, i, 0.0)                      # the tail (unnormalised: multinomial
+                        pt[pt.sum(-1) <= 0] = 1.0                              # normalises; an empty tail: any token,
+                        j = torch.multinomial(pt, a.tail, replacement=True, generator=gen)   # weight 0 in the trainer)
+                        s_i[b, c0:c0 + 512] = j.int().cpu().numpy(); s_l[b, c0:c0 + 512] = lp.gather(1, j).half().cpu().numpy()
+                        del pt, j
         del H
         tmp = fn + ".tmp.npz"
-        np.savez(tmp, starts=st, ids=top_i, lp=top_l)
+        np.savez(tmp, starts=st, ids=top_i, lp=top_l, **({"sids": s_i, "slp": s_l} if a.tail else {}))
         os.replace(tmp, fn)
         cov = float(np.exp(top_l.astype(np.float32)).sum(-1).mean())
         print(f"shard {sh + 1}/{nsh}: {len(st)} windows in {time.time() - t1:.0f}s, top-{a.k} mass {cov:.3f}", flush=True)

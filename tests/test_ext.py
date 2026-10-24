@@ -55,3 +55,21 @@ def test_base_unwraps():
         def __init__(self, lin): self.lin = lin
     t = T()
     assert X.base(t) is t and X.base(W(t)) is t and X.base(W(W(t))) is t
+
+
+def test_kd_sampled_weights():
+    """--kd-cache-mode sample: top k exact plus S tail samples at p_rest / S each; the weights sum to 1 per position and
+    their expectation over the sampling is the teacher's distribution"""
+    import numpy as np
+    from ttf.data import _kd_sampled
+    rng = np.random.default_rng(0)
+    V, k, S = 50, 5, 8
+    p = rng.dirichlet(np.ones(V) * 0.3)
+    top = np.argsort(-p)[:k]; tail = np.setdiff1d(np.arange(V), top); pt = p[tail] / p[tail].sum()
+    est = np.zeros(V); n = 4000
+    for _ in range(n):
+        s = rng.choice(tail, S, p=pt)
+        ids, lw = _kd_sampled(top[None].astype(np.int32), np.log(p[top])[None].astype(np.float16), s[None].astype(np.int32))
+        w = np.exp(lw[0]); assert abs(w.sum() - 1) < 2e-3
+        np.add.at(est, ids[0], w / n)
+    assert np.abs(est - p).max() < 0.01
