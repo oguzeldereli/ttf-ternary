@@ -45,6 +45,11 @@ def _tern_lays(model):
     return tern_emb_layers(model)
 
 
+def _intk_lays(model):
+    from .intk_emb import intk_layers
+    return intk_layers(model)
+
+
 def mem_report(model, tail_opt, lr_state):
     """--mem-report: MiB held by each part of training (tensors counted by their own size; CUDA context excluded)"""
     MB = 2 ** 20
@@ -502,7 +507,11 @@ def main():
                     # --tern-emb: the ternary embedding matrices' TTF state (U V, update count, factored v)
                     "tern_emb_state": [(lr_state.get(id(m)), {k[0]: lr_state.get("_ts", {})[k] for k in
                                         (("t", id(m)), ("v", id(m))) if k in lr_state.get("_ts", {})})
-                                       for m in _tern_lays(model)] if te and lr_state else None}, tmp)
+                                       for m in _tern_lays(model)] if te and lr_state else None,
+                    # --intk-emb: the int-k embedding / head matrices' TTF state, the same form
+                    "intk_state": [(lr_state.get(id(m)), {k[0]: lr_state.get("_ts", {})[k] for k in
+                                    (("t", id(m)), ("v", id(m))) if k in lr_state.get("_ts", {})})
+                                   for m in _intk_lays(model)] if args.intk_emb and lr_state else None}, tmp)
         os.replace(tmp, ckpt_path)
 
     mag_on = [False]
@@ -672,14 +681,16 @@ def main():
                         lr_state[id(m)] = tuple(t.to(dv_) for t in pr_)
             if _amsg:
                 print(f"*** {_amsg} ***", flush=True)
-        if blob.get("tern_emb_state"):
-            st_ = lr_state.setdefault("_ts", {})
-            for m, (uv, d_) in zip(_tern_lays(model), blob["tern_emb_state"]):
-                if uv is not None:
-                    lr_state[id(m)] = tuple(t.to(device) for t in uv)
-                for k_, v_ in d_.items():
-                    st_[(k_, id(m))] = tuple(x.to(device) for x in v_) if isinstance(v_, tuple) else v_
-            print(f"resumed --tern-emb TTF state for {len(blob['tern_emb_state'])} matrices", flush=True)
+        for _key, _lays_of in (("tern_emb_state", _tern_lays), ("intk_state", _intk_lays)):
+          if not blob.get(_key):
+            continue
+          st_ = lr_state.setdefault("_ts", {})
+          for m, (uv, d_) in zip(_lays_of(model), blob[_key]):
+            if uv is not None:
+                lr_state[id(m)] = tuple(t.to(device) for t in uv)
+            for k_, v_ in d_.items():
+                st_[(k_, id(m))] = tuple(x.to(device) for x in v_) if isinstance(v_, tuple) else v_
+          print(f"resumed the {_key} TTF state of {len(blob[_key])} matrices", flush=True)
         if blob.get("ts_state"):
             lays = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
             st_ = lr_state.setdefault("_ts", {})
