@@ -125,6 +125,12 @@ class _KernelTernFn(torch.autograd.Function):
                 gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
             if getattr(layer, "cap_accum", False):
                 layer._ts_final = getattr(layer, "cap_final", True)
+            if getattr(layer, "_dw_dense", False):   # --dw-thin dense: a thin layer's update from the dense gradient
+                with _rf("tern.dw"):                 # (2 T N K flops < the factored path's 2 T (N + K)(k + 2 r))
+                    gw = torch.mm(gyf.transpose(0, 1), xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype),
+                                  out_dtype=torch.float32)
+                layer.on_grad(layer, gw)
+                return gx.to(gy.dtype), None, None
             layer.on_grad(layer, (gyf, xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype)))
             return gx.to(gy.dtype), None, None
         if not layer.capture:     # no update asked for: the input gradient only (the trits stay as they are)

@@ -102,6 +102,9 @@ def build_parser():
                    help="factored: the update from the gradient's factors (gy, x), the dense weight gradient never "
                         "formed (equal loss to dense at 110M)")
     g.add_argument("--dw-sketch", type=int, default=256, help="--dw factored: sketch size for the sums of g^2")
+    g.add_argument("--dw-thin", default="factored", choices=["factored", "dense"],
+                   help="--dw factored: dense = layers with N K < (N + K)(sketch + 2 rank) (thin adapter factors) take "
+                        "the dense weight gradient instead (fewer flops and launches; exact g^2 sums, not bit-identical)")
     g.add_argument("--dw-precision", default="bf16", choices=["bf16", "fp32"],
                    help="--dw dense: the weight gradient's GEMM output (fp32: no bf16 rounding)")
     g.add_argument("--fire", default="fused", choices=["fused", "torch"], help="--dw factored: the firing in one kernel")

@@ -47,3 +47,49 @@ def head_loss_chunk(h, w, tgt, tlp=None, a=0.0):
     log-probabilities, weight a)"""
     assert not w.requires_grad, "--head-fused: the head must be frozen (its gradient is not computed)"
     return _HeadLossFn.apply(h, w, tgt, tlp, float(a))
+
+
+class _HeadLossTopkFn(torch.autograd.Function):
+    """as qwen._kd_topk_chunk ((1 - a) CE + a KD to the teacher's top k; mode 'rest': the k tokens plus one bucket for
+    the rest of the mass, 'renorm': the k renormalised), with dL/dh computed in the forward (frozen head)"""
+    @staticmethod
+    def forward(ctx, h, w, tgt, ids, tlp, a, mode):
+        with torch.no_grad():
+            z = F.linear(h, w).float()
+            lse = torch.logsumexp(z, -1, keepdim=True)
+            s = (z - lse).exp()                                           # the student's softmax
+            lq = z.gather(1, ids) - lse
+            if mode == "renorm":
+                q = torch.softmax(tlp.float(), -1)
+                kd = -(q * lq).sum()
+                dz = s * q.sum(-1, keepdim=True)
+                dz.scatter_add_(1, ids, -q)
+            else:
+                pk = tlp.float().exp(); p_rest = (1 - pk.sum(-1, keepdim=True)).clamp_min(0)
+                zm = z.scatter(1, ids, float("-inf")); lse_r = torch.logsumexp(zm, -1, keepdim=True)
+                kd = -(pk * lq).sum() - (p_rest * (lse_r - lse)).sum()
+                dz = s * (pk.sum(-1, keepdim=True) + p_rest) - p_rest * (zm - lse_r).exp()
+                dz.scatter_add_(1, ids, -pk)
+                del zm
+            if a >= 1.0:
+                loss = kd
+            else:
+                ok = tgt != -1
+                ce = -(z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0][ok].sum()
+                loss = (1 - a) * ce + a * kd
+                dz.mul_(a).add_(s * ((1 - a) * ok.float()[:, None]))
+                idx = tgt.clamp_min(0)[:, None]
+                dz.scatter_add_(1, idx, torch.full_like(idx, -(1 - a), dtype=dz.dtype) * ok[:, None])
+            dh = torch.mm(dz.to(h.dtype), w, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dz.to(h.dtype) @ w
+        ctx.save_for_backward(dh); ctx.h_dtype = h.dtype
+        return loss
+
+    @staticmethod
+    def backward(ctx, go):
+        (dh,) = ctx.saved_tensors
+        return (dh * go.float()).to(ctx.h_dtype), None, None, None, None, None, None
+
+
+def head_loss_topk_chunk(h, w, tgt, ids, tlp, a, mode="rest"):
+    assert not w.requires_grad, "--head-fused: the head must be frozen (its gradient is not computed)"
+    return _HeadLossTopkFn.apply(h, w, tgt, ids, tlp, float(a), mode)

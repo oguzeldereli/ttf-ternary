@@ -732,6 +732,13 @@ def main():
         if args.factored_k:
             assert args.micro or tc.grad_accum == 1, "--dw factored: 16 x 1 or --ttf-accum micro"
             print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
+            if args.dw_thin == "dense":   # thin layers (adapter factors): the dense gradient is cheaper than the factors
+                _thin = [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)
+                         and m_.N * m_.K < (m_.N + m_.K) * (args.factored_k + 2 * args.ttf_rank)]
+                for m_ in _thin:
+                    m_._dw_dense = True
+                print(f"--dw-thin dense: {len(_thin)} thin layers updated from the dense gradient "
+                      f"(N K < (N + K)(k + 2 r))", flush=True)
     if args.w_cache != "off" or args.dw_precision == "fp32":
         from .layers import WCACHE as _WC, DW_FP32 as _DF
         _WC["mode"] = args.w_cache; _DF[0] = args.dw_precision == "fp32"
