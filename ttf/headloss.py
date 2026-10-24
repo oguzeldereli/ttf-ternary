@@ -32,14 +32,14 @@ class _HeadLossFn(torch.autograd.Function):
             if ca:
                 idx = tgt.clamp_min(0)[:, None]
                 dz.scatter_add_(1, idx, torch.full_like(idx, -ca, dtype=dz.dtype) * ok[:, None])
-            dh = dz.to(h.dtype) @ w
-        ctx.save_for_backward(dh)
+            dh = torch.mm(dz.to(h.dtype), w, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dz.to(h.dtype) @ w
+        ctx.save_for_backward(dh); ctx.h_dtype = h.dtype
         return loss
 
     @staticmethod
     def backward(ctx, go):
         (dh,) = ctx.saved_tensors
-        return (dh * go.to(dh.dtype)), None, None, None, None
+        return (dh * go.float()).to(ctx.h_dtype), None, None, None, None   # dL/dh kept fp32: one rounding, as autograd's
 
 
 def head_loss_chunk(h, w, tgt, tlp=None, a=0.0):
