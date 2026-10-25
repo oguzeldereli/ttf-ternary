@@ -1,6 +1,7 @@
 """GPU tests (lab PC): the kernels against their references, the TTF update's invariants, the factored update against
 the dense one, and a short training run resumed half way against the same run straight through."""
 import json
+import re
 import os
 import subprocess
 import sys
@@ -340,6 +341,25 @@ def test_train_resume_round_trip(tmp_path):
     assert len(a) == 8 and a == b, (a, b)
     recs = [json.loads(l) for l in open(tmp_path / "b" / "records.jsonl")]
     assert [r["type"] for r in recs].count("run") == 2 and recs[-1].get("status") == "finished"
+
+
+def test_ttf_basis_small_resume(tmp_path):
+    """--ttf-basis small: 8 steps straight vs 4 + resumed 4, the same losses; a resume with --ttf-basis in re-splits the
+    output-side accumulators (the same A) and runs"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    tb = ["--ttf-basis", "small"]
+    a = _train(str(tmp_path / "a"), tb, 8, data)
+    assert len(_train(str(tmp_path / "b"), tb, 4, data)) == 4
+    b = _train(str(tmp_path / "b"), tb + ["--resume"], 8, data)
+    assert len(a) == 8 and a == b, (a, b)
+    r = _run(str(tmp_path / "c"), tb, 4, data)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    n = re.search(r"--ttf-basis small: (\d+) layers \(N < K\)", r.stdout + r.stderr)
+    assert n and int(n.group(1)) > 0
+    r = _run(str(tmp_path / "c"), ["--resume"], 6, data)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    assert "--ttf-basis in: re-split the accumulators of" in r.stdout + r.stderr
 
 
 def test_resume_new_theta_needs_acc_scale(tmp_path):
