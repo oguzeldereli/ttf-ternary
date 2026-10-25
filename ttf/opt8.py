@@ -9,6 +9,9 @@ from __future__ import annotations
 import torch
 
 
+CHUNK = 1 << 24
+
+
 class Adam8bit(torch.optim.Optimizer):
     def __init__(self, params, lr=3e-4, betas=(0.9, 0.95), eps=1e-8,
                  weight_decay=0.0):
@@ -24,21 +27,28 @@ class Adam8bit(torch.optim.Optimizer):
             for p in grp["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad.float()
                 st = self.state[p]
                 if not st:
                     st["step"] = 0
                     st["m"] = torch.zeros_like(p, dtype=torch.bfloat16)
                     st["v"] = torch.zeros_like(p, dtype=torch.bfloat16)
                 st["step"] += 1
-                m = st["m"].float().mul_(b1).add_(g, alpha=1 - b1)
-                v = st["v"].float().mul_(b2).addcmul_(g, g, value=1 - b2)
-                st["m"].copy_(m)                    # store back as bf16
-                st["v"].copy_(v)
                 bc1 = 1 - b1 ** st["step"]
                 bc2 = 1 - b2 ** st["step"]
-                denom = (v / bc2).sqrt_().add_(eps)
                 if wd > 0:
                     p.mul_(1 - lr * wd)
-                p.addcdiv_(m / bc1, denom, value=-lr)
+                # in chunks of CHUNK elements: the fp32 temporaries (g, m, v, the denominator) of a whole large
+                # parameter (a 27B embedding: 1.3G elements, ~5 GiB each) were the step's memory peak. Elementwise,
+                # so the chunks give the same values.
+                ts = (p, p.grad, st["m"], st["v"])
+                flat = all(t.is_contiguous() for t in ts)       # (else one piece: a view would fail, a reshape copy)
+                pf, gf, mf, vf = (t.view(-1) for t in ts) if flat else ts
+                for c in ([slice(i, i + CHUNK) for i in range(0, pf.numel(), CHUNK)] if flat else [slice(None)]):
+                    g = gf[c].float()
+                    m = mf[c].float().mul_(b1).add_(g, alpha=1 - b1)
+                    v = vf[c].float().mul_(b2).addcmul_(g, g, value=1 - b2)
+                    mf[c].copy_(m)                      # store back as bf16
+                    vf[c].copy_(v)
+                    denom = (v / bc2).sqrt_().add_(eps)
+                    pf[c].addcdiv_(m / bc1, denom, value=-lr)
         return loss
