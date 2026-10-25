@@ -269,7 +269,9 @@ def _step_scale(R, C, b2, n):
 
 def _hspend_basis(st, key, x, V, c):
     """--ttf-hspend F: a move spends theta (D H~) instead of theta D, H~ = I + F (C - I), C the correlation of the layer's
-    input (an EMA, ~100 steps, of the centred input's x^T x from the last micro-batch of each step): a move at (i, j)
+    input factor x (an EMA, ~100 steps, of x^T x from the last micro-batch of each step; the second moment, not the
+    covariance: a move's output change is dW x with x the input the trits multiply, already centred in a centred
+    layer): a move at (i, j)
     also takes theta d C_jk from the row's entry (i, k) fed by a correlated input, whose evidence was for the same
     output change (P2h 500 -> 999: a row's moves changed the output 1.2-1.6 x what independent inputs would, chance
     1.0-1.1). Low rank exactly: U -= theta D (H~ V), the spend's basis Vs = H~ V [K, r]. State: H [K, K] fp32 and a count"""
