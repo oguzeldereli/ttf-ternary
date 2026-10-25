@@ -112,10 +112,6 @@ def build_parser():
     g.add_argument("--dw-thin", default="factored", choices=["factored", "dense"],
                    help="--dw factored: dense = layers with N K < (N + K)(sketch + 2 rank) (thin adapter factors) take "
                         "the dense weight gradient instead (fewer flops and launches; exact g^2 sums, not bit-identical)")
-    g.add_argument("--ttf-basis", default="in", choices=["in", "small"],
-                   help="--dw factored: the accumulator basis' side. in: the input side (K); small: the smaller side, "
-                        "so the output side of the layers with N < K (the writers into the residual stream: down_proj, "
-                        "o_proj, out_proj), where the gradient's persistent part lies (not on the --dw-thin dense layers)")
     g.add_argument("--dw-precision", default="bf16", choices=["bf16", "fp32"],
                    help="--dw dense: the weight gradient's GEMM output (fp32: no bf16 rounding)")
     g.add_argument("--fire", default="fused", choices=["fused", "torch"], help="--dw factored: the firing in one kernel")

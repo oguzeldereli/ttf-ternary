@@ -64,24 +64,6 @@ def _split_emb_group(model, groups, wd, mult):
     return groups
 
 
-def _dw_thin(args, m):
-    """--dw-thin dense: a layer whose dense weight gradient is cheaper than the factors (N K < (N + K)(k + 2 r))"""
-    return (args.dw_thin == "dense" and bool(args.factored_k) and m.N * m.K < (m.N + m.K) * (
-        args.factored_k + 2 * min(getattr(m, "ts_rank", None) or args.ttf_rank, m.N, m.K)))
-
-
-def _basis_out(args, m):
-    """--ttf-basis small: the layer's accumulator basis on its output side (N < K, factored, not thin)"""
-    return args.ttf_basis == "small" and bool(args.factored_k) and m.N < m.K and not _dw_thin(args, m)
-
-
-def _reorient(U, V):
-    """the same A with the basis on the other side: A = U V^T = Q (V R^T)^T for U = Q R, so the pair for A^T is
-    (V R^T, Q), Q orthonormal"""
-    Q, R = torch.linalg.qr(U.float())
-    return V.float() @ R.T, Q
-
-
 def _intk_lays(model):
     from .intk_emb import intk_layers
     return intk_layers(model)
@@ -694,21 +676,6 @@ def main():
                 if uv is not None and not m.wpacked.is_meta:
                     lr_state[id(m)] = tuple(t.to(_sdev[id(m)]) for t in uv)
             print(f"resumed low-rank momentum for {len(lr_state)} layers", flush=True)
-            if ttf:   # --ttf-basis: an accumulator stored with its basis on the other side (N != K: U's rows tell) is
-                # re-split, the same A
-                _sa = _store_codec(store); _nr = 0
-                for m in lays:
-                    if id(m) not in lr_state or m.wpacked.is_meta or m.N == m.K:
-                        continue
-                    U_, V_ = _load_pair(lr_state[id(m)])
-                    if (U_.shape[0] == m.K) == _basis_out(args, m):
-                        continue
-                    dv_ = U_.device; U2, V2 = _reorient(U_.to(device), V_.to(device))
-                    pr_ = _store_pair(_sa, U2, V2) if _sa else (U2, V2)
-                    lr_state[id(m)] = tuple(t.to(dv_) for t in pr_); _nr += 1
-                if _nr:
-                    print(f"--ttf-basis {args.ttf_basis}: re-split the accumulators of {_nr} layers from the checkpoint's "
-                          f"side", flush=True)
             if ttf and args.ttf_rank:   # a larger --lowrank than the checkpoint's: grow each accumulator (the --ttf-accum micro
                 # path never resizes): V gains orthonormal columns outside its span, U zeros there, so A = U V^T is
                 # unchanged and the new directions start empty
@@ -723,10 +690,9 @@ def main():
                         continue
                     dv_ = V_.device; U_, V_ = U_.to(device).float(), V_.to(device).float()
                     g_ = torch.Generator(device=device).manual_seed(9_000_001 + 2 * i_)
-                    X_ = torch.randn(V_.shape[0], ra_ - V_.shape[1], device=device, generator=g_)
+                    X_ = torch.randn(m.K, ra_ - V_.shape[1], device=device, generator=g_)
                     X_ = X_ - V_ @ (V_.T @ X_); X_ = X_ - V_ @ (V_.T @ X_)
-                    V2 = torch.cat([V_, _orth(X_)], 1)
-                    U2 = torch.cat([U_, torch.zeros(U_.shape[0], ra_ - V_.shape[1], device=device)], 1)
+                    V2 = torch.cat([V_, _orth(X_)], 1); U2 = torch.cat([U_, torch.zeros(m.N, ra_ - V_.shape[1], device=device)], 1)
                     pr_ = _store_pair(_sa, U2, V2) if _sa else (U2, V2)
                     lr_state[id(m)] = tuple(t.to(dv_) for t in pr_); _ng += 1
                 if _ng:
@@ -862,19 +828,13 @@ def main():
             assert args.micro or tc.grad_accum == 1, "--dw factored: 16 x 1 or --ttf-accum micro"
             print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
             if args.dw_thin == "dense":   # thin layers (adapter factors): the dense gradient is cheaper than the factors
-                _thin = [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear) and _dw_thin(args, m_)]
+                _thin = [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)
+                         and m_.N * m_.K < (m_.N + m_.K) * (args.factored_k
+                                                          + 2 * min(getattr(m_, "ts_rank", None) or args.ttf_rank, m_.N, m_.K))]
                 for m_ in _thin:
                     m_._dw_dense = True
                 print(f"--dw-thin dense: {len(_thin)} thin layers updated from the dense gradient "
                       f"(N K < (N + K)(k + 2 r))", flush=True)
-            if args.ttf_basis == "small":
-                _tb = [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear) and _basis_out(args, m_)]
-                for m_ in _tb:
-                    m_._ts_tb = True
-                print(f"--ttf-basis small: {len(_tb)} layers (N < K) keep the accumulator basis on the output side",
-                      flush=True)
-        else:
-            assert args.ttf_basis == "in", "--ttf-basis small: --dw factored"
     if args.w_cache != "off" or args.dw_precision == "fp32":
         from .layers import WCACHE as _WC, DW_FP32 as _DF
         _WC["mode"] = args.w_cache; _DF[0] = args.dw_precision == "fp32"

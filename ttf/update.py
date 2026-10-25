@@ -614,16 +614,10 @@ def _ts_layer_factored(l, fg, state, c):
     if c.get("start") and c.get("step", 0) < c["start"]:                  # --ttf-start: frozen, v keeps learning
         return
     ra = min(r, l.N, l.K)
-    # --ttf-basis small: on a layer with N < K the basis sits on the output side, the state holds A^T = U V^T (U [K, r],
-    # V [N, r]), so u's two products swap. The part of the gradient that persists across steps lies on the residual-stream
-    # side (Qwen 0.8B layer 12, a step's u in the other steps' top 256: gate input 0.67 / output 0.10, down output 0.45 /
-    # input 0.31); with the basis on the other side the turn discards the tally (down_proj: ~10 steps of memory)
-    tb = getattr(l, "_ts_tb", False)
-    mm_r, mm_l = (_fg_mm_l, _fg_mm_r) if tb else (_fg_mm_r, _fg_mm_l)
     if key not in state:
         g_ = torch.Generator(device=dev).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
-        V = _orth(-lr_ratio * _dpm(mm_l(fgb, ia, torch.randn(l.K if tb else l.N, ra, device=dev, generator=g_))))
-        U = -lr_ratio * _dpm(mm_r(fgb, ia, V))
+        V = _orth(-lr_ratio * _dpm(_fg_mm_l(fgb, ia, torch.randn(l.N, ra, device=dev, generator=g_))))
+        U = -lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
     elif M_ > 1:   # basis fixed within the step, turned on the last micro-batch from M u_M^T U
         U, V = _load_pair(_host_get(state, key, dev, off))
         if (t - 1) % M_ == 0:
@@ -632,18 +626,16 @@ def _ts_layer_factored(l, fg, state, c):
             # data parallel: the earlier micro-batches' terms are linear in g and V is fixed within the step, so each
             # rank summed its own and one mean here replaces a mean per micro-batch (N x r per layer: 16 x less traffic)
             U = _dpm(U)
-            S_ = (-lr_ratio * M_) * _dpm(mm_l(fgb, ia, U))
+            S_ = (-lr_ratio * M_) * _dpm(_fg_mm_l(fgb, ia, U))
             Vn = _orth(V @ (U.T @ U) + S_); del S_
-            U = (U - lr_ratio * _dpm(mm_r(fgb, ia, V))) @ (V.T @ Vn); V = Vn
-        elif tb:
-            U = U - lr_ratio * _fg_mm_l(fgb, ia, V)
+            U = (U - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))) @ (V.T @ Vn); V = Vn
         else:
             U = _fg_add_r(U, fgb, ia, V, -lr_ratio)    # (data parallel: this rank's term, averaged on the last one)
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         U = U * lk
-        Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(mm_l(fgb, ia, U)))
-        U = U @ (V.T @ Vn) - lr_ratio * _dpm(mm_r(fgb, ia, Vn)); V = Vn
+        Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
+        U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
     if not final_:
         if STEP_FP32[0] and sa and not off:   # --ttf-step-fp32: within the step U stays fp32 (V is fixed until the last
             # micro-batch: kept as stored); encoded once, on the last micro-batch. Skips U's encode / decode per micro-batch
@@ -657,14 +649,14 @@ def _ts_layer_factored(l, fg, state, c):
     st.pop(("venc", key), None)
     from .kernel import unpack_rows, pack_rows
     before = l.wpacked.clone() if l.track else None
-    if FIRE_FUSED[0] and dev.type == "cuda" and not tb:   # --fire fused: A, the moves, the repack and D V in one kernel
+    if FIRE_FUSED[0] and dev.type == "cuda":   # --fire fused: A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
         DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta)
         DV = _dpm(DV)          # data parallel: the spend's sparse sums (index_add_) are not bit-reproducible: one mean
         l._after_fire(dnnz)    # the kernel writes the trits in place (no version bump): beta follows the moves, --w-cache recomputes
         U = U - c["spend"] * (theta * DV); del DV
     else:
-        A = V @ U.T if tb else U @ V.T
+        A = U @ V.T
         w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
         d = A.sign()
         fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
@@ -672,7 +664,7 @@ def _ts_layer_factored(l, fg, state, c):
         D = torch.where(fire, d, torch.zeros_like(d))
         nf = fire.sum()
         l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))
-        U = U - c["spend"] * (theta * (D.T @ V if tb else D @ V))
+        U = U - c["spend"] * (theta * (D @ V))
     _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
     if before is not None:
