@@ -233,7 +233,11 @@ class QwenTern(nn.Module):
         return h
 
     def _h_meta(self, x):
-        return (x.shape[0], x.shape[1], self.hf.config.hidden_size), self.hf.model.embed_tokens.weight.dtype
+        e = self.hf.model.embed_tokens
+        from .intk_emb import _Emb
+        # (an int-k embedding's .weight dequantizes the whole matrix: its lookup's dtype instead)
+        dt = torch.bfloat16 if isinstance(e, _Emb) else e.weight.dtype
+        return (x.shape[0], x.shape[1], self.hf.config.hidden_size), dt
 
     def _pp_forward(self, idx, targets):
         """a forward without gradients (evaluation): the hidden states go down the stages, the last computes the loss,

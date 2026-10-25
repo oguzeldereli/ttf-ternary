@@ -355,3 +355,18 @@ def test_dense_step_bf16_group_parameters():
     m._G = gy.T @ x
     m.step(U.ts_layer, {}, _cfg(theta=0.05))
     assert m.lo.grad.dtype == torch.bfloat16 and m.s.grad.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("dt", [torch.float32, torch.bfloat16])
+def test_dequant_bf16_chunks(monkeypatch, dt):
+    # the row-chunked bf16 dequantization equals the whole fp32 matrix rounded once (fp32 and bf16 group parameters)
+    torch.manual_seed(0)
+    m = IE.IntKMatrix(torch.randn(37, 128), 3, 64)
+    m.lo.data, m.s.data = m.lo.data.to(dt), m.s.data.to(dt)
+    monkeypatch.setattr(IE.IntKMatrix, "DEQ_ROWS", 8)
+    ref = m.dequant().detach().to(torch.bfloat16)
+    assert torch.equal(m.dequant_bf16(), ref)
+    with torch.no_grad():
+        assert torch.equal(m.leaf(), ref)
+    W = m.leaf()
+    assert W.requires_grad and W.is_leaf and torch.equal(W.detach(), ref)

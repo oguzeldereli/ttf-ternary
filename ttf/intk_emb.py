@@ -67,14 +67,25 @@ class IntKMatrix(nn.Module):
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()
         return (self.lo[..., None] + self.s[..., None] * q).reshape(self.N, self.K)
 
+    DEQ_ROWS = 8192
+
+    def dequant_bf16(self):
+        """dequant() rounded to bf16, formed in row chunks (no autograd): the same values without the whole fp32 matrix
+        (27B embedding: a 5 GB fp32 transient before its 2.5 GB bf16 copy, on every eval batch through the head)"""
+        out = torch.empty(self.N, self.K, dtype=torch.bfloat16, device=self.codes.device)
+        for i in range(0, self.N, self.DEQ_ROWS):
+            j = min(self.N, i + self.DEQ_ROWS)
+            out[i:j] = self.deq_rows(i, j)
+        return out
+
     def leaf(self):
         """the step's dequantized matrix (bf16): a leaf while training, else a plain tensor. Each micro-batch's gradient
         (bf16, rounded once) is moved by a post-accumulate hook into an fp32 sum (self._G), so the step's sum is fp32 and
         no bf16 .grad accumulates (at 27B: 2.5 GB per matrix instead of an fp32 leaf's 5 GB plus a bf16 copy)"""
         if not torch.is_grad_enabled():
-            return self.dequant().detach().to(torch.bfloat16)
+            return self.dequant_bf16()
         if self._W is None:
-            self._W = self.dequant().detach().to(torch.bfloat16).requires_grad_(True)
+            self._W = self.dequant_bf16().requires_grad_(True)
             self._G = None
 
             def _acc(p):
