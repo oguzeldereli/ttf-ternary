@@ -1,4 +1,4 @@
-"""--head-fused (ttf/headloss.py): the fused frozen-head loss matches the autograd chunks (qwen._ce_chunk,
+"""The fused head loss (ttf/headloss.py, the default path): the fused frozen-head loss matches the autograd chunks (qwen._ce_chunk,
 BitTransformer._loss_chunk_kd) in loss and dL/dh, with ignored targets, at a 248k vocabulary."""
 import torch, torch.nn.functional as F
 from ttf.headloss import head_loss_chunk

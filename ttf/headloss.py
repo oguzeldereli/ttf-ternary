@@ -1,4 +1,4 @@
-"""--head-fused: the loss of a FROZEN head (conversion recovery: the embedding / head do not train) computed with its
+"""The fused head loss (QwenTern.head_fused, the default): the loss of a FROZEN head (conversion recovery: the embedding / head do not train) computed with its
 gradient in one pass. A checkpointed chunk computes z = h W^T and the loss in the forward, then again in the backward
 (the recompute) before the softmax backward and dh = dz W: two 248k-wide GEMMs + softmaxes per chunk in the forward
 direction. Here the forward computes the loss AND dL/dh = dz W at once and saves only dL/dh (chunk x d), so the
@@ -83,7 +83,7 @@ class _HeadLossFn(torch.autograd.Function):
 def head_loss_chunk(h, w, tgt, tlp=None, a=0.0):
     """the summed loss of one chunk (frozen head w): as _ce_chunk (tlp None) / _loss_chunk_kd (tlp the teacher's
     log-probabilities, weight a)"""
-    assert not w.requires_grad, "--head-fused: the head must be frozen (its gradient is not computed)"
+    assert not w.requires_grad, "head_loss: the head must be frozen (its gradient is not computed)"
     return _HeadLossFn.apply(h, w, tgt, tlp, float(a))
 
 
@@ -105,7 +105,7 @@ class _HeadLossTopkFn(torch.autograd.Function):
 
 
 def head_loss_topk_chunk(h, w, tgt, ids, tlp, a, mode="rest"):
-    assert not w.requires_grad, "--head-fused: the head must be frozen (its gradient is not computed)"
+    assert not w.requires_grad, "head_loss: the head must be frozen (its gradient is not computed)"
     return _HeadLossTopkFn.apply(h, w, tgt, ids, tlp, float(a), mode)
 
 
@@ -137,7 +137,7 @@ class _HeadLossTrainFn(torch.autograd.Function):
             acc["go"] = go.detach(); gw = (acc["dW"] * go.float()).to(ctx.w_dtype)
         else:
             if _CHECK:                         # (a host sync: only when asked)
-                assert torch.allclose(acc["go"].float(), go.float(), rtol=1e-6), "--head-fused: unequal chunk scales"
+                assert torch.allclose(acc["go"].float(), go.float(), rtol=1e-6), "head_loss_train_chunk: unequal chunk scales"
             gw = None
         acc["left"] = acc.get("left", acc["n"]) - 1
         if acc["left"] == 0:

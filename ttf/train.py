@@ -2,7 +2,7 @@
 
 Data: a flat binary file of token ids (uint16, or uint32 with --data-dtype u32) for train and another for val.
 Kernel mode: the ternary layers update inside their backward (TTF, ttf/update.py), so only the float tail (embedding,
-norms, scales, adapters) has an optimizer. Also the baselines: --mode master (BitNet b1.58) and --mode fp32.
+norms, scales, adapters) has an optimizer. Also the baselines: --mode bitnet (BitNet b1.58) and --mode fp32.
 """
 from __future__ import annotations
 import os
@@ -642,8 +642,8 @@ def main():
             for m, uv in zip(lays, blob["lowrank"]):
                 if uv is not None and not m.wpacked.is_meta:
                     lr_state[id(m)] = tuple(t.to(_sdev[id(m)]) for t in uv)
-            print(f"resumed low-rank momentum for {len(lr_state)} layers", flush=True)
-            if ttf and args.ttf_rank:   # a larger --lowrank than the checkpoint's: grow each accumulator (the --ttf-accum micro
+            print(f"resumed the TTF accumulators of {len(lr_state)} layers", flush=True)
+            if ttf and args.ttf_rank:   # a larger --ttf-rank than the checkpoint's: grow each accumulator (the micro-batch
                 # path never resizes): V gains orthonormal columns outside its span, U zeros there, so A = U V^T is
                 # unchanged and the new directions start empty
                 _sa = _store_codec(store)
@@ -663,7 +663,7 @@ def main():
                     pr_ = _store_pair(_sa, U2, V2) if _sa else (U2, V2)
                     lr_state[id(m)] = tuple(t.to(dv_) for t in pr_); _ng += 1
                 if _ng:
-                    print(f"--lowrank {args.ttf_rank}: grew the accumulators of {_ng} layers from the checkpoint's rank",
+                    print(f"--ttf-rank {args.ttf_rank}: grew the accumulators of {_ng} layers from the checkpoint's rank",
                           flush=True)
             _ba = blob.get("args") or {}   # (checkpoints before 17 Oct: the old option names)
             _acc, _amsg = resume_acc_scale(_ba.get("ttf_theta", _ba.get("ts_theta")), args.ttf_theta, args.ttf_acc_scale,
@@ -699,7 +699,7 @@ def main():
             for m, d_ in zip(lays, blob["ts_state"]):
                 for k_, v_ in (d_.items() if not m.wpacked.is_meta else ()):
                     st_[(k_, id(m))] = tuple(x.to(_sdev[id(m)]) for x in v_) if isinstance(v_, tuple) else v_
-            print(f"resumed TTF state (short momentum, v, step counts) for {len(lays)} layers", flush=True)
+            print(f"resumed TTF state (v, step counts) for {len(lays)} layers", flush=True)
         tmask = blob.get("touched") or {}
         nres = 0
         for n, m in model.named_modules():
@@ -707,12 +707,12 @@ def main():
                 m.touched.copy_(tmask[n].to(m.touched.device)); nres += 1
         if nres:
             _touched_origin["v"] = int(blob.get("touched_origin", 0))
-            print(f"resumed from {ckpt_path} at step {start_step} (flip history for "
+            print(f"resumed from {_load_path} at step {start_step} (flip history for "
                   f"{nres} layers, accumulated since step {_touched_origin['v']})",
                   flush=True)
         else:
             _touched_origin["v"] = start_step
-            print(f"resumed from {ckpt_path} at step {start_step}", flush=True)
+            print(f"resumed from {_load_path} at step {start_step}", flush=True)
             if args.track_flips:
                 print(f"  WARNING: checkpoint has no flip history -> 'never flipped' "
                       f"counts only from step {start_step}, NOT since init. The true "
@@ -799,7 +799,7 @@ def main():
     if _QWEN:
         from .qwen import enable_fused_norm
         enable_fused_norm()
-        print("--fused-norm: Qwen RMSNorm in one kernel each way", flush=True)
+        print("Qwen: RMSNorm, gated norm and SwiGLU in fused kernels", flush=True)
     for step in range(start_step, end_step):
         if args.profile and step == start_step + 20:         # after autotune / warm-up
             from torch.profiler import profile, ProfilerActivity

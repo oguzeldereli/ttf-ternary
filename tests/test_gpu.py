@@ -251,7 +251,7 @@ def test_orth_cholqr2():
 
 
 def test_micro_fused_matches_torch():
-    """--ttf-accum micro: kernel.micro_sketch (the sketch sides' statistics in four kernels) against the torch ops,
+    """--accum M > 1: kernel.micro_sketch (the sketch sides' statistics in four kernels) against the torch ops,
     over 3 steps x 4 micro-batches (shapes that are not tile multiples): v agrees to fp32 rounding (the sums run in
     another order), the accumulator to the running sketch's bf16 rounding (the basis turn reads it: update._sketch_cross;
     the two paths keep it in bf16 and round it at other points: 0.3% of A here). fp32 factors: with bf16 ones the products round their right-hand side to bf16
@@ -477,7 +477,7 @@ def test_intk_rows_matches_dense():
 
 @pytest.mark.parametrize("wdt", [torch.float32, torch.bfloat16])
 def test_qwen_fused_kernels(wdt):
-    """--fused-norm: kernel.rms_norm_qwen, swiglu and gated_norm_qwen against the Hugging Face formulas (forward and
+    """The fused Qwen kernels (always on): kernel.rms_norm_qwen, swiglu and gated_norm_qwen against the Hugging Face formulas (forward and
     the gradients of every input), bf16 activations; within bf16 rounding (fp32 internals in both)"""
     import torch.nn.functional as F
     import ttf.kernel as KN

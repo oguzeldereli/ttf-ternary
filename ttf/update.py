@@ -301,7 +301,7 @@ def ts_layer(l, g, state, c):
     Per layer: v, the factored row x column EMA of g^2 (decay b2); u = -lr_ratio g / sqrt(v); A, the accumulator, rank
     r: A <- (1 - lr_ratio^p / tau) A + u projected on its basis (V turns with the evidence); a trit moves by sign(A_ij)
     when |A_ij| >= theta (and stays in {-1, 0, 1}), and the move spends theta: A -= theta D (kept low-rank: U -= theta
-    D V). With --ttf-accum micro (grad_accum M) every micro-batch's u enters the accumulator, normalised by the v of the steps
+    D V). With --accum M > 1 every micro-batch's u enters the accumulator, normalised by the v of the steps
     before; v, the basis turn, the firing and the spend once per step, on the last micro-batch."""
     from .kernel import unpack_rows, pack_rows
     if not torch.is_tensor(g):           # --dw factored: the backward passed (gy, x) instead of the dense gradient
@@ -310,7 +310,7 @@ def ts_layer(l, g, state, c):
     r = getattr(l, "ts_rank", None) or r   # a layer's own accumulator rank (set by a plug-in, e.g. thin adapter factors)
     if c.get("theta_sched"):   # --ttf-theta-sched T0:T1[:START]: the threshold moves linearly from T0 to T1
         theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
-    M_ = int(c.get("micro") or 1)   # --ttf-accum micro with --accum M: the accumulator takes every micro-batch's u
+    M_ = int(c.get("micro") or 1)   # --accum M: the accumulator takes every micro-batch's u
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True   # firing and the spend only on the last one
     b2o = b2
     if M_ > 1:
@@ -320,7 +320,7 @@ def ts_layer(l, g, state, c):
     off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device  # --ttf-offload async (--ttf-offload-keep)
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
     mic_nm = M_ > 1
-    if mic_nm:    # --ttf-accum micro: the accumulator takes every micro-batch's u, normalised by the v of the steps before
+    if mic_nm:    # --accum M > 1: the accumulator takes every micro-batch's u, normalised by the v of the steps before
         # (this step's v needs all of its micro-batches); on the first step there is none, so each micro-batch uses its
         # own g^2 x M^2 (each g_i carries the loss / M). Firing and the spend once per step, on the last one. As Adam's
         # v includes the current gradient (which bounds a step at 1 / sqrt(1 - beta2) per weight), this micro-batch's
@@ -346,7 +346,7 @@ def ts_layer(l, g, state, c):
         del r0, c0
     fs_ = mic_nm and _rsq is not None and not c.get("vdiag")   # the fused sums stand in for g^2's means
     g2 = None if fs_ else g * g
-    if M_ > 1:    # --ttf-accum micro: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
+    if M_ > 1:    # --accum M > 1: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
         # row / column means of (sum_i g_i)^2 = the micro-batches' own squares + 2 <g_i, sum of earlier g_i'>, the
         # cross terms through a k-dim random sketch of the running sum (unbiased; k (N + K) floats, held within the step)
         Sr, Sc = _micro_sketch(l, dev, (t - 1) // M_)
@@ -401,7 +401,7 @@ def ts_layer(l, g, state, c):
     del v
     ra = min(r, l.N, l.K)
     lk = 1 - lr_ratio / tau   # the leak, annealed with the learning rate: the memory is a distance, not a step count
-    if mic_nm and key in state:   # --ttf-accum micro: the basis stays fixed within the step (every micro-batch's u is projected
+    if mic_nm and key in state:   # --accum M > 1: the basis stays fixed within the step (every micro-batch's u is projected
         # on it: U += u_i V), and turns once, on the last micro-batch (_acc_turn); turning it per micro-batch lets each
         # micro-batch's noisier u rotate the evidence away (110M r512: 5.64 vs 4.42 at 600 steps)
         U, V = _load_pair(_host_get(state, key, dev, off))
@@ -418,7 +418,7 @@ def ts_layer(l, g, state, c):
         U, V = _load_pair(_host_get(state, key, dev, off))
         U = U * lk + u @ V
         U, V = _acc_turn(U, V, u.T @ U)
-    if mic_nm and not final_:   # --ttf-accum micro: not the last micro-batch: keep the accumulator, no firing
+    if mic_nm and not final_:   # --accum M > 1: not the last micro-batch: keep the accumulator, no firing
         _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
     del u
@@ -501,11 +501,11 @@ def _layer_gen(l, dev):
 
 
 def _ts_layer_factored(l, fg, state, c):
-    """--dw factored K: the TTF  update (16 x 1 or --ttf-accum micro) from the factors of the weight gradient,
+    """--dw factored K: the TTF update (one batch per step, or --accum M > 1) from the factors of the weight gradient,
     g = gy^T x, which is never formed. Everything the update reads from g is a product with a thin matrix: the
     accumulator's projections u V and u^T U (u = -lr g / sqrt(v) with the factored v = a_i b_j, so u = -lr diag(1/a) g
     diag(1/b)), and v's row / column sums of g^2, estimated from a K-column random sketch g S (E[S S^T] = I; with
-    --ttf-accum micro the same sketch the cross terms use, so the batch's sums are ||(sum_i g_i) S||^2). Differences from the
+    --accum M > 1 the same sketch the cross terms use, so the batch's sums are ||(sum_i g_i) S||^2). Differences from the
     dense path: the sums of g^2 are sketch estimates (relative noise sqrt(2 / K) per row and step, before v's EMA), and
     the 1e-8 in sqrt(v) + 1e-8 is left out (a scale factor needs a product form). Cost per call 2 T (N + K)(K_s + 2 r)
     instead of the dense gradient's 2 T N K."""
@@ -528,7 +528,7 @@ def _ts_layer_factored(l, fg, state, c):
     Sr = torch.randn(l.K, k_, device=dev, generator=gen) / k_ ** 0.5
     Sc = torch.randn(k_, l.N, device=dev, generator=gen) / k_ ** 0.5
     if MICRO_FUSED[0] and M_ > 1 and dev.type == "cuda" and not c.get("vdiag"):
-        # --ttf-accum micro on the GPU: each sketch side's statistics (its squares, the cross terms with the step's
+        # --accum M > 1 on the GPU: each sketch side's statistics (its squares, the cross terms with the step's
         # running sum, v's EMA, the scale and its bounded reciprocal) in two kernels (kernel.micro_sketch) instead of
         # ~50 small ops; the running sum of the column side is kept as (Sc g)^T [K, k], so no transpose copy
         from .kernel import micro_sketch
@@ -557,7 +557,7 @@ def _ts_layer_factored(l, fg, state, c):
         gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                    # g Sr  [N, k]
         Sg = _dpm(_mmb(x.T, _mmb(gy, Sc.T)).T.contiguous())                   # Sc g  [k, K]
         rsq, csq = gS.square().sum(1), Sg.square().sum(0)                     # ~ row / column sums of g^2
-        if M_ > 1:   # as ts_layer's --ttf-accum micro  branch, with the sketched own squares
+        if M_ > 1:   # as ts_layer's micro-batch branch, with the sketched own squares
             r0, c0 = rsq * (M_ * M_ / l.K), csq * (M_ * M_ / l.N)
             if ("v", key) in st and ts_ > 0:
                 R0, C0 = _host_get(st, ("v", key), dev, off)
@@ -639,7 +639,7 @@ def _ts_layer_factored(l, fg, state, c):
         from .kernel import ttf_fire
         DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta)
         DV = _dpm(DV)          # data parallel: the spend's sparse sums (index_add_) are not bit-reproducible: one mean
-        l._after_fire(dnnz)    # the kernel writes the trits in place (no version bump): beta follows the moves, --w-cache recomputes
+        l._after_fire(dnnz)    # the kernel writes the trits in place (no version bump): beta follows the moves
         U = U - c["spend"] * (theta * DV); del DV
     else:
         A = U @ V.T
@@ -660,11 +660,11 @@ def _ts_layer_factored(l, fg, state, c):
 MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "256"))]   # the dense path's sketch size: --dw-sketch's default
 # (the v cross terms and the basis turn; TERN_MICRO_K: tests only)
 FIRE_FUSED = [True]           # the factored path's firing through ttf.kernel.ttf_fire on CUDA (False: the torch reference; tests)
-MICRO_FUSED = [os.environ.get("TERN_MICRO_FUSED", "1") == "1"]   # --ttf-accum micro: kernel.micro_sketch (TERN_MICRO_FUSED=0: the torch reference path)
+MICRO_FUSED = [os.environ.get("TERN_MICRO_FUSED", "1") == "1"]   # --accum M > 1: kernel.micro_sketch (TERN_MICRO_FUSED=0: the torch reference path)
 
 
 def _micro_sketch(l, dev, step):
-    """--ttf-accum micro: a layer's random maps (K x k, k x N; E[S S^T] = I) for the cross terms of the batch's v; fixed within
+    """--accum M > 1: a layer's random maps (K x k, k x N; E[S S^T] = I) for the cross terms of the batch's v; fixed within
     a step, new every step, so their errors are independent across steps and v's EMA averages them out"""
     k = MICRO_SKETCH[0]
     gen = torch.Generator(device=dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * step)

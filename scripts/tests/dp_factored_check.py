@@ -1,7 +1,7 @@
 """Data parallel with the factored TTF update (--dw factored): every rank gets its own gradient factors (gy_r, x_r), the
 update averages the thin products it reads from g across the ranks (ttf.update.DP_REDUCE), and every rank must then hold
 exactly what one process holds after the same update from the mean gradient, g = (1 / R) sum_r gy_r^T x_r, given to it as
-the concatenated factors (cat_r gy_r / R, cat_r x_r). Checked for --ttf-accum micro (M micro-batches per step) and one
+the concatenated factors (cat_r gy_r / R, cat_r x_r). Checked for --accum M > 1 (M micro-batches per step) and one
 micro-batch per step, several steps with firing: the accumulator U V^T and the trits. With fp32 factors (FP32=1) they
 agree to fp32 summation order; with bf16 factors (the training path) the update's bf16-rounded intermediates (x (b V)
 on the tensor cores) turn the ~1e-7 differences into ~1e-4, and near-threshold trits can then go the other way: the

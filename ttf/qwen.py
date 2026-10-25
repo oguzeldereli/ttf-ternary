@@ -19,7 +19,7 @@ from torch.utils.checkpoint import checkpoint
 
 # linears kept in float (tiny, or gates whose rounding would be all error)
 _KEEP_FLOAT = ("in_proj_a", "in_proj_b")
-FUSED_NORM = [False]     # --fused-norm: Qwen3_5RMSNorm through kernel.rms_norm_qwen (one kernel forward, one backward)
+FUSED_NORM = [False]     # (set by enable_fused_norm, which the trainer always calls) Qwen3_5RMSNorm through kernel.rms_norm_qwen (one kernel forward, one backward)
 
 
 def enable_fused_norm():
@@ -181,14 +181,14 @@ class QwenTern(nn.Module):
         for i in range(0, hf_.shape[0], n):
             hc, tc = hf_[i:i + n], tf[i:i + n]
             if self.head_fused and self.training and wc.requires_grad and self.kd_topk is None and self.pp is None:
-                from .headloss import head_loss_train_chunk      # --head-fused, trained head: dL/dW accumulated in
+                from .headloss import head_loss_train_chunk      # trained head: dL/dW accumulated in
                 if i == 0:                                       # the forward, returned once (headloss.py)
                     _acc = {}
                 total = total + head_loss_train_chunk(hc, wc, tc, kd[i:i + n] if kd is not None else None,
                                                       self.kd_w if kd is not None else 0.0, _acc)
                 continue
             if self.head_fused and self.training and not wc.requires_grad:
-                from .headloss import head_loss_chunk, head_loss_topk_chunk   # --head-fused: loss and dL/dh in one
+                from .headloss import head_loss_chunk, head_loss_topk_chunk   # the loss and dL/dh in one
                 if self.kd_topk is not None:                                   # pass (frozen head)
                     total = total + head_loss_topk_chunk(hc, wc, tc, self.kd_topk[0][i:i + n],
                                                          self.kd_topk[1][i:i + n], self.kd_w, self.kd_mode)

@@ -475,7 +475,7 @@ def _msk_vec_kernel(sq_ptr, cr_ptr, rs_ptr, ds_ptr, v_ptr, o_ptr, n, c_sq, c_d, 
 
 
 def micro_sketch(G, P, rs, ds, v, M, n_other, b2, bc, norm):
-    """--ttf-accum micro, one side of the factored update's statistics in two kernels (instead of ~25 torch ops):
+    """--accum M > 1: one side of the factored update's statistics in two kernels (instead of ~25 torch ops):
     G [n, k] fp32, this micro-batch's sketch (g Sr, or (Sc g)^T); P [n, k] bf16, the running sum of the step's
     sketches (None on its first micro-batch); rs, ds [n] fp32, the running cross-term and own-square sums (None with
     P); v [n], the side's v (None before the first step). Returns (1 / a, rs, ds, P), P and rs / ds updated in place.
@@ -1029,7 +1029,7 @@ def _dx_col_kernel(y1_ptr, y2_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, gx_ptr, pc_ptr, 
                    BM: tl.constexpr, BK: tl.constexpr):
     """g = bf16((y1 + y2 / 254) * s) (_dx2_epi_kernel), then the column scale's backward (_scale_bwd_kernel):
     gx = bf16(g * c) and per row block the column sums of bf16(g * x); HAS_MU: x is the layer's input and the centred
-    bf16(x - mu) the prologue would have saved is formed here (same rounding: --fused-save-x)"""
+    bf16(x - mu) the prologue would have saved is formed here (the same rounding)"""
     pm = tl.program_id(0)
     rows = pm * BM + tl.arange(0, BM); cols = tl.program_id(1) * BK + tl.arange(0, BK)
     m = (rows[:, None] < M) & (cols[None, :] < K)
