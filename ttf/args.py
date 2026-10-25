@@ -160,6 +160,9 @@ def build_parser():
     g.add_argument("--train-emb", default="none", choices=["none", "head", "both"],
                    help="Qwen: train the output head (head) or the head and the token embedding (both) in the float tail; "
                         "the conversion leaves them frozen")
+    g.add_argument("--emb-wd", type=float, default=0.0, help="weight decay of the trained embedding / head and the "
+                   "int-k group parameters (their own group; 24 Oct: they shared the 0.1 of the float tail)")
+    g.add_argument("--emb-lr-mult", type=float, default=1.0, help="their learning rate x this")
     g.add_argument("--init-ckpt", default="", help="start a run from a checkpoint's weights (e.g. a pre-converted "
                    "model, saved with --stop-after 0): step 0, a fresh optimizer and TTF state, the same --ext list")
     g.add_argument("--intk-emb", default="", help="Qwen: E:H[:G]: token embedding / output head as E- / H-bit codes in "

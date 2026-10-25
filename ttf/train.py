@@ -45,6 +45,25 @@ def _tern_lays(model):
     return tern_emb_layers(model)
 
 
+def _split_emb_group(model, groups, wd, mult):
+    """the embedding / head (--train-emb) and the int-k matrices' group mins / steps (--intk-emb) out of the decayed
+    float-tail group into their own: weight decay wd (default 0: decay shrinks every row each step, seen or not, and
+    squeezes int-k values toward their group minimum; 24 Oct Q4b / Q5 ran with 0.1), lr x mult"""
+    ids = {id(p) for n, p in model.named_parameters()
+           if "embed_tokens" in n or "lm_head" in n or n.endswith((".m.lo", ".m.s"))}
+    moved = []
+    for g in groups:
+        if g.get("weight_decay", 0.0) and not g.get("rc_lr"):
+            keep = [p for p in g["params"] if id(p) not in ids]
+            moved += [p for p in g["params"] if id(p) in ids]
+            g["params"] = keep
+    if moved:
+        groups.append({"params": moved, "weight_decay": wd, "emb_mult": mult})
+        print(f"embedding / head group: {sum(p.numel() for p in moved) / 1e6:.1f}M, weight decay {wd}, lr x{mult}",
+              flush=True)
+    return groups
+
+
 def _intk_lays(model):
     from .intk_emb import intk_layers
     return intk_layers(model)
@@ -406,6 +425,7 @@ def main():
         tail_groups = [{"params": emb, "weight_decay": tc.weight_decay}, {"params": norms, "weight_decay": 0.0}]
         if rc:
             tail_groups.append({"params": rc, "weight_decay": 0.0, "rc_lr": args.rc_lr})
+        tail_groups = _split_emb_group(model, tail_groups, args.emb_wd, args.emb_lr_mult)
         tail_opt = LeanAdam(tail_groups, lr=tc.lr, betas=(tc.beta1, tc.beta2))
         LeanAdam.BATCHED = bool(args.tail_batched)
         print(f"lean float tail: {sum(p.numel() for p in emb)/1e6:.1f}M bf16 + {sum(p.numel() for p in small)/1e3:.1f}k fp16, "
@@ -428,6 +448,7 @@ def main():
                        {"params": norms, "weight_decay": 0.0}]
         if rc:
             tail_groups.append({"params": rc, "weight_decay": 0.0, "rc_lr": args.rc_lr})
+        tail_groups = _split_emb_group(model, tail_groups, args.emb_wd, args.emb_lr_mult)
         tail_opt = torch.optim.AdamW(tail_groups, lr=tc.lr, betas=(tc.beta1, tc.beta2))
         print(f"fp32 float tail: {sum(p.numel() for p in emb)/1e6:.1f}M emb + "
               f"{sum(p.numel() for p in norms)/1e3:.1f}k norm gains, AdamW fp32 states", flush=True)
@@ -863,7 +884,7 @@ def main():
                       flush=True)
         STATE.lr = lr
         for g in tail_opt.param_groups:
-            g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0)
+            g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0) * g.get("emb_mult", 1.0)
         STATE.updates_enabled = True
         STATE.grad_scale = tc.grad_accum
         tail_opt.zero_grad(set_to_none=True)
