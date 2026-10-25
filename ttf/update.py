@@ -231,18 +231,21 @@ def _ts_state_bytes(lr_state):
     return n
 
 
-def _acc_turn(U, V, S_):
-    """the basis turn at the end of a step, the same for any split of the step into micro-batches: one subspace
-    iteration of the step's whole tally A' = A + sum u from U (the accumulator after the step's u entered on its basis,
-    U = lk U_0 + sum u V): X = A'^T U = V (U^T U) + (I - V V^T) (sum u)^T U, S_ = (sum u)^T U [K, r] (exact where the
-    step is one batch, else _sketch_cross, its unbiased estimate); A becomes U V^T Vn Vn^T. The micro rule before turned
-    from M u_M^T U, the last micro-batch's u scaled by M (16 x the noise of the step's sum; on a converted Qwen 0.8B's
-    down_proj ~10 steps of memory, no trit moved); the one-batch rule before turned from U_0 and added u Vn (u read
-    twice more). Simulated on real 0.8B micro-gradients (down / gate / out_proj): captures a persistent signal as well
-    or better than both. Returns (U, V)"""
+def _acc_turn(U, V, S_, mass=None):
+    """the basis turn at the end of a step: one subspace iteration of the step's whole tally A' = A + sum u, and A' kept
+    on the new basis (A <- A' Vn Vn^T). Here from U = lk U_0 + sum u V (the step's u entered on its basis, the
+    --ttf-accum micro path: U_0 is not kept): X = A'^T U = V (U^T U) + (I - V V^T) (sum u)^T U with S_ = (sum u)^T U
+    [K, r] (_sketch_cross), and A' Vn = U V^T Vn + sum u (I - V V^T) Vn: mass(W) = sum u W (_sketch_mass). A one-batch
+    step turns from U_0 itself (X = A'^T U_0, A' Vn = U_0 V^T Vn + u Vn: exact, two products of u). The micro rule
+    before turned from M u_M^T U (the last micro-batch's u x M: 16 x the noise of the step's sum; a converted Qwen
+    0.8B's down_proj kept ~10 steps of memory and moved no trit) and dropped the mass outside V. Returns (U, V)"""
     S_ = S_ - V @ (V.T @ S_)
     Vn = _orth(V @ (U.T @ U) + S_); del S_
-    return U @ (V.T @ Vn), Vn
+    P_ = V.T @ Vn
+    Un = U @ P_
+    if mass is not None:
+        Un = Un + mass(Vn - V @ P_)
+    return Un, Vn
 
 
 def _sketch_cross(U, SPt, Sc, ia, ib, lr_ratio):
@@ -252,10 +255,73 @@ def _sketch_cross(U, SPt, Sc, ia, ib, lr_ratio):
     return (-lr_ratio) * ib[:, None] * (SPt.float() @ (Sc @ (ia[:, None] * U)))
 
 
+def _sketch_mass(PS, Sr, ia, ib, lr_ratio):
+    """W -> (sum u) W [N, r] without sum u: through the step's k-column sketch PS = (sum g) Sr [N, k], kept for v as
+    well (E[Sr Sr^T] = I): -lr diag(ia) PS (Sr^T diag(ib) W)"""
+    return lambda W: (-lr_ratio) * ia[:, None] * (PS.float() @ (Sr.T @ (ib[:, None] * W)))
+
+
 def _step_scale(R, C, b2, n):
     """1 / a_i, 1 / b_j of the step's v (R, C after n steps), as the update's u uses them"""
     a = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** n)).sqrt(); b = C.sqrt()
     return 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30), 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)
+
+
+def _hspend_basis(st, key, x, V, c):
+    """--ttf-hspend F: a move spends theta (D H~) instead of theta D, H~ = I + F (C - I), C the correlation of the layer's
+    input factor x (an EMA, ~100 steps, of x^T x from the last micro-batch of each step; the second moment, not the
+    covariance: a move's output change is dW x with x the input the trits multiply, already centred in a centred
+    layer): a move at (i, j)
+    also takes theta d C_jk from the row's entry (i, k) fed by a correlated input, whose evidence was for the same
+    output change (P2h 500 -> 999: a row's moves changed the output 1.2-1.6 x what independent inputs would, chance
+    1.0-1.1). Low rank exactly: U -= theta D (H~ V), the spend's basis Vs = H~ V [K, r]. State: H [K, K] fp32 and a count"""
+    H, n = st.get(("hs", key), (None, 0))
+    Hn = _dpm(torch.mm(x.T, x, out_dtype=torch.float32) if x.dtype == torch.bfloat16 else x.T.float() @ x.float())
+    Hn = Hn / x.shape[0]
+    w = max(0.01, 1.0 / (n + 1))
+    H = Hn if H is None else H.mul_(1 - w).add_(Hn, alpha=w); del Hn
+    st[("hs", key)] = (H, n + 1)
+    d = H.diag().clamp_min(1e-30).rsqrt()
+    CV = d[:, None] * (H @ (d[:, None] * V.float()))
+    return V + float(c["hspend"]) * (CV - V)
+
+
+def _band_fire(l, st, key, c, U, V, A_prev, u, lk, theta):
+    """--ttf-band F: the exact tally on the entries near the threshold. A band of at most F N K entries (where |A| >=
+    --ttf-band-lo x theta after the step's moves) keeps E, the exact tally there (lk A + u, the moves' spends) minus
+    the low-rank accumulator's value (the part of each step's evidence the rank-r projection drops, and the part of a
+    spend the low-rank spend misses); the moves are decided by A + E on the band, by A elsewhere. An entry entering the
+    band starts at E = 0; one leaving it loses E. State: the band's flat indices (int64) and E (fp32). (Phase 1: the
+    torch path, dense [N, K] temporaries and g from its factors; one batch per step.) Returns (U, moves)"""
+    from .kernel import unpack_rows, pack_rows
+    N, K = l.N, l.K
+    A = U @ V.T
+    bd = st.get(("bd", key))
+    if bd is not None and A_prev is not None:
+        idx, e = bd
+        Ex = lk * (A_prev.view(-1)[idx] + e) + u.view(-1)[idx]       # the exact tally after this step's evidence
+        A.view(-1)[idx] = Ex
+    w0 = unpack_rows(l.wpacked, K).to(torch.int8)
+    d = A.sign()
+    fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
+    D = torch.where(fire, d, torch.zeros_like(d)); nf = fire.sum(); del d, fire
+    l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8))); del w0
+    sp = c["spend"] * theta
+    A.sub_(sp * D)                                                   # the exact spend (on the band; elsewhere A is replaced)
+    U = U - sp * (D @ V); del D
+    Alr = U @ V.T
+    E = torch.zeros(N * K, device=U.device)
+    if bd is not None and A_prev is not None:
+        E[idx] = A.view(-1)[idx] - Alr.view(-1)[idx]
+    del A
+    score = (Alr.view(-1) + E).abs_(); del Alr
+    n_ = max(1, int(c["band"] * N * K))
+    score[score < c.get("band_lo", 0.5) * theta] = 0
+    top = score.topk(n_, sorted=False)
+    keep = top.values > 0
+    idx = top.indices[keep].sort().values; del score, top, keep
+    st[("bd", key)] = (idx, E[idx])
+    return U, nf
 
 
 def _orth(X):
@@ -365,7 +431,7 @@ def ts_layer(l, g, state, c):
             else:
                 R, C = (1 - b2o) * rs, (1 - b2o) * cs
             _host_put(st, ("v", key), (R, C), off)
-            turn_ = (SP.T,) + _step_scale(R, C, b2o, t // M_)          # (Sc sum g)^T: the basis turn's sketch
+            turn_ = (SP.T, PS) + _step_scale(R, C, b2o, t // M_)       # (Sc sum g)^T, (sum g) Sr: the basis turn's sketches
             # the full [N, K] v only where it is read: --ttf-vdiag (the micro-batch u uses the factored v of the steps before)
             v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2o ** (t // M_)) if c.get("vdiag") else None
         else:
@@ -409,15 +475,17 @@ def ts_layer(l, g, state, c):
             U = U * lk
         U = U + u @ V
         if final_:
-            U, V = _acc_turn(U, V, _sketch_cross(U, turn_[0], Sc, turn_[1], turn_[2], lr_ratio))
+            SPt, PS_, ia_, ib_ = turn_
+            U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio), _sketch_mass(PS_, Sr, ia_, ib_, lr_ratio))
     elif key not in state:
         gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
         V = _orth(u.T @ torch.randn(l.N, ra, device=g.device, generator=gen))
         U = u @ V
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
-        U = U * lk + u @ V
-        U, V = _acc_turn(U, V, u.T @ U)
+        U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
+        Vn = _orth(V @ (U.T @ U) + u.T @ U)
+        U = U @ (V.T @ Vn) + u @ Vn; V = Vn
     if mic_nm and not final_:   # --accum M > 1: not the last micro-batch: keep the accumulator, no firing
         _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
@@ -549,7 +617,7 @@ def _ts_layer_factored(l, fg, state, c):
             else:
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
-            turn_ = (SP,) + _step_scale(R, C, b2, ts_ + 1)          # (Sc sum g)^T [K, k]: the basis turn's sketch
+            turn_ = (SP, PS) + _step_scale(R, C, b2, ts_ + 1)       # (Sc sum g)^T [K, k], (sum g) Sr: the turn's sketches
         else:
             st[("mx", key)] = (PS, SP, rs, cs, ds, es)
         del PS, SP
@@ -579,7 +647,7 @@ def _ts_layer_factored(l, fg, state, c):
                 else:
                     R, C = (1 - b2) * rs, (1 - b2) * cs
                 _host_put(st, ("v", key), (R, C), off)
-                turn_ = (SP.T,) + _step_scale(R, C, b2, ts_ + 1)
+                turn_ = (SP.T, PS) + _step_scale(R, C, b2, ts_ + 1)
                 if c.get("vdiag"):   # --ttf-vdiag: this micro-batch's g^2 against v (the u extremes need the dense u: not kept)
                     sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** (t // M_))).clamp_min(1e-30))
                     _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
@@ -604,6 +672,7 @@ def _ts_layer_factored(l, fg, state, c):
     if c.get("start") and c.get("step", 0) < c["start"]:                  # --ttf-start: frozen, v keeps learning
         return
     ra = min(r, l.N, l.K)
+    A_prev = None
     if key not in state:
         g_ = torch.Generator(device=dev).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
         V = _orth(-lr_ratio * _dpm(_fg_mm_l(fgb, ia, torch.randn(l.N, ra, device=dev, generator=g_))))
@@ -617,11 +686,14 @@ def _ts_layer_factored(l, fg, state, c):
             # data parallel: the micro-batches' terms are linear in g and V is fixed within the step, so each rank
             # summed its own and one mean here replaces a mean per micro-batch (N x r per layer: 16 x less traffic)
             U = _dpm(U)
-            U, V = _acc_turn(U, V, _sketch_cross(U, turn_[0], Sc, turn_[1], turn_[2], lr_ratio))
+            SPt, PS_, ia_, ib_ = turn_
+            U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio), _sketch_mass(PS_, Sr, ia_, ib_, lr_ratio))
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
-        U = U * lk - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
-        U, V = _acc_turn(U, V, -lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))       # the step is one batch: (sum u)^T U exact
+        A_prev = U @ V.T if c.get("band") else None
+        U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
+        Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
+        U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
     if not final_:
         if STEP_FP32[0] and sa and not off:   # --ttf-step-fp32: within the step U stays fp32 (V is fixed until the last
             # micro-batch: kept as stored); encoded once, on the last micro-batch. Skips U's encode / decode per micro-batch
@@ -635,9 +707,17 @@ def _ts_layer_factored(l, fg, state, c):
     st.pop(("venc", key), None)
     from .kernel import unpack_rows, pack_rows
     before = l.wpacked.clone() if l.track else None
-    if FIRE_FUSED[0] and dev.type == "cuda":   # A, the moves, the repack and D V in one kernel
+    Vs = _hspend_basis(st, key, x, V, c) if c.get("hspend") else V
+    if c.get("band"):
+        if A_prev is not None:
+            g_ = torch.mm(gy.T, x, out_dtype=torch.float32) if gy.dtype == torch.bfloat16 else gy.T.float() @ x.float()
+            u_ = (-lr_ratio) * ia[:, None] * g_ * ib[None, :]; del g_
+        else:
+            u_ = None                                 # (the first step: the band starts empty)
+        U, nf = _band_fire(l, st, key, c, U, V, A_prev, u_, lk, theta)
+    elif FIRE_FUSED[0] and dev.type == "cuda":   # A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
-        DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta)
+        DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta, Vs=Vs)
         DV = _dpm(DV)          # data parallel: the spend's sparse sums (index_add_) are not bit-reproducible: one mean
         l._after_fire(dnnz)    # the kernel writes the trits in place (no version bump): beta follows the moves
         U = U - c["spend"] * (theta * DV); del DV
@@ -650,7 +730,7 @@ def _ts_layer_factored(l, fg, state, c):
         D = torch.where(fire, d, torch.zeros_like(d))
         nf = fire.sum()
         l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))
-        U = U - c["spend"] * (theta * (D @ V))
+        U = U - c["spend"] * (theta * (D @ Vs))
     _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
     if before is not None:

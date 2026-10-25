@@ -539,12 +539,13 @@ FIRE_SPEND = ["dense"]     # ttf_fire's D V: "dense" (no host sync: three bf16 G
                            # layer, which stalls the CPU's queue of launches; before 23 Oct)
 
 
-def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, theta: float):
+def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, theta: float, Vs=None):
     """TTF firing in one pass: A = U V^T (fp32 accumulation), every legal move (|A| >= theta, the trit stays in
     {-1, 0, 1}) applied to the packed trits in place; returns D V (D the moves, {-1, 0, 1}; from the moves alone, a
     sparse product) for the spend, and the number of moves (a device tensor). The fp32 [N, K] accumulator and the
     unpacked trits are never formed (D is int8). Differences from the unfused path: A's sums in another order and
-    precision (rounding level), so an entry within rounding of theta may decide otherwise."""
+    precision (rounding level), so an entry within rounding of theta may decide otherwise. Vs [K, r]: the spend's
+    basis (D Vs instead of D V: --ttf-hspend)"""
     N, R = U.shape
     K5 = packed.shape[1]
     U = U.contiguous().float(); V = V.contiguous().float()
@@ -554,8 +555,9 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     _fire_kernel[(triton.cdiv(N, BN), triton.cdiv(K5, BK5))](U, V, packed, D, cnt, N, K, K5, R, U.stride(0), V.stride(0),
                                                               packed.stride(0), D.stride(0), float(theta),
                                                               RC=RC, BN=BN, BK5=BK5, PREC=FIRE_PREC[0])
+    Vs = V if Vs is None else Vs.contiguous().float()
     if FIRE_SPEND[0] == "dense":                                       # D V without the moves' indices (no host sync)
-        Vh = V.to(torch.bfloat16); r_ = V - Vh.float(); Vm = r_.to(torch.bfloat16); Vl = (r_ - Vm.float()).to(torch.bfloat16)
+        Vh = Vs.to(torch.bfloat16); r_ = Vs - Vh.float(); Vm = r_.to(torch.bfloat16); Vl = (r_ - Vm.float()).to(torch.bfloat16)
         dU = torch.empty(N, R, dtype=torch.float32, device=U.device)
         for a0 in range(0, N, 8192):                                   # (row chunks: the bf16 copy of D stays small)
             Db = D[a0:a0 + 8192].to(torch.bfloat16)                    # (exact: D is -1 / 0 / 1)
@@ -566,7 +568,7 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     dU = torch.zeros(N, R, dtype=torch.float32, device=U.device)
     for c0 in range(0, nz.shape[0], 1 << 16):                          # in chunks: moves x r floats at a time
         z_ = nz[c0:c0 + (1 << 16)]
-        dU.index_add_(0, z_[:, 0], D[z_[:, 0], z_[:, 1]].float()[:, None] * V[z_[:, 1]])
+        dU.index_add_(0, z_[:, 0], D[z_[:, 0], z_[:, 1]].float()[:, None] * Vs[z_[:, 1]])
     # the change of the nonzero count, from the moved entries alone (a move is one level: it ends on a nonzero trit
     # (+1) or on zero (-1)), so the layer's beta follows exactly without a scan of all the trits
     byte = packed[nz[:, 0], torch.div(nz[:, 1], 5, rounding_mode="floor")].long()

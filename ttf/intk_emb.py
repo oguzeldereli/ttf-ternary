@@ -131,7 +131,7 @@ def ttf_rows(l, g, state, c, rows=16384):
     (row / column EMAs of g^2, decay b2, bias-corrected), u = -lr g / (sqrt v + 1e-8), the rank-r accumulator A = U V^T
     (leak, u on the basis, then the basis turned: update._acc_turn), a code moves one level where |A| >= theta (within 0 .. levels),
     each move spends theta. V's first basis comes from a chunk-wise random projection (not ts_layer's single draw)."""
-    from .update import _orth, _acc_turn
+    from .update import _orth
     N, K = g.shape
     lr, theta, tau, b2 = c["lr_ratio"], c["theta"], c["tau"], c["b2"]
     st = state.setdefault("_ts", {}); key = id(l)
@@ -162,10 +162,14 @@ def ttf_rows(l, g, state, c, rows=16384):
     else:
         U, V = state[key]
         U = U * (1 - lr / tau)
-        S_ = torch.zeros(K, ra, device=g.device)       # update._acc_turn: u on the old basis, the turn from u^T U
+        X = V @ (U.T @ U)                              # update._acc_turn, a one-batch step: the turn from U_0
         for i in range(0, N, rows):
-            u = u_of(i); U[i:i + rows] += u @ V; S_ += u.T @ U[i:i + rows]; del u
-        U, V = _acc_turn(U, V, S_); del S_
+            X += u_of(i).T @ U[i:i + rows]
+        Vn = _orth(X); del X
+        P = V.T @ Vn
+        for i in range(0, N, rows):
+            U[i:i + rows] = U[i:i + rows] @ P + u_of(i) @ Vn
+        V = Vn
     nf = torch.zeros((), device=g.device, dtype=torch.long)
     for i in range(0, N, rows):
         A = U[i:i + rows] @ V.T; w0 = l.codes[i:i + rows]
@@ -375,7 +379,7 @@ def _intk_update(l, parts, state, c):
             else:
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
-            turn_ = (SP,) + _step_scale(R, C, b2, ts_ + 1)      # Sc sum g [k, K]: the basis turn's sketch
+            turn_ = (SP, PS) + _step_scale(R, C, b2, ts_ + 1)   # Sc sum g [k, K], (sum g) Sr [N, k]: the turn's sketches
         else:
             st[("mx", key)] = (PS.to(torch.bfloat16), SP.to(torch.bfloat16), rs, cs, ds, es)
         del PS, SP
@@ -416,33 +420,39 @@ def _intk_update(l, parts, state, c):
             S.flush(); return
         _fire(l, S, Us, V, theta, c, st)
         return
-    # update._acc_turn by row chunk: every micro-batch's u enters on the step's basis, the basis turns on the last
+    # update._acc_turn by row chunk: a one-batch step turns from U_0 (exact); with micro-batches every micro-batch's u
+    # enters on the step's basis and the basis turns on the last, from U and the step's sketches
     V = S.v()
+    if M_ == 1:
+        Us = [S.u(cc) * lk for cc in range(S.nch)]
+        UtU = sum(U.T @ U for U in Us)
+        Vn = _orth(V @ UtU - lr_ratio * _dpm(l_term(lambda i, j: Us[i // S.rows]))); del UtU
+        rt = r_term(Vn); P_ = V.T @ Vn
+        Us = [U @ P_ - lr_ratio * _dpm(rt(*S.rng(cc))) for cc, U in enumerate(Us)]
+        _fire(l, S, Us, Vn, theta, c, st)
+        return
     rt = r_term(V)
-    keep_ = M_ > 1 and not final_
     Us = []
     for cc in range(S.nch):
         U = S.u(cc)
-        if M_ == 1 or (t - 1) % M_ == 0:
+        if (t - 1) % M_ == 0:
             U = U * lk
         U.add_(rt(*S.rng(cc)), alpha=-lr_ratio)     # (data parallel: this rank's term, averaged on the last micro-batch)
-        if keep_:
-            S.put_u(cc, U)
-        else:
+        if final_:
             Us.append(_dpm(U))
-    if keep_:
+        else:
+            S.put_u(cc, U)
+    if not final_:
         S.flush(); return
+    SP_, PS_, ia_, ib_ = turn_
     UtU = sum(U.T @ U for U in Us)
-    if M_ == 1:             # the step is one batch: (sum u)^T U exact
-        S_ = -lr_ratio * _dpm(l_term(lambda i, j: Us[i // S.rows]))
-    else:                   # update._sketch_cross by row chunk
-        SP_, ia_, ib_ = turn_
-        Y = sum(Sc[:, i:j] @ (ia_[i:j, None] * U) for U, (i, j) in zip(Us, map(S.rng, range(S.nch))))
-        S_ = (-lr_ratio) * ib_[:, None] * (SP_.float().T @ Y); del Y
+    Y = sum(Sc[:, i:j] @ (ia_[i:j, None] * U) for U, (i, j) in zip(Us, map(S.rng, range(S.nch))))
+    S_ = (-lr_ratio) * ib_[:, None] * (SP_.float().T @ Y); del Y          # update._sketch_cross
     S_ = S_ - V @ (V.T @ S_)
     Vn = _orth(V @ UtU + S_); del S_, UtU
     P_ = V.T @ Vn
-    Us = [U @ P_ for U in Us]
+    Z = Sr.T @ (ib_[:, None] * (Vn - V @ P_))                           # update._sketch_mass
+    Us = [U @ P_ - lr_ratio * ia_[i:j, None] * (PS_[i:j].float() @ Z) for U, (i, j) in zip(Us, map(S.rng, range(S.nch)))]
     _fire(l, S, Us, Vn, theta, c, st)
 
 
