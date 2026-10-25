@@ -60,7 +60,7 @@ class TernEmbed(nn.Module):
 
     @property
     def weight(self):
-        if self._fresh:                     # the tied head of the forward that just did the lookup
+        if self._fresh and self._W is not None:   # the tied head of the forward that just did the lookup
             self._fresh = False
             return self._W
         return self._compute()
@@ -76,6 +76,7 @@ class TernEmbed(nn.Module):
             return None
         g = self._W.grad.float() * self.scale().detach()
         self._W = None
+        self._fresh = False                 # an unread lookup's W (untied) is stale once the trits move
         return g
 
 
@@ -103,7 +104,7 @@ class TernEmbedWide(nn.Module):
 
     @property
     def weight(self):
-        if self._fresh:
+        if self._fresh and self._E is not None:
             self._fresh = False
             return self._E
         return self._compute()
