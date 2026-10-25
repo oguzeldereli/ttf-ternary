@@ -795,6 +795,10 @@ def main():
             m_.ts_micro = bool(args.micro)
         print("--ttf-update fused: the update runs inside each layer's backward", flush=True)
         FIRE_FUSED[0] = args.fire == "fused"
+        if args.ttf_step_fp32:
+            from .update import STEP_FP32 as _SF
+            _SF[0] = True
+            print("--ttf-step-fp32: U in fp32 between micro-batches, encoded once per step", flush=True)
         if args.ttf_orth != "qr":
             from .update import ORTH as _OR
             _OR[0] = args.ttf_orth

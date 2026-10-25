@@ -99,9 +99,11 @@ def _load_pair(t):
 
 
 def _load_pair_(t):
-    """inverse of _store_pair (and a no-op on a plain fp32 (U, V))"""
+    """inverse of _store_pair (and a no-op on a plain fp32 (U, V)); (U fp32, V codes[, V scale]): --ttf-step-fp32"""
     if len(t) == 4:
         return _decode(t[0], t[1]), _decode(t[2], t[3])
+    if len(t) == 3:
+        return t[0], _decode(t[1], t[2])
     return t[0].float(), t[1].float()
 
 
@@ -266,6 +268,7 @@ def _orth(X):
         return _orth_(X)
 
 
+STEP_FP32 = [False]   # --ttf-step-fp32: the accumulator's U in fp32 between a step's micro-batches (see _ts_layer_factored)
 ORTH = ["qr"]   # --ttf-orth: qr (Householder), cholqr2 (two Cholesky QR passes, QR where they would fail), or spanqr
 _SPANQR = [None]  # (the spanqr package's orth: robust shifted Cholesky QR, no host sync; for r <= 512, cholqr2 above)
 
@@ -630,8 +633,16 @@ def _ts_layer_factored(l, fg, state, c):
         Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
         U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
     if not final_:
-        _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
+        if STEP_FP32[0] and sa and not off:   # --ttf-step-fp32: within the step U stays fp32 (V is fixed until the last
+            # micro-batch: kept as stored); encoded once, on the last micro-batch. Skips U's encode / decode per micro-batch
+            enc_ = st.get(("venc", key))
+            if enc_ is None or (t - 1) % M_ == 0:
+                enc_ = st[("venc", key)] = sa(V)
+            _host_put(state, key, (U,) + tuple(enc_), off)
+        else:
+            _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
+    st.pop(("venc", key), None)
     from .kernel import unpack_rows, pack_rows
     before = l.wpacked.clone() if l.track else None
     if FIRE_FUSED[0] and dev.type == "cuda":   # --fire fused: A, the moves, the repack and D V in one kernel
