@@ -82,6 +82,10 @@ def build_parser():
     g.add_argument("--ttf-step-p", type=float, default=0.75, help="the step scale (lr / peak lr)^P")
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")
     g.add_argument("--ttf-spend", type=float, default=1.0, help="a move spends this x theta of the accumulator")
+    g.add_argument("--ttf-band", type=float, default=0.0, help="the exact tally on at most this share of the entries, those "
+                   "near the threshold (update._band_fire; 0: off; one batch per step)")
+    g.add_argument("--ttf-band-lo", type=float, default=0.5, help="--ttf-band: an entry is in the band while its |A| >= "
+                   "this x theta")
     g.add_argument("--ttf-start", type=int, default=0, help="trits frozen until this step (floats train)")
     g.add_argument("--ttf-acc-scale", type=float, default=None, help="--resume: multiply the accumulators by F "
                    "(continuing at theta F x the old one); required when --ttf-theta differs from the checkpoint's")

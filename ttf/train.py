@@ -497,7 +497,7 @@ def main():
                     "lowrank": [lr_state.get(id(m)) for m in model.modules()
                                 if isinstance(m, KernelTernaryLinear)] if lr_state else None,
                     # TTF: the rest of the per-layer state (update count, factored v, short momentum), module order
-                    "ts_state": [{k[0]: st_[k] for k in (("t", id(m)), ("v", id(m)), ("m", id(m))) if k in st_}
+                    "ts_state": [{k[0]: st_[k] for k in (("t", id(m)), ("v", id(m)), ("m", id(m)), ("bd", id(m))) if k in st_}
                                  for m in model.modules() if isinstance(m, KernelTernaryLinear)]
                                 if (st_ := lr_state.get("_ts")) else None,
                     # --tern-emb: the ternary embedding matrices' TTF state (U V, update count, factored v)
@@ -751,10 +751,12 @@ def main():
         if args.ttf_offload_keep and args.ttf_offload != "none":
             print(f"--ttf-offload-keep: state of {sum(not m_._ts_host for m_ in _lays)} of {len(_lays)} layers on the GPU",
                   flush=True)
+        assert not args.ttf_band or (tc.grad_accum == 1 and args.dw == "factored" and _WS == 1), \
+            "--ttf-band: one batch per step (--accum 1), --dw factored, one process (phase 1)"
         ts_cfg = dict(r=args.ttf_rank, lr_ratio=1.0, theta=args.ttf_theta, tau=args.ttf_tau, b2=args.ttf_b2, spend=args.ttf_spend,
                       store_a=store, offload=args.ttf_offload == "async",
                       theta_sched=(tuple(float(x) for x in args.ttf_theta_sched.split(":")) if args.ttf_theta_sched else None),
-                      progress=0.0, factored=args.factored_k)
+                      progress=0.0, factored=args.factored_k, band=args.ttf_band, band_lo=args.ttf_band_lo)
     if ttf and args.intk_emb and args.intk_update == "factored":   # the int-k matrices update inside their backward
         for m_ in _intk_lays(model):
             m_._ts_state, m_._ts_cfg = lr_state, ts_cfg

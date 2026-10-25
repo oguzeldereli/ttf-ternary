@@ -267,6 +267,44 @@ def _step_scale(R, C, b2, n):
     return 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30), 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)
 
 
+def _band_fire(l, st, key, c, U, V, A_prev, u, lk, theta):
+    """--ttf-band F: the exact tally on the entries near the threshold. A band of at most F N K entries (where |A| >=
+    --ttf-band-lo x theta after the step's moves) keeps E, the exact tally there (lk A + u, the moves' spends) minus
+    the low-rank accumulator's value (the part of each step's evidence the rank-r projection drops, and the part of a
+    spend the low-rank spend misses); the moves are decided by A + E on the band, by A elsewhere. An entry entering the
+    band starts at E = 0; one leaving it loses E. State: the band's flat indices (int64) and E (fp32). (Phase 1: the
+    torch path, dense [N, K] temporaries and g from its factors; one batch per step.) Returns (U, moves)"""
+    from .kernel import unpack_rows, pack_rows
+    N, K = l.N, l.K
+    A = U @ V.T
+    bd = st.get(("bd", key))
+    if bd is not None and A_prev is not None:
+        idx, e = bd
+        Ex = lk * (A_prev.view(-1)[idx] + e) + u.view(-1)[idx]       # the exact tally after this step's evidence
+        A.view(-1)[idx] = Ex
+    w0 = unpack_rows(l.wpacked, K).to(torch.int8)
+    d = A.sign()
+    fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)
+    D = torch.where(fire, d, torch.zeros_like(d)); nf = fire.sum(); del d, fire
+    l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8))); del w0
+    sp = c["spend"] * theta
+    A.sub_(sp * D)                                                   # the exact spend (on the band; elsewhere A is replaced)
+    U = U - sp * (D @ V); del D
+    Alr = U @ V.T
+    E = torch.zeros(N * K, device=U.device)
+    if bd is not None and A_prev is not None:
+        E[idx] = A.view(-1)[idx] - Alr.view(-1)[idx]
+    del A
+    score = (Alr.view(-1) + E).abs_(); del Alr
+    n_ = max(1, int(c["band"] * N * K))
+    score[score < c.get("band_lo", 0.5) * theta] = 0
+    top = score.topk(n_, sorted=False)
+    keep = top.values > 0
+    idx = top.indices[keep].sort().values; del score, top, keep
+    st[("bd", key)] = (idx, E[idx])
+    return U, nf
+
+
 def _orth(X):
     with _rf("ttf.orth"):
         return _orth_(X)
@@ -615,6 +653,7 @@ def _ts_layer_factored(l, fg, state, c):
     if c.get("start") and c.get("step", 0) < c["start"]:                  # --ttf-start: frozen, v keeps learning
         return
     ra = min(r, l.N, l.K)
+    A_prev = None
     if key not in state:
         g_ = torch.Generator(device=dev).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
         V = _orth(-lr_ratio * _dpm(_fg_mm_l(fgb, ia, torch.randn(l.N, ra, device=dev, generator=g_))))
@@ -632,6 +671,7 @@ def _ts_layer_factored(l, fg, state, c):
             U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio), _sketch_mass(PS_, Sr, ia_, ib_, lr_ratio))
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
+        A_prev = U @ V.T if c.get("band") else None
         U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
         Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
         U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
@@ -648,7 +688,14 @@ def _ts_layer_factored(l, fg, state, c):
     st.pop(("venc", key), None)
     from .kernel import unpack_rows, pack_rows
     before = l.wpacked.clone() if l.track else None
-    if FIRE_FUSED[0] and dev.type == "cuda":   # A, the moves, the repack and D V in one kernel
+    if c.get("band"):
+        if A_prev is not None:
+            g_ = torch.mm(gy.T, x, out_dtype=torch.float32) if gy.dtype == torch.bfloat16 else gy.T.float() @ x.float()
+            u_ = (-lr_ratio) * ia[:, None] * g_ * ib[None, :]; del g_
+        else:
+            u_ = None                                 # (the first step: the band starts empty)
+        U, nf = _band_fire(l, st, key, c, U, V, A_prev, u_, lk, theta)
+    elif FIRE_FUSED[0] and dev.type == "cuda":   # A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
         DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta)
         DV = _dpm(DV)          # data parallel: the spend's sparse sums (index_add_) are not bit-reproducible: one mean
