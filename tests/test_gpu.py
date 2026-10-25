@@ -534,3 +534,40 @@ def test_fused_save_x_bit_identical(dx8):
         L.FUSED_SAVE_X[0] = False; L.DX_MODE[0] = old_dx; KN.DX_I8X2_MIN_N[0] = old_min
     for a, b in zip(res[False], res[True]):
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("wdt", [torch.float32, torch.bfloat16])
+def test_qwen_fused_kernels(wdt):
+    """--fused-norm: kernel.rms_norm_qwen, swiglu and gated_norm_qwen against the Hugging Face formulas (forward and
+    the gradients of every input), bf16 activations; within bf16 rounding (fp32 internals in both)"""
+    import torch.nn.functional as F
+    import ttf.kernel as KN
+    dev = "cuda"
+    torch.manual_seed(0)
+    M, D, eps = 300, 1000, 1e-6
+
+    def close(a, b, tol):
+        return ((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-30)).item() < tol
+
+    def both(fk, fr, xs):
+        a = [x.detach().clone().requires_grad_(True) for x in xs]
+        b = [x.detach().clone().requires_grad_(True) for x in xs]
+        ya, yb = fk(*a), fr(*b)
+        g = torch.randn_like(yb)
+        ya.backward(g); yb.backward(g)
+        assert ya.dtype == yb.dtype and close(ya, yb, 1e-2)
+        for p, q in zip(a, b):
+            assert close(p.grad, q.grad, 2e-2), (p.shape, p.dtype)
+
+    x = torch.randn(M, D, device=dev, dtype=torch.bfloat16) * 3
+    w = (torch.randn(D, device=dev) * 0.1).to(wdt)
+    both(lambda x, w: KN.rms_norm_qwen(x, w, eps),
+         lambda x, w: (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+                       * (1.0 + w.float())).type_as(x), [x, w])
+    g, u = (torch.randn(M, D, device=dev, dtype=torch.bfloat16) * 2 for _ in range(2))
+    both(KN.swiglu, lambda g, u: F.silu(g) * u, [g, u])
+    z = torch.randn(M, D, device=dev, dtype=torch.bfloat16) * 2
+    wg = (1 + torch.randn(D, device=dev) * 0.1).float()
+    both(lambda x, z, w: KN.gated_norm_qwen(x, z, w, eps),
+         lambda x, z, w: ((w * (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype))
+                          * F.silu(z.float())).to(x.dtype), [x, z, wg])
