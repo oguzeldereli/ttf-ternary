@@ -252,27 +252,34 @@ class QwenTern(nn.Module):
         """one step's micro-batches through the pipeline, 1F1B: stage r runs n - r - 1 warm-up forwards, then one forward
         and one backward in turn, then the remaining backwards, so at most n - r micro-batches' activations are alive on
         it (the old schedule, all forwards then all backwards, kept all M). The backwards still run in the order 0 .. M-1,
-        as the single-GPU loop (pre_bwd(i) before each, for the TTF accumulation flags), each scaled 1 / M; sends are
-        non-blocking (a forward's send and the next backward's receive would otherwise wait on each other). Returns the
-        last micro-batch's loss (what the loop logs) on every stage. batches: [(x, y, kd_topk or None)]"""
+        as the single-GPU loop (pre_bwd(i) before each, for the TTF accumulation flags), each scaled 1 / M. In the steady
+        state a forward's send and the next backward's receive go as one group (_pp_sendrecv), and a backward's send and
+        the next forward's receive likewise: NCCL runs a rank pair's sends and receives in order on one stream, so as
+        separate ops stage r's send of micro-batch i + 1 waited behind stage r + 1's send of the gradient of i, and that
+        behind stage r's receive of it (a deadlock once a message exceeds NCCL's buffer: 27B, 2 x L40S, 25 Oct). Returns
+        the last micro-batch's loss (what the loop logs) on every stage. batches: [(x, y, kd_topk or None)]"""
         P = self.pp; r, n = P["rank"], P["n"]; M = len(batches)
         self._ckpt_setup()
         keep, pend = {}, []
-        last = torch.zeros((), device=batches[0][0].device)
+        dev = batches[0][0].device
+        last = torch.zeros((), device=dev)
 
-        def fwd(i):
+        def fwd(i, hin):
+            """forward of micro-batch i from the received hidden states hin (stage 0: None); returns what goes to the
+            next stage (the last stage: None)"""
             x, y, kd = batches[i]
-            sh, dt = self._h_meta(x)
             with autocast():
-                hin = None if r == 0 else _pp_recv(sh, dt, r - 1, x.device).requires_grad_()
+                if hin is not None:
+                    hin.requires_grad_()
                 h = self._stage(x if r == 0 else hin)
                 if r < n - 1:
-                    pend.append(_pp_isend(h.detach(), r + 1)); keep[i] = (hin, h)
-                else:
-                    self.kd_topk = kd
-                    keep[i] = (hin, self._head_loss(h, y)); self.kd_topk = None
+                    keep[i] = (hin, h); return h.detach()
+                self.kd_topk = kd
+                keep[i] = (hin, self._head_loss(h, y)); self.kd_topk = None
 
-        def bwd(i):
+        def bwd(i, g):
+            """backward of micro-batch i with the received gradient g (the last stage: None); returns the gradient for
+            the previous stage (stage 0: None)"""
             nonlocal last
             hin, out = keep.pop(i)
             pre_bwd(i)
@@ -280,18 +287,35 @@ class QwenTern(nn.Module):
                 if r == n - 1:
                     (out / M).backward(); last = out.detach().float()
                 else:
-                    out.backward(_pp_recv(out.shape, out.dtype, r + 1, out.device))
-            if r > 0:
-                pend.append(_pp_isend(hin.grad, r - 1))
+                    out.backward(g)
+            return hin.grad if r > 0 else None
 
-        fi = bi = 0
-        for _ in range(min(n - r - 1, M)):
-            fwd(fi); fi += 1
+        def recv_f(i):
+            return _pp_recv(*self._h_meta(batches[i][0]), r - 1, dev) if r > 0 else None
+
+        def g_meta(i):
+            return keep[i][1].shape, keep[i][1].dtype
+
+        nw = min(n - r - 1, M)
+        for i in range(nw):                       # (warm-up: never the last stage)
+            pend.append(_pp_isend(fwd(i, recv_f(i)), r + 1))
+        hin = recv_f(nw) if nw < M else None
+        fi, bi = nw, 0
         while fi < M:
-            fwd(fi); fi += 1
-            bwd(bi); bi += 1
+            h = fwd(fi, hin); fi += 1
+            g = _pp_sendrecv(h, r + 1, *g_meta(bi), dev, pend) if r < n - 1 else None
+            gin = bwd(bi, g); bi += 1
+            hin = None
+            if r > 0:
+                if fi < M:
+                    hin = _pp_sendrecv(gin, r - 1, *self._h_meta(batches[fi][0]), dev, pend)
+                else:
+                    pend.append(_pp_isend(gin, r - 1))
         while bi < M:
-            bwd(bi); bi += 1
+            g = _pp_recv(*g_meta(bi), r + 1, dev) if r < n - 1 else None
+            gin = bwd(bi, g); bi += 1
+            if r > 0:
+                pend.append(_pp_isend(gin, r - 1))
         for w, _buf in pend:
             w.wait()
         return _pp_bcast(last, n - 1)
@@ -344,6 +368,20 @@ def _pp_isend(t, dst):
     t = t.contiguous()
     b = t.cpu() if _pp_gloo() else t
     return dist.isend(b, dst), b
+
+
+def _pp_sendrecv(t, peer, shape, dtype, dev, pend):
+    """send t to peer and receive a (shape, dtype) tensor from it as one group (NCCL: both progress together, see
+    pp_train); the send's (work, buffer) goes to pend. gloo (a test on one GPU): a buffered isend, then the receive"""
+    import torch.distributed as dist
+    if _pp_gloo():
+        pend.append(_pp_isend(t, peer)); return _pp_recv(shape, dtype, peer, dev)
+    t = t.contiguous(); buf = torch.empty(shape, dtype=dtype, device=dev)
+    ws = dist.batch_isend_irecv([dist.P2POp(dist.isend, t, peer), dist.P2POp(dist.irecv, buf, peer)])
+    for w in ws:                 # (one coalesced work for the group under NCCL)
+        w.wait()
+    pend.append((ws[0], t))
+    return buf
 
 
 def _pp_recv(shape, dtype, src, dev):
