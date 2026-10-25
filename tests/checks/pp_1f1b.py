@@ -2,9 +2,24 @@
 gradients and loss against the same layers run on one process, M micro-batches. Large hidden states (H = 5120, T = 2048:
 21 MB per send, past NCCL's buffer) caught the send/send deadlock of the separate isend / recv ops (25 Oct).
   torchrun --nproc_per_node 2 tests/checks/pp_1f1b.py               (NCCL, one GPU per stage)
-  BACKEND=gloo torchrun --nproc_per_node 3 tests/checks/pp_1f1b.py  (CPU, any stage count)"""
-import contextlib, datetime, os, types
+  BACKEND=gloo torchrun --nproc_per_node 3 tests/checks/pp_1f1b.py  (CPU, any stage count)
+Run without torchrun (tests/test_checks.py): it relaunches itself under torch.distributed.run, NCCL over 2 GPUs when
+there are 2 (the 27B message size), else gloo on the CPU with 2 and 3 stages (small shapes)."""
+import contextlib, datetime, os, subprocess, sys, types
 import torch, torch.distributed as dist
+
+if "RANK" not in os.environ:
+    runs = ([("nccl", 2, {})] if torch.cuda.device_count() >= 2 else
+            [("gloo", 2, {"H": "64", "T": "16"}), ("gloo", 3, {"H": "64", "T": "16"})])
+    for be, n, ex in runs:
+        for m in ("1", "5", "16"):
+            env = dict(os.environ, BACKEND=be, M=m, **ex)
+            r = subprocess.run([sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", str(n),
+                                __file__], env=env, timeout=600)
+            if r.returncode:
+                raise SystemExit(f"pp_1f1b: {be} {n} stages M={m} failed")
+    print("pp_1f1b: all OK"); raise SystemExit(0)
+
 from ttf.qwen import QwenTern
 
 be = os.environ.get("BACKEND", "nccl"); dist.init_process_group(be, timeout=datetime.timedelta(seconds=120))
