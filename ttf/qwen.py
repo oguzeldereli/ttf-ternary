@@ -239,26 +239,32 @@ class QwenTern(nn.Module):
         return None, _pp_bcast(loss, n - 1)
 
     def pp_train(self, batches, pre_bwd, autocast):
-        """one step's micro-batches through the pipeline: all forwards (stage r sends micro-batch i on while it computes
-        i + 1), then all backwards in the same order 0 .. M-1 as the single-GPU loop (pre_bwd(i) before each, for the
-        TTF accumulation flags), each scaled 1 / M. Returns the last micro-batch's loss (what the loop logs) on every
-        stage. batches: [(x, y, kd_topk or None)]"""
+        """one step's micro-batches through the pipeline, 1F1B: stage r runs n - r - 1 warm-up forwards, then one forward
+        and one backward in turn, then the remaining backwards, so at most n - r micro-batches' activations are alive on
+        it (the old schedule, all forwards then all backwards, kept all M). The backwards still run in the order 0 .. M-1,
+        as the single-GPU loop (pre_bwd(i) before each, for the TTF accumulation flags), each scaled 1 / M; sends are
+        non-blocking (a forward's send and the next backward's receive would otherwise wait on each other). Returns the
+        last micro-batch's loss (what the loop logs) on every stage. batches: [(x, y, kd_topk or None)]"""
         P = self.pp; r, n = P["rank"], P["n"]; M = len(batches)
         self._ckpt_setup()
-        keep = []
-        for x, y, kd in batches:
+        keep, pend = {}, []
+        last = torch.zeros((), device=batches[0][0].device)
+
+        def fwd(i):
+            x, y, kd = batches[i]
             sh, dt = self._h_meta(x)
             with autocast():
                 hin = None if r == 0 else _pp_recv(sh, dt, r - 1, x.device).requires_grad_()
                 h = self._stage(x if r == 0 else hin)
                 if r < n - 1:
-                    _pp_send(h.detach(), r + 1); keep.append((hin, h))
+                    pend.append(_pp_isend(h.detach(), r + 1)); keep[i] = (hin, h)
                 else:
                     self.kd_topk = kd
-                    keep.append((hin, self._head_loss(h, y))); self.kd_topk = None
-        last = torch.zeros((), device=batches[0][0].device)
-        for i in range(M):
-            hin, out = keep[i]; keep[i] = None
+                    keep[i] = (hin, self._head_loss(h, y)); self.kd_topk = None
+
+        def bwd(i):
+            nonlocal last
+            hin, out = keep.pop(i)
             pre_bwd(i)
             with torch.profiler.record_function("model.bwd"):
                 if r == n - 1:
@@ -266,8 +272,18 @@ class QwenTern(nn.Module):
                 else:
                     out.backward(_pp_recv(out.shape, out.dtype, r + 1, out.device))
             if r > 0:
-                _pp_send(hin.grad, r - 1)
-            del hin, out
+                pend.append(_pp_isend(hin.grad, r - 1))
+
+        fi = bi = 0
+        for _ in range(min(n - r - 1, M)):
+            fwd(fi); fi += 1
+        while fi < M:
+            fwd(fi); fi += 1
+            bwd(bi); bi += 1
+        while bi < M:
+            bwd(bi); bi += 1
+        for w, _buf in pend:
+            w.wait()
         return _pp_bcast(last, n - 1)
 
     def float_tail_parameters(self):
@@ -310,6 +326,14 @@ def _pp_send(t, dst):
     import torch.distributed as dist
     t = t.contiguous()
     dist.send(t.cpu() if _pp_gloo() else t, dst)     # gloo (several stages on one GPU, a test): host tensors
+
+
+def _pp_isend(t, dst):
+    """non-blocking send; returns (work, the buffer, kept alive until work.wait())"""
+    import torch.distributed as dist
+    t = t.contiguous()
+    b = t.cpu() if _pp_gloo() else t
+    return dist.isend(b, dst), b
 
 
 def _pp_recv(shape, dtype, src, dev):

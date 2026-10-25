@@ -56,7 +56,7 @@ class IntKMatrix(nn.Module):
         if G_ is None:
             return
         import torch.distributed as dist
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:   # data parallel: the codes
+        if getattr(self, "dp_reduce", False) and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:   # data parallel: the codes
             dist.all_reduce(G_); G_.div_(dist.get_world_size())   # move on the mean gradient (the same on every rank)
         gW = G_.reshape(self.N, self.K // self.g, self.g)
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()
@@ -168,7 +168,8 @@ def enable_intk_emb(model, spec, log=print):
     for i, m in enumerate((me, mh)):
         m._ts_idx = 20_000 + i
     hf.model.embed_tokens = _Emb(me); hf.lm_head = _Head(mh)
-    err = [float((m.dequant() - W.float()).norm() / W.float().norm()) for m, W in ((me, E.data), (mh, H.data))]
+    err = [float((m.dequant() - W.float()).norm() / W.float().norm()) if not W.is_meta else float("nan")   # (--pipe:
+           for m, W in ((me, E.data), (mh, H.data))]                                                         # another stage's)
     log(f"--intk-emb {spec}: embedding {eb}-bit, head {hb}-bit codes in groups of {g} (rel err {err[0]:.4f} / "
         f"{err[1]:.4f}), trained by TTF; {(me.lo.numel() + me.s.numel() + mh.lo.numel() + mh.s.numel()) / 1e6:.1f}M "
         f"group parameters in the float tail")

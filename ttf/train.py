@@ -382,7 +382,8 @@ def main():
     if _QWEN and args.intk_emb:              # --intk-emb: int-k code matrices for the embedding and head, TTF-trained
         from .intk_emb import enable_intk_emb
         assert args.train_emb == "none", "--intk-emb trains the embedding / head itself"
-        enable_intk_emb(model, args.intk_emb, log=lambda m_: print(m_, flush=True))
+        for m_ in enable_intk_emb(model, args.intk_emb, log=lambda m_: print(m_, flush=True)):
+            m_.dp_reduce = _WS > 1 and not _PP          # (data parallel only: --pipe stages are not replicas)
     if _QWEN and args.train_emb != "none":   # --train-emb: the head (and the embedding) join the float tail (the
         _te = [model.hf.lm_head.weight] + ([model.hf.model.embed_tokens.weight] if args.train_emb == "both" else [])
         for p_ in _te:                        # conversion and the resume freeze them; 0.8B, 22 Oct, theta 64: -0.085 wiki)
