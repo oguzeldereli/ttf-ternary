@@ -81,3 +81,28 @@ def test_sketch_cross():
         Sc = torch.randn(k, N, generator=g) / k ** 0.5
         err.append(float((UP._sketch_cross(U, (Sc @ G).T, Sc, ia, ib, 0.1) - ex).norm() / ex.norm()))
     assert 0.15 < err[1] / err[0] < 0.35, err      # sqrt(64 / 1024) = 0.25
+
+
+def test_acc_turn_keeps_mass():
+    """_acc_turn with mass: A' itself kept on the new basis, A = A' Vn Vn^T (A' = A0 + u, the turn from U = U0 + u V)"""
+    g = torch.Generator().manual_seed(1)
+    U0, V = torch.randn(30, 6, generator=g), torch.linalg.qr(torch.randn(20, 6, generator=g)).Q
+    u = torch.randn(30, 20, generator=g)
+    U1 = U0 + u @ V
+    U, Vn = UP._acc_turn(U1, V, u.T @ U1, lambda W: u @ W)
+    Ap = U0 @ V.T + u
+    assert torch.allclose(U @ Vn.T, Ap @ Vn @ Vn.T, atol=1e-4)
+
+
+def test_sketch_mass():
+    """_sketch_mass: (sum u) W from the k-column sketch (sum g) Sr; its error falls as 1 / sqrt(k)"""
+    g = torch.Generator().manual_seed(0)
+    N, K, r = 50, 200, 4
+    G, W = torch.randn(N, K, generator=g), torch.randn(K, r, generator=g)
+    ia, ib = torch.rand(N, generator=g) + 0.5, torch.rand(K, generator=g) + 0.5
+    ex = (-0.1 * ia[:, None] * G * ib[None, :]) @ W
+    err = []
+    for k in (64, 1024):
+        Sr = torch.randn(K, k, generator=g) / k ** 0.5
+        err.append(float((UP._sketch_mass(G @ Sr, Sr, ia, ib, 0.1)(W) - ex).norm() / ex.norm()))
+    assert 0.15 < err[1] / err[0] < 0.35, err

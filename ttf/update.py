@@ -231,18 +231,21 @@ def _ts_state_bytes(lr_state):
     return n
 
 
-def _acc_turn(U, V, S_):
-    """the basis turn at the end of a step, the same for any split of the step into micro-batches: one subspace
-    iteration of the step's whole tally A' = A + sum u from U (the accumulator after the step's u entered on its basis,
-    U = lk U_0 + sum u V): X = A'^T U = V (U^T U) + (I - V V^T) (sum u)^T U, S_ = (sum u)^T U [K, r] (exact where the
-    step is one batch, else _sketch_cross, its unbiased estimate); A becomes U V^T Vn Vn^T. The micro rule before turned
-    from M u_M^T U, the last micro-batch's u scaled by M (16 x the noise of the step's sum; on a converted Qwen 0.8B's
-    down_proj ~10 steps of memory, no trit moved); the one-batch rule before turned from U_0 and added u Vn (u read
-    twice more). Simulated on real 0.8B micro-gradients (down / gate / out_proj): captures a persistent signal as well
-    or better than both. Returns (U, V)"""
+def _acc_turn(U, V, S_, mass=None):
+    """the basis turn at the end of a step: one subspace iteration of the step's whole tally A' = A + sum u, and A' kept
+    on the new basis (A <- A' Vn Vn^T). Here from U = lk U_0 + sum u V (the step's u entered on its basis, the
+    --ttf-accum micro path: U_0 is not kept): X = A'^T U = V (U^T U) + (I - V V^T) (sum u)^T U with S_ = (sum u)^T U
+    [K, r] (_sketch_cross), and A' Vn = U V^T Vn + sum u (I - V V^T) Vn: mass(W) = sum u W (_sketch_mass). A one-batch
+    step turns from U_0 itself (X = A'^T U_0, A' Vn = U_0 V^T Vn + u Vn: exact, two products of u). The micro rule
+    before turned from M u_M^T U (the last micro-batch's u x M: 16 x the noise of the step's sum; a converted Qwen
+    0.8B's down_proj kept ~10 steps of memory and moved no trit) and dropped the mass outside V. Returns (U, V)"""
     S_ = S_ - V @ (V.T @ S_)
     Vn = _orth(V @ (U.T @ U) + S_); del S_
-    return U @ (V.T @ Vn), Vn
+    P_ = V.T @ Vn
+    Un = U @ P_
+    if mass is not None:
+        Un = Un + mass(Vn - V @ P_)
+    return Un, Vn
 
 
 def _sketch_cross(U, SPt, Sc, ia, ib, lr_ratio):
@@ -250,6 +253,12 @@ def _sketch_cross(U, SPt, Sc, ia, ib, lr_ratio):
     which the update keeps for v anyway (E[Sc^T Sc] = I; Sc regenerated from its seed), with the step's v (ia, ib):
     -lr diag(ib) SPt (Sc diag(ia) U)"""
     return (-lr_ratio) * ib[:, None] * (SPt.float() @ (Sc @ (ia[:, None] * U)))
+
+
+def _sketch_mass(PS, Sr, ia, ib, lr_ratio):
+    """W -> (sum u) W [N, r] without sum u: through the step's k-column sketch PS = (sum g) Sr [N, k], kept for v as
+    well (E[Sr Sr^T] = I): -lr diag(ia) PS (Sr^T diag(ib) W)"""
+    return lambda W: (-lr_ratio) * ia[:, None] * (PS.float() @ (Sr.T @ (ib[:, None] * W)))
 
 
 def _step_scale(R, C, b2, n):
@@ -365,7 +374,7 @@ def ts_layer(l, g, state, c):
             else:
                 R, C = (1 - b2o) * rs, (1 - b2o) * cs
             _host_put(st, ("v", key), (R, C), off)
-            turn_ = (SP.T,) + _step_scale(R, C, b2o, t // M_)          # (Sc sum g)^T: the basis turn's sketch
+            turn_ = (SP.T, PS) + _step_scale(R, C, b2o, t // M_)       # (Sc sum g)^T, (sum g) Sr: the basis turn's sketches
             # the full [N, K] v only where it is read: --ttf-vdiag (the micro-batch u uses the factored v of the steps before)
             v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2o ** (t // M_)) if c.get("vdiag") else None
         else:
@@ -409,15 +418,17 @@ def ts_layer(l, g, state, c):
             U = U * lk
         U = U + u @ V
         if final_:
-            U, V = _acc_turn(U, V, _sketch_cross(U, turn_[0], Sc, turn_[1], turn_[2], lr_ratio))
+            SPt, PS_, ia_, ib_ = turn_
+            U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio), _sketch_mass(PS_, Sr, ia_, ib_, lr_ratio))
     elif key not in state:
         gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
         V = _orth(u.T @ torch.randn(l.N, ra, device=g.device, generator=gen))
         U = u @ V
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
-        U = U * lk + u @ V
-        U, V = _acc_turn(U, V, u.T @ U)
+        U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
+        Vn = _orth(V @ (U.T @ U) + u.T @ U)
+        U = U @ (V.T @ Vn) + u @ Vn; V = Vn
     if mic_nm and not final_:   # --ttf-accum micro: not the last micro-batch: keep the accumulator, no firing
         _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
@@ -549,7 +560,7 @@ def _ts_layer_factored(l, fg, state, c):
             else:
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
-            turn_ = (SP,) + _step_scale(R, C, b2, ts_ + 1)          # (Sc sum g)^T [K, k]: the basis turn's sketch
+            turn_ = (SP, PS) + _step_scale(R, C, b2, ts_ + 1)       # (Sc sum g)^T [K, k], (sum g) Sr: the turn's sketches
         else:
             st[("mx", key)] = (PS, SP, rs, cs, ds, es)
         del PS, SP
@@ -579,7 +590,7 @@ def _ts_layer_factored(l, fg, state, c):
                 else:
                     R, C = (1 - b2) * rs, (1 - b2) * cs
                 _host_put(st, ("v", key), (R, C), off)
-                turn_ = (SP.T,) + _step_scale(R, C, b2, ts_ + 1)
+                turn_ = (SP.T, PS) + _step_scale(R, C, b2, ts_ + 1)
                 if c.get("vdiag"):   # --ttf-vdiag: this micro-batch's g^2 against v (the u extremes need the dense u: not kept)
                     sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** (t // M_))).clamp_min(1e-30))
                     _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
@@ -617,11 +628,13 @@ def _ts_layer_factored(l, fg, state, c):
             # data parallel: the micro-batches' terms are linear in g and V is fixed within the step, so each rank
             # summed its own and one mean here replaces a mean per micro-batch (N x r per layer: 16 x less traffic)
             U = _dpm(U)
-            U, V = _acc_turn(U, V, _sketch_cross(U, turn_[0], Sc, turn_[1], turn_[2], lr_ratio))
+            SPt, PS_, ia_, ib_ = turn_
+            U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio), _sketch_mass(PS_, Sr, ia_, ib_, lr_ratio))
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
-        U = U * lk - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
-        U, V = _acc_turn(U, V, -lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))       # the step is one batch: (sum u)^T U exact
+        U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
+        Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
+        U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
     if not final_:
         if STEP_FP32[0] and sa and not off:   # --ttf-step-fp32: within the step U stays fp32 (V is fixed until the last
             # micro-batch: kept as stored); encoded once, on the last micro-batch. Skips U's encode / decode per micro-batch
