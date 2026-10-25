@@ -795,6 +795,10 @@ def main():
             m_.ts_micro = bool(args.micro)
         print("--ttf-update fused: the update runs inside each layer's backward", flush=True)
         FIRE_FUSED[0] = args.fire == "fused"
+        if args.fused_save_x:
+            from .layers import FUSED_SAVE_X as _FX
+            _FX[0] = True
+            print("--fused-save-x: fused layers keep their input, the centring redone in the backward", flush=True)
         if args.ttf_step_fp32:
             from .update import STEP_FP32 as _SF
             _SF[0] = True

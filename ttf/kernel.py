@@ -1253,9 +1253,11 @@ def fused_bwd_rows(g, t, r_b, beta_b, slices):
 
 
 @triton.jit
-def _dx_col_kernel(y1_ptr, y2_ptr, s_ptr, c_ptr, x_ptr, gx_ptr, pc_ptr, M, K, BM: tl.constexpr, BK: tl.constexpr):
+def _dx_col_kernel(y1_ptr, y2_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, gx_ptr, pc_ptr, M, K, HAS_MU: tl.constexpr,
+                   BM: tl.constexpr, BK: tl.constexpr):
     """g = bf16((y1 + y2 / 254) * s) (_dx2_epi_kernel), then the column scale's backward (_scale_bwd_kernel):
-    gx = bf16(g * c) and per row block the column sums of bf16(g * x)"""
+    gx = bf16(g * c) and per row block the column sums of bf16(g * x); HAS_MU: x is the layer's input and the centred
+    bf16(x - mu) the prologue would have saved is formed here (same rounding: --fused-save-x)"""
     pm = tl.program_id(0)
     rows = pm * BM + tl.arange(0, BM); cols = tl.program_id(1) * BK + tl.arange(0, BK)
     m = (rows[:, None] < M) & (cols[None, :] < K)
@@ -1266,17 +1268,20 @@ def _dx_col_kernel(y1_ptr, y2_ptr, s_ptr, c_ptr, x_ptr, gx_ptr, pc_ptr, M, K, BM
     g = _rbf((y1 + y2 * (1.0 / 254.0)) * s[:, None])
     c = tl.load(c_ptr + cols, mask=cols < K, other=0.0).to(tl.float32)
     x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
+    if HAS_MU:
+        x = _rbf(x - tl.load(mu_ptr + cols, mask=cols < K, other=0.0).to(tl.float32))
     tl.store(gx_ptr + off, (g * c[None, :]).to(tl.bfloat16), mask=m)
     tl.store(pc_ptr + pm * K + cols, tl.sum(_rbf(g * x), axis=0), mask=cols < K)
 
 
-def fused_dx_col(y1, y2, s, c_b, x):
+def fused_dx_col(y1, y2, s, c_b, x, mu_b=None):
     M, K = y1.shape
     gx = torch.empty(M, K, dtype=torch.bfloat16, device=y1.device)
     BM, BK = 64, 128
     nb = triton.cdiv(M, BM)
     pc = torch.empty(nb, K, dtype=torch.float32, device=y1.device)
-    _dx_col_kernel[(nb, triton.cdiv(K, BK))](y1, y2, s, c_b, x, gx, pc, M, K, BM=BM, BK=BK)
+    _dx_col_kernel[(nb, triton.cdiv(K, BK))](y1, y2, s, c_b, x, mu_b if mu_b is not None else c_b, gx, pc, M, K,
+                                             HAS_MU=mu_b is not None, BM=BM, BK=BK)
     return gx, pc.sum(0)
 
 

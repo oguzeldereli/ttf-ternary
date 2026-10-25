@@ -72,6 +72,8 @@ def build_parser():
 
     g = ap.add_argument_group("TTF (--mode ttf)")
     g.add_argument("--ttf-rank", type=int, default=512, help="rank of each layer's accumulator A = U V^T")
+    g.add_argument("--fused-save-x", action=ON, default=False, help="--fused-layer: keep the layer's input for the "
+                   "backward instead of a centred copy (the readers of one input share it; bit-identical)")
     g.add_argument("--ttf-step-fp32", action=ON, default=False, help="--ttf-accum micro: keep U in fp32 between a step's "
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
     g.add_argument("--ttf-orth", default="qr", choices=["qr", "cholqr2", "spanqr"],

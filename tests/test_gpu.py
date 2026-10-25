@@ -507,3 +507,30 @@ def test_intk_rows_matches_dense():
     assert int((a.codes != b.codes).sum()) <= 3, int((a.codes != b.codes).sum())
     Ua, Va = sa[id(a)]; Ub, Vb = sb[id(b)]
     assert float((Ua @ Va.T - Ub @ Vb.T).norm() / (Ua @ Va.T).norm()) < 1e-3
+
+
+@pytest.mark.parametrize("dx8", [False, True])
+def test_fused_save_x_bit_identical(dx8):
+    """--fused-save-x: the input kept instead of the centred copy, the centring redone in the backward (same bf16
+    rounding): output, input gradient, scale / bias gradients and the TTF factors identical to the default"""
+    from ttf import layers as L, kernel as KN
+    from ttf.layers import KernelTernaryLinear
+    KN.GEMM_BACKEND[0] = "int8mm"; L.FUSED_LAYER[0] = True
+    old_dx, old_min = L.DX_MODE[0], KN.DX_I8X2_MIN_N[0]
+    L.DX_MODE[0] = "int8x2"; KN.DX_I8X2_MIN_N[0] = 0 if dx8 else 10 ** 9
+    res = {}
+    try:
+        for sx in (False, True):
+            L.FUSED_SAVE_X[0] = sx
+            torch.manual_seed(0)
+            l = KernelTernaryLinear(256, 192, 8, beta=True, int8=True, int8_dx=False).to(dev); l.enable_rc_scale()
+            l.enable_centering(torch.randn(256, device=dev) * 0.1, torch.randn(192, device=dev) * 0.01)
+            got = {}
+            l.capture = True; l.on_grad = lambda l_, g: got.__setitem__("f", tuple(t.clone() for t in g))
+            x = torch.randn(64, 256, device=dev, dtype=torch.bfloat16).requires_grad_(True)
+            y = l(x); y.backward(torch.randn_like(y))
+            res[sx] = [y.detach(), x.grad] + [p.grad for p in (l.col_scale, l.row_scale)] + list(got["f"])
+    finally:
+        L.FUSED_SAVE_X[0] = False; L.DX_MODE[0] = old_dx; KN.DX_I8X2_MIN_N[0] = old_min
+    for a, b in zip(res[False], res[True]):
+        assert torch.equal(a, b)

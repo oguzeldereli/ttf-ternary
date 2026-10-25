@@ -201,7 +201,8 @@ def _grad_x(layer, gyf, wpacked):
     return tern_gemm_dx(gyf, wpacked, layer.K, w8=layer._cached_w8(wpacked))
 
 
-FUSED_LAYER = [False]        # --fused-layer: centring, column scale, act-quant, GEMM epilogue, row scale, bias and the
+FUSED_LAYER = [False]
+FUSED_SAVE_X = [False]   # --fused-save-x: the fused layer keeps its input, not a centred copy (one tensor for all its readers)        # --fused-layer: centring, column scale, act-quant, GEMM epilogue, row scale, bias and the
                              # adapter sum in a few kernels each way (_FusedTernFn); bit-identical output and input grad
 
 
@@ -225,7 +226,9 @@ def _fused_fwd(l, x2, acc2, save):
     cb, rb = l.col_scale.to(torch.bfloat16), l.row_scale.to(torch.bfloat16)
     ob = getattr(l, "out_bias", None)
     bb = ob.to(torch.bfloat16) if ob is not None else None
-    xq, xs, xc = _K.fused_prologue(x2, mu_b, cb, l.act_bits, save)
+    xq, xs, xc = _K.fused_prologue(x2, mu_b, cb, l.act_bits, save and not FUSED_SAVE_X[0])
+    if save and FUSED_SAVE_X[0]:
+        xc = None          # --fused-save-x: the input itself is kept; the backward re-forms bf16(x - mu)
     beta = l._cached_beta(l.wpacked) if l.use_beta else None
     w8 = l._cached_w8(l.wpacked)
     if w8 is None:
@@ -247,6 +250,8 @@ class _FusedTernFn(torch.autograd.Function):
         with _rf("tern.fwd"):
             o, sv = _fused_fwd(layer, x2, acc2, True)
         xq, xs, xc, t, cb, rb, beta = sv
+        ctx.mu_b = (layer.in_mean.to(torch.bfloat16) if FUSED_SAVE_X[0] and getattr(layer, "in_mean", None) is not None
+                    else None)   # (--fused-save-x: xc above is the input, its centring redone in the backward)
         ctx.save_for_backward(xq, xs, xc, t, cb, rb)
         ctx.layer, ctx.beta, ctx.xshape = layer, beta, x.shape
         ctx.cdt, ctx.rdt, ctx.has_bias, ctx.has_acc = c.dtype, r.dtype, bias is not None, acc is not None
@@ -264,10 +269,11 @@ class _FusedTernFn(torch.autograd.Function):
             f, q1, q2, s, gbias, grow = _K.fused_bwd_rows(g2, t, rb, bb, sl)
             if sl:
                 wt = _K.unpack_t_i8(l.wpacked, l.K).t()
-                gx, gc = _K.fused_dx_col(torch._int_mm(q1, wt), torch._int_mm(q2, wt), s, cb, xc)
+                gx, gc = _K.fused_dx_col(torch._int_mm(q1, wt), torch._int_mm(q2, wt), s, cb, xc, ctx.mu_b)
                 del wt, q1, q2
             else:
-                gx, gc = _K.scale_bwd(_grad_x(l, f, l.wpacked), cb, xc)
+                xc_ = xc if ctx.mu_b is None else (xc.float() - ctx.mu_b.float()).to(torch.bfloat16)
+                gx, gc = _K.scale_bwd(_grad_x(l, f, l.wpacked), cb, xc_); del xc_
         if l.capture and getattr(l, "on_grad", None) is not None:    # (_fused_ok: the factored TTF update)
             if getattr(l, "cap_accum", False):
                 l._ts_final = getattr(l, "cap_final", True)
