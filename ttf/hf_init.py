@@ -4,17 +4,13 @@ The float parts (token embedding, output head, RMSNorm gains) are copied. Each l
   fp32    the weight as is (sanity check: the loss should match the original model's)
   master  the latent is the weight (BitNet's absmean ternary in the forward, as published conversions do)
   kernel  the weight is ternarized (--convert):
-            gptqs    sequential, error-aware, centred GPTQ (convert_seq_asym): each layer calibrated on the partly
-                     converted model's inputs and aimed at the fp output; centred as gptqc (needs --rc-scale)
             gptqc    GPTQ on the input covariance instead of the second moment, the layer computing W_hat (x - mu) + W mu:
                      the input mean mu (fixed) is taken out before the activation quantisation and its product with
                      the fp weight is a float bias (trained); for fp models whose residual stream carries a large
                      constant offset (massive activations)
             absmean  T = round(clip(W / mean|W|)) per tensor, the output scale mean|W| (BitNet b1.58)
-            row      a per-row scale a_i chosen from a grid to minimise |W_i - a_i T_i| (least-squares magnitude)
             als      W ~ a_i c_j T_ij, row and column scales by alternating least squares (needs --rc-scale)
             scratch  nothing loaded, only the shape (the from-scratch baseline for the same model)
-            native   the float parts loaded, the linears keep their random ternary init
           the scales go into row_scale / col_scale (with --rc-scale) over the layer's beta = 1 / sqrt(K rho);
           without --rc-scale only the per-tensor part is kept (row and column factors are averaged out).
 
@@ -186,70 +182,6 @@ def calib_hessians(path, data_path, n_seq=64, seq=2048, dev="cuda", log=print):
     return out
 
 
-@torch.no_grad()
-def convert_seq_asym(path, data_path, n_seq=32, seq=2048, dev="cuda", damp=0.01, log=print):
-    """--convert gptqs: sequential, error-aware, centred GPTQ (training-free). The linears are rounded in
-    network order (per block: q k v, o, gate up, down), each calibrated on the inputs x_hat of the partly converted
-    model and aimed at the fp layer's output on the clean input x:
-        min | W_hat (x_hat - mu_hat) + b - W x |   ->   GPTQ of W* = W C(x, x_hat) C(x_hat, x_hat)^-1 on C(x_hat, x_hat),
-        b = W mu_x, mu_hat = E[x_hat]  (covariances of the centred inputs)
-    so each layer repairs part of the error that arrives from below, the inputs' mean (the fp residual stream's large
-    constant offset) passes exactly, and GPTQ's precision goes to the varying part. 110M: rounding gap +0.364 (plain
-    GPTQ) -> +0.274 (scripts/analysis/seq_gptq.py, tag pre-consolidation-2026-10-17). Returns {(block, name): (T int8, a, c, mu_hat, b)} on the CPU."""
-    import numpy as np
-    import torch.nn as nn
-    from .model import BitTransformer
-    mc = model_config_from_hf(path, max_seq_len=seq)
-    mk = lambda: BitTransformer(mc, grad_checkpoint=False, make_linear=lambda i, o: nn.Linear(i, o, bias=False)).to(dev)
-    clean, q = mk(), mk()
-    init_from_hf(clean, path, "fp32", log=lambda *_: None); init_from_hf(q, path, "fp32", log=lambda *_: None)
-    clean.eval(); q.eval()
-    data = np.memmap(data_path, dtype=np.uint16, mode="r")
-    starts = np.random.default_rng(4321).integers(0, len(data) - seq - 1, n_seq)
-    sub = lambda nm: "attn" if nm in ("wq", "wk", "wv", "wo") else "ffn"
-    stages = [["wq", "wk", "wv"], ["wo"], ["w_gate", "w_up"], ["w_down"]]
-    out, gains = {}, []
-    for i in range(mc.n_layers):
-        for names in stages:
-            acc, buf, hooks = {}, {}, []
-            for nm in names:
-                K = getattr(getattr(clean.layers[i], sub(nm)), nm).in_features
-                acc[nm] = [torch.zeros(K, K, device=dev, dtype=torch.float64) for _ in range(2)] + \
-                          [torch.zeros(K, device=dev, dtype=torch.float64) for _ in range(2)] + [0]
-                hooks.append(getattr(getattr(clean.layers[i], sub(nm)), nm).register_forward_pre_hook(
-                    lambda mod, inp, nm=nm: buf.__setitem__(nm, inp[0].reshape(-1, inp[0].shape[-1]).double())))
-
-                def qh(mod, inp, nm=nm):
-                    xh = inp[0].reshape(-1, inp[0].shape[-1]).double(); x = buf[nm]; d = acc[nm]
-                    d[0] += xh.T @ xh; d[1] += x.T @ xh; d[2] += xh.sum(0); d[3] += x.sum(0); d[4] += xh.shape[0]
-                hooks.append(getattr(getattr(q.layers[i], sub(nm)), nm).register_forward_pre_hook(qh))
-            for s0 in starts:
-                x = torch.tensor(data[s0:s0 + seq + 1].astype(np.int64), device=dev)[None]
-                clean(x[:, :-1], x[:, 1:]); q(x[:, :-1], x[:, 1:])
-            for h in hooks:
-                h.remove()
-            for nm in names:
-                Hh, Hx, sh, sx, n = acc[nm]
-                mh, mx = sh / n, sx / n
-                Ch = Hh / n - torch.outer(mh, mh); Cxh = Hx / n - torch.outer(mx, mh)
-                lin = getattr(getattr(q.layers[i], sub(nm)), nm)
-                W = getattr(getattr(clean.layers[i], sub(nm)), nm).weight.data.double()
-                Cr = Ch + damp * torch.diagonal(Ch).mean() * torch.eye(Ch.shape[0], device=dev, dtype=Ch.dtype)
-                Wt = (W @ Cxh @ torch.linalg.inv(Cr)).float()
-                T, a, c = ternarize(Wt, "als")
-                T, a, c = ternarize_gptq(Wt, Ch.float(), a, c, damp=damp)
-                b = (W @ mx).float()
-                lin.weight.data = a[:, None] * c[None, :] * T.float()      # the partly converted model, dequantised
-                lin._mu = mh.float()
-                lin.register_forward_pre_hook(lambda mod, inp: (inp[0] - mod._mu.to(inp[0].dtype),))
-                lin.register_forward_hook(lambda mod, inp, o, b=b: o + b.to(o.dtype))
-                out[(i, nm)] = (T.cpu(), a.cpu(), c.cpu(), mh.float().cpu(), b.cpu())
-        log(f"gptqs: block {i + 1}/{mc.n_layers} rounded")
-    del clean, q
-    torch.cuda.empty_cache()
-    return out
-
-
 GPTQ_OPTS = {"mag_svd": 0}   # --adapter-init svd (train.py)
 
 
@@ -366,16 +298,6 @@ def init_from_hf(model, path, mode, method="als", rc=False, log=print, hess=None
                 continue
             if not isinstance(lin, KernelTernaryLinear):        # fp32 mode: nn.Linear
                 lin.weight.copy_(W)
-                continue
-            if method == "native":         # a ternary-native start: the floats (embedding, norms, head)
-                continue                   # come from the checkpoint, the linears keep their random ternary init
-            if method == "gptqs":          # precomputed by convert_seq_asym (sequential, error-aware, centred)
-                T, a, c, mu_, b_ = (t.to(dev) for t in hess[(i, name)])
-                lin.wpacked.copy_(pack_rows(T))
-                beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
-                lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
-                lin.enable_centering(mu_, b_)
-                errs.append(_rel_err(W, T, a, c))
                 continue
             T, a, c = ternarize(W, "als" if method in ("gptq", "gptqc") else method)
             if hess is not None:

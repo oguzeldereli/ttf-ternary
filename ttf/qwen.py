@@ -114,7 +114,8 @@ def _text_state(path):
 
 class QwenTern(nn.Module):
     loss_chunk = 2048
-    head_fused = False      # --head-fused (ttf/headloss.py)
+    head_fused = True       # the loss and dL/dh in one pass where it applies (ttf/headloss.py; False: the autograd path,
+    # the reference for tests)
 
     def __init__(self, hf_model, grad_checkpoint=True):
         super().__init__()
@@ -409,19 +410,6 @@ def pp_split(n_layers, n_stages, spec=""):
     assert len(c) == n_stages and sum(c) == n_layers, f"--pipe-split {spec}: {n_stages} counts summing to {n_layers}"
     lo = [sum(c[:i]) for i in range(n_stages)]
     return [(lo[i], lo[i] + c[i]) for i in range(n_stages)]
-
-
-def _swap_linears(hf_model, make_linear):
-    """replace the decoder's nn.Linear modules (except _KEEP_FLOAT) by make_linear(in, out); returns {name: module}"""
-    swapped = {}
-    for name, mod in list(hf_model.model.layers.named_modules()):
-        for cname, child in list(mod.named_children()):
-            if isinstance(child, nn.Linear) and cname not in _KEEP_FLOAT:
-                assert child.bias is None, f"{name}.{cname} has a bias"
-                new = make_linear(child.in_features, child.out_features)
-                setattr(mod, cname, new)
-                swapped[f"model.layers.{name}.{cname}" if name else f"model.layers.{cname}"] = new
-    return swapped
 
 
 def build_qwen(path, mode, make_linear=None, grad_checkpoint=True, device="cuda", dtype=torch.bfloat16, own=None):

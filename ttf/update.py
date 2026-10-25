@@ -9,45 +9,26 @@ from .layers import KernelTernaryLinear, _rf
 from .schedule import _theta_at
 
 
-TS_FUSED_STATS = [True]          # TERN_FUSED_STATS=0: the TTF row / column sums of g^2 by torch reductions (the old path)
-
-
 def _store_codec(name):
     """--ttf-store: compressed storage of the accumulator's low-rank pair. Returns enc(X) -> tuple of stored tensors:
-    int8 / int8det / fp8 / fp16s keep codes + a per-column fp32 scale (1 x r), fp16 / bf16 keep the tensor in that
-    dtype."""
+    fp12s keeps 12-bit codes (X scaled per column to |X| <= 32768, then fp16 with the low 4 mantissa bits rounded off:
+    sign, 5 exponent, 6 mantissa bits) + the per-column fp32 scale (1 x r); bf16 keeps the tensor in bf16. (The removed
+    codecs int8 / int8det / fp8 / fp16s / fp16 still decode: _decode, _load_pair.)"""
     if name in ("", "none", "fp32"):
         return None
-    cs = lambda X, qmax: X.abs().amax(0, keepdim=True).clamp_min(1e-30) / qmax
-    if name == "int8":
+    if name == "fp12s":
         def enc(X):
-            sc = cs(X, 127); return ((X / sc + torch.rand_like(X)).floor().clamp_(-127, 127).to(torch.int8), sc)
-    elif name == "int8det":
-        def enc(X):
-            sc = cs(X, 127); return ((X / sc).round().clamp_(-127, 127).to(torch.int8), sc)
-    elif name == "fp8":
-        def enc(X):
-            sc = cs(X, 448); return ((X / sc).to(torch.float8_e4m3fn), sc)
-    elif name == "fp16s":
-        def enc(X):
-            sc = cs(X, 32768); return ((X / sc).to(torch.float16), sc)
-    elif name == "fp12s":     # fp16s with the low 4 mantissa bits rounded off: sign, 5 exponent, 6 mantissa bits
-        def enc(X):
-            sc = cs(X, 32768)
-            if X.is_cuda and X.dim() == 2 and CODEC_FUSED[0]:   # one kernel, identical codes (kernel.pack12_scaled)
+            sc = X.abs().amax(0, keepdim=True).clamp_min(1e-30) / 32768
+            if X.is_cuda and X.dim() == 2:   # one kernel, identical codes (kernel.pack12_scaled)
                 from .kernel import pack12_scaled
                 return (pack12_scaled(X.float(), sc), sc)
             return (_pack12((X / sc).to(torch.float16)), sc)
-    elif name in ("fp16", "bf16"):
-        dt = torch.float16 if name == "fp16" else torch.bfloat16
+    elif name == "bf16":
         def enc(X):
-            return (X.to(dt),)
+            return (X.to(torch.bfloat16),)
     else:
-        raise ValueError(name)
+        raise ValueError(f"--ttf-store {name}: fp32, bf16 or fp12s")
     return enc
-
-
-CODEC_FUSED = [os.environ.get("TERN_CODEC_FUSED", "1") != "0"]   # fp12s through kernel.pack12_scaled / unpack12_scaled
 
 
 def _pack12(Y):
@@ -76,7 +57,7 @@ def _unpack12(P, n):
 
 def _decode(c, s):
     """stored codes (int8 / fp8 / fp16 / packed 12-bit) times their per-column scale"""
-    if c.dtype == torch.uint8 and c.is_cuda and c.dim() == 2 and CODEC_FUSED[0]:   # one kernel, identical values
+    if c.dtype == torch.uint8 and c.is_cuda and c.dim() == 2:   # one kernel, identical values
         from .kernel import unpack12_scaled
         return unpack12_scaled(c, s)
     return (_unpack12(c, s.shape[-1]) if c.dtype == torch.uint8 else c).float() * s
@@ -108,7 +89,7 @@ def _load_pair_(t):
 
 
 def _ts_on_host(args, i, n):
-    """--ttf-offload host | async with --ttf-offload-keep F: layer i of n (module order) keeps its state in host memory
+    """--ttf-offload async with --ttf-offload-keep F: layer i of n (module order) keeps its state in host memory
     unless it is among the first round(F n)"""
     return args.ttf_offload != "none" and i >= round(args.ttf_offload_keep * n)
 
@@ -148,7 +129,7 @@ _PINNED = _PinnedPool()
 
 
 class _AsyncOffload:
-    """--ttf-offload async: the --ttf-offload host copies on two side streams (host-to-device prefetch, device-to-host
+    """--ttf-offload async: the TTF state in pinned host memory, its copies on two side streams (host-to-device prefetch, device-to-host
     write-back), so the PCIe traffic overlaps with the backward pass instead of stalling it. The order in which the
     update reads its states (v, m, accumulator per layer) is recorded during the first step that reads them and repeats
     every step; from then on, reading state j prefetches states j+1 .. j+AHEAD (wrapping into the next step). Each
@@ -220,12 +201,8 @@ def _host_get(d, k, dev, off):
 
 
 def _host_get_(d, k, dev, off):
-    """--ttf-offload host: a state tuple kept in pinned host memory, copied to the GPU for this layer's update (the copy is
-    queued on the current stream, so it is ordered before the kernels that read it; no host sync)"""
-    if off == "async":
-        return _OFFLOAD.get(d, k, dev)
-    v = d[k]
-    return tuple(x.to(dev, non_blocking=True) for x in v) if off else v
+    """--ttf-offload async: a state tuple kept in pinned host memory, prefetched to the GPU for this layer's update"""
+    return _OFFLOAD.get(d, k, dev) if off else d[k]
 
 
 def _host_put(d, k, v, off):
@@ -234,20 +211,11 @@ def _host_put(d, k, v, off):
 
 
 def _host_put_(d, k, v, off):
-    """--ttf-offload host: write a state tuple back to its pinned host buffers (reused across steps; the device-to-host copy
-    is queued on the same stream after this step's kernels and before next step's host-to-device copy)"""
+    """--ttf-offload async: write a state tuple back to its pinned host buffers (reused across steps)"""
     if not off:
         d[k] = v
         return
-    if off == "async":
-        return _OFFLOAD.put(d, k, v)
-    old = d.get(k)
-    if (old is not None and len(old) == len(v) and all(o.device.type == "cpu" and o.shape == x.shape and o.dtype == x.dtype
-                                                       and _PINNED.owns(o) for o, x in zip(old, v))):
-        for o, x in zip(old, v):
-            o.copy_(x, non_blocking=True)
-    else:
-        d[k] = tuple(_PINNED.empty(x.shape, x.dtype).copy_(x, non_blocking=True) for x in v)
+    _OFFLOAD.put(d, k, v)
 
 
 def _ts_state_bytes(lr_state):
@@ -329,7 +297,7 @@ def _orth_(X):
 def ts_layer(l, g, state, c):
     """one layer of TTF (the no-momentum update): g is this layer's gradient (fp32), or its factors (gy, x) with
     --dw factored; c holds the settings and lr_ratio. Called from the layer's backward right after its input gradient
-    is computed (--ttf-update fused), so only one layer's fp32 gradient exists at a time.
+    is computed, so only one layer's fp32 gradient exists at a time.
     Per layer: v, the factored row x column EMA of g^2 (decay b2); u = -lr_ratio g / sqrt(v); A, the accumulator, rank
     r: A <- (1 - lr_ratio^p / tau) A + u projected on its basis (V turns with the evidence); a trit moves by sign(A_ij)
     when |A_ij| >= theta (and stays in {-1, 0, 1}), and the move spends theta: A -= theta D (kept low-rank: U -= theta
@@ -349,7 +317,7 @@ def ts_layer(l, g, state, c):
         b2 = b2 ** (1.0 / M_)
     sa = _store_codec(c.get("store_a", ""))                                            # --ttf-store: real storage
     st = state.setdefault("_ts", {})
-    off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device  # --ttf-offload host(_keep)
+    off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device  # --ttf-offload async (--ttf-offload-keep)
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
     mic_nm = M_ > 1
     if mic_nm:    # --ttf-accum micro: the accumulator takes every micro-batch's u, normalised by the v of the steps before
@@ -359,7 +327,7 @@ def ts_layer(l, g, state, c):
         # own square (x M^2, the batch's scale) joins with weight 1 - beta2; without it a gradient spike passes into the
         # accumulator whole (110M: a 6% flip burst at step ~55, 5.64 vs 4.42 at 600 steps)
         ts_ = (t - 1) // M_
-        if g.is_cuda and TS_FUSED_STATS[0]:   # one pass for both sums of g^2 (rounding-level differences only)
+        if g.is_cuda:   # one pass for both sums of g^2 (rounding-level differences only)
             from .kernel import sq_sums as _sq_sums
             _rsq, _csq = _sq_sums(g)
             r0, c0 = _rsq * (M_ * M_ / l.K), _csq * (M_ * M_ / l.N)
@@ -432,7 +400,7 @@ def ts_layer(l, g, state, c):
         return
     del v
     ra = min(r, l.N, l.K)
-    lk = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau   # --ttf-leak annealed: memory in distance
+    lk = 1 - lr_ratio / tau   # the leak, annealed with the learning rate: the memory is a distance, not a step count
     if mic_nm and key in state:   # --ttf-accum micro: the basis stays fixed within the step (every micro-batch's u is projected
         # on it: U += u_i V), and turns once, on the last micro-batch (_acc_turn); turning it per micro-batch lets each
         # micro-batch's noisier u rotate the evidence away (110M r512: 5.64 vs 4.42 at 600 steps)
@@ -553,7 +521,7 @@ def _ts_layer_factored(l, fg, state, c):
     off = c.get("offload", False) if getattr(l, "_ts_host", True) else False
     sa = _store_codec(c.get("store_a", ""))
     key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
-    lk = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau
+    lk = 1 - lr_ratio / tau
     k_ = int(c["factored"])
     ts_ = (t - 1) // M_
     gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
@@ -667,7 +635,7 @@ def _ts_layer_factored(l, fg, state, c):
     st.pop(("venc", key), None)
     from .kernel import unpack_rows, pack_rows
     before = l.wpacked.clone() if l.track else None
-    if FIRE_FUSED[0] and dev.type == "cuda":   # --fire fused: A, the moves, the repack and D V in one kernel
+    if FIRE_FUSED[0] and dev.type == "cuda":   # A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
         DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta)
         DV = _dpm(DV)          # data parallel: the spend's sparse sums (index_add_) are not bit-reproducible: one mean
@@ -691,7 +659,7 @@ def _ts_layer_factored(l, fg, state, c):
 
 MICRO_SKETCH = [int(os.environ.get("TERN_MICRO_K", "256"))]   # the dense path's sketch size: --dw-sketch's default
 # (the v cross terms and the basis turn; TERN_MICRO_K: tests only)
-FIRE_FUSED = [False]          # --fire fused (with --dw factored): ttf.kernel.ttf_fire
+FIRE_FUSED = [True]           # the factored path's firing through ttf.kernel.ttf_fire on CUDA (False: the torch reference; tests)
 MICRO_FUSED = [os.environ.get("TERN_MICRO_FUSED", "1") == "1"]   # --ttf-accum micro: kernel.micro_sketch (TERN_MICRO_FUSED=0: the torch reference path)
 
 
@@ -712,17 +680,10 @@ def _ts_recmax(st, name, x):
     d = st.setdefault("_dgmax", {}); d[name] = max(d.get(name, -float("inf")), x)
 
 
-def ts_step(model, state, c, fused=True):
-    """after the backward: with --ttf-update fused (every recipe) the layers have already updated inside their backward, so this
-    only collects the step's statistics (share of trits moved, --ttf-vdiag means / maxima); without it each layer's
-    captured gradient goes through ts_layer here"""
+def ts_step(model, state, c):
+    """after the backward: the layers have already updated inside their backward, so this only collects the step's
+    statistics (share of trits moved, --ttf-vdiag means / maxima)"""
     st = state.setdefault("_ts", {})
-    if not fused:
-        for i, l in enumerate([l for l in model.modules() if isinstance(l, KernelTernaryLinear)]):
-            l._ts_idx = i
-            g = l.gw.float(); l.gw = None; l.capture = False
-            ts_layer(l, g, state, c)
-            del g
     nf, nt = st.pop("_nf", 0), st.pop("_nt", 0)
     info = {"ts_frac": float(nf) / max(nt, 1)}
     for k_, (tot, n_) in st.pop("_dg", {}).items():      # --ttf-vdiag: means over layers this step

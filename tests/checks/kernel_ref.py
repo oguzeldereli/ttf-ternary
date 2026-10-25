@@ -2,10 +2,10 @@
 
     python tests/test_kernel_ref.py
 
-Checks pack/unpack, trit_beta, the ternary GEMMs (forward int8 / bf16, input gradient, weight gradient) on both
-backends (triton, cublas) and shapes whose K is not a multiple of 5, and the kernel layer's forward / backward against
+Checks pack/unpack, trit_beta, the ternary GEMMs (the int8 forward, the bf16 and two-slice int8 input gradients) on
+shapes whose K is not a multiple of 5, and the kernel layer's forward / backward against
 beta * Q8(x) @ W^T with a straight-through activation quantiser. Prints the max relative error of each and fails on
-errors beyond bf16 rounding (or int8 rounding for the int8 weight-gradient paths).
+errors beyond bf16 rounding .
 """
 import os, sys
 import torch
@@ -44,26 +44,21 @@ for Kd in (1, 4, 5, 6, 13, 768, 1000, 2049):
     rho = (w != 0).float().mean()
     check(f"trit_beta K={Kd}", rel(K.trit_beta(p, Kd), (Kd * rho).clamp_min(1.0).rsqrt()), 1e-6)
 
-for backend in ("triton", "cublas"):
-    K.GEMM_BACKEND[0] = backend
-    for (M, N, Kd) in ((4096, 768, 768), (4096, 2048, 768), (4096, 768, 2048), (1024, 333, 1000), (512, 1024, 5120)):
-        w = trits(N, Kd); p = K.pack_rows(w); Wf = w.float()
-        x = torch.randn(M, Kd, device=dev)
-        beta = K.trit_beta(p, Kd)
-        xq, xs = K.act_quant_i8(x)
-        ref = (xq.float() @ Wf.T) * xs.float()[:, None] * beta
-        check(f"[{backend}] tern_gemm_i8 {M}x{N}x{Kd}", rel(K.tern_gemm_i8(xq, xs, p, Kd, beta), ref), 8e-3)
-        xb = x.to(torch.bfloat16)
-        check(f"[{backend}] tern_gemm (bf16) {M}x{N}x{Kd}", rel(K.tern_gemm(xb, p, Kd), xb.float() @ Wf.T), 8e-3)
-        gy = torch.randn(M, N, device=dev)
-        gb = gy.to(torch.bfloat16)
-        check(f"[{backend}] tern_gemm_dx {M}x{N}x{Kd}", rel(K.tern_gemm_dx(gb, p, Kd), gb.float() @ Wf), 8e-3)
-        check(f"[{backend}] tern_gemm_dx_i8 {M}x{N}x{Kd}", rel(K.tern_gemm_dx_i8(gy, p, Kd), gy @ Wf), 3e-2)
+for (M, N, Kd) in ((4096, 768, 768), (4096, 2048, 768), (4096, 768, 2048), (1024, 333, 1000), (512, 1024, 5120)):
+    w = trits(N, Kd); p = K.pack_rows(w); Wf = w.float()
+    x = torch.randn(M, Kd, device=dev)
+    beta = K.trit_beta(p, Kd)
+    xq, xs = K.act_quant_i8(x)
+    ref = (xq.float() @ Wf.T) * xs.float()[:, None] * beta
+    check(f"tern_gemm_i8 {M}x{N}x{Kd}", rel(K.tern_gemm_i8(xq, xs, p, Kd, beta), ref), 8e-3)
+    gy = torch.randn(M, N, device=dev)
+    gb = gy.to(torch.bfloat16)
+    check(f"tern_gemm_dx {M}x{N}x{Kd}", rel(K.tern_gemm_dx(gb, p, Kd), gb.float() @ Wf), 8e-3)
+    check(f"tern_gemm_dx_i8x2 {M}x{N}x{Kd}", rel(K.tern_gemm_dx_i8x2(gb, p, Kd), gb.float() @ Wf), 8e-3)
 
-# the layer: forward and both gradients, int8 forward + dense weight gradient (the configuration of the runs)
-K.GEMM_BACKEND[0] = "triton"
+# the layer: forward and both gradients, the dense weight gradient
 for (N, Kd) in ((768, 768), (2048, 768), (333, 1000)):
-    l = KernelTernaryLinear(Kd, N, 8, beta=True, int8=True).to(dev)
+    l = KernelTernaryLinear(Kd, N, 8, beta=True).to(dev)
     captured = {}
     l.capture = True
     l.on_grad = lambda layer, g: captured.__setitem__("g", g.clone())

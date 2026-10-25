@@ -49,22 +49,17 @@ def test_act_quant_epilogue_ttf_u():
     assert float(((cs - (g * g).sum(0)).abs() / (g * g).sum(0)).max()) < 1e-5
 
 
-@pytest.mark.parametrize("backend", ["triton", "int8mm", "cublas"])
-def test_gemms(backend):
+def test_gemms():
     from ttf import kernel as Kn
-    Kn.GEMM_BACKEND[0] = backend
-    try:
-        for M, N, K in ((64, 256, 768), (100, 333, 1000)):
-            w = torch.randint(-1, 2, (N, K), dtype=torch.int8, device=dev); p = Kn.pack_rows(w); Wf = w.float()
-            x = torch.randn(M, K, device=dev); xq, xs = Kn.act_quant_i8(x)
-            ref = (xq.float() @ Wf.T) * xs[:, None]
-            y = Kn.tern_gemm_i8(xq, xs, p, K, 1.0).float()
-            assert float((y - ref).norm() / ref.norm()) < 8e-3
-            gy = torch.randn(M, N, device=dev).to(torch.bfloat16)
-            gx = Kn.tern_gemm_dx(gy, p, K).float()
-            assert float((gx - gy.float() @ Wf).norm() / (gy.float() @ Wf).norm()) < 8e-3
-    finally:
-        Kn.GEMM_BACKEND[0] = "triton"
+    for M, N, K in ((64, 256, 768), (100, 333, 1000), (8, 256, 768)):     # (M <= 16: torch._int_mm's fallback)
+        w = torch.randint(-1, 2, (N, K), dtype=torch.int8, device=dev); p = Kn.pack_rows(w); Wf = w.float()
+        x = torch.randn(M, K, device=dev); xq, xs = Kn.act_quant_i8(x)
+        ref = (xq.float() @ Wf.T) * xs[:, None]
+        y = Kn.tern_gemm_i8(xq, xs, p, K, 1.0).float()
+        assert float((y - ref).norm() / ref.norm()) < 8e-3
+        gy = torch.randn(M, N, device=dev).to(torch.bfloat16)
+        gx = Kn.tern_gemm_dx(gy, p, K).float()
+        assert float((gx - gy.float() @ Wf).norm() / (gy.float() @ Wf).norm()) < 8e-3
 
 
 def test_codec_fp12():
@@ -121,35 +116,6 @@ def test_dx_int8x2():
         Kn.DX_I8X2_MIN_N[0] = old
 
 
-def test_fused_scales():
-    import ttf.layers as FL
-    from ttf.layers import KernelTernaryLinear
-    K, N, T = 512, 384, 1000
-    l = KernelTernaryLinear(K, N, int8=True).to(dev)
-    l.row_scale = torch.nn.Parameter((torch.rand(N, device=dev) + 0.5).half())
-    l.col_scale = torch.nn.Parameter((torch.rand(K, device=dev) + 0.5).half())
-    l.enable_lowrank_mag("add", 16); l.mag_A.data.normal_(0, 0.02)
-    l.capture = True
-    x0 = torch.randn(T, K, device=dev, dtype=torch.bfloat16); g0 = torch.randn(T, N, device=dev, dtype=torch.bfloat16)
-    out = {}
-    try:
-        for fz in (False, True):
-            FL.FUSED_SCALES[0] = fz
-            for p in (l.row_scale, l.col_scale, l.mag_A, l.mag_B):
-                p.grad = None
-            x = x0.clone().requires_grad_()
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                y = l(x)
-            y.backward(g0)
-            out[fz] = (y.detach(), x.grad, l.row_scale.grad.float(), l.col_scale.grad.float())
-    finally:
-        FL.FUSED_SCALES[0] = False
-    a, b = out[False], out[True]
-    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
-    for u, v in zip(a[2:], b[2:]):
-        assert float((u - v).norm() / u.norm()) < 1e-2          # the sums of fp16 products in another order
-
-
 def test_lean_adam_batched():
     from ttf.opt_lean import LeanAdam
     shapes = [((300,), torch.float16), ((77,), torch.bfloat16), ((64, 16), torch.bfloat16), ((40, 16), torch.bfloat16)]
@@ -169,12 +135,12 @@ def test_lean_adam_batched():
                 opt.step()
             res[batched] = [p.detach().float().clone() for p in ps]
     finally:
-        torch.rand_like = rl; LeanAdam.BATCHED = False
+        torch.rand_like = rl; LeanAdam.BATCHED = True
     assert max(float((a - b).abs().max()) for a, b in zip(res[False], res[True])) < 1e-6
 
 
 def _cfg(**kw):
-    c = dict(r=512, lr_ratio=1.0, theta=2.0, tau=1000.0, b2=0.95, spend=1.0, tau_anneal=1.0, store_a="", offload=False,
+    c = dict(r=512, lr_ratio=1.0, theta=2.0, tau=1000.0, b2=0.95, spend=1.0, store_a="", offload=False,
              theta_sched=None, progress=0.0, factored=0, start=0, step=10, micro=1)
     c.update(kw)
     return c
@@ -224,7 +190,7 @@ def test_factored_matches_dense():
             x = (torch.randn(T, K, device=dev, generator=gen) + 0.3).to(torch.bfloat16)
             gy[:, :8] *= 20
             l._ts_final = True
-            c = _cfg(r=r, theta=1e9, tau_anneal=0.75, factored=ks, step=10 + s)
+            c = _cfg(r=r, theta=1e9, factored=ks, step=10 + s)
             U.ts_layer(l, (gy, x) if ks else (gy.T.float() @ x.float()).contiguous(), state, c)
         Uu, V = U._load_pair(state[id(l)])
         return Uu @ V.T
@@ -303,7 +269,7 @@ def test_micro_fused_matches_torch():
                 gy = torch.randn(T, N, device=dev, generator=gen) * 1e-3
                 x = torch.randn(T, K, device=dev, generator=gen) + 0.2
                 l._ts_final = i == M - 1
-                U.ts_layer(l, (gy, x), state, _cfg(r=24, theta=1e9, tau_anneal=0.75, factored=64, step=10 + s, micro=M))
+                U.ts_layer(l, (gy, x), state, _cfg(r=24, theta=1e9, factored=64, step=10 + s, micro=M))
         Uu, V = U._load_pair(state[id(l)])
         return Uu @ V.T, state["_ts"][("v", id(l))]
     old = U.MICRO_FUSED[0]
@@ -385,19 +351,18 @@ def test_beta_follows_fused_fire():
             l._ts_final = True
             U.ts_layer(l, (gy, x), state, _cfg(r=16, theta=1e-3, factored=64, step=10 + s))
     finally:
-        U.FIRE_FUSED[0] = False
+        U.FIRE_FUSED[0] = True
     fresh = float(trit_beta(l.wpacked, K))
     assert fresh != b0                                   # trits moved
     assert abs(float(l._cached_beta(l.wpacked)) - fresh) < 1e-7
 
 
-@pytest.mark.parametrize("extra", [["--ttf-offload", "async"], ["--w-cache", "int8"]], ids=["offload_async", "w_cache"])
+@pytest.mark.parametrize("extra", [["--ttf-offload", "async"]], ids=["offload_async"])
 def test_same_losses(tmp_path, extra):
     """options that must not change the numbers: per-step losses identical to the plain run (deterministic mode)"""
     data = str(tmp_path / "tok.bin")
     np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
-    base = ["--ttf-offload", "host"] if extra[0] == "--ttf-offload" else []
-    a = _train(str(tmp_path / "a"), base, 6, data)
+    a = _train(str(tmp_path / "a"), [], 6, data)
     b = _train(str(tmp_path / "b"), extra, 6, data)
     assert a == b, (a, b)
 
@@ -426,13 +391,13 @@ def test_fused_layer(K, N, dx):
     import ttf.layers as L
     from ttf.layers import KernelTernaryLinear
     dev, T = "cuda", 512
-    old = (KN.GEMM_BACKEND[0], L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], KN.DX_I8X2_MIN_N[0])
-    KN.GEMM_BACKEND[0], L.DX_MODE[0], L.FACTORED[0], KN.DX_I8X2_MIN_N[0] = "int8mm", dx, True, 1024
+    old = (L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], KN.DX_I8X2_MIN_N[0])
+    L.DX_MODE[0], L.FACTORED[0], KN.DX_I8X2_MIN_N[0] = dx, True, 1024
     try:
         torch.manual_seed(0)
 
         def mk(k, n):
-            l = KernelTernaryLinear(k, n, 8, beta=True, int8=True).to(dev); l.enable_rc_scale()
+            l = KernelTernaryLinear(k, n, 8, beta=True).to(dev); l.enable_rc_scale()
             l.wpacked.copy_(KN.pack_rows(torch.randint(-1, 2, (n, k), device=dev, dtype=torch.int8)))
             with torch.no_grad():
                 l.row_scale.uniform_(0.5, 1.5); l.col_scale.uniform_(0.5, 1.5)
@@ -442,7 +407,7 @@ def test_fused_layer(K, N, dx):
         a.enable_centering(torch.randn(K, device=dev) * 0.3, torch.randn(N, device=dev) * 0.1)
         ls = [a, b, d, u]; cap = {}
         for i, m in enumerate(ls):
-            m.capture = True; m.ts_micro = True
+            m.capture = True
             m.on_grad = (lambda l_, g_, i=i: cap.setdefault(i, (g_[0].clone(), g_[1].clone())))
         x0 = torch.randn(T, K, device=dev, dtype=torch.bfloat16) * 2
         gy = torch.randn(T, N, device=dev, dtype=torch.bfloat16)
@@ -468,7 +433,7 @@ def test_fused_layer(K, N, dx):
         for (ga, xa), (gb, xb) in zip(A[4], B[4]):
             assert torch.equal(ga, gb) and torch.equal(xa, xb)
     finally:
-        KN.GEMM_BACKEND[0], L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], KN.DX_I8X2_MIN_N[0] = old
+        L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], KN.DX_I8X2_MIN_N[0] = old
 
 
 def test_intk_codes_fire_in_range():
@@ -508,33 +473,6 @@ def test_intk_rows_matches_dense():
     assert int((a.codes != b.codes).sum()) <= 3, int((a.codes != b.codes).sum())
     Ua, Va = sa[id(a)]; Ub, Vb = sb[id(b)]
     assert float((Ua @ Va.T - Ub @ Vb.T).norm() / (Ua @ Va.T).norm()) < 1e-3
-
-
-@pytest.mark.parametrize("dx8", [False, True])
-def test_fused_save_x_bit_identical(dx8):
-    """--fused-save-x: the input kept instead of the centred copy, the centring redone in the backward (same bf16
-    rounding): output, input gradient, scale / bias gradients and the TTF factors identical to the default"""
-    from ttf import layers as L, kernel as KN
-    from ttf.layers import KernelTernaryLinear
-    KN.GEMM_BACKEND[0] = "int8mm"; L.FUSED_LAYER[0] = True
-    old_dx, old_min = L.DX_MODE[0], KN.DX_I8X2_MIN_N[0]
-    L.DX_MODE[0] = "int8x2"; KN.DX_I8X2_MIN_N[0] = 0 if dx8 else 10 ** 9
-    res = {}
-    try:
-        for sx in (False, True):
-            L.FUSED_SAVE_X[0] = sx
-            torch.manual_seed(0)
-            l = KernelTernaryLinear(256, 192, 8, beta=True, int8=True, int8_dx=False).to(dev); l.enable_rc_scale()
-            l.enable_centering(torch.randn(256, device=dev) * 0.1, torch.randn(192, device=dev) * 0.01)
-            got = {}
-            l.capture = True; l.on_grad = lambda l_, g: got.__setitem__("f", tuple(t.clone() for t in g))
-            x = torch.randn(64, 256, device=dev, dtype=torch.bfloat16).requires_grad_(True)
-            y = l(x); y.backward(torch.randn_like(y))
-            res[sx] = [y.detach(), x.grad] + [p.grad for p in (l.col_scale, l.row_scale)] + list(got["f"])
-    finally:
-        L.FUSED_SAVE_X[0] = False; L.DX_MODE[0] = old_dx; KN.DX_I8X2_MIN_N[0] = old_min
-    for a, b in zip(res[False], res[True]):
-        assert torch.equal(a, b)
 
 
 @pytest.mark.parametrize("wdt", [torch.float32, torch.bfloat16])

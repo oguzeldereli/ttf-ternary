@@ -10,7 +10,7 @@ from ttf.kernel import pack_rows
 
 
 def _cfg(**kw):
-    c = dict(r=12, lr_ratio=1.0, theta=1e9, tau=1000.0, b2=0.95, spend=1.0, tau_anneal=1.0, store_a="", offload=False,
+    c = dict(r=12, lr_ratio=1.0, theta=1e9, tau=1000.0, b2=0.95, spend=1.0, store_a="", offload=False,
              theta_sched=None, progress=0.0, factored=16, start=0, step=10, micro=4)
     c.update(kw)
     return c

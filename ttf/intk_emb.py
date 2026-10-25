@@ -161,7 +161,7 @@ def ttf_rows(l, g, state, c, rows=16384):
             U[i:i + rows] = u_of(i) @ V
     else:
         U, V = state[key]
-        U = U * (1 - (lr ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau)
+        U = U * (1 - lr / tau)
         S_ = torch.zeros(K, ra, device=g.device)       # update._acc_turn: u on the old basis, the turn from u^T U
         for i in range(0, N, rows):
             u = u_of(i); U[i:i + rows] += u @ V; S_ += u.T @ U[i:i + rows]; del u
@@ -344,7 +344,7 @@ def _intk_update(l, parts, state, c):
     if old_:
         st[("t", key)] = st.get(("t", key), 0) * M_
     t = st.get(("t", key), 0) + 1; st[("t", key)] = t
-    lk = 1 - (lr_ratio ** float(c["tau_anneal"]) if c["tau_anneal"] else 1.0) / tau
+    lk = 1 - lr_ratio / tau
     k_ = int(c.get("factored") or 0) or 64
     ts_ = (t - 1) // M_
     gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)

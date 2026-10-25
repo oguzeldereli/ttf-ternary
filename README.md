@@ -71,7 +71,7 @@ is an early 60-step probe; a release model (about 40M tokens of recovery with di
   At its leanest it peaks at 9.73 GiB.
 - **Qwen3.8-27B on one 24 GB GPU** (RTX 3090 Ti): converted layer by layer and trained at 32k tokens per step (2 × 8 ×
   2048) in 68.9 s per step, peak 19.7 GB (`recipes/convert-27b.toml`; the whole pipeline: [docs/CONVERT_27B.md](docs/CONVERT_27B.md)).
-- **Micro-batches without a dense gradient** (`--ttf-accum micro`, the default): each micro-batch's gradient enters the state and is
+- **Micro-batches without a dense gradient** (with `--accum M`): each micro-batch's gradient enters the state and is
   discarded; 4 × 4 micro-batches match one pass of batch 16 over the full schedule (2.6733 vs 2.6728) at 3.1 instead of
   7.4 GiB.
 - **State formats:** a 12-bit accumulator (`--ttf-store fp12s`: per-column scale, sign, 5 exponent and 6 mantissa
@@ -116,14 +116,12 @@ short momentum) run from a checkout of that tag (`python -m bitnet.train` there;
 | `--mode ttf / bitnet / fp32` | TTF; BitNet b1.58 (latent weights, STE, AdamW); the full-precision model |
 | `--recipe NAME` | defaults for a setting (`recipes/`: scratch-110m, convert-110m, convert-qwen, convert-27b, continue-27b) |
 | `--ttf-rank R` | rank of each layer's accumulator (512) |
-| `--ttf-theta`, `--ttf-tau`, `--ttf-step-p P`, `--ttf-leak annealed / fixed` | threshold, leak, step scale ρ^P (ρ = lr / peak lr), leak scaled with the step |
-| `--ttf-update fused / after` | each layer's update inside its backward pass (one layer's gradient at a time) |
-| `--ttf-accum micro / sum` | with `--accum M`: the micro-batch update, no dense gradient |
+| `--ttf-theta`, `--ttf-tau`, `--ttf-step-p P` | threshold, leak, step scale ρ^P (ρ = lr / peak lr); the leak scales with the step |
 | `--dw factored / dense`, `--dw-sketch K` | the update from the gradient's factors, the dense weight gradient never formed |
-| `--ttf-store fp32 / fp12s / int8 / ...` | compressed accumulator |
-| `--ttf-offload host / async`, `--ttf-offload-keep F` | state in pinned host memory (all but the first share F of layers); async: copies overlapped with the backward |
+| `--ttf-store fp32 / bf16 / fp12s` | compressed accumulator |
+| `--ttf-offload async`, `--ttf-offload-keep F` | state in pinned host memory (all but the first share F of layers), copies overlapped with the backward |
 | `--adapter-rank R`, `--adapter-init zero / svd` | rank-R float adapter beside the trits (16) |
-| `--init-hf DIR`, `--convert gptqc / gptq / als / ...` | convert a pretrained model (Llama, Qwen3.5 / 3.8, layer by layer) |
+| `--init-hf DIR`, `--convert gptqc / gptq / als / absmean / scratch` | convert a pretrained model (Llama, Qwen3.5 / 3.8, layer by layer) |
 | `--teacher DIR`, `--kd-weight W`, `--kd-cache DIR` | distillation from the full-precision model, or from cached top-k targets |
 | `--ttf-start S` | trits frozen until step S (conversion) |
 | `--tern-emb tied / untied / tied_wide:M` | ternary token embedding (and head), trained by TTF |

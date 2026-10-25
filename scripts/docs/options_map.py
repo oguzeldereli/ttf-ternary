@@ -6,7 +6,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from ttf import args as A  # noqa: E402
 
 SAMPLE = {"--lowrank_mag": "add:16", "--ts_factored": "128", "--lr_wsd": "4000", "--init_mag_svd": "16",
-          "--mode": "kernel"}
+          "--mode": "kernel", "--master_dtype": "fp32", "--init_hf_method": "gptqc", "--kd_mode": "renorm",
+          "--hid_kd": "0", "--ts_store_a": "fp12s", "--ts_tau_anneal_pow": "1", "--extend_to": "0"}
 NOTE = {"--ts": "implied by `--mode ttf`", "--ts_nomom": "implied by `--mode ttf` (TTF has no short momentum)",
         "--ts_vdiag": None, "--ts_vdiag_every": None}
 rows = []
@@ -19,8 +20,12 @@ for f, m in A._LEGACY.items():
         rows.append((f, "removed (no effect at the values the TTF recipes passed)"))
         continue
     v = True if f in A._OLD_BOOL else SAMPLE.get(f, "V")
+    note = getattr(m, "note", "")
+    if note.startswith("removed"):
+        rows.append((f, note + " (the run cannot be repeated with the core)"))
+        continue
     new = " ".join(x for x in m(v) if x is not None)
-    rows.append((f if v is True else f"{f} {v}", new))
+    rows.append((f if v is True else f"{f} {v}", (new or "(nothing)") + (f"; {note}" if note else "")))
 rows.append(("--ts_vdiag --ts_vdiag_every N", "--ttf-vdiag N"))
 rows.append(("--mode master / fp32", "--mode bitnet / fp32"))
 off = [(f, " ".join(n)) for f, n in A._OLD_OFF]
@@ -30,7 +35,10 @@ out = ["# Options map: the trainer's flags before 17 Oct 2026 and the current op
        "e.g. a run's config in the results database). Flags of features that are no longer in the core (the flip "
        "rules, low-rank momentum, look-ahead, TTF with a short momentum and the other experiments) are those of "
        "the trainer at tag `pre-consolidation-2026-10-17` (`python -m bitnet.train` there).", "",
-       "| old | new |", "|---|---|"] + [f"| `{a}` | {b if b.startswith(('removed', 'implied')) else '`' + b + '`'} |" for a, b in rows]
+       "| old | new |", "|---|---|"] + [f"| `{a}` | {b if b.startswith(('removed', 'implied', '(')) else '`' + b.split('; ')[0] + '`' + ('; ' + b.split('; ', 1)[1] if '; ' in b else '')} |" for a, b in rows]
+out += ["", "Removed on 25 Oct 2026 (the measured best is now the only path): an old command line that left out `--int8` "
+        "(the bf16 forward) or `--ts_tau_anneal` (the fixed leak), or ran `--grad_accum` > 1 without `--ts_micro` (one "
+        "update from the summed micro-batch gradients), is refused by `from_legacy`, as are the values marked above."]
 out += ["", "## Old flags that were off by default, now on (an old command line without them)", "",
         "| absent | new equivalent |", "|---|---|"] + [f"| `{a}` | `{b}` |" for a, b in off]
 out += ["", "## Old defaults that differ from the new ones (an old command line without the flag)", "",

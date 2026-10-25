@@ -31,7 +31,6 @@ def build_parser():
     g.add_argument("--seed", type=int, default=None, help="init and data order (default TrainConfig.seed, 1337)")
     g.add_argument("--steps", type=int, default=None, help="the schedule's length (default TrainConfig)")
     g.add_argument("--stop-after", type=int, default=None, help="stop at this step without changing the schedules")
-    g.add_argument("--extend-to", type=int, default=0, help="train past --steps to this step at --min-lr")
 
     g = ap.add_argument_group("data")
     g.add_argument("--data", default=None, help="flat token-id file (train)")
@@ -53,7 +52,6 @@ def build_parser():
     g.add_argument("--tail", default="fp32", choices=["fp32", "lean", "bf16"],
                    help="the float parameters: fp32 + AdamW; lean: bf16 / fp16 + LeanAdam (int8 first moment, factored "
                         "second moment); bf16: bf16 + 8-bit Adam (norm gains cannot train in bf16)")
-    g.add_argument("--tail-batched", action=ON, default=True, help="--tail lean: one pass per shape group")
 
     g = ap.add_argument_group("float extras of the ternary layers")
     g.add_argument("--rc-scale", action=ON, default=True, help="per-row and per-column scales (W = beta r_i c_j q_ij)")
@@ -72,8 +70,6 @@ def build_parser():
 
     g = ap.add_argument_group("TTF (--mode ttf)")
     g.add_argument("--ttf-rank", type=int, default=512, help="rank of each layer's accumulator A = U V^T")
-    g.add_argument("--fused-save-x", action=ON, default=False, help="--fused-layer: keep the layer's input for the "
-                   "backward instead of a centred copy (the readers of one input share it; bit-identical)")
     g.add_argument("--ttf-step-fp32", action=ON, default=False, help="--ttf-accum micro: keep U in fp32 between a step's "
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
     g.add_argument("--ttf-orth", default="qr", choices=["qr", "cholqr2", "spanqr"],
@@ -81,28 +77,20 @@ def build_parser():
                         "fail), or spanqr for ranks <= 512 (the spanqr package on PYTHONPATH) and cholqr2 above")
     g.add_argument("--ttf-theta", type=float, default=16.0, help="firing threshold (in units of the step)")
     g.add_argument("--ttf-theta-sched", default="", help="T0:T1[:START]: theta T0 until fraction START, then linear to T1")
-    g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant (steps)")
-    g.add_argument("--ttf-leak", default="annealed", choices=["annealed", "fixed"],
-                   help="annealed: the leak per step shrinks with the step scale (memory in distance, not steps)")
-    g.add_argument("--ttf-leak-pow", type=float, default=1.0, help="--ttf-leak annealed: leak a^Q / tau, a = step scale")
+    g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant (steps at the "
+                   "peak step scale; the leak per step shrinks with the step scale: the memory is a distance)")
     g.add_argument("--ttf-step-p", type=float, default=0.75, help="the step scale (lr / peak lr)^P")
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")
     g.add_argument("--ttf-spend", type=float, default=1.0, help="a move spends this x theta of the accumulator")
     g.add_argument("--ttf-start", type=int, default=0, help="trits frozen until this step (floats train)")
     g.add_argument("--ttf-acc-scale", type=float, default=None, help="--resume: multiply the accumulators by F "
                    "(continuing at theta F x the old one); required when --ttf-theta differs from the checkpoint's")
-    g.add_argument("--ttf-update", default="fused", choices=["fused", "after"],
-                   help="fused: each layer's update inside its backward (one layer's gradient alive at a time)")
-    g.add_argument("--ttf-accum", default="micro", choices=["micro", "sum"],
-                   help="with --accum > 1: micro: the update sees each micro-batch (no gradient kept across them); "
-                        "sum: one update from the summed gradient")
-    g.add_argument("--ttf-store", default="fp32", choices=["fp32", "bf16", "fp16", "fp16s", "fp12s", "fp8", "int8",
-                                                            "int8det"],
+    g.add_argument("--ttf-store", default="fp32", choices=["fp32", "bf16", "fp12s"],
                    help="storage of U and V (fp12s: 1.5 bytes per value)")
-    g.add_argument("--ttf-offload", default="none", choices=["none", "host", "async"],
-                   help="host: the state in pinned host memory, copied per layer; async: the copies on side streams, "
-                        "prefetched in the update's order (overlapping the backward; the same values)")
-    g.add_argument("--ttf-offload-keep", type=float, default=0.0, help="--ttf-offload host: this share of the layers "
+    g.add_argument("--ttf-offload", default="none", choices=["none", "async"],
+                   help="async: the state in pinned host memory, its copies on side streams, prefetched in the update's "
+                        "order (overlapping the backward; the same values)")
+    g.add_argument("--ttf-offload-keep", type=float, default=0.0, help="--ttf-offload async: this share of the layers "
                    "(module order) keeps its state on the GPU")
     g.add_argument("--ttf-vdiag", type=int, default=0, help="every N steps log g^2 / v (0: off)")
     g.add_argument("--dw", default="factored", choices=["factored", "dense"],
@@ -112,35 +100,20 @@ def build_parser():
     g.add_argument("--dw-thin", default="factored", choices=["factored", "dense"],
                    help="--dw factored: dense = layers with N K < (N + K)(sketch + 2 rank) (thin adapter factors) take "
                         "the dense weight gradient instead (fewer flops and launches; exact g^2 sums, not bit-identical)")
-    g.add_argument("--dw-precision", default="bf16", choices=["bf16", "fp32"],
-                   help="--dw dense: the weight gradient's GEMM output (fp32: no bf16 rounding)")
-    g.add_argument("--fire", default="fused", choices=["fused", "torch"], help="--dw factored: the firing in one kernel")
 
     g = ap.add_argument_group("kernels and memory")
-    g.add_argument("--gemm", default="int8mm", choices=["int8mm", "triton", "cublas"],
-                   help="ternary GEMMs: int8 tensor cores (torch._int_mm), our Triton kernels, or cuBLAS bf16")
-    g.add_argument("--fwd", default="int8", choices=["int8", "bf16"], help="int8: exact int32 forward on 8-bit "
-                   "activations")
-    g.add_argument("--dx", default="int8x2", choices=["bf16", "int8", "int8x2"], help="the input gradient's GEMM "
+    g.add_argument("--dx", default="int8x2", choices=["bf16", "int8x2"], help="the input gradient's GEMM "
                    "(int8x2: gy in two int8 slices on the int8 tensor cores where the summed width is >= 4096, else "
-                   "bf16; as accurate as bf16, the 110M conversion recipe 2.6675 vs 2.6672 with it on every layer; "
-                   "int8: one slice, diverges)")
-    g.add_argument("--fused-scales", action=ON, default=True, help="the scales' and adapter's elementwise work fused")
+                   "bf16; as accurate as bf16, the 110M conversion recipe 2.6675 vs 2.6672 with it on every layer)")
     g.add_argument("--fused-layer", action=ON, default=False,
                    help="int8 ternary layers with row / column scales: the centring, column scale and act-quant in one "
                         "kernel, the GEMM's epilogue with the row scale, bias and the sum of a converted layer's parts, "
                         "the backward's elementwise work in two kernels (output, input gradient and the TTF factors "
                         "bit-identical; the scale / bias gradients summed in fp32)")
-    g.add_argument("--w-cache", default="off", choices=["off", "int8"],
-                   help="int8: each layer's unpacked trits kept between updates (1 byte per weight more; the same "
-                        "values; faster with --gemm int8mm / cublas where memory allows)")
-    g.add_argument("--fused-norm", action=ON, default=True, help="Qwen: RMSNorm in one kernel each way")
-    g.add_argument("--tf32", action=ON, default=False, help="TF32 for fp32 matmuls")
     g.add_argument("--ckpt", default="layer", choices=["layer", "block"],
                    help="activation checkpointing: attention and MLP separately, or each block once (half the memory)")
     g.add_argument("--ckpt-skip", type=int, default=0, help="the last K blocks without checkpointing")
     g.add_argument("--loss-chunk", type=int, default=2048, help="tokens per output-head chunk (memory only)")
-    g.add_argument("--compile", action=ON, default=False, help="torch.compile the elementwise parts")
     g.add_argument("--mem-cap-gib", type=float, default=0.0, help="cap PyTorch's GPU memory (0: no cap)")
     g.add_argument("--pipe", action=ON, default=False, help="Qwen under torchrun: pipeline parallel over the ranks")
     g.add_argument("--pipe-split", default="", help="--pipe: decoder layers per stage, e.g. 17,16,16,15")
@@ -148,19 +121,14 @@ def build_parser():
     g = ap.add_argument_group("conversion and distillation")
     g.add_argument("--init-hf", default="", help="start from a Hugging Face checkpoint (Llama or Qwen3.5 / 3.8)")
     g.add_argument("--convert", default="gptqc",
-                   choices=["gptqc", "gptq", "gptqs", "als", "absmean", "row", "scratch", "native", "random"],
+                   choices=["gptqc", "gptq", "als", "absmean", "scratch"],
                    help="how the weights become trits and scales (gptqc: GPTQ on centred inputs)")
     g.add_argument("--convert-stream", action=ON, default=True, help="Qwen: convert layer by layer from the files")
-    g.add_argument("--head-fused", action=ON, default=False,
-                   help="Qwen: each loss chunk's loss and its gradients in one pass, no checkpoint recompute of the "
-                        "248k-wide logits (ttf/headloss.py; same maths, not bit-identical). Frozen head: CE, KD, top-k "
-                        "cache; trained head: CE and KD (not with --kd-cache or --pipe). No effect on non-Qwen models")
     g.add_argument("--ext", action="append", default=[], metavar="MODULE[:SPEC]",
                    help="a structure / conversion plug-in (ttf/ext.py), e.g. ttfconv.adapters:rank=0.2,alt=1; repeatable, in order")
     g.add_argument("--calib", type=int, default=64, help="calibration windows for gptq / gptqc")
     g.add_argument("--teacher", default="", help="full-precision teacher (Hugging Face dir): loss (1 - W) CE + W KL")
     g.add_argument("--kd-weight", type=float, default=0.75, help="W, the KL term's weight")
-    g.add_argument("--kd-hidden", type=float, default=0.0, help="--teacher: + this x every block update's error")
     g.add_argument("--train-emb", default="none", choices=["none", "head", "both"],
                    help="Qwen: train the output head (head) or the head and the token embedding (both) in the float tail; "
                         "the conversion leaves them frozen")
@@ -177,20 +145,17 @@ def build_parser():
     g.add_argument("--intk-theta-mult", type=float, default=1.0, help="--intk-emb: the codes' theta = --ttf-theta x this "
                    "(inf: the codes frozen, only the group mins / steps train)")
     g.add_argument("--kd-cache", default="", help="precomputed teacher top-k targets (scripts/quant/teacher_topk.py)")
-    g.add_argument("--kd-cache-mode", default="renorm", choices=["renorm", "rest", "sample", "windows"],
+    g.add_argument("--kd-cache-mode", default="renorm", choices=["renorm", "rest", "sample"],
                    help="renorm: KL on the top k renormalised; rest: top k plus one bucket for the remaining mass; sample: "
-                        "top k plus the cache's tail samples (unbiased); windows: the cache's windows only, the online "
-                        "teacher's full distribution as the target (needs --teacher)")
+                        "top k plus the cache's tail samples (unbiased)")
     g.add_argument("--kd-cache-start", type=int, default=0, help="the step that reads the cache's window 0")
     g.add_argument("--moe", default="", help="E:K[:H]: mixture of E ternary experts, top-K routing")
     g.add_argument("--moe-aux", type=float, default=0.01, help="load-balancing loss weight")
     g.add_argument("--tern-emb", default="none", help="none | tied | untied | tied_wide[:M]: ternary token embedding")
-    g.add_argument("--bitnet-dtype", default="fp32", choices=["fp32", "bf16"], help="--mode bitnet: latent dtype")
 
     g = ap.add_argument_group("evaluation, checkpoints, diagnostics")
     g.add_argument("--eval-interval", type=int, default=None)
     g.add_argument("--eval-iters", type=int, default=None)
-    g.add_argument("--eval-first-n", type=int, default=0, help="before training: loss over the first N val windows")
     g.add_argument("--save-secs", type=float, default=900.0, help="seconds between checkpoint saves")
     g.add_argument("--snap-every", type=int, default=0, help="also keep ckpt_<step>.pt every N steps")
     g.add_argument("--final-save", action=ON, default=True, help="checkpoint at the end")
@@ -230,7 +195,6 @@ def resolve(a):
     a.factored_k = a.dw_sketch if (a.mode == "ttf" and a.dw == "factored") else 0
     a.svd_rank = a.adapter_rank if a.adapter_init == "svd" else 0
     a.u32 = a.data_dtype == "u32"
-    a.micro = a.ttf_accum == "micro"
     if a.adapter_schedule:
         f = a.adapter_schedule.split(":")
         if len(f) < 2 or int(f[0]) != a.adapter_rank or int(f[1]) >= int(f[0]) or int(f[1]) < 1:
@@ -245,58 +209,80 @@ def resolve(a):
 # None: removed with no effect at the values the recipes passed (or a feature only in the trainer at tag pre-consolidation-2026-10-17)
 _SAME = lambda new: (lambda v: [new] if v is True else [new, v])
 _FLAG = lambda new, val: (lambda v: [new, val])
+_TAG = "the old trainer only: tag pre-consolidation-2026-10-17, python -m bitnet.train there"
+
+
+def _gone(what):
+    """a feature removed from the core (25 Oct 2026): a run that used it cannot be repeated here"""
+    def f(v):
+        raise ValueError(f"{what}: removed ({_TAG})")
+    f.note = "removed 25 Oct 2026"
+    return f
+
+
+def _keep_if(ok, then, what):
+    """the value translates by then(v) when ok(v), else the run used a removed setting"""
+    def f(v):
+        if not ok(v):
+            raise ValueError(f"{what} {v}: removed ({_TAG})")
+        return then(v)
+    f.note = "other values: removed 25 Oct 2026"
+    return f
+
+
 _LEGACY = {
     "--preset": _SAME("--preset"), "--data": _SAME("--data"), "--val": _SAME("--val"), "--steps": _SAME("--steps"),
     "--batch_size": _SAME("--batch-size"), "--grad_accum": _SAME("--accum"), "--seq_len": _SAME("--seq-len"),
     "--mode": lambda v: ["--mode", {"kernel": "ttf", "master": "bitnet", "fp32": "fp32"}[v]],
-    "--master_dtype": _SAME("--bitnet-dtype"), "--lowrank": _SAME("--ttf-rank"), "--profile": _SAME("--profile"),
+    "--master_dtype": _keep_if(lambda v: v == "fp32", lambda v: [], "--master_dtype"), "--lowrank": _SAME("--ttf-rank"), "--profile": _SAME("--profile"),
     "--qk_temp": _FLAG("--qk-temp", None), "--lowrank_mag": lambda v: ["--adapter-rank", v.split(":")[1]],
     "--mag_wd": _SAME("--adapter-wd"), "--mag_lr_mult": _SAME("--adapter-lr-mult"), "--ts": None,
     "--ts_theta": _SAME("--ttf-theta"), "--mem_cap_gib": _SAME("--mem-cap-gib"), "--init_hf": _SAME("--init-hf"),
-    "--init_hf_method": _SAME("--convert"), "--distill": _SAME("--teacher"), "--distill_w": _SAME("--kd-weight"),
-    "--kd_cache": _SAME("--kd-cache"), "--kd_mode": _SAME("--kd-cache-mode"),
+    "--init_hf_method": _keep_if(lambda v: v in ("gptqc", "gptq", "als", "absmean", "scratch"), _SAME("--convert"),
+                                 "--init_hf_method"), "--distill": _SAME("--teacher"), "--distill_w": _SAME("--kd-weight"),
+    "--kd_cache": _SAME("--kd-cache"), "--kd_mode": _keep_if(lambda v: v != "windows", _SAME("--kd-cache-mode"), "--kd_mode"),
     "--kd_cache_start": _SAME("--kd-cache-start"), "--moe": _SAME("--moe"), "--moe_aux": _SAME("--moe-aux"),
     "--init_stream": _FLAG("--convert-stream", None), "--data_u32": _FLAG("--data-dtype", "u32"),
-    "--hid_kd": _SAME("--kd-hidden"), "--init_calib": _SAME("--calib"), "--ts_theta_sched": _SAME("--ttf-theta-sched"),
+    "--hid_kd": _keep_if(lambda v: float(v) == 0, lambda v: [], "--hid_kd"), "--init_calib": _SAME("--calib"), "--ts_theta_sched": _SAME("--ttf-theta-sched"),
     "--ts_start": _SAME("--ttf-start"), "--ts_vdiag": None, "--ts_vdiag_every": None, "--ts_nomom": None,
-    "--ts_spend": _SAME("--ttf-spend"), "--gemm": _SAME("--gemm"), "--ts_store_a": _SAME("--ttf-store"),
+    "--ts_spend": _SAME("--ttf-spend"), "--gemm": None,
+    "--ts_store_a": _keep_if(lambda v: v in ("", "none", "fp32", "bf16", "fp12s"),
+                             lambda v: ["--ttf-store", v if v in ("bf16", "fp12s") else "fp32"], "--ts_store_a"),
     "--tern_emb": _SAME("--tern-emb"), "--lr_linear": _FLAG("--lr-schedule", "linear"),
     "--lr_wsd": lambda v: ["--lr-schedule", f"wsd:{v}"] if int(v) else [], "--lr_rewarm": _SAME("--lr-rewarm"),
-    "--lean_batched": _FLAG("--tail-batched", None), "--lean_tail": _FLAG("--tail", "lean"),
-    "--init_mag_svd": lambda v: ["--adapter-init", "svd"] if int(v) else [], "--ts_fire_fused": _FLAG("--fire", "fused"),
-    "--ts_acc_scale": _SAME("--ttf-acc-scale"), "--fused_norm": _FLAG("--fused-norm", None),
-    "--fused_scales": _FLAG("--fused-scales", None), "--ts_factored": lambda v: ["--dw", "factored", "--dw-sketch", v] if int(v) else ["--dw", "dense"],
-    "--ts_micro": _FLAG("--ttf-accum", "micro"), "--ckpt_block": _FLAG("--ckpt", "block"),
+    "--lean_batched": None, "--lean_tail": _FLAG("--tail", "lean"),
+    "--init_mag_svd": lambda v: ["--adapter-init", "svd"] if int(v) else [], "--ts_fire_fused": None,
+    "--ts_acc_scale": _SAME("--ttf-acc-scale"), "--fused_norm": None,
+    "--fused_scales": None, "--ts_factored": lambda v: ["--dw", "factored", "--dw-sketch", v] if int(v) else ["--dw", "dense"],
+    "--ts_micro": None, "--ckpt_block": _FLAG("--ckpt", "block"),
     "--no_final_save": _FLAG("--no-final-save", None), "--mem_snapshot": _SAME("--mem-snapshot"),
-    "--eval_first_n": _SAME("--eval-first-n"), "--mem_report": _FLAG("--mem-report", None),
-    "--ts_offload": _FLAG("--ttf-offload", "host"), "--ts_offload_async": None, "--dw_fp32": _FLAG("--dw-precision", "fp32"),
-    "--w_cache": _SAME("--w-cache"), "--ts_offload_keep": _SAME("--ttf-offload-keep"),
-    "--ts_fused": _FLAG("--ttf-update", "fused"), "--ts_anneal": _SAME("--ttf-step-p"),
-    "--ts_tau_anneal_pow": _SAME("--ttf-leak-pow"), "--ts_tau_anneal": _FLAG("--ttf-leak", "annealed"),
-    "--ts_tau": _SAME("--ttf-tau"), "--ts_b2": _SAME("--ttf-b2"), "--tf32": _FLAG("--tf32", None),
-    "--int8": _FLAG("--fwd", "int8"), "--int8_dx": _FLAG("--dx", "int8"), "--stop_after": _SAME("--stop-after"),
+    "--eval_first_n": None, "--mem_report": _FLAG("--mem-report", None),
+    "--ts_offload": _FLAG("--ttf-offload", "async"), "--ts_offload_async": _FLAG("--ttf-offload", "async"),
+    "--dw_fp32": _gone("--dw_fp32 (the dense weight gradient's GEMM in fp32)"), "--w_cache": None, "--ts_offload_keep": _SAME("--ttf-offload-keep"),
+    "--ts_fused": None, "--ts_anneal": _SAME("--ttf-step-p"),
+    "--ts_tau_anneal_pow": _keep_if(lambda v: float(v) == 1, lambda v: [], "--ts_tau_anneal_pow"), "--ts_tau_anneal": None,
+    "--ts_tau": _SAME("--ttf-tau"), "--ts_b2": _SAME("--ttf-b2"), "--tf32": None,
+    "--int8": None, "--int8_dx": _gone("--int8_dx (the input gradient in one int8 slice)"), "--stop_after": _SAME("--stop-after"),
     "--snap_every": _SAME("--snap-every"), "--tail_fp32": _FLAG("--tail", "fp32"), "--seed": _SAME("--seed"),
     "--track_flips": _FLAG("--track-flips", None), "--resume": _FLAG("--resume", None), "--out_dir": _SAME("--out-dir"),
-    "--lr": _SAME("--lr"), "--warmup": _SAME("--warmup"), "--extend_to": _SAME("--extend-to"),
+    "--lr": _SAME("--lr"), "--warmup": _SAME("--warmup"), "--extend_to": _keep_if(lambda v: int(v) == 0, lambda v: [], "--extend_to"),
     "--weight_decay": _SAME("--weight-decay"), "--min_lr": _SAME("--min-lr"), "--eval_interval": _SAME("--eval-interval"),
     "--eval_iters": _SAME("--eval-iters"), "--loss_chunk": _SAME("--loss-chunk"), "--save_secs": _SAME("--save-secs"),
     "--max_temp": _SAME("--max-temp"), "--resume_temp": _SAME("--resume-temp"), "--rc_scale": _FLAG("--rc-scale", None),
-    "--rc_lr": _SAME("--rc-lr"), "--compile": _FLAG("--compile", None), "--pipe": _FLAG("--pipe", None),
+    "--rc_lr": _SAME("--rc-lr"), "--compile": None, "--pipe": _FLAG("--pipe", None),
     "--pipe_split": _SAME("--pipe-split"), "--ckpt_skip": _SAME("--ckpt-skip"), "--temp_check": _SAME("--temp-check"),
     # no effect in the TTF recipes (the stateless flip rule's knobs, the dense weight gradient, look-ahead off, the
-    # short momentum's rank under --ts_nomom)
+    # short momentum's rank under --ts_nomom); above, None also marks a speed switch whose path is now the only one
+    # (the int8 GEMMs, the fused kernels, the update inside the backward, the batched LeanAdam, TF32, compile, the
+    # trit cache) or a diagnostic that went (--eval_first_n)
     "--rate": None, "--rate_peak": None, "--rate_warmup": None, "--rate_schedule": None, "--g_ref": None,
     "--dw_mode": None, "--lookahead": None, "--ts_rank_s": None,
 }
 # flags whose old meaning is off when absent but whose new option defaults to on (or to another value)
 _OLD_OFF = [("--qk_temp", ["--no-qk-temp"]), ("--rc_scale", ["--no-rc-scale"]), ("--lowrank_mag", ["--adapter-rank", "0"]),
-            ("--ts_fused", ["--ttf-update", "after"]), ("--ts_micro", ["--ttf-accum", "sum"]),
-            ("--ts_factored", ["--dw", "dense"]), ("--ts_fire_fused", ["--fire", "torch"]),
-            ("--int8", ["--fwd", "bf16"]), ("--fused_scales", ["--no-fused-scales"]),
-            ("--fused_norm", ["--no-fused-norm"]), ("--lean_batched", ["--no-tail-batched"]),
-            ("--init_stream", ["--no-convert-stream"]), ("--ts_tau_anneal", ["--ttf-leak", "fixed"])]
+            ("--ts_factored", ["--dw", "dense"]), ("--init_stream", ["--no-convert-stream"])]
 # old defaults that differ from the new ones
-_OLD_DEFAULTS = [("--mode", ["--mode", "ttf"]), ("--gemm", ["--gemm", "triton"]), ("--ts_tau", ["--ttf-tau", "300"]),
+_OLD_DEFAULTS = [("--mode", ["--mode", "ttf"]), ("--ts_tau", ["--ttf-tau", "300"]),
                  ("--ts_anneal", ["--ttf-step-p", "1.0"]), ("--lowrank", ["--ttf-rank", "0"]),
                  ("--init_hf_method", ["--convert", "als"]), ("--distill_w", ["--kd-weight", "1.0"]),
                  ("--mag_wd", ["--adapter-wd", "0.0"])]
@@ -331,8 +317,6 @@ def from_legacy(argv):
             out += [x for x in m(v) if x is not None]
     if vd[0]:
         out += ["--ttf-vdiag", str(vd[1] or 1)]
-    if "--ts_offload_async" in argv:
-        out += ["--ttf-offload", "async"]          # (with or without --ts_offload)
     for f, new in _OLD_OFF + _OLD_DEFAULTS:
         if f not in seen:
             out += new
@@ -343,4 +327,10 @@ def from_legacy(argv):
         raise ValueError("kernel mode without --ts (a flip rule): the old trainer only (tag pre-consolidation-2026-10-17)")
     if mode == "kernel" and "--ts_nomom" not in seen:
         raise ValueError("--ts without --ts_nomom (TTF with a short momentum): the old trainer only (tag pre-consolidation-2026-10-17)")
+    if mode == "kernel":    # off when absent in the old trainer, removed from the core since (25 Oct 2026)
+        acc = int(([argv[j + 1] for j, x in enumerate(argv[:-1]) if x == "--grad_accum"] or ["1"])[-1])
+        for f, what in (("--int8", "the bf16 forward (no --int8)"), ("--ts_tau_anneal", "the fixed leak (no --ts_tau_anneal)")) + \
+                ((("--ts_micro", "one update from the summed micro-batch gradients (no --ts_micro)"),) if acc > 1 else ()):
+            if f not in seen:
+                raise ValueError(f"{what}: removed ({_TAG})")
     return out

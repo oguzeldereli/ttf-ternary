@@ -47,7 +47,7 @@ if not a.skip_fp:
     m, sw = build_qwen(a.hf_dir, "fp32", grad_checkpoint=False, device=dev); load_qwen(m, a.hf_dir, sw); m.eval()
     print(f"fp: model forward {loss_model(m):.4f}, stepped layer by layer {loss_stepped(m):.4f}", flush=True)
     del m; torch.cuda.empty_cache()
-mk = lambda i, o: KernelTernaryLinear(i, o, 8, beta=True, int8=True)
+mk = lambda i, o: KernelTernaryLinear(i, o, 8, beta=True)
 for meth in a.methods.split(","):
     m, sw = build_qwen(a.hf_dir, "kernel", make_linear=mk, grad_checkpoint=False, device=dev); enable_rc_scales(m); m.eval()
     t = time.time(); convert_qwen_streaming(m, a.hf_dir, sw, a.calib_data, method=meth, n_seq=64, seq=a.seq)

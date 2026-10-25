@@ -71,7 +71,7 @@ del m; torch.cuda.empty_cache()
 hess = calib_hessians_qwen(a.hf_dir, a.calib_data or a.data.replace("_val", "_train"), n_seq=a.calib, seq=a.seq) \
     if "gptq" in a.methods.split(",") else None
 for meth in [x for x in a.methods.split(",") if x]:
-    mk = lambda i, o: KernelTernaryLinear(i, o, 8, beta=True, int8=True)
+    mk = lambda i, o: KernelTernaryLinear(i, o, 8, beta=True)
     m, sw = build_qwen(a.hf_dir, "kernel", make_linear=mk, grad_checkpoint=False, device=dev)
     enable_rc_scales(m)
     t = time.time(); load_qwen(m, a.hf_dir, sw, method=meth, hess=hess)

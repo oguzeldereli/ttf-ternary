@@ -13,7 +13,7 @@ from ttf import update as U
 
 
 def _cfg(**kw):
-    c = dict(r=16, lr_ratio=1.0, theta=1e9, tau=1000.0, b2=0.95, spend=1.0, tau_anneal=1.0, store_a="", offload=False,
+    c = dict(r=16, lr_ratio=1.0, theta=1e9, tau=1000.0, b2=0.95, spend=1.0, store_a="", offload=False,
              theta_sched=None, progress=0.0, factored=16, start=0, step=10, micro=1)
     c.update(kw)
     return c
@@ -226,7 +226,7 @@ def test_fire_scale_ratio():
     assert int((m.codes[:, 64:] == 2).sum()) == N * 64 and int((m.codes[:, :64] == 1).sum()) == N * 64
 
 
-@pytest.mark.parametrize("codec", ["fp12s", "bf16", "int8det"])
+@pytest.mark.parametrize("codec", ["fp12s", "bf16"])
 def test_store_codecs(codec):
     """the per-chunk encoded store (--ttf-store): the accumulator after a few micro-batch steps close to the fp32 one"""
     N, K, T, M = 300, 64, 24, 2

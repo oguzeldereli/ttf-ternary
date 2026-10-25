@@ -1,13 +1,10 @@
-"""Triton packed-ternary GEMM.
+"""The ternary layer's kernels.
 
-Weight is stored packed 5 trits/byte along the K (input) dimension, one row per
-output feature: wpacked[N, K5] uint8, K5 = ceil(K/5). The kernel loads a byte,
-decodes 5 trits {-1,0,1} in registers, and accumulates x*trit — so the dense
-bf16 weight is never materialized in global memory. y = x @ W^T.
-
-Forward runs on the kernel (also the inference path). Backward re-derives the
-weight transiently for one layer at a time (grad_x and the flip), which is
-already memory-bounded.
+Weights are stored packed 5 trits per byte along the K (input) dimension, one row per output feature: wpacked[N, K5]
+uint8, K5 = ceil(K/5). The GEMMs unpack them per call (int8 for the forward and the int8x2 input gradient on the int8
+tensor cores, bf16 for the bf16 input gradient); the forward on 8-bit activation codes is exact (int32 accumulation).
+The rest: the TTF update's kernels (firing, sketches, the fp12 codec) and the fused elementwise work of the layer and
+of Qwen's norms.
 """
 from __future__ import annotations
 import os
@@ -19,13 +16,6 @@ _P3 = [1, 3, 9, 27, 81]
 
 
 _P3_DEV = {}
-
-
-# --gemm cublas: the ternary GEMMs go through cuBLAS in bf16 on weights unpacked per call (transient [N, K] bf16).
-# --gemm int8mm: the same, except the int8-activation forward, which runs int8 x int8 on the int8 tensor cores.
-# int8 codes and trits are exact in bf16 and cuBLAS accumulates in fp32, so the result matches the Triton kernels up
-# to the order of summation; on the A100 the Triton kernels were ~4x slower than cuBLAS (1.3B profile, 2 Oct).
-GEMM_BACKEND = ["triton"]
 
 
 def _mm_f32(a, b):
@@ -187,133 +177,15 @@ def popcount(mask: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
     return tot
 
 
-def _configs():
-    cfgs = []
-    for BM in (64, 128):
-        for BN in (64, 128):
-            for BK5 in (16, 32):
-                for w in (4, 8):
-                    for s in (2, 3):
-                        cfgs.append(triton.Config(
-                            {"BM": BM, "BN": BN, "BK5": BK5},
-                            num_warps=w, num_stages=s))
-    return cfgs
-
-
-@triton.autotune(configs=_configs(), key=["N", "K"])
-@triton.jit
-def _tern_gemm_kernel(x_ptr, w_ptr, y_ptr, M, N, K, K5,
-                      sxm, sxk, swn, swk, sym, syn,
-                      BM: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offm = pid_m * BM + tl.arange(0, BM)
-    offn = pid_n * BN + tl.arange(0, BN)
-    acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for k5 in range(0, K5, BK5):
-        offk5 = k5 + tl.arange(0, BK5)
-        w = tl.load(w_ptr + offn[:, None] * swn + offk5[None, :] * swk,
-                    mask=(offn[:, None] < N) & (offk5[None, :] < K5),
-                    other=0).to(tl.int32)                       # [BN, BK5]
-        for j in tl.static_range(5):
-            trit = ((w // (3 ** j)) % 3 - 1).to(tl.bfloat16)      # [BN, BK5]
-            offkx = offk5 * 5 + j                                # x column index
-            xj = tl.load(x_ptr + offm[:, None] * sxm + offkx[None, :] * sxk,
-                         mask=(offm[:, None] < M) & (offkx[None, :] < K),
-                         other=0.0).to(tl.bfloat16)               # [BM, BK5]
-            acc += tl.dot(xj, tl.trans(trit))
-    y = acc.to(tl.bfloat16)
-    tl.store(y_ptr + offm[:, None] * sym + offn[None, :] * syn, y,
-             mask=(offm[:, None] < M) & (offn[None, :] < N))
-
-
-@triton.autotune(configs=_configs(), key=["N", "K"])
-@triton.jit
-def _dx_kernel(gy_ptr, w_ptr, gx_ptr, M, N, K, K5,
-               sgm, sgn, swn, swk, sxm, sxk,
-               BM: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr):
-    # grad_x[m, k] = sum_n gy[m, n] * W[n, k]   (contract over N)
-    pid_m = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    offm = pid_m * BM + tl.arange(0, BM)
-    offk5 = pid_k * BK5 + tl.arange(0, BK5)
-    a0 = tl.zeros((BM, BK5), tl.float32)
-    a1 = tl.zeros((BM, BK5), tl.float32)
-    a2 = tl.zeros((BM, BK5), tl.float32)
-    a3 = tl.zeros((BM, BK5), tl.float32)
-    a4 = tl.zeros((BM, BK5), tl.float32)
-    for n0 in range(0, N, BN):
-        offn = n0 + tl.arange(0, BN)
-        gy = tl.load(gy_ptr + offm[:, None] * sgm + offn[None, :] * sgn,
-                     mask=(offm[:, None] < M) & (offn[None, :] < N),
-                     other=0.0).to(tl.bfloat16)                  # [BM, BN]
-        w = tl.load(w_ptr + offn[:, None] * swn + offk5[None, :] * swk,
-                    mask=(offn[:, None] < N) & (offk5[None, :] < K5),
-                    other=0).to(tl.int32)                       # [BN, BK5]
-        a0 += tl.dot(gy, (((w // 1) % 3 - 1)).to(tl.bfloat16))
-        a1 += tl.dot(gy, (((w // 3) % 3 - 1)).to(tl.bfloat16))
-        a2 += tl.dot(gy, (((w // 9) % 3 - 1)).to(tl.bfloat16))
-        a3 += tl.dot(gy, (((w // 27) % 3 - 1)).to(tl.bfloat16))
-        a4 += tl.dot(gy, (((w // 81) % 3 - 1)).to(tl.bfloat16))
-    for j in tl.static_range(5):
-        aj = a0 * (j == 0) + a1 * (j == 1) + a2 * (j == 2) + a3 * (j == 3) + a4 * (j == 4)
-        offkx = offk5 * 5 + j
-        tl.store(gx_ptr + offm[:, None] * sxm + offkx[None, :] * sxk,
-                 aj.to(tl.bfloat16),
-                 mask=(offm[:, None] < M) & (offkx[None, :] < K))
-
-
-def tern_gemm_dx(gy: torch.Tensor, wpacked: torch.Tensor, K: int, w8=None) -> torch.Tensor:
-    """grad_x = gy @ decode(wpacked), gy [M,N] -> [M,K]. Packed weight, no unpack (Triton); cuBLAS: unpacked to bf16
-    per call, or cast from the cached int8 trits w8 (--w-cache)."""
-    if GEMM_BACKEND[0] in ("cublas", "int8mm"):
-        wb = w8.to(torch.bfloat16) if w8 is not None else _w_bf16(wpacked, K)
-        return torch.mm(gy.contiguous().to(torch.bfloat16), wb)
-    M, N = gy.shape
-    Nw, K5 = wpacked.shape
-    gy = gy.contiguous().to(torch.bfloat16)
-    gx = torch.empty(M, K, dtype=torch.bfloat16, device=gy.device)
-    grid = lambda meta: (triton.cdiv(M, meta["BM"]), triton.cdiv(K5, meta["BK5"]))
-    _dx_kernel[grid](gy, wpacked, gx, M, N, K, K5,
-                     gy.stride(0), gy.stride(1), wpacked.stride(0), wpacked.stride(1),
-                     gx.stride(0), gx.stride(1))
-    return gx
-
-
-def tern_gemm(x: torch.Tensor, wpacked: torch.Tensor, K: int) -> torch.Tensor:
-    """x [M,K] (fp16/bf16) @ decode(wpacked)^T -> y [M,N] fp16."""
-    if GEMM_BACKEND[0] in ("cublas", "int8mm"):
-        return torch.mm(x.contiguous().to(torch.bfloat16), _w_bf16(wpacked, K).t())
-    M, Kx = x.shape
-    assert Kx == K, (Kx, K)
-    N, K5 = wpacked.shape
-    x = x.contiguous().to(torch.bfloat16)
-    y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
-    grid = lambda meta: (triton.cdiv(M, meta["BM"]), triton.cdiv(N, meta["BN"]))
-    _tern_gemm_kernel[grid](
-        x, wpacked, y, M, N, K, K5,
-        x.stride(0), x.stride(1), wpacked.stride(0), wpacked.stride(1),
-        y.stride(0), y.stride(1))
-    return y
+def tern_gemm_dx(gy: torch.Tensor, wpacked: torch.Tensor, K: int) -> torch.Tensor:
+    """grad_x = gy @ decode(wpacked), gy [M, N] -> bf16 [M, K]: cuBLAS in bf16 on the trits unpacked per call"""
+    return torch.mm(gy.contiguous().to(torch.bfloat16), _w_bf16(wpacked, K))
 
 
 # =============================================================================
-# int8 path (Phase 4a/4b): trits decode to int8 and feed the s8 tensor cores.
-# Activations are already 8-bit (per-token absmax), so the FORWARD is lossless:
-# |acc| <= K * 127 fits int32 exactly, where the bf16 path rounded partial sums.
+# int8 path: trits decode to int8 and feed the s8 tensor cores. Activations are already 8-bit (per-token absmax), so
+# the forward is lossless: |acc| <= K * 127 fits int32 exactly.
 # =============================================================================
-
-def _i8_configs():
-    cfgs = []
-    for BM in (64, 128):
-        for BN in (64, 128):
-            for BK5 in (32, 64):          # s8 mma contracts k=32
-                for w in (4, 8):
-                    for st in (2, 3):
-                        cfgs.append(triton.Config(
-                            {"BM": BM, "BN": BN, "BK5": BK5}, num_warps=w, num_stages=st))
-    return cfgs
-
 
 def act_quant_i8(x: torch.Tensor, bits: int = 8):
     """Per-token symmetric absmax quantization -> (int8 codes, scale) with x ~ q*scale."""
@@ -324,35 +196,6 @@ def act_quant_i8(x: torch.Tensor, bits: int = 8):
     return q, scale.squeeze(-1)
 
 
-@triton.autotune(configs=_i8_configs(), key=["N", "K"])
-@triton.jit
-def _tern_gemm_i8_kernel(x_ptr, w_ptr, y_ptr, xs_ptr, M, N, K, K5,
-                         sxm, sxk, swn, swk, sym, syn, beta_ptr,
-                         BM: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    offm = pid_m * BM + tl.arange(0, BM)
-    offn = pid_n * BN + tl.arange(0, BN)
-    acc = tl.zeros((BM, BN), dtype=tl.int32)
-    for k5 in range(0, K5, BK5):
-        offk5 = k5 + tl.arange(0, BK5)
-        w = tl.load(w_ptr + offn[:, None] * swn + offk5[None, :] * swk,
-                    mask=(offn[:, None] < N) & (offk5[None, :] < K5),
-                    other=0).to(tl.int32)                        # [BN, BK5]
-        for j in tl.static_range(5):
-            trit = ((w // (3 ** j)) % 3 - 1).to(tl.int8)          # [BN, BK5]
-            offkx = offk5 * 5 + j
-            xj = tl.load(x_ptr + offm[:, None] * sxm + offkx[None, :] * sxk,
-                         mask=(offm[:, None] < M) & (offkx[None, :] < K),
-                         other=0).to(tl.int8)                     # [BM, BK5]
-            acc += tl.dot(xj, tl.trans(trit), out_dtype=tl.int32)
-    xs = tl.load(xs_ptr + offm, mask=offm < M, other=0.0).to(tl.float32)
-    beta = tl.load(beta_ptr).to(tl.float32)
-    y = acc.to(tl.float32) * (xs[:, None] * beta)
-    tl.store(y_ptr + offm[:, None] * sym + offn[None, :] * syn, y.to(tl.bfloat16),
-             mask=(offm[:, None] < M) & (offn[None, :] < N))
-
-
 def _dev_scalar(v, device):
     """A 0-dim fp32 device tensor: tensors pass through (no host sync), floats are filled on device."""
     if torch.is_tensor(v):
@@ -360,89 +203,18 @@ def _dev_scalar(v, device):
     return torch.full((), float(v), dtype=torch.float32, device=device)
 
 
-def tern_gemm_i8(xq: torch.Tensor, xs: torch.Tensor, wpacked: torch.Tensor, K: int,
-                 beta=1.0, w8=None) -> torch.Tensor:
-    """int8 x [M,K] (codes) @ decode(wpacked)^T * xs[:,None] * beta -> bf16 [M,N].
-    beta: float or a 0-dim device tensor (read in the kernel, so no host sync). w8: the unpacked int8 trits [N, K] if
-    the caller holds them (--w-cache), else they are unpacked here."""
-    if GEMM_BACKEND[0] == "int8mm":
-        # --gemm int8mm: int8 activation codes x int8 trits on the int8 tensor cores (cuBLASLt via torch._int_mm),
-        # int32 accumulation: exact; the trits are unpacked per call to int8 (1 byte per weight, half of bf16)
-        if w8 is None:
-            w8 = unpack_fast(wpacked, K)
-        M_, N_ = xq.shape[0], w8.shape[0]
-        if M_ > 16 and K % 16 == 0 and N_ % 8 == 0:   # (K % 16: cuBLASLt int8 on Blackwell sm_120 refuses K 8 / 24
-            y32 = torch._int_mm(xq.contiguous(), w8.t())  # with N 48, the rank-8 adapters of in_proj_a / b; Ada took them)
-            if y32.is_contiguous():
-                return i8_epilogue(y32, xs, beta)
-            return (y32.float() * xs.float()[:, None] * beta).to(torch.bfloat16)
-        return (_mm_f32(xq.to(torch.bfloat16), w8.to(torch.bfloat16).t()) * xs.float()[:, None] * beta).to(torch.bfloat16)
-    if GEMM_BACKEND[0] in ("cublas", "int8mm"):
-        y = _mm_f32(xq.to(torch.bfloat16), _w_bf16(wpacked, K).t()) * xs.float()[:, None] * beta
-        return y.to(torch.bfloat16)
-    M, Kx = xq.shape
-    assert Kx == K, (Kx, K)
-    N, K5 = wpacked.shape
-    xq = xq.contiguous()
-    y = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device)
-    grid = lambda meta: (triton.cdiv(M, meta["BM"]), triton.cdiv(N, meta["BN"]))
-    _tern_gemm_i8_kernel[grid](xq, wpacked, y, xs.contiguous().float(), M, N, K, K5,
-                               xq.stride(0), xq.stride(1), wpacked.stride(0),
-                               wpacked.stride(1), y.stride(0), y.stride(1),
-                               _dev_scalar(beta, xq.device))
-    return y
-
-
-@triton.autotune(configs=_i8_configs(), key=["N", "K"])
-@triton.jit
-def _dx_i8_kernel(g_ptr, w_ptr, gx_ptr, gs_ptr, M, N, K, K5,
-                  sgm, sgn, swn, swk, sxm, sxk,
-                  BM: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr):
-    # grad_x[m, k] = sum_n gy[m, n] * W[n, k], gy quantized to int8 per row.
-    pid_m = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    offm = pid_m * BM + tl.arange(0, BM)
-    offk5 = pid_k * BK5 + tl.arange(0, BK5)
-    a0 = tl.zeros((BM, BK5), tl.int32)
-    a1 = tl.zeros((BM, BK5), tl.int32)
-    a2 = tl.zeros((BM, BK5), tl.int32)
-    a3 = tl.zeros((BM, BK5), tl.int32)
-    a4 = tl.zeros((BM, BK5), tl.int32)
-    for n0 in range(0, N, BN):
-        offn = n0 + tl.arange(0, BN)
-        gy = tl.load(g_ptr + offm[:, None] * sgm + offn[None, :] * sgn,
-                     mask=(offm[:, None] < M) & (offn[None, :] < N),
-                     other=0).to(tl.int8)                          # [BM, BN]
-        w = tl.load(w_ptr + offn[:, None] * swn + offk5[None, :] * swk,
-                    mask=(offn[:, None] < N) & (offk5[None, :] < K5),
-                    other=0).to(tl.int32)                          # [BN, BK5]
-        a0 += tl.dot(gy, (((w // 1) % 3 - 1)).to(tl.int8), out_dtype=tl.int32)
-        a1 += tl.dot(gy, (((w // 3) % 3 - 1)).to(tl.int8), out_dtype=tl.int32)
-        a2 += tl.dot(gy, (((w // 9) % 3 - 1)).to(tl.int8), out_dtype=tl.int32)
-        a3 += tl.dot(gy, (((w // 27) % 3 - 1)).to(tl.int8), out_dtype=tl.int32)
-        a4 += tl.dot(gy, (((w // 81) % 3 - 1)).to(tl.int8), out_dtype=tl.int32)
-    gs = tl.load(gs_ptr + offm, mask=offm < M, other=0.0).to(tl.float32)
-    for j in tl.static_range(5):
-        aj = a0 * (j == 0) + a1 * (j == 1) + a2 * (j == 2) + a3 * (j == 3) + a4 * (j == 4)
-        offkx = offk5 * 5 + j
-        tl.store(gx_ptr + offm[:, None] * sxm + offkx[None, :] * sxk,
-                 (aj.to(tl.float32) * gs[:, None]).to(tl.bfloat16),
-                 mask=(offm[:, None] < M) & (offkx[None, :] < K))
-
-
-def tern_gemm_dx_i8(gy: torch.Tensor, wpacked: torch.Tensor, K: int) -> torch.Tensor:
-    """grad_x = gy @ decode(wpacked) with gy quantized int8 per row. [M,N] -> [M,K]."""
-    M, N = gy.shape
-    gq, gs = act_quant_i8(gy)
-    if GEMM_BACKEND[0] in ("cublas", "int8mm"):
-        return (_mm_f32(gq.to(torch.bfloat16), _w_bf16(wpacked, K)) * gs.float()[:, None]).to(torch.bfloat16)
-    gx = torch.empty(M, K, dtype=torch.bfloat16, device=gy.device)
-    K5 = wpacked.shape[1]
-    grid = lambda meta: (triton.cdiv(M, meta["BM"]), triton.cdiv(K5, meta["BK5"]))
-    _dx_i8_kernel[grid](gq, wpacked, gx, gs, M, N, K, K5,
-                        gq.stride(0), gq.stride(1), wpacked.stride(0), wpacked.stride(1),
-                        gx.stride(0), gx.stride(1))
-    return gx
+def tern_gemm_i8(xq: torch.Tensor, xs: torch.Tensor, wpacked: torch.Tensor, K: int, beta=1.0) -> torch.Tensor:
+    """int8 x [M,K] (codes) @ decode(wpacked)^T * xs[:,None] * beta -> bf16 [M,N]: int8 activation codes x int8 trits
+    on the int8 tensor cores (cuBLASLt via torch._int_mm), int32 accumulation: exact; the trits unpacked per call to
+    int8 (1 byte per weight). beta: float or a 0-dim device tensor (no host sync)."""
+    w8 = unpack_fast(wpacked, K)
+    M_, N_ = xq.shape[0], w8.shape[0]
+    if M_ > 16 and K % 16 == 0 and N_ % 8 == 0:   # (K % 16: cuBLASLt int8 on Blackwell sm_120 refuses K 8 / 24
+        y32 = torch._int_mm(xq.contiguous(), w8.t())  # with N 48, the rank-8 adapters of in_proj_a / b; Ada took them)
+        if y32.is_contiguous():
+            return i8_epilogue(y32, xs, beta)
+        return (y32.float() * xs.float()[:, None] * beta).to(torch.bfloat16)
+    return (_mm_f32(xq.to(torch.bfloat16), w8.to(torch.bfloat16).t()) * xs.float()[:, None] * beta).to(torch.bfloat16)
 
 
 # --dx int8x2: the input gradient on the int8 tensor cores without losing precision. gy (bf16) is split per row into

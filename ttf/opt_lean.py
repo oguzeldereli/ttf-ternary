@@ -74,7 +74,8 @@ class LeanAdam(torch.optim.Optimizer):
                 torch._foreach_mul_(pl, 1 - lr * wd)
             torch._foreach_add_(pl, upd, alpha=-lr)
 
-    BATCHED = False       # --tail-batched: low-precision 1-D parameters as one flat pass, 2-D ones stacked by shape
+    BATCHED = True        # low-precision 1-D parameters as one flat pass, 2-D ones stacked by shape (False: the per-tensor
+    # loop for all, the reference; tests. The loop also takes what the batched pass does not: CPU, big 2-D parameters)
 
     def _flat_state(self, pl, names, init):
         """the fp32 state tensors `names` of the parameters pl as views into one flat (1-D) or stacked (2-D) buffer per

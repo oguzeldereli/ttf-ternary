@@ -17,12 +17,12 @@ N, K, Tk, r = 1024, 512, 2048, 64
 
 def cfg(M, ks):
     return dict(r=r, lr_ratio=1.0, theta=TH[0], tau=1000, rank_s=r, b1=0.9, b2=0.95, gate=False, spend=1.0,
-                tau_anneal=0.75, micro=M, factored=ks, store_a="", offload=False, nomom=True, start=0, step=10)
+                micro=M, factored=ks, store_a="", offload=False, nomom=True, start=0, step=10)
 
 
 def run(M, ks, steps=6, seed=0):
     torch.manual_seed(seed)
-    l = KernelTernaryLinear(K, N, int8=True).to(dev); l.track = False; l._ts_idx = 3; l._ts_host = False
+    l = KernelTernaryLinear(K, N).to(dev); l.track = False; l._ts_idx = 3; l._ts_host = False
     global W0
     W0 = unpack_rows(l.wpacked, K).clone()
     state = {}

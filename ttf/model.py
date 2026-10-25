@@ -33,27 +33,8 @@ def _rope_rot(x, freqs_cis):
     return torch.view_as_real(xc * f).flatten(-2).type_as(x)
 
 
-def _rope_rot_real(x, freqs_cis):
-    # the same complex multiply in real arithmetic, for torch.compile (inductor has no
-    # complex codegen). Rounds differently, so only used with --compile; the default
-    # path stays bit-identical to earlier runs.
-    xf = x.float().reshape(*x.shape[:-1], -1, 2)
-    a, b = xf[..., 0], xf[..., 1]
-    f = freqs_cis[: x.shape[1]].unsqueeze(0).unsqueeze(2)  # [1,T,1,dim/2]
-    c, s = f.real, f.imag
-    return torch.stack((a * c - b * s, a * s + b * c), -1).flatten(-2).type_as(x)
-
-
-# elementwise pieces, swappable for torch.compile'd versions (enable_compile)
+# elementwise pieces, swappable (tests)
 _FN = {"rmsnorm": _rmsnorm, "swiglu": _swiglu, "rope": _rope_rot}
-
-
-def enable_compile():
-    """torch.compile the elementwise parts (norm, RoPE rotation, SwiGLU): fuses their
-    reads/writes. The ternary GEMMs are Triton kernels and stay as they are."""
-    _FN["rope"] = _rope_rot_real
-    for k, f in list(_FN.items()):
-        _FN[k] = torch.compile(f, dynamic=None)
 
 
 class RMSNorm(nn.Module):
@@ -266,33 +247,6 @@ class BitTransformer(nn.Module):
             return kl
         return (1 - a) * F.nll_loss(lp, tgt, ignore_index=-1, reduction="sum") + a * kl
 
-    hid_t = None          # --kd-hidden: the teacher's residual stream at every block boundary, matched along the student's path
-    hid_w = 0.0
-    hid_last = 0.0
-
-    @torch.no_grad()
-    def hiddens(self, idx):
-        """the residual stream entering each block and leaving the last one ([L + 1] tensors [B, T, d])"""
-        h = self.tok_emb(idx)
-        if torch.is_autocast_enabled(h.device.type):
-            h = h.to(torch.get_autocast_dtype(h.device.type))
-        fc = self.freqs_cis.to(h.device)
-        out = [h]
-        for layer in self.layers:
-            h = layer(h, fc)
-            out.append(h)
-        return out
-
-    @staticmethod
-    def _rel_update_err(ds, dt):
-        """a block's update d = h_out - h_in against the teacher's, in two parts, each relative to the teacher's: the mean
-        over tokens (the constant offset the fp stream carries) and the varying rest"""
-        ds, dt = ds.float(), dt.float()
-        ms, mt = ds.mean((0, 1)), dt.mean((0, 1))
-        cs, ct = ds - ms, dt - mt
-        return (ms - mt).pow(2).sum() / mt.pow(2).sum().clamp_min(1e-6) \
-            + (cs - ct).pow(2).mean() / ct.pow(2).mean().clamp_min(1e-6)
-
     def forward(self, idx, targets=None):
         h = self.tok_emb(idx)
         if torch.is_autocast_enabled(h.device.type):
@@ -303,16 +257,12 @@ class BitTransformer(nn.Module):
         fc = self.freqs_cis.to(h.device)
         ckpt = self.grad_checkpoint and self.training
         n_ck = len(self.layers) - self.ckpt_skip
-        ht, hid = self.hid_t, 0.0
         for i, layer in enumerate(self.layers):
-            h_in = h
             h = layer(h, fc, ckpt=ckpt and i < n_ck)
-            if ht is not None and targets is not None:   # --kd-hidden: this block's update on the student's own path
-                hid = hid + self._rel_update_err(h - h_in, ht[i + 1] - ht[i])   # against the teacher block's
         h = self.norm(h)
         from .intk_emb import factored_head, head_loss as _ik_loss
         ik = factored_head(self.tok_emb if self.lm_head is None else self.lm_head, self.training)
-        if ik is not None and targets is not None and self.hid_t is None:
+        if ik is not None and targets is not None:
             # --intk-emb, factored update: the int-k head's chunked loss (no [V, d] matrix, no dense dL/dW)
             hf, tf = h.reshape(-1, h.shape[-1]), targets.reshape(-1)
             kd = ("lp", self.kd_logp, self.kd_w) if self.kd_logp is not None else None
@@ -341,9 +291,6 @@ class BitTransformer(nn.Module):
             total = total + (checkpoint(self._loss_chunk, hc, w, tc, use_reentrant=False)
                              if ckpt else self._loss_chunk(hc, w, tc))
         loss = total / (tf != -1).sum().clamp_min(1)
-        if ht is not None:
-            self.hid_last = float(hid) / len(self.layers)
-            loss = loss + self.hid_w * hid / len(self.layers)
         aux = [l.ffn.aux_loss for l in self.layers if getattr(l.ffn, "aux_loss", None) is not None]
         if aux and self.moe_aux_w:
             loss = loss + self.moe_aux_w * torch.stack(aux).mean()

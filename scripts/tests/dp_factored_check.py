@@ -28,7 +28,7 @@ DT = torch.float32 if os.environ.get("FP32") == "1" else torch.bfloat16
 
 
 def cfg(M, s):
-    return dict(r=16, lr_ratio=1.0, theta=THETA, tau=1000.0, b2=0.95, spend=1.0, tau_anneal=1.0, store_a="",
+    return dict(r=16, lr_ratio=1.0, theta=THETA, tau=1000.0, b2=0.95, spend=1.0, store_a="",
                 offload=False, theta_sched=None, progress=0.0, factored=64, start=0, step=10 + s, micro=M)
 
 

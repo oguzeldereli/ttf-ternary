@@ -43,9 +43,12 @@ def load_model(path, device):
     if old:
         raise SystemExit(f"{path}: trained with features removed from the core ({', '.join(old)}): run "
                          f"scripts/eval/final_eval.py from a checkout of tag pre-consolidation-2026-10-17")
-    kw = dict(beta=ck.get("beta", False), int8=ck.get("int8", False), int8_dx=ck.get("int8_dx", False))
+    if mode == "kernel" and (not ck.get("int8", False) or ck.get("int8_dx", False)):   # (removed 25 Oct 2026)
+        raise SystemExit(f"{path}: trained with the {'bf16 forward' if not ck.get('int8', False) else 'one-slice int8 input '
+                         'gradient'}, removed from the core: run scripts/eval/final_eval.py from a checkout of tag "
+                         f"pre-consolidation-2026-10-17 (or the commit before 25 Oct's option removal)")
     if mode == "kernel":
-        model = build_kernel_transformer(mc, grad_checkpoint=False, **kw)
+        model = build_kernel_transformer(mc, grad_checkpoint=False, beta=ck.get("beta", False))
     elif mode == "master":
         dt = next(v.dtype for k, v in sd.items() if k.endswith(".weight") and v.dim() == 2 and "tok_emb" not in k)
         model = build_master_transformer(mc, grad_checkpoint=False, dtype=dt)

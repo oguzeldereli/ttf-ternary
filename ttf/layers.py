@@ -1,8 +1,8 @@
 """The ternary layer of TTF: KernelTernaryLinear, pure trits packed 5 per byte, the forward on the packed-ternary GEMM.
 
 Its weight gradient is never applied here: with capture on (every TTF run) the backward hands it, or with --dw factored
-its factors (gy, x), to the layer's on_grad hook (the fused TTF update, train.ts_layer), or keeps it in .gw for the
-update after the backward. The earlier rules that flipped trits inside this backward (the stateless stochastic flip,
+its factors (gy, x), to the layer's on_grad hook (the TTF update, update.ts_layer), or keeps it in .gw when the layer
+has no hook (analysis tools). The earlier rules that flipped trits inside this backward (the stateless stochastic flip,
 the evidence counter, lockout, error feedback, the flip predictor) are at tag pre-consolidation-2026-10-17.
 """
 from __future__ import annotations
@@ -24,21 +24,9 @@ def _rf(name):
     return torch.profiler.record_function(name) if _PROF_ON() else _NULL
 
 
-from .kernel import (pack_rows, unpack_rows, unpack_fast, tern_gemm, tern_gemm_dx, trit_beta, trit_nnz, beta_from_nnz,
-                     trit_diff, popcount,
-                     tern_gemm_i8, tern_gemm_dx_i8, tern_gemm_dx_i8x2, act_quant_i8, act_quant_i8_fast)
+from .kernel import (pack_rows, unpack_rows, unpack_fast, tern_gemm_dx, trit_beta, trit_nnz, beta_from_nnz,
+                     trit_diff, popcount, tern_gemm_i8, tern_gemm_dx_i8x2, act_quant_i8, act_quant_i8_fast)
 from . import kernel as _K
-
-
-def _act_quant_plain(x, bits=8):
-    """Detached 8-bit activation quant (no autograd graph); used inside the
-    custom Function where the straight-through path is handled manually."""
-    qp = 2 ** (bits - 1) - 1
-    scale = qp / x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-5)
-    return (x * scale).round().clamp_(-qp - 1, qp) / scale
-
-
-FUSED_SCALES = [False]       # --fused-scales: the column scale's backward and the adapter add + row scale in fused kernels
 
 
 class _ColScaleFn(torch.autograd.Function):
@@ -82,30 +70,19 @@ class _AddRowFn(torch.autograd.Function):
 
 FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
 DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices
-DW_FP32 = [False]            # --dw-precision fp32: dense weight gradients in fp32 from the GEMM (no bf16 rounding)
-WCACHE = {"mode": "off"}     # --w-cache int8: each layer's unpacked int8 trits kept between updates (1 byte / weight)
 
 
 class _KernelTernFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, wpacked, layer):
         beta = layer._cached_beta(wpacked) if layer.use_beta else None
-        if layer.int8:
-            # int8 path: activations are already 8-bit, so x @ W^T is exact in int32
-            # on the s8 tensor cores, and the saved activation is 1 byte/element.
-            xq, xs = (act_quant_i8_fast if x.is_cuda else act_quant_i8)(x.reshape(-1, layer.K), layer.act_bits)
-            with _rf("tern.fwd"):
-                y = tern_gemm_i8(xq, xs, wpacked, layer.K, beta if beta is not None else 1.0,
-                                 w8=layer._cached_w8(wpacked))
-            y = y.view(*x.shape[:-1], layer.N)
-            ctx.save_for_backward(xq, xs, wpacked)
-        else:
-            xq = _act_quant_plain(x, layer.act_bits)
-            y = tern_gemm(xq.reshape(-1, layer.K), wpacked, layer.K).view(
-                *x.shape[:-1], layer.N)
-            if beta is not None:
-                y = y * beta.to(y.dtype)
-            ctx.save_for_backward(x, wpacked)
+        # activations are already 8-bit, so x @ W^T is exact in int32 on the s8 tensor cores, and the saved
+        # activation is 1 byte per element
+        xq, xs = (act_quant_i8_fast if x.is_cuda else act_quant_i8)(x.reshape(-1, layer.K), layer.act_bits)
+        with _rf("tern.fwd"):
+            y = tern_gemm_i8(xq, xs, wpacked, layer.K, beta if beta is not None else 1.0)
+        y = y.view(*x.shape[:-1], layer.N)
+        ctx.save_for_backward(xq, xs, wpacked)
         ctx.layer = layer
         ctx.beta = beta
         ctx.xshape = x.shape
@@ -118,77 +95,31 @@ class _KernelTernFn(torch.autograd.Function):
         gyf = gy.reshape(-1, layer.N).contiguous()
         if beta is not None:
             gyf = gyf * beta.to(gyf.dtype)       # y = beta * x@W^T: both grads carry beta
-        if (FACTORED[0] and layer.int8 and layer.capture and getattr(layer, "on_grad", None) is not None
-                and (getattr(layer, "ts_micro", False) or not getattr(layer, "cap_accum", False))):
-            # --dw factored: no dense weight gradient; the TTF update gets its factors (gy, x), g = gy^T x
-            xq, xs, wpacked = ctx.saved_tensors
-            with _rf("tern.dx"):
-                gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
-            if getattr(layer, "cap_accum", False):
-                layer._ts_final = getattr(layer, "cap_final", True)
-            if getattr(layer, "_dw_dense", False):   # --dw-thin dense: a thin layer's update from the dense gradient
-                with _rf("tern.dw"):                 # (2 T N K flops < the factored path's 2 T (N + K)(k + 2 r))
-                    gw = torch.mm(gyf.transpose(0, 1), xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype),
-                                  out_dtype=torch.float32)
-                layer.on_grad(layer, gw)
-                return gx.to(gy.dtype), None, None
-            layer.on_grad(layer, (gyf, xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype)))
-            return gx.to(gy.dtype), None, None
-        if not layer.capture:     # no update asked for: the input gradient only (the trits stay as they are)
-            wpacked = ctx.saved_tensors[-1]
-            with _rf("tern.dx"):
-                gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
-            return gx.to(gy.dtype), None, None
-        if layer.int8:
-            xq, xs, wpacked = ctx.saved_tensors
-            with _rf("tern.dw"):
-                if DW_FP32[0]:   # the weight gradient straight out of the GEMM in fp32 (no bf16 rounding, no copy)
-                    gw = torch.mm(gyf.transpose(0, 1), xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype),
-                                  out_dtype=torch.float32)
-                else:
-                    gw = gyf.transpose(0, 1) @ (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype))
-        else:
-            x, wpacked = ctx.saved_tensors
-            xq = _act_quant_plain(x, layer.act_bits).reshape(-1, layer.K)
-            xs = None
-            gw = gyf.transpose(0, 1) @ xq                       # [N,K] dense grad
-
+        xq, xs, wpacked = ctx.saved_tensors
         with _rf("tern.dx"):
             gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
-        if getattr(layer, "cap_accum", False) and getattr(layer, "ts_micro", False):
-            # --ttf-accum micro: the TTF update sees every micro-batch's gradient (momentum and v step per micro-batch; the
-            # accumulator, firing and spend on the last one), so no dense gradient is kept across micro-batches
-            layer._ts_final = getattr(layer, "cap_final", True)
-            layer.on_grad(layer, gw.detach().float())
-            del gw
+        if not layer.capture:     # no update asked for: the input gradient only (the trits stay as they are)
             return gx.to(gy.dtype), None, None
-        if getattr(layer, "cap_accum", False):
-            # gradient accumulation with a captured gradient (TTF, grad_accum > 1): sum the micro-batches (each
-            # loss is already divided by grad_accum); with --ttf-update fused the update runs on the last micro-batch only
-            g = gw.detach().float() if layer.gw is None else layer.gw + gw.float()
-            del gw
-            if getattr(layer, "on_grad", None) is not None and getattr(layer, "cap_final", True):
-                layer.gw = None
-                layer.on_grad(layer, g)
+        if getattr(layer, "cap_accum", False):   # --accum > 1: the update sees every micro-batch (no gradient kept
+            layer._ts_final = getattr(layer, "cap_final", True)   # across them); the turn and firing on the last one
+        xf = xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype)
+        if FACTORED[0] and getattr(layer, "on_grad", None) is not None and not getattr(layer, "_dw_dense", False):
+            layer.on_grad(layer, (gyf, xf))      # --dw factored: no dense weight gradient, the factors (gy, x), g = gy^T x
+            return gx.to(gy.dtype), None, None
+        with _rf("tern.dw"):
+            if getattr(layer, "_dw_dense", False):   # --dw-thin dense: a thin layer's dense gradient (2 T N K flops <
+                gw = torch.mm(gyf.transpose(0, 1), xf, out_dtype=torch.float32)   # the factored 2 T (N + K)(k + 2 r))
             else:
-                layer.gw = g
-            return gx.to(gy.dtype), None, None
+                gw = (gyf.transpose(0, 1) @ xf).float()
         if getattr(layer, "on_grad", None) is not None:
-            # --ttf-update fused: the layer's update runs here, after its input gradient (gx) is computed, so this layer's
-            # trits are not needed again in this step (earlier layers recompute with their own, unchanged trits)
-            layer.on_grad(layer, gw.detach().float())
-            del gw
+            # the layer's update runs here, after its input gradient (gx) is computed, so this layer's trits are not
+            # needed again in this step (earlier layers recompute with their own, unchanged trits)
+            layer.on_grad(layer, gw)
             return gx.to(gy.dtype), None, None
-        layer.gw = gw.detach().float()          # the update after the backward (ts_step without --ttf-update fused), diagnostics
-        if getattr(layer, "capture_stats", False):
-            # per-input-channel and per-output-row RMS, for selection diagnostics
-            xf2 = (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype)) if layer.int8 else xq
-            layer.x_rms = xf2.float().pow(2).mean(0).sqrt().detach()
-            layer.gy_rms = gyf.float().pow(2).mean(0).sqrt().detach()
+        layer.gw = gw              # no update hook: kept for the caller (analysis tools)
         if getattr(layer, "capture_h", False):
             # Gauss-Newton diagonal for this layer: H[n,k] = sum_m (beta*gy)^2 x^2.
             # Same shape and cost as the weight gradient, one extra GEMM.
-            xf = (xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype)) if layer.int8 else xq
             layer.hw = ((gyf * gyf).transpose(0, 1) @ (xf * xf)).detach().float()
         return gx.to(gy.dtype), None, None
 
@@ -196,26 +127,22 @@ class _KernelTernFn(torch.autograd.Function):
 def _grad_x(layer, gyf, wpacked):
     if DX_MODE[0] == "int8x2":
         return tern_gemm_dx_i8x2(gyf, wpacked, layer.K)
-    if layer.int8 and layer.int8_dx:
-        return tern_gemm_dx_i8(gyf, wpacked, layer.K)
-    return tern_gemm_dx(gyf, wpacked, layer.K, w8=layer._cached_w8(wpacked))
+    return tern_gemm_dx(gyf, wpacked, layer.K)
 
 
-FUSED_LAYER = [False]
-FUSED_SAVE_X = [False]   # --fused-save-x: the fused layer keeps its input, not a centred copy (one tensor for all its readers)        # --fused-layer: centring, column scale, act-quant, GEMM epilogue, row scale, bias and the
-                             # adapter sum in a few kernels each way (_FusedTernFn); bit-identical output and input grad
+FUSED_LAYER = [False]    # --fused-layer: centring, column scale, act-quant, GEMM epilogue, row scale, bias and the adapter
+                         # sum in a few kernels each way (_FusedTernFn); bit-identical output and input grad
 
 
 def _fused_ok(l, x):
-    """the layers _FusedTernFn takes: int8 forward on the int8 GEMM, bf16 CUDA input, row / column scales, no float
-    adapter; with capture on, only the factored TTF update (--dw factored, micro or 16 x 1) and no --dw-thin dense"""
-    if not (FUSED_LAYER[0] and l.int8 and x.is_cuda and x.dtype == torch.bfloat16 and _K.GEMM_BACKEND[0] == "int8mm"
+    """the layers _FusedTernFn takes: bf16 CUDA input, row / column scales, no float adapter; with capture on, only the
+    factored TTF update (--dw factored) and no --dw-thin dense"""
+    if not (FUSED_LAYER[0] and x.is_cuda and x.dtype == torch.bfloat16
             and l.col_scale is not None and l.row_scale is not None and getattr(l, "mag_A", None) is None
             and l.K % 16 == 0 and l.N % 8 == 0 and x.numel() // l.K > 16):   # (K % 16: kernel.tern_gemm_i8)
         return False
     if l.capture and torch.is_grad_enabled():
-        return (FACTORED[0] and getattr(l, "on_grad", None) is not None and not getattr(l, "_dw_dense", False)
-                and (getattr(l, "ts_micro", False) or not getattr(l, "cap_accum", False)))
+        return FACTORED[0] and getattr(l, "on_grad", None) is not None and not getattr(l, "_dw_dense", False)
     return True
 
 
@@ -226,16 +153,12 @@ def _fused_fwd(l, x2, acc2, save):
     cb, rb = l.col_scale.to(torch.bfloat16), l.row_scale.to(torch.bfloat16)
     ob = getattr(l, "out_bias", None)
     bb = ob.to(torch.bfloat16) if ob is not None else None
-    xq, xs, xc = _K.fused_prologue(x2, mu_b, cb, l.act_bits, save and not FUSED_SAVE_X[0])
-    if save and FUSED_SAVE_X[0]:
-        xc = None          # --fused-save-x: the input itself is kept; the backward re-forms bf16(x - mu)
-    beta = l._cached_beta(l.wpacked) if l.use_beta else None
-    w8 = l._cached_w8(l.wpacked)
-    if w8 is None:
-        w8 = unpack_fast(l.wpacked, l.K)
+    xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, l.act_bits, False)   # (the input itself is kept for the backward,
+    beta = l._cached_beta(l.wpacked) if l.use_beta else None          # which re-forms bf16(x - mu): one tensor for
+    w8 = unpack_fast(l.wpacked, l.K)                                   # all the readers of one input, bit-identical)
     y32 = torch._int_mm(xq, w8.t()); del w8
     t, o = _K.fused_epilogue(y32, xs, beta if beta is not None else 1.0, rb, bb, acc2, save)
-    return o, ((xq, xs, xc if xc is not None else x2, t, cb, rb, beta) if save else None)
+    return o, ((xq, xs, x2, t, cb, rb, beta) if save else None)
 
 
 class _FusedTernFn(torch.autograd.Function):
@@ -250,8 +173,8 @@ class _FusedTernFn(torch.autograd.Function):
         with _rf("tern.fwd"):
             o, sv = _fused_fwd(layer, x2, acc2, True)
         xq, xs, xc, t, cb, rb, beta = sv
-        ctx.mu_b = (layer.in_mean.to(torch.bfloat16) if FUSED_SAVE_X[0] and getattr(layer, "in_mean", None) is not None
-                    else None)   # (--fused-save-x: xc above is the input, its centring redone in the backward)
+        ctx.mu_b = (layer.in_mean.to(torch.bfloat16) if getattr(layer, "in_mean", None) is not None
+                    else None)   # (xc above is the input, its centring redone in the backward)
         ctx.save_for_backward(xq, xs, xc, t, cb, rb)
         ctx.layer, ctx.beta, ctx.xshape = layer, beta, x.shape
         ctx.cdt, ctx.rdt, ctx.has_bias, ctx.has_acc = c.dtype, r.dtype, bias is not None, acc is not None
@@ -285,12 +208,9 @@ class _FusedTernFn(torch.autograd.Function):
 class KernelTernaryLinear(nn.Module):
     """Pure-ternary linear, forward on the Triton packed-ternary GEMM (weights
     stay packed, never materialized dense). Row-packed 5-trits/byte along K."""
-    def __init__(self, in_features, out_features, act_bits: int = 8, beta: bool = False, int8: bool = False,
-                 int8_dx: bool = False):
+    def __init__(self, in_features, out_features, act_bits: int = 8, beta: bool = False):
         super().__init__()
         self.use_beta = beta      # scale output by 1/sqrt(K*rho); False = legacy raw trits
-        self.int8 = int8          # s8 tensor-core path (fwd exact, dx 8-bit gy)
-        self.int8_dx = int8_dx    # use the s8 dx kernel (else the bf16 one)
         self.K = in_features
         self.N = out_features
         self.act_bits = act_bits
@@ -328,25 +248,14 @@ class KernelTernaryLinear(nn.Module):
 
     def _after_fire(self, dnnz):
         """after the fused firing (trits written in place, no version bump): the nonzero count moves by dnnz, so a
-        valid cached beta is updated exactly instead of recomputed from all the trits; the --w-cache copy recomputes"""
+        valid cached beta is updated exactly instead of recomputed from all the trits"""
         if getattr(self, "_beta_key", None) is not None and self._beta_key == self._wkey(self.wpacked):
             self._nnz = self._nnz + dnnz; self._beta_val = beta_from_nnz(self._nnz, self.N)
         else:
             self._beta_key = None
-        self._w8_key = None; self._w8 = None
-
-    @torch.no_grad()
-    def _cached_w8(self, wpacked):
-        if WCACHE["mode"] != "int8":
-            return None
-        k = self._wkey(wpacked)
-        if getattr(self, "_w8_key", None) != k:
-            self._w8 = None
-            self._w8 = unpack_fast(wpacked, self.K); self._w8_key = k
-        return self._w8
 
     def _invalidate(self):
-        self._beta_key = None; self._w8_key = None; self._w8 = None
+        self._beta_key = None
 
     def enable_tracking(self):
         """Track per-step flip count and which trits have ever changed since init.
@@ -415,9 +324,9 @@ class KernelTernaryLinear(nn.Module):
         # column scale before the GEMM (and before the int8 activation quantization),
         # row scale after it: the packed kernels are unchanged, autograd handles r and c,
         # and the update's dL/dq comes out scaled by r_i * c_j per weight
-        fz = (FUSED_SCALES[0] and x.is_cuda and x.dtype == torch.bfloat16 and self.col_scale is not None
+        fz = (x.is_cuda and x.dtype == torch.bfloat16 and self.col_scale is not None
               and self.row_scale is not None and getattr(self, "mag_A", None) is not None)
-        if fz:      # --fused-scales: the same layer, the elementwise work in fewer passes
+        if fz:      # the scales' and the adapter's elementwise work in fused kernels (the same values)
             x = _ColScaleFn.apply(x, self.col_scale)
             y = _KernelTernFn.apply(x, self.wpacked, self)
             a = (x @ self.mag_B.to(x.dtype)) @ self.mag_A.to(y.dtype).T
@@ -445,10 +354,9 @@ class KernelTernaryLinear(nn.Module):
         return w, scale
 
 
-def build_kernel_transformer(c: ModelConfig, grad_checkpoint: bool = True, beta: bool = False, int8: bool = False,
-                             int8_dx: bool = False):
+def build_kernel_transformer(c: ModelConfig, grad_checkpoint: bool = True, beta: bool = False):
     def make_linear(i, o):
-        return KernelTernaryLinear(i, o, c.act_bits, beta=beta, int8=int8, int8_dx=int8_dx)
+        return KernelTernaryLinear(i, o, c.act_bits, beta=beta)
     return BitTransformer(c, grad_checkpoint=grad_checkpoint, make_linear=make_linear)
 
 

@@ -30,11 +30,10 @@ print("pack_rows: identical")
 
 
 
-# 3/4. compile and partial checkpointing: same loss and same weight gradients
-def run(compile_=False, ckpt_skip=0):
+# 3. partial checkpointing: same loss and same weight gradients
+def run(ckpt_skip=0):
     torch.manual_seed(0)
-    m = build_kernel_transformer(PRESETS["small"], grad_checkpoint=True, beta=True,
-                                 int8=True).to(dev).train()
+    m = build_kernel_transformer(PRESETS["small"], grad_checkpoint=True, beta=True).to(dev).train()
     m.ckpt_skip = ckpt_skip
     Ls = [l for l in m.modules() if isinstance(l, KernelTernaryLinear)]
     for l in Ls: l.capture = True                      # gradients only, no flips
@@ -54,10 +53,8 @@ ref_l, ref_g = run()
 ref_cos = min(F.cosine_similarity(a.flatten(), b.flatten(), 0).item() for a, b in zip(base_g, ref_g))
 print(f"rounding reference (eager, one-rounding SwiGLU): loss {ref_l:.6f}, min grad cosine {ref_cos:.6f}")
 M._FN["swiglu"] = M._swiglu
-for name, kw in (("ckpt_skip=6", dict(ckpt_skip=6)), ("compile", dict(compile_=True))):
-    if kw.get("compile_"):
-        M.enable_compile()
-    l, gs = run(ckpt_skip=kw.get("ckpt_skip", 0))
+for name, kw in (("ckpt_skip=6", dict(ckpt_skip=6)),):
+    l, gs = run(**kw)
     cos = min(torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), 0).item()
               for a, b in zip(base_g, gs))
     print(f"{name}: loss {l:.6f} vs {base_l:.6f}, min per-layer grad cosine {cos:.6f}")

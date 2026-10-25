@@ -65,7 +65,7 @@ def main():
         init_from_hf(m, a.hf_dir, "master"); run("master", m); del m; torch.cuda.empty_cache()
     hess = calib_hessians(a.hf_dir, a.calib_data, n_seq=a.calib, dev=dev) if a.calib else None
     for meth in a.methods.split(","):
-        m = build_kernel_transformer(mc, grad_checkpoint=False, beta=True, int8=True).to(dev)
+        m = build_kernel_transformer(mc, grad_checkpoint=False, beta=True).to(dev)
         enable_rc_scales(m)
         t0 = time.time()
         init_from_hf(m, a.hf_dir, "kernel", meth, rc=True, hess=hess)

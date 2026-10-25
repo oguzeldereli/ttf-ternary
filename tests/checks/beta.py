@@ -1,8 +1,8 @@
 """beta = 1/sqrt(K*rho) on the kernel path: matches a dense reference (fwd, grad_x),
 restores unit output scale, and un-collapses attention on a fresh model."""
 import math, torch
-from ttf.kernel import pack_rows, unpack_rows, trit_beta
-from ttf.layers import KernelTernaryLinear, build_kernel_transformer, _act_quant_plain
+from ttf.kernel import pack_rows, unpack_rows, trit_beta, act_quant_i8
+from ttf.layers import KernelTernaryLinear, build_kernel_transformer
 from ttf.config import ModelConfig
 from ttf import model as M
 
@@ -17,12 +17,11 @@ for K, N in [(512, 1408), (1408, 512), (768, 777)]:        # 777/768: exercise p
     x = torch.randn(3, 50, K, device=dev, dtype=torch.bfloat16, requires_grad=True)
     y = lay(x)
     xd = x.detach().float().requires_grad_(True)
-    # dense reference: the layer's own bf16 act-quant (STE), then beta * x@W^T in fp32
-    xq = xd + (_act_quant_plain(x.detach(), 8).float() - xd).detach()
-    bb = b.to(torch.bfloat16).float()          # the layer multiplies by beta in bf16
-    yd = bb * (xq @ w.T)
-    # tolerance: the kernel itself matches bf16 F.linear exactly; beta adds a second
-    # bf16 rounding of the product, so allow ~2 bf16 ulp worst-case, tight in norm.
+    # dense reference: the layer's 8-bit act-quant (STE), then beta * x@W^T in fp32
+    q_, s_ = act_quant_i8(x.detach().reshape(-1, K))
+    xq = xd + ((q_.float() * s_.float()[:, None]).reshape(xd.shape) - xd).detach()
+    yd = b * (xq @ w.T)
+    # tolerance: the int32 product times the scales and beta in fp32, rounded once to bf16
     assert (y.float() - yd).abs().max() / yd.abs().max() < 1e-2
     assert (y.float() - yd).norm() / yd.norm() < 3e-3
     gy = torch.randn_like(yd)
