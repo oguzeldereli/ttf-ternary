@@ -24,7 +24,7 @@ def _rf(name):
     return torch.profiler.record_function(name) if _PROF_ON() else _NULL
 
 
-from .kernel import (pack_rows, unpack_rows, unpack_fast, tern_gemm_dx, trit_beta, trit_nnz, beta_from_nnz,
+from .kernel import (pack_rows, unpack_fast, tern_gemm_dx, trit_nnz, beta_from_nnz,
                      trit_diff, popcount, tern_gemm_i8, tern_gemm_dx_i8x2, act_quant_i8, act_quant_i8_fast)
 from . import kernel as _K
 
@@ -344,14 +344,6 @@ class KernelTernaryLinear(nn.Module):
         if getattr(self, "out_bias", None) is not None:
             y = y + self.out_bias.to(y.dtype)
         return y
-
-    @torch.no_grad()
-    def ternary_weight(self):
-        w = unpack_rows(self.wpacked, self.K)
-        if self.use_beta:
-            return w, trit_beta(self.wpacked, self.K).item()
-        scale = w.to(torch.float32).abs().mean().clamp_min(1e-5)
-        return w, scale
 
 
 def build_kernel_transformer(c: ModelConfig, grad_checkpoint: bool = True, beta: bool = False):

@@ -18,7 +18,14 @@ import torch.nn.functional as F
 
 from .config import ModelConfig
 from .model import BitTransformer
-from .bitlinear import _act_quant_ste
+
+
+def _act_quant_ste(x: torch.Tensor, bits: int = 8) -> torch.Tensor:
+    """Per-token symmetric absmax activation quantization with straight-through."""
+    qp = 2 ** (bits - 1) - 1
+    scale = qp / x.detach().abs().amax(dim=-1, keepdim=True).clamp_min(1e-5)
+    xq = (x * scale).round().clamp_(-qp - 1, qp) / scale
+    return x + (xq - x).detach()
 
 
 def _ternary_ste(w: torch.Tensor) -> torch.Tensor:
@@ -72,12 +79,6 @@ class MasterTernaryLinear(nn.Module):
     def _forward(self, x):
         # under autocast both operands go to bf16, matching the kernel path's math
         return F.linear(_act_quant_ste(x, self.act_bits), _ternary_ste(self.weight))
-
-    @torch.no_grad()
-    def ternary_weight(self):
-        w = self.weight.float()
-        gamma = w.abs().mean().clamp_min(1e-5)
-        return (w / gamma).round().clamp_(-1, 1).to(torch.int8), gamma
 
     def extra_repr(self):
         return f"in={self.K}, out={self.N}, ternary fwd (STE), latent {self.weight.dtype}"

@@ -24,7 +24,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from ttf.bitlinear import STATE                                   # noqa: E402
 from ttf.layers import KernelTernaryLinear, build_kernel_transformer, enable_rc_scales   # noqa: E402
 from ttf.master import MasterTernaryLinear, build_master_transformer                      # noqa: E402
 from ttf.model import Attention, BitTransformer, enable_moe                              # noqa: E402
@@ -55,7 +54,8 @@ def load_model(path, device):
     elif mode == "fp32":                                     # the full-precision reference (--mode fp32)
         model = BitTransformer(mc, grad_checkpoint=False, make_linear=lambda i, o: nn.Linear(i, o, bias=False))
     else:
-        raise SystemExit(f"mode {mode} not supported")
+        raise SystemExit(f"{path}: mode {mode} is not in the core (removed modes, e.g. the stateless int8-latent "
+                         f"BitLinear): run scripts/eval/final_eval.py from a checkout of tag pre-consolidation-2026-10-17")
     model = model.to(device)
     if "layers.0.ffn.router.weight" in sd:                   # --moe E:K:H (top-K from the run's arguments, else 2)
         E_ = sd["layers.0.ffn.router.weight"].shape[0]
@@ -150,7 +150,6 @@ def main():
     a = ap.parse_args()
     device = "cuda"
     assert torch.cuda.is_available(), "GPU only (never the laptop GPU: run on a lab PC / 4090 / Myriad)"
-    STATE.updates_enabled = False
     wiki = np.memmap(a.wiki, dtype=np.uint16, mode="r")
     fw = np.memmap(a.fwval, dtype=np.uint16, mode="r") if a.fw and os.path.exists(a.fwval) else None
     for run in a.runs:

@@ -17,7 +17,6 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ttf.bitlinear import STATE                     # noqa: E402
 from final_eval import load_model                      # noqa: E402
 
 
@@ -52,7 +51,6 @@ def main():
     ap.add_argument("--dir", default="data/zeroshot/tok")
     a = ap.parse_args()
     assert torch.cuda.is_available(), "GPU only (never the laptop GPU)"
-    STATE.updates_enabled = False
     tasks = {t: json.load(open(os.path.join(a.dir, t + ".json"))) for t in a.tasks.split(",")}
     for run in a.runs:
         t0 = time.time()

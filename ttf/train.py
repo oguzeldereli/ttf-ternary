@@ -29,7 +29,6 @@ def gpu_temp():
 
 from .config import ModelConfig, TrainConfig, PRESETS
 from .model import BitTransformer
-from .bitlinear import STATE
 from .master import build_master_transformer, split_params
 from .layers import KernelTernaryLinear, build_kernel_transformer, enable_flip_tracking, collect_flip_stats, _rf
 from .args import parse
@@ -446,8 +445,6 @@ def main():
         tail_opt = Adam8bit(groups, lr=tc.lr, betas=(tc.beta1, tc.beta2),          # on this tail before 25 Oct)
                             weight_decay=tc.weight_decay)
 
-    STATE.weight_decay = tc.weight_decay
-
     if args.track_flips:
         n = enable_flip_tracking(model)
         print(f"flip tracking on for {n} ternary layers", flush=True)
@@ -850,11 +847,8 @@ def main():
                 log_metrics({"step": step, "adapter_rank": r_t, "adapter_dropped_energy": e_})
                 print(f"--adapter-schedule: step {step}: adapters {r_c} -> {r_t} (dropped {e_:.4f} of their energy)",
                       flush=True)
-        STATE.lr = lr
         for g in tail_opt.param_groups:
             g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0) * g.get("emb_mult", 1.0)
-        STATE.updates_enabled = True
-        STATE.grad_scale = tc.grad_accum
         tail_opt.zero_grad(set_to_none=True)
         last_loss = 0.0
         if args.ttf_rank:          # TTF: every ternary layer hands its gradient to the update (ts_layer)

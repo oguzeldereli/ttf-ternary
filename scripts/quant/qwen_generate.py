@@ -9,7 +9,6 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from ttf.qwen import build_qwen                                        # noqa: E402
 from ttf.layers import KernelTernaryLinear, enable_rc_scales            # noqa: E402
-from ttf.bitlinear import STATE                                        # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("hf_dir"); ap.add_argument("ckpt")
@@ -31,7 +30,7 @@ miss, unexp = model.load_state_dict(sd, strict=False)
 print(f"loaded {a.ckpt} in {time.time() - t0:.0f}s; missing {len(miss)} {miss[:3]}, unexpected {len(unexp)} {unexp[:3]}",
       flush=True)
 del sd
-model.eval(); STATE.updates_enabled = False
+model.eval()
 for p in model.parameters():
     p.requires_grad_(False)
 print(f"GPU memory {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)

@@ -1,8 +1,7 @@
-"""Ternary BitNet b1.58 transformer (Llama-style) with master-free BitLinear.
-
-Only the BitLinear matrices are ternary/master-free. The token embedding, the
-RMSNorm gains, and the (tied) output projection stay full precision — together
-~10% of params — and are trained by an ordinary tiny optimizer in the trainer.
+"""The from-scratch transformer (Llama-style). Its linear layers come from make_linear: TTF's KernelTernaryLinear
+(layers.build_kernel_transformer), the BitNet baseline's MasterTernaryLinear (master.build_master_transformer) or
+nn.Linear (--mode fp32). The token embedding, the RMSNorm gains and the (tied) output projection stay full precision
+and are trained by the trainer's float optimizer.
 """
 from __future__ import annotations
 import torch
@@ -11,7 +10,6 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
-from .bitlinear import BitLinear
 
 
 def _rmsnorm(x, w, eps: float):
@@ -205,8 +203,7 @@ class BitTransformer(nn.Module):
         super().__init__()
         self.c = c
         self.grad_checkpoint = grad_checkpoint
-        if make_linear is None:
-            make_linear = lambda i, o: BitLinear(i, o, c.act_bits)
+        assert make_linear is not None, "BitTransformer: make_linear builds the linear layers (see the module docstring)"
         self.tok_emb = nn.Embedding(c.vocab_size, c.dim)
         self.layers = nn.ModuleList([Block(c, make_linear) for _ in range(c.n_layers)])
         self.norm = RMSNorm(c.dim, c.norm_eps)
@@ -297,12 +294,8 @@ class BitTransformer(nn.Module):
         return None, loss
 
     def float_tail_parameters(self):
-        """Params NOT handled by the master-free BitLinear hooks (small tail).
-
-        BitLinear stores its weight as int8 *buffers*, so it contributes no
-        nn.Parameter. Everything in .parameters() is therefore the float tail:
-        token embedding, RMSNorm gains, and (if untied) the lm_head.
-        """
+        """The trainable parameters (requires_grad): with TTF layers (trits in buffers) the float tail: token
+        embedding, RMSNorm gains and (if untied) the lm_head."""
         return [p for p in self.parameters() if p.requires_grad]
 
     @torch.no_grad()

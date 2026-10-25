@@ -3,14 +3,12 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .bitlinear import STATE
 from .data import get_batch
 
 
 @torch.no_grad()
 def evaluate(model, data, tc, device):
     model.eval()
-    STATE.updates_enabled = False
     losses = []
     # fixed windows: same val batches every eval and across runs (comparable). At least 16 windows per batch whatever
     # the training batch size (before 5 Oct a run at batch 4 was scored on the first quarter of a batch-16 run's windows,
