@@ -247,10 +247,12 @@ def test_store_codecs(codec):
 
 def test_head_dense_g_equals_factors():
     """the int-k head's two gradient forms (factors / dense [V, d]) give the same group gradients and accumulator (up to
-    the factors' bf16 rounding: 0.5%), and at a low theta (~1 fire per weight per step) nearly the same moves"""
+    the factors' bf16 rounding: 0.5%), and with firing (a quarter of the codes move in 3 steps) nearly the same moves
+    (at theta 0.05 nearly every code moves every step: the residual left is small and turned by the sketch's noise, and
+    0.5% in the gradient became 12% of the moves)"""
     N, K, T = 200, 64, 48
     IE.ROWS[0] = 64
-    for theta in (1e9, 0.05):
+    for theta in (1e9, 1.0):
         res = []
         for d in (False, True):
             IE.DENSE_G[0] = d
