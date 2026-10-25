@@ -65,7 +65,7 @@ def load_model(path, device):
         a_ = a_ if isinstance(a_, dict) else vars(a_)
         k_ = int(str(a_.get("moe") or f"{E_}:2").split(":")[1])
         mk = (lambda i, o: MasterTernaryLinear(i, o, mc.act_bits, dtype=dt).to(device)) if mode == "master" else \
-             (lambda i, o: KernelTernaryLinear(i, o, mc.act_bits, **kw).to(device))
+             (lambda i, o: KernelTernaryLinear(i, o, mc.act_bits, beta=ck.get("beta", False)).to(device))
         enable_moe(model, f"{E_}:{k_}:{H_}", mk)
     if "tok_emb.table.wpacked" in sd:                         # --tern-emb tied_wide:M
         M_ = sd["tok_emb.table.col_scale"].numel() // sd["tok_emb.proj.row_scale"].numel()

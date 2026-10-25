@@ -137,7 +137,7 @@ def _out_err(W, T, a, c, H, mu=None):
 
 
 @torch.no_grad()
-def calib_hessians(path, data_path, n_seq=64, seq=2048, dev="cuda", log=print):
+def calib_hessians(path, data_path, n_seq=64, seq=2048, dev="cuda", dtype_u32=False, log=print):
     """H = X^T X / tokens of every linear's input in the full-precision model on n_seq random windows of the run's
     data (q / k / v share one, gate / up another): {(block, name): H [K, K] fp32 on the CPU}"""
     import numpy as np
@@ -161,7 +161,7 @@ def calib_hessians(path, data_path, n_seq=64, seq=2048, dev="cuda", log=print):
                 x = inp[0].reshape(-1, inp[0].shape[-1]).float()
                 H[key].addmm_(x.T, x); MU[key] += x.sum(0); cnt[key] += x.shape[0]
             hooks.append(lin.register_forward_pre_hook(hook))
-    data = np.memmap(data_path, dtype=np.uint16, mode="r")
+    data = np.memmap(data_path, dtype=np.uint32 if dtype_u32 else np.uint16, mode="r")   # (before 26 Oct: uint16 always)
     rng = np.random.default_rng(4321)                   # not the training stream's windows
     for s in rng.integers(0, len(data) - seq - 1, n_seq):
         x = torch.tensor(data[s:s + seq + 1].astype(np.int64), device=dev)[None]

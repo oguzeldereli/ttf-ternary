@@ -46,14 +46,15 @@ def _tern_lays(model):
 
 
 def _split_emb_group(model, groups, wd, mult):
-    """the embedding / head (--train-emb) and the int-k matrices' group mins / steps (--intk-emb) out of the decayed
-    float-tail group into their own: weight decay wd (default 0: decay shrinks every row each step, seen or not, and
-    squeezes int-k values toward their group minimum; 24 Oct Q4b / Q5 ran with 0.1), lr x mult"""
+    """the embedding / head (--train-emb) and the int-k matrices' group mins / steps (--intk-emb) out of the float-tail
+    groups into their own: weight decay wd (default 0: decay shrinks every row each step, seen or not, and squeezes int-k
+    values toward their group minimum; 24 Oct Q4b / Q5 ran with 0.1), lr x mult. (Before 26 Oct only from a group with
+    nonzero weight decay: with --weight-decay 0, --emb-wd and --emb-lr-mult had no effect.)"""
     ids = {id(p) for n, p in model.named_parameters()
            if "embed_tokens" in n or "lm_head" in n or n.endswith((".m.lo", ".m.s"))}
     moved = []
     for g in groups:
-        if g.get("weight_decay", 0.0) and not g.get("rc_lr"):
+        if not g.get("rc_lr"):
             keep = [p for p in g["params"] if id(p) not in ids]
             moved += [p for p in g["params"] if id(p) in ids]
             g["params"] = keep
@@ -315,7 +316,7 @@ def main():
             _hess = None
         elif args.convert in ("gptq", "gptqc"):     # input second moments of the full-precision model (not the run's windows)
             from .hf_init import calib_hessians
-            _hess = calib_hessians(args.init_hf, tc.data_path, n_seq=args.calib, dev=device,
+            _hess = calib_hessians(args.init_hf, tc.data_path, n_seq=args.calib, dev=device, dtype_u32=args.u32,
                                    log=lambda m_: print(m_, flush=True))
         if not _QWEN:
             init_from_hf(model, args.init_hf, kmode, args.convert, rc=args.rc_scale, hess=_hess,
