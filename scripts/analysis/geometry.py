@@ -15,10 +15,9 @@ Per model and layer:
             and anisotropy (top eigenvalue share and effective rank of the token covariance)
 Light: 4 CPU threads, activations of every 4th token on the GPU. Writes --out JSON and prints a summary table.
 """
-import argparse, json, math, os, sys
+import argparse, json, os, sys
 import numpy as np
 import torch
-import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eval"))

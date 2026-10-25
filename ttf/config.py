@@ -1,5 +1,6 @@
-"""Model + training configuration for the ternary BitNet b1.58 LLM."""
-from dataclasses import dataclass, field, asdict
+"""Model + training configuration for the from-scratch transformer (ttf/model.py); a Qwen model takes its shape from
+its Hugging Face config (ttf/qwen.py)."""
+from dataclasses import dataclass
 
 
 @dataclass
@@ -18,8 +19,8 @@ class ModelConfig:
     act_bits: int = 8              # activation quantization bit-width
 
     def __post_init__(self):
-        assert self.dim % self.n_heads == 0, "dim must divide n_heads"
-        assert self.n_heads % self.n_kv_heads == 0, "n_heads must divide n_kv_heads"
+        assert self.dim % self.n_heads == 0, "n_heads must divide dim"
+        assert self.n_heads % self.n_kv_heads == 0, "n_kv_heads must divide n_heads"
 
     # ---- parameter / memory accounting -------------------------------------
     def n_params(self) -> int:
@@ -29,12 +30,10 @@ class ModelConfig:
         embed = V * d
         head = 0 if self.tie_embeddings else V * d
         norms = L * 2 * d + d                       # small; rope has none
-        # BitLinear carries an internal RMSNorm weight per linear:
-        bitlinear_norms = L * (4 * d + 2 * H + d)   # q,k,v,o inputs + gate,up + down input
-        return per_layer * L + embed + head + norms + bitlinear_norms
+        return per_layer * L + embed + head + norms
 
     def n_ternary_params(self) -> int:
-        """Weights stored ternary at deploy (the BitLinear weight matrices only)."""
+        """Weights stored ternary at deploy (the linear layers' weight matrices)."""
         d, L, H = self.dim, self.n_layers, self.hidden_dim
         kv = self.n_kv_heads * (d // self.n_heads)
         return (2 * d * d + 2 * d * kv + 3 * d * H) * L
@@ -50,9 +49,7 @@ class ModelConfig:
         return (
             f"params        : {self.n_params()/1e6:,.1f} M\n"
             f"  ternary      : {self.n_ternary_params()/1e6:,.1f} M (packed ~1.58 bit)\n"
-            f"deploy size    : {self.deploy_bytes()/gib:.3f} GiB\n"
-            f"train est bf16 : ~{self.n_params()*6/gib:.2f} GiB weights+8bit-Adam "
-            f"(+ activations)"
+            f"deploy size    : {self.deploy_bytes()/gib:.3f} GiB"
         )
 
 
@@ -73,14 +70,10 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
     grad_checkpoint: bool = True            # trade compute for VRAM
-    use_8bit_adam: bool = True              # needs bitsandbytes; else falls back to AdamW
-    compile: bool = True
     eval_interval: int = 1000
     eval_iters: int = 100
     log_interval: int = 10
-    save_interval: int = 2000
     seed: int = 1337
-    dtype: str = "bfloat16"
 
 
 # --- presets sized for a single consumer GPU -------------------------------
@@ -88,7 +81,7 @@ PRESETS = {
     # ~340M params. Trains comfortably on 12GiB with checkpointing.
     "d1024_l24": ModelConfig(dim=1024, n_layers=24, n_heads=16, n_kv_heads=16,
                              hidden_dim=2816),
-    # ~130M params. Fast to iterate / debug the pipeline.
+    # ~110M params (the 110M runs). Fast to iterate / debug the pipeline.
     "small": ModelConfig(dim=768, n_layers=12, n_heads=12, n_kv_heads=12,
                          hidden_dim=2048),
     # ~15M (6.4M in the linears + 8.2M tied 32k embedding): 300M tokens = 20 tokens per parameter (Chinchilla).
@@ -96,18 +89,16 @@ PRESETS = {
     # ~51M, GPT-2 BPE vocab (50257). For the master vs master-free study on Wiki.
     "s50": ModelConfig(vocab_size=50257, dim=512, n_layers=8, n_heads=8,
                        n_kv_heads=8, hidden_dim=1408, max_seq_len=512),
-    # 2-layer toy for the induction-head test on synthetic repeated-segment data (scripts/toy/).
+    # 2-layer toy for the induction-head test on synthetic repeated-segment data.
     "toy2": ModelConfig(vocab_size=2048, dim=256, n_layers=2, n_heads=4, n_kv_heads=4,
                         hidden_dim=768, max_seq_len=256),
-    # ~730M params. Pushes a 12GiB card: use batch_size=1, grad_checkpoint, 8bit-adam.
     # ~1.3B: the 340M shape at twice the width (a third width for the rank-vs-width question).
     "d2048_l24": ModelConfig(dim=2048, n_layers=24, n_heads=16, n_kv_heads=16,
                              hidden_dim=5632),
     "d1536_l24": ModelConfig(dim=1536, n_layers=24, n_heads=16, n_kv_heads=8,
                              hidden_dim=4096),
-    # ~27B. Deploys ~5.3GiB packed ternary. VERIFIED trainable on a 12GiB laptop
-    # GPU (stateless mode, seq<=512, peak ~10.9GiB, ~67 tok/s). 32k vocab keeps
-    # the embedding tail small; raise it if your tokenizer needs more.
+    # 23.0B by n_params (named for the 27B target it was sized for). Deploys ~4.5GiB packed ternary. 32k vocab keeps the embedding tail small; raise it if your tokenizer
+    # needs more.
     "b27": ModelConfig(vocab_size=32000, dim=5120, n_layers=83, n_heads=40,
                        n_kv_heads=8, hidden_dim=13824, max_seq_len=2048),
     # width sweep (3 Oct): ~10B and ~15B with the b27 head layout (GQA, 8 KV heads of 128)
@@ -118,7 +109,7 @@ PRESETS = {
     # ~2.9B (5 Oct, memory-matched goldbug arm): width 3072, the b27 head layout (GQA, 8 KV heads of 128)
     "b3": ModelConfig(vocab_size=32000, dim=3072, n_layers=28, n_heads=24,
                       n_kv_heads=8, hidden_dim=8192, max_seq_len=2048),
-    # ~40B target. NOT trainable on one 12GiB card (weights alone ~8GiB ternary +
+    # 32.0B by n_params (named for a ~40B target). NOT trainable on one 12GiB card (weights alone ~8GiB ternary +
     # activations). Needs multi-GPU / big-RAM offload. Architecture is identical.
     "b40": ModelConfig(vocab_size=128000, dim=6144, n_layers=80, n_heads=48,
                        n_kv_heads=8, hidden_dim=16384, max_seq_len=4096),

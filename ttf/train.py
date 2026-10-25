@@ -193,7 +193,8 @@ def main():
     if args.mem_snapshot and device == "cuda":   # --mem-snapshot PATH:STEP: every allocation with its Python stack
         torch.cuda.memory._record_memory_history(enabled="all", stacks="python", max_entries=2_000_000)
     torch.manual_seed(tc.seed)
-    print(mc.report())
+    if not _QWEN:
+        print(mc.report())
     use_beta = args.mode == "ttf"
 
     _qsw = {}
@@ -226,7 +227,7 @@ def main():
     elif args.mode == "bitnet":
         model = build_master_transformer(mc, grad_checkpoint=tc.grad_checkpoint, dtype=torch.float32)
     model = model.to(device) if not _PP else model._apply(lambda t_: t_ if t_.is_meta else t_.to(device))   # --pipe: others' stay meta
-    try:   # counted from the modules (mc.report() above is a formula: approximate for hybrid / HF models)
+    try:   # counted from the modules (mc.report() above is the preset's formula)
         n_t_ = sum(m_.N * m_.K for m_ in model.modules() if getattr(m_, "wpacked", None) is not None and hasattr(m_, "N"))
         n_f_ = sum(p_.numel() for p_ in model.parameters())
         print(f"counted       : ternary {n_t_ / 1e6:,.1f} M + float {n_f_ / 1e6:,.1f} M", flush=True)

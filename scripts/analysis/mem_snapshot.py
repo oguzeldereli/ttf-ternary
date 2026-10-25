@@ -31,7 +31,7 @@ def main():
     snap = pickle.load(open(args.snap, "rb"))
     tr = snap["device_traces"][0]
     live, cur, res = {}, 0, 0
-    peak, peak_i, rpeak, rpeak_i, rpeak_alloc = 0, -1, 0, -1, 0
+    peak, peak_i, rpeak, rpeak_alloc = 0, -1, 0, 0
     for i, e in enumerate(tr):
         a = e["action"]
         if a == "alloc":
@@ -50,7 +50,7 @@ def main():
         if cur > peak:
             peak, peak_i = cur, i
         if res > rpeak:
-            rpeak, rpeak_i, rpeak_alloc = res, i, cur
+            rpeak, rpeak_alloc = res, cur
     end_live = {v[1] for v in live.values()}
     print(f"{len(tr)} events; peak allocated {peak / GiB:.2f} GiB at event {peak_i}; peak reserved {rpeak / GiB:.2f} GiB "
           f"(allocated then {rpeak_alloc / GiB:.2f}: {(rpeak - rpeak_alloc) / GiB:.2f} GiB cached but unused); "

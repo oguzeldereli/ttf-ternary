@@ -8,7 +8,6 @@ head (the two 248k x d matrices, about half the bytes in bf16) in B-bit groups o
 ttf_qwen.py loads either form (grouped matrices are expanded to bf16 at load: the same memory and speed as bf16, a
 smaller file)."""
 import argparse
-import sys
 
 import torch
 

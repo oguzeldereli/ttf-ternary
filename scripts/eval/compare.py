@@ -8,7 +8,7 @@ consecutive windows, since neighbouring windows can come from the same article).
 over its runs (seeds), and the spread across seeds is reported next to the window interval.
 """
 from __future__ import annotations
-import argparse, os, sys
+import argparse, os
 import numpy as np
 
 

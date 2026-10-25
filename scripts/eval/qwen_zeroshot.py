@@ -17,7 +17,6 @@ import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 TASKS = ("lambada", "hellaswag", "piqa", "arc_easy", "arc_challenge", "winogrande")

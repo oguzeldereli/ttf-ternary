@@ -13,7 +13,7 @@ flash-linear-attention.
   python ttf_qwen.py MODEL_DIR WEIGHTS.pt [-p "prompt"] [-i] [--chat] [-n 256] [--temp 0.7]
 MODEL_DIR holds config.json and the tokenizer files; WEIGHTS.pt the trainer's model state (scripts: slim27.py).
 """
-import argparse, os, sys, time, math
+import argparse, os, sys, time
 
 import torch
 import torch.nn as nn
@@ -160,7 +160,6 @@ def build(model_dir, weights, dev, emb_cpu):
             if isinstance(child, nn.Linear) and cname not in _KEEP_FLOAT:
                 shapes[(name, cname)] = (child.in_features, child.out_features)
                 setattr(mod, cname, nn.Identity())
-    emb_shape = tuple(hf.model.embed_tokens.weight.shape)
     if emb_cpu:
         hf.model.embed_tokens = nn.Identity()
     hf = hf.to(torch.bfloat16)            # still on meta: free; to_empty then allocates bf16 directly (no fp32 copy)

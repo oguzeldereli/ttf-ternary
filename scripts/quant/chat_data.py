@@ -8,7 +8,6 @@ every assistant turn carries the empty think block the model sees at inference) 
 --mix WIKI_BIN OUT_BIN FRAC: interleave a chat stream with another stream in 8192-token segments, FRAC of chat
 (the trainer samples windows uniformly, so the mix is the share of training windows)."""
 import argparse
-import os
 import sys
 
 import numpy as np

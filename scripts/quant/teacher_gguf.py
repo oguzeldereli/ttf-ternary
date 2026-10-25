@@ -9,7 +9,7 @@ Window starts: --sequential = every non-overlapping seq-token window of DATA onc
 writes only the shards with index % N == R (the order and the starts are the same on every machine), so N machines fill
 one cache; restarts skip finished shards. OUT_DIR/done is written by whoever finds every shard present.
 """
-import argparse, os, subprocess, sys, time
+import argparse, os, subprocess, time
 import numpy as np
 
 ap = argparse.ArgumentParser()

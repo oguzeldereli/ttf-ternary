@@ -1,7 +1,7 @@
 """beta = 1/sqrt(K*rho) on the kernel path: matches a dense reference (fwd, grad_x),
 restores unit output scale, and un-collapses attention on a fresh model."""
 import math, torch
-from ttf.kernel import pack_rows, unpack_rows, trit_beta, act_quant_i8
+from ttf.kernel import unpack_rows, trit_beta, act_quant_i8
 from ttf.layers import KernelTernaryLinear, build_kernel_transformer
 from ttf.config import ModelConfig
 from ttf import model as M

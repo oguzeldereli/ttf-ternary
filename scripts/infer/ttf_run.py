@@ -13,7 +13,7 @@ inside a Llama-style decoder (RMSNorm, RoPE, SwiGLU, per-head attention temperat
   python ttf_run.py export CKPT OUT.safetensors                             (trits + scales only, no optimizer state)
 MODEL is a trainer checkpoint (.pt) or an exported .safetensors file.
 """
-import argparse, json, math, os, sys, time, types
+import argparse, json, math, sys, time, types
 
 import torch
 import torch.nn.functional as F

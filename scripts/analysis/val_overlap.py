@@ -5,7 +5,7 @@
 Reports: val articles whose exact token sequence also occurs as an article in train; the share of val n-grams
 (n tokens, default 32) that occur anywhere in train (rolling hash; collisions make this an upper bound).
 """
-import argparse, hashlib, sys
+import argparse, hashlib
 import numpy as np
 
 ap = argparse.ArgumentParser()

@@ -5,7 +5,7 @@ import os
 import math
 import torch
 
-from .layers import KernelTernaryLinear, _rf
+from .layers import _rf
 from .schedule import _theta_at
 
 
@@ -234,7 +234,7 @@ def _ts_state_bytes(lr_state):
 def _acc_turn(U, V, S_, mass=None):
     """the basis turn at the end of a step: one subspace iteration of the step's whole tally A' = A + sum u, and A' kept
     on the new basis (A <- A' Vn Vn^T). Here from U = lk U_0 + sum u V (the step's u entered on its basis, the
-    --ttf-accum micro path: U_0 is not kept): X = A'^T U = V (U^T U) + (I - V V^T) (sum u)^T U with S_ = (sum u)^T U
+    micro-batch path: U_0 is not kept): X = A'^T U = V (U^T U) + (I - V V^T) (sum u)^T U with S_ = (sum u)^T U
     [K, r] (_sketch_cross), and A' Vn = U V^T Vn + sum u (I - V V^T) Vn: mass(W) = sum u W (_sketch_mass). A one-batch
     step turns from U_0 itself (X = A'^T U_0, A' Vn = U_0 V^T Vn + u Vn: exact, two products of u). The micro rule
     before turned from M u_M^T U (the last micro-batch's u x M: 16 x the noise of the step's sum; a converted Qwen
