@@ -443,14 +443,14 @@ def load_qwen(m, path, swapped, method="als", rc=True, hess=None, log=print):
         T, a, c = ternarize(W, "als" if method in ("gptq", "gptqc") else method)
         if hess is not None:
             Hl = hess[name].to(W.device)
-            e0 = _out_err(W, T, a, c, Hl)
+            mu = hess["mu:" + name].to(W.device) if method == "gptqc" else None   # (centred: the layer's error)
+            e0 = _out_err(W, T, a, c, Hl, mu)
             if method == "gptq":
                 T, a, c = ternarize_gptq(W, Hl, a, c)
             elif method == "gptqc":     # centred (hf_init gptqc): GPTQ on the input covariance, the layer takes the
-                mu = hess["mu:" + name].to(W.device)    # input mean out before its activation quantisation, W mu as a bias
-                T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)
-                lin.enable_centering(mu, W @ mu)
-            oerrs.append((e0, _out_err(W, T, a, c, Hl))); del Hl
+                T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)   # input mean out before its activation
+                lin.enable_centering(mu, W @ mu)                            # quantisation, W mu as a bias
+            oerrs.append((e0, _out_err(W, T, a, c, Hl, mu))); del Hl
         errs.append(_rel_err(W, T, a, c))
         lin.wpacked.copy_(pack_rows(T))
         beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
@@ -638,7 +638,8 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
             lin = mine[n]
             W = f.weight.float(); Hl = Hs.pop(n) / max(cnt[n], 1); mu = Ss.pop(n) / max(cnt[n], 1)
             T, a, c = ternarize(W, "als")
-            e0 = _out_err(W, T, a, c, Hl)
+            mu_e = mu if method == "gptqc" else None    # (centred: the layer's error, not the raw input's)
+            e0 = _out_err(W, T, a, c, Hl, mu_e)
             if method == "gptq":
                 T, a, c = ternarize_gptq(W, Hl, a, c)
             elif method == "gptqc":                     # centred (hf_init gptqc)
@@ -647,7 +648,7 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
                 for f_ in X_.having("refine"):          # e.g. coordinate descent on the trits
                     T, a, c = f_(n, W, Hc_, T, a, c)
                 lin.enable_centering(mu, W @ mu)
-            oerrs.append((e0, _out_err(W, T, a, c, Hl))); errs.append(_rel_err(W, T, a, c))
+            oerrs.append((e0, _out_err(W, T, a, c, Hl, mu_e))); errs.append(_rel_err(W, T, a, c))
             lin.wpacked.copy_(pack_rows(T))
             beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
             lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
@@ -668,8 +669,9 @@ def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64,
         torch.cuda.empty_cache()
         if li % 8 == 0 or li == len(layers) - 1:
             e0, e1 = zip(*oerrs[-len(mine):])
+            per = " ".join(f"{n.rsplit('.', 2)[-2]}.{n.rsplit('.', 1)[-1]} {e:.3f}" for n, e in zip(mine, e1))
             log(f"  layer {li}: {len(mine)} linears, output-space error {sum(e1) / len(e1):.4f} "
-                f"(ALS {sum(e0) / len(e0):.4f}), peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
+                f"(ALS {sum(e0) / len(e0):.4f}), peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB; {per}")
     for n, q in wrapped.items():                         # the wrappers back in the tree
         par, cn = n[len("model.layers."):].rsplit(".", 1)
         setattr(hf.model.layers.get_submodule(par), cn, q)

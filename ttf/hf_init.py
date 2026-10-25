@@ -131,10 +131,13 @@ def _rel_err(W, T, a, c):
     return float((W - a[:, None] * c[None, :] * T.float()).norm() / W.norm())
 
 
-def _out_err(W, T, a, c, H):
-    """output-space relative error tr(E H E^T) / tr(W H W^T), E = W - a c T, H = X^T X of the layer's inputs"""
+def _out_err(W, T, a, c, H, mu=None):
+    """output-space relative error tr(E H E^T) / tr(W H W^T), E = W - a c T, H = X^T X of the layer's inputs; mu: a
+    centred layer (gptqc: x - mu goes through the trits, W mu is added back exactly), whose error is tr(E Hc E^T),
+    Hc = H - mu mu^T (the raw H counted the mean's error, which the layer does not make: ALS > 1 at 27B layer 0)"""
     E = W - a[:, None] * c[None, :] * T.float()
-    return float(((E @ H) * E).sum() / ((W @ H) * W).sum())
+    Hn = H if mu is None else H - torch.outer(mu, mu)
+    return float(((E @ Hn) * E).sum() / ((W @ H) * W).sum())
 
 
 @torch.no_grad()
@@ -377,14 +380,14 @@ def init_from_hf(model, path, mode, method="als", rc=False, log=print, hess=None
             T, a, c = ternarize(W, "als" if method in ("gptq", "gptqc") else method)
             if hess is not None:
                 Hl = hess[(i, name)].to(dev)
-                e0 = _out_err(W, T, a, c, Hl)
+                mu = hess[("mu", i, name)].to(dev) if method == "gptqc" else None
+                e0 = _out_err(W, T, a, c, Hl, mu)
                 if method == "gptq":
                     T, a, c = ternarize_gptq(W, Hl, a, c)
                 elif method == "gptqc":     # centred: GPTQ on the input covariance; the layer subtracts the input mean
-                    mu = hess[("mu", i, name)].to(dev)  # before its activation quantisation and adds W mu back as a bias
-                    T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)
-                    lin.enable_centering(mu, W @ mu)
-                oerrs.append((e0, _out_err(W, T, a, c, Hl)))
+                    T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)   # before its activation quantisation
+                    lin.enable_centering(mu, W @ mu)                            # and adds W mu back as a bias
+                oerrs.append((e0, _out_err(W, T, a, c, Hl, mu)))
                 del Hl
             errs.append(_rel_err(W, T, a, c))
             lin.wpacked.copy_(pack_rows(T))
