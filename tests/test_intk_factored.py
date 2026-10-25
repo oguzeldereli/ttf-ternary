@@ -283,3 +283,24 @@ def test_fire_negative_step():
     W = m.dequant()
     assert int((m.codes[0] == 2).sum()) == K and int((m.codes[1] == 0).sum()) == K
     assert bool((W - (m.lo.detach()[:, :1] + m.s.detach()[:, :1] * 1.0)).gt(0).all())
+
+
+def test_bf16_group_parameters():
+    """the 27B model keeps lo / s in bf16 (box, 25 Oct: index_add_ bf16 self / fp32 source in the lookup's backward):
+    the lookup and the head loss return their gradients in the parameters' dtype, close to the fp32 ones"""
+    N, K, T = 120, 64, 30
+    grads = {}
+    for dt in (torch.float32, torch.bfloat16):
+        torch.manual_seed(0)
+        m = IE.IntKMatrix(torch.randn(N, K) * 0.1, 2)
+        m.lo.data, m.s.data = m.lo.data.to(dt), m.s.data.to(dt)
+        m.add_part = lambda p: None
+        idx = torch.randint(0, N, (2, 15))
+        y = IE._Emb(m).train()(idx)
+        (y.float() * torch.randn(y.shape, generator=torch.Generator().manual_seed(3))).sum().backward()
+        h = torch.randn(T, K, generator=torch.Generator().manual_seed(4))
+        IE.head_loss(m, h, torch.randint(0, N, (T,), generator=torch.Generator().manual_seed(5)), None, chunk=16).backward()
+        assert m.lo.grad.dtype == dt and m.s.grad.dtype == dt
+        grads[dt] = (m.lo.grad.float(), m.s.grad.float())
+    for a, b in zip(grads[torch.bfloat16], grads[torch.float32]):
+        assert float((a - b).norm() / b.norm()) < 3e-2

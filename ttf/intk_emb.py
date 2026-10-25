@@ -476,8 +476,9 @@ class _EmbFn(torch.autograd.Function):
         Gu.index_add_(0, inv, go.reshape(-1, m.K).float())
         Gg = Gu.view(-1, m.K // m.g, m.g)
         q = m.codes[u].view(-1, m.K // m.g, m.g).float()
-        glo = torch.zeros_like(m.lo).index_add_(0, u, Gg.sum(-1))
-        gs = torch.zeros_like(m.s).index_add_(0, u, (Gg * q).sum(-1)); del q, Gg
+        f32 = dict(dtype=torch.float32, device=go.device)   # summed in fp32, returned in the parameters' dtype (bf16 at 27B)
+        glo = torch.zeros(m.lo.shape, **f32).index_add_(0, u, Gg.sum(-1)).to(m.lo.dtype)
+        gs = torch.zeros(m.s.shape, **f32).index_add_(0, u, (Gg * q).sum(-1)).to(m.s.dtype); del q, Gg
         m.add_part(("s", u, Gu))
         return None, glo, gs, None
 
