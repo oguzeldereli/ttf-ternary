@@ -379,10 +379,15 @@ def main():
     if args.compile:
         from .model import enable_compile
         enable_compile()
-    if _QWEN and args.intk_emb:              # --intk-emb: int-k code matrices for the embedding and head, TTF-trained
-        from .intk_emb import enable_intk_emb
+    if args.intk_emb:                        # --intk-emb: int-k code matrices for the embedding and head, TTF-trained
+        from .intk_emb import enable_intk_emb, enable_intk_emb_bt, INTK_FACTORED as _IKF
+        _IKF[0] = args.intk_update == "factored"
         assert args.train_emb == "none", "--intk-emb trains the embedding / head itself"
-        for m_ in enable_intk_emb(model, args.intk_emb, log=lambda m_: print(m_, flush=True)):
+        assert args.mode == "ttf", "--intk-emb: the codes are TTF-trained (--mode ttf)"
+        assert not (_IKF[0] and tc.grad_accum > 1 and not args.micro), \
+            "--intk-update factored with --accum > 1 needs --ttf-accum micro (no gradient is kept across micro-batches)"
+        _en = enable_intk_emb if _QWEN else enable_intk_emb_bt
+        for m_ in _en(model, args.intk_emb, log=lambda m_: print(m_, flush=True)):
             m_.dp_reduce = _WS > 1 and not _PP          # (data parallel only: --pipe stages are not replicas)
     if _QWEN and args.train_emb != "none":   # --train-emb: the head (and the embedding) join the float tail (the
         _te = [model.hf.lm_head.weight] + ([model.hf.model.embed_tokens.weight] if args.train_emb == "both" else [])
@@ -532,7 +537,7 @@ def main():
                                        for m in _tern_lays(model)] if te and lr_state else None,
                     # --intk-emb: the int-k embedding / head matrices' TTF state, the same form
                     "intk_state": [(lr_state.get(id(m)), {k[0]: lr_state.get("_ts", {})[k] for k in
-                                    (("t", id(m)), ("v", id(m))) if k in lr_state.get("_ts", {})})
+                                    (("t", id(m)), ("v", id(m)), ("f", id(m))) if k in lr_state.get("_ts", {})})
                                    for m in _intk_lays(model)] if args.intk_emb and lr_state else None}, tmp)
         os.replace(tmp, ckpt_path)
 
@@ -711,7 +716,8 @@ def main():
             if uv is not None:
                 lr_state[id(m)] = tuple(t.to(device) for t in uv)
             for k_, v_ in d_.items():
-                st_[(k_, id(m))] = tuple(x.to(device) for x in v_) if isinstance(v_, tuple) else v_
+                st_[(k_, id(m))] = (tuple(x.to(device) if torch.is_tensor(x) else x for x in v_) if isinstance(v_, tuple)
+                                    else v_)    # (("f": the int-k store's chunking, ints)
           print(f"resumed the {_key} TTF state of {len(blob[_key])} matrices", flush=True)
         if blob.get("ts_state"):
             lays = [m for m in model.modules() if isinstance(m, KernelTernaryLinear)]
@@ -778,6 +784,10 @@ def main():
                       offload={"none": False, "host": True, "async": "async"}[args.ttf_offload],
                       theta_sched=(tuple(float(x) for x in args.ttf_theta_sched.split(":")) if args.ttf_theta_sched else None),
                       progress=0.0, factored=args.factored_k)
+    if ttf and args.intk_emb and args.intk_update == "factored":   # the int-k matrices update inside their backward
+        for m_ in _intk_lays(model):
+            m_._ts_state, m_._ts_cfg = lr_state, ts_cfg
+            m_._ts_host = args.ttf_offload != "none"
     if ttf and args.ttf_update == "fused":         # --ttf-update fused: each layer's update inside its backward (ts_layer)
         for i_, m_ in enumerate([m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)]):
             m_._ts_idx = i_
@@ -922,6 +932,8 @@ def main():
                     for l_ in model.modules():
                         if isinstance(l_, KernelTernaryLinear):
                             l_.cap_accum = True; l_.cap_final = i_ == tc.grad_accum - 1
+                    for l_ in (_intk_lays(model) if args.intk_emb else ()):
+                        l_._ts_final = i_ == tc.grad_accum - 1
             last_loss = model.pp_train(_bt, _pre_bwd, lambda: torch.autocast(device_type=device.split(":")[0],
                                                                              dtype=torch.bfloat16)).item()
             del _bt
@@ -930,6 +942,8 @@ def main():
                 for l_ in model.modules():
                     if isinstance(l_, KernelTernaryLinear):
                         l_.cap_accum = True; l_.cap_final = micro == tc.grad_accum - 1
+                for l_ in (_intk_lays(model) if args.intk_emb else ()):
+                    l_._ts_final = micro == tc.grad_accum - 1
             if args.kd_cache:          # --kd-cache: the next precomputed window, its tokens and the teacher's top k
                 # data parallel: each rank its own windows (rank 0 of 1 reads what a single run always read)
                 x, y, model.kd_topk = _kd_cache_batch(args, ((step - args.kd_cache_start) * tc.grad_accum + micro) * _WS + _RK,
@@ -964,7 +978,7 @@ def main():
             if te and args.mode != "bitnet":   # the ternary embedding's TTF update (both of its gradients)
                 from .tern_emb import tern_emb_step
                 tern_emb_step(model, lr_state, ts_cfg, ts_layer)
-            if args.intk_emb and micro == tc.grad_accum - 1:   # --intk-emb: after the step's last backward
+            if args.intk_emb and args.intk_update == "dense" and micro == tc.grad_accum - 1:   # after the last backward
                 from .intk_emb import intk_layers
                 for m_ in intk_layers(model):
                     m_.step(ts_layer, lr_state, ts_cfg)

@@ -77,6 +77,11 @@ def load_model(path, device, mag_kind="add"):
         enable_tern_emb = importlib.import_module(P + ".tern_emb").enable_tern_emb
         enable_tern_emb(model, "untied" if ("lm_head.wpacked" in sd or "lm_head.latent" in sd) else "tied",
                         "master" if mode == "master" else "kernel")
+    if "tok_emb.m.codes" in sd:                               # --intk-emb E:H[:G]: int-k code embedding (/ head)
+        a_ = ck.get("args") or {}
+        a_ = a_ if isinstance(a_, dict) else vars(a_)
+        from ttf.intk_emb import enable_intk_emb_bt
+        enable_intk_emb_bt(model, a_["intk_emb"], log=lambda m_: None)
     if any(k.endswith(".rot_Q") for k in sd):                # --init_rot: rotated inputs
         for n_, m_ in model.named_modules():
             if isinstance(m_, KernelTernaryLinear) and f"{n_}.rot_Q" in sd:

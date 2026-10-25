@@ -169,8 +169,11 @@ def build_parser():
     g.add_argument("--emb-lr-mult", type=float, default=1.0, help="their learning rate x this")
     g.add_argument("--init-ckpt", default="", help="start a run from a checkpoint's weights (e.g. a pre-converted "
                    "model, saved with --stop-after 0): step 0, a fresh optimizer and TTF state, the same --ext list")
-    g.add_argument("--intk-emb", default="", help="Qwen: E:H[:G]: token embedding / output head as E- / H-bit codes in "
-                   "groups of G (64), trained by TTF (ttf/intk_emb.py), e.g. 2:3")
+    g.add_argument("--intk-emb", default="", help="E:H[:G]: token embedding / output head as E- / H-bit codes in "
+                   "groups of G (64), trained by TTF (ttf/intk_emb.py), e.g. 2:3 (a tied matrix: E bits)")
+    g.add_argument("--intk-update", default="factored", choices=["factored", "dense"],
+                   help="--intk-emb: factored (no dense matrix or gradient: the head's loss in chunks from the codes, "
+                   "the embedding's update on its rows) or dense (the bf16 matrix and an fp32 gradient sum per step)")
     g.add_argument("--kd-cache", default="", help="precomputed teacher top-k targets (scripts/quant/teacher_topk.py)")
     g.add_argument("--kd-cache-mode", default="renorm", choices=["renorm", "rest", "sample", "windows"],
                    help="renorm: KL on the top k renormalised; rest: top k plus one bucket for the remaining mass; sample: "

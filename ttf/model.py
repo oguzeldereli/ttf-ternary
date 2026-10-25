@@ -310,6 +310,17 @@ class BitTransformer(nn.Module):
             if ht is not None and targets is not None:   # --kd-hidden: this block's update on the student's own path
                 hid = hid + self._rel_update_err(h - h_in, ht[i + 1] - ht[i])   # against the teacher block's
         h = self.norm(h)
+        from .intk_emb import factored_head, head_loss as _ik_loss
+        ik = factored_head(self.tok_emb if self.lm_head is None else self.lm_head, self.training)
+        if ik is not None and targets is not None and self.hid_t is None:
+            # --intk-emb, factored update: the int-k head's chunked loss (no [V, d] matrix, no dense dL/dW)
+            hf, tf = h.reshape(-1, h.shape[-1]), targets.reshape(-1)
+            kd = ("lp", self.kd_logp, self.kd_w) if self.kd_logp is not None else None
+            loss = _ik_loss(ik, hf, tf, kd, self.loss_chunk) / (tf != -1).sum().clamp_min(1)
+            aux = [l.ffn.aux_loss for l in self.layers if getattr(l.ffn, "aux_loss", None) is not None]
+            if aux and self.moe_aux_w:
+                loss = loss + self.moe_aux_w * torch.stack(aux).mean()
+            return None, loss
         w = self.tok_emb.weight if self.lm_head is None else self.lm_head.weight
         if targets is None:
             return F.linear(h, w), None

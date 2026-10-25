@@ -461,7 +461,11 @@ def ts_layer(l, g, state, c):
 def _mmb(A, B):
     """A (bf16, the factor) @ B on the bf16 tensor cores with fp32 accumulation and output (B rounded to bf16, as the
     dense path rounds the weight gradient to bf16)"""
-    return torch.mm(A, B.to(A.dtype), out_dtype=torch.float32) if A.dtype == torch.bfloat16 else A @ B
+    if A.dtype != torch.bfloat16:
+        return A @ B
+    if not A.is_cuda:        # (CPU: no mm with out_dtype; the same bf16 rounding of B, fp32 products)
+        return A.float() @ B.to(A.dtype).float()
+    return torch.mm(A, B.to(A.dtype), out_dtype=torch.float32)
 
 
 def _fg_mm_r(fg, a, W):

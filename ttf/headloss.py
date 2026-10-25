@@ -14,29 +14,62 @@ import torch.nn.functional as F
 _CHECK = os.environ.get("TERN_CHECK_HEAD") == "1"
 
 
+def ce_kd_dz(z, tgt, tlp, a):
+    """the summed loss of one chunk's logits z [n, V] (fp32) and dL/dz: (1 - a) CE + a KL(p_t || softmax(z)) (tlp the
+    teacher's log-probabilities), or CE (tlp None); z is consumed (overwritten)"""
+    lp = F.log_softmax(z, -1)
+    del z
+    ok = tgt != -1
+    nll = -lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0][ok].sum()
+    p = lp.exp()
+    if tlp is not None:
+        tl = tlp.float(); pt = tl.exp()
+        kl = (pt * (tl - lp)).sum(); del tl
+        loss = kl if a >= 1.0 else (1 - a) * nll + a * kl
+        ca = 0.0 if a >= 1.0 else (1 - a)
+        ak = min(a, 1.0)                  # a >= 1: the loss is the KL alone, weight 1 (as _loss_chunk_kd)
+        dz = p * (ca * ok.float()[:, None] + ak * pt.sum(-1, keepdim=True)) - ak * pt
+    else:
+        loss, ca = nll, 1.0
+        dz = p * ok.float()[:, None]
+    if ca:
+        idx = tgt.clamp_min(0)[:, None]
+        dz.scatter_add_(1, idx, torch.full_like(idx, -ca, dtype=dz.dtype) * ok[:, None])
+    return loss, dz
+
+
+def topk_dz(z, tgt, ids, tlp, a, mode):
+    """as ce_kd_dz for qwen._kd_topk_chunk ((1 - a) CE + a KD to the teacher's top k, mode 'rest' / 'renorm')"""
+    lse = torch.logsumexp(z, -1, keepdim=True)
+    s = (z - lse).exp()                                           # the student's softmax
+    lq = z.gather(1, ids) - lse
+    if mode == "renorm":
+        q = torch.softmax(tlp.float(), -1)
+        kd = -(q * lq).sum()
+        dz = s * q.sum(-1, keepdim=True)
+        dz.scatter_add_(1, ids, -q)
+    else:
+        pk = tlp.float().exp(); p_rest = (1 - pk.sum(-1, keepdim=True)).clamp_min(0)
+        zm = z.scatter(1, ids, float("-inf")); lse_r = torch.logsumexp(zm, -1, keepdim=True)
+        kd = -(pk * lq).sum() - (p_rest * (lse_r - lse)).sum()
+        dz = s * (pk.sum(-1, keepdim=True) + p_rest) - p_rest * (zm - lse_r).exp()
+        dz.scatter_add_(1, ids, -pk)
+        del zm
+    if a >= 1.0:
+        return kd, dz
+    ok = tgt != -1
+    ce = -(z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0][ok].sum()
+    dz.mul_(a).add_(s * ((1 - a) * ok.float()[:, None]))
+    idx = tgt.clamp_min(0)[:, None]
+    dz.scatter_add_(1, idx, torch.full_like(idx, -(1 - a), dtype=dz.dtype) * ok[:, None])
+    return (1 - a) * ce + a * kd, dz
+
+
 class _HeadLossFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h, w, tgt, tlp, a):
         with torch.no_grad():
-            z = F.linear(h, w).float()
-            lp = F.log_softmax(z, -1)
-            del z
-            ok = tgt != -1
-            nll = -lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0][ok].sum()
-            p = lp.exp()
-            if tlp is not None:
-                tl = tlp.float(); pt = tl.exp()
-                kl = (pt * (tl - lp)).sum(); del tl
-                loss = kl if a >= 1.0 else (1 - a) * nll + a * kl
-                ca = 0.0 if a >= 1.0 else (1 - a)
-                ak = min(a, 1.0)                  # a >= 1: the loss is the KL alone, weight 1 (as _loss_chunk_kd)
-                dz = p * (ca * ok.float()[:, None] + ak * pt.sum(-1, keepdim=True)) - ak * pt
-            else:
-                loss, ca = nll, 1.0
-                dz = p * ok.float()[:, None]
-            if ca:
-                idx = tgt.clamp_min(0)[:, None]
-                dz.scatter_add_(1, idx, torch.full_like(idx, -ca, dtype=dz.dtype) * ok[:, None])
+            loss, dz = ce_kd_dz(F.linear(h, w).float(), tgt, tlp, a)
             dh = torch.mm(dz.to(h.dtype), w, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dz.to(h.dtype) @ w
         ctx.save_for_backward(dh); ctx.h_dtype = h.dtype
         return loss
@@ -60,31 +93,7 @@ class _HeadLossTopkFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h, w, tgt, ids, tlp, a, mode):
         with torch.no_grad():
-            z = F.linear(h, w).float()
-            lse = torch.logsumexp(z, -1, keepdim=True)
-            s = (z - lse).exp()                                           # the student's softmax
-            lq = z.gather(1, ids) - lse
-            if mode == "renorm":
-                q = torch.softmax(tlp.float(), -1)
-                kd = -(q * lq).sum()
-                dz = s * q.sum(-1, keepdim=True)
-                dz.scatter_add_(1, ids, -q)
-            else:
-                pk = tlp.float().exp(); p_rest = (1 - pk.sum(-1, keepdim=True)).clamp_min(0)
-                zm = z.scatter(1, ids, float("-inf")); lse_r = torch.logsumexp(zm, -1, keepdim=True)
-                kd = -(pk * lq).sum() - (p_rest * (lse_r - lse)).sum()
-                dz = s * (pk.sum(-1, keepdim=True) + p_rest) - p_rest * (zm - lse_r).exp()
-                dz.scatter_add_(1, ids, -pk)
-                del zm
-            if a >= 1.0:
-                loss = kd
-            else:
-                ok = tgt != -1
-                ce = -(z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0][ok].sum()
-                loss = (1 - a) * ce + a * kd
-                dz.mul_(a).add_(s * ((1 - a) * ok.float()[:, None]))
-                idx = tgt.clamp_min(0)[:, None]
-                dz.scatter_add_(1, idx, torch.full_like(idx, -(1 - a), dtype=dz.dtype) * ok[:, None])
+            loss, dz = topk_dz(F.linear(h, w).float(), tgt, ids, tlp, a, mode)
             dh = torch.mm(dz.to(h.dtype), w, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dz.to(h.dtype) @ w
         ctx.save_for_backward(dh); ctx.h_dtype = h.dtype
         return loss
@@ -108,25 +117,7 @@ class _HeadLossTrainFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h, w, tgt, tlp, a, acc):
         with torch.no_grad():
-            z = F.linear(h, w).float()
-            lp = F.log_softmax(z, -1)
-            del z
-            ok = tgt != -1
-            nll = -lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0][ok].sum()
-            p = lp.exp()
-            if tlp is not None:
-                tl = tlp.float(); pt = tl.exp()
-                kl = (pt * (tl - lp)).sum(); del tl
-                loss = kl if a >= 1.0 else (1 - a) * nll + a * kl
-                ca = 0.0 if a >= 1.0 else (1 - a)
-                ak = min(a, 1.0)                  # a >= 1: the loss is the KL alone, weight 1 (as _loss_chunk_kd)
-                dz = p * (ca * ok.float()[:, None] + ak * pt.sum(-1, keepdim=True)) - ak * pt
-            else:
-                loss, ca = nll, 1.0
-                dz = p * ok.float()[:, None]
-            if ca:
-                idx = tgt.clamp_min(0)[:, None]
-                dz.scatter_add_(1, idx, torch.full_like(idx, -ca, dtype=dz.dtype) * ok[:, None])
+            loss, dz = ce_kd_dz(F.linear(h, w).float(), tgt, tlp, a)
             dzb = dz.to(h.dtype)
             dh = torch.mm(dzb, w, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dzb @ w
             dW = torch.mm(dzb.T, h, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dzb.T.float() @ h.float()

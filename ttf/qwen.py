@@ -160,6 +160,16 @@ class QwenTern(nn.Module):
     def _head_loss(self, h, targets):
         """the mean loss of the final hidden states: the head and the (KD) loss in chunks of loss_chunk tokens"""
         ckpt = self.grad_checkpoint and self.training
+        from .intk_emb import factored_head, head_loss as _ik_loss
+        ik = factored_head(self.hf.lm_head, self.training)
+        if ik is not None:      # --intk-emb, factored update: the int-k head's chunked loss (no [V, d] matrix, no dense dL/dW)
+            with torch.profiler.record_function("loss.head_kd"):
+                hf_, tf = h.reshape(-1, h.shape[-1]), targets.reshape(-1)
+                if self.kd_topk is not None:
+                    kd = ("topk", self.kd_topk[0], self.kd_topk[1], self.kd_w, self.kd_mode)
+                else:
+                    kd = ("lp", self.kd_logp, self.kd_w) if self.kd_logp is not None else None
+                return _ik_loss(ik, hf_, tf, kd, self.loss_chunk) / (tf != -1).sum().clamp_min(1)
         w = self._head_w()
         _lrf = torch.profiler.record_function("loss.head_kd"); _lrf.__enter__()   # the 248k head + the (KD) loss
         hf_, tf = h.reshape(-1, h.shape[-1]), targets.reshape(-1)
