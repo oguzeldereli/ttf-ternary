@@ -304,3 +304,21 @@ def test_bf16_group_parameters():
         grads[dt] = (m.lo.grad.float(), m.s.grad.float())
     for a, b in zip(grads[torch.bfloat16], grads[torch.float32]):
         assert float((a - b).norm() / b.norm()) < 3e-2
+
+
+def test_bf16_update():
+    """the update with bf16 lo / s and bf16 factors (27B) runs and fires the same codes as with fp32 ones, up to ties"""
+    N, K = 100, 64
+    IE.ROWS[0] = 8192
+    out = {}
+    for dt in (torch.float32, torch.bfloat16):
+        m = _mat(N, K, s_const=False); m.lo.data, m.s.data = m.lo.data.to(dt), m.s.data.to(dt)
+        st = {}
+        for step in range(3):
+            gy, x = _factors(16, N, K, step)
+            u = torch.tensor([3, 7, 50]); G = torch.randn(3, K, generator=torch.Generator().manual_seed(step))
+            IE._intk_update(m, [("d", gy.to(dt), x.to(dt)), ("s", u, G)], st, _cfg(theta=0.05))
+        out[dt] = m.codes.clone()
+    ch = (out[torch.float32] != _mat(N, K).codes).float().mean()
+    agree = (out[torch.float32] == out[torch.bfloat16]).float().mean()
+    assert float(ch) > 0.01 and float(agree) > 0.97, (float(ch), float(agree))
