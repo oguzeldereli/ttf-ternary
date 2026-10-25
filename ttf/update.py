@@ -267,6 +267,23 @@ def _step_scale(R, C, b2, n):
     return 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30), 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)
 
 
+def _hspend_basis(st, key, x, V, c):
+    """--ttf-hspend F: a move spends theta (D H~) instead of theta D, H~ = I + F (C - I), C the correlation of the layer's
+    input (an EMA, ~100 steps, of the centred input's x^T x from the last micro-batch of each step): a move at (i, j)
+    also takes theta d C_jk from the row's entry (i, k) fed by a correlated input, whose evidence was for the same
+    output change (P2h 500 -> 999: a row's moves changed the output 1.2-1.6 x what independent inputs would, chance
+    1.0-1.1). Low rank exactly: U -= theta D (H~ V), the spend's basis Vs = H~ V [K, r]. State: H [K, K] fp32 and a count"""
+    H, n = st.get(("hs", key), (None, 0))
+    Hn = _dpm(torch.mm(x.T, x, out_dtype=torch.float32) if x.dtype == torch.bfloat16 else x.T.float() @ x.float())
+    Hn = Hn / x.shape[0]
+    w = max(0.01, 1.0 / (n + 1))
+    H = Hn if H is None else H.mul_(1 - w).add_(Hn, alpha=w); del Hn
+    st[("hs", key)] = (H, n + 1)
+    d = H.diag().clamp_min(1e-30).rsqrt()
+    CV = d[:, None] * (H @ (d[:, None] * V.float()))
+    return V + float(c["hspend"]) * (CV - V)
+
+
 def _band_fire(l, st, key, c, U, V, A_prev, u, lk, theta):
     """--ttf-band F: the exact tally on the entries near the threshold. A band of at most F N K entries (where |A| >=
     --ttf-band-lo x theta after the step's moves) keeps E, the exact tally there (lk A + u, the moves' spends) minus
@@ -688,6 +705,7 @@ def _ts_layer_factored(l, fg, state, c):
     st.pop(("venc", key), None)
     from .kernel import unpack_rows, pack_rows
     before = l.wpacked.clone() if l.track else None
+    Vs = _hspend_basis(st, key, x, V, c) if c.get("hspend") else V
     if c.get("band"):
         if A_prev is not None:
             g_ = torch.mm(gy.T, x, out_dtype=torch.float32) if gy.dtype == torch.bfloat16 else gy.T.float() @ x.float()
@@ -697,7 +715,7 @@ def _ts_layer_factored(l, fg, state, c):
         U, nf = _band_fire(l, st, key, c, U, V, A_prev, u_, lk, theta)
     elif FIRE_FUSED[0] and dev.type == "cuda":   # A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
-        DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta)
+        DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta, Vs=Vs)
         DV = _dpm(DV)          # data parallel: the spend's sparse sums (index_add_) are not bit-reproducible: one mean
         l._after_fire(dnnz)    # the kernel writes the trits in place (no version bump): beta follows the moves, --w-cache recomputes
         U = U - c["spend"] * (theta * DV); del DV
@@ -710,7 +728,7 @@ def _ts_layer_factored(l, fg, state, c):
         D = torch.where(fire, d, torch.zeros_like(d))
         nf = fire.sum()
         l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8)))
-        U = U - c["spend"] * (theta * (D @ V))
+        U = U - c["spend"] * (theta * (D @ Vs))
     _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
     if before is not None:

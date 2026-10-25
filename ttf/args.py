@@ -84,6 +84,8 @@ def build_parser():
     g.add_argument("--ttf-spend", type=float, default=1.0, help="a move spends this x theta of the accumulator")
     g.add_argument("--ttf-band", type=float, default=0.0, help="the exact tally on at most this share of the entries, those "
                    "near the threshold (update._band_fire; 0: off; one batch per step)")
+    g.add_argument("--ttf-hspend", type=float, default=0.0, help="a move also spends theta x F x the input correlation "
+                   "from the row's correlated entries (update._hspend_basis; 0: off; --dw factored)")
     g.add_argument("--ttf-band-lo", type=float, default=0.5, help="--ttf-band: an entry is in the band while its |A| >= "
                    "this x theta")
     g.add_argument("--ttf-start", type=int, default=0, help="trits frozen until this step (floats train)")

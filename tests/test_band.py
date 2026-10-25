@@ -57,3 +57,21 @@ def test_band_fires_within_cap():
     idx, e = st["_ts"][("bd", id(l))]
     assert 0 < idx.numel() <= int(0.05 * 24 * 16) and torch.isfinite(e).all()
     assert int((unpack_rows(l.wpacked, 16) != 0).sum()) > 0
+
+
+def test_hspend_identity_and_coupling():
+    """--ttf-hspend: F = 0 or white inputs spend theta D (the plain spend); with correlated inputs a move also takes
+    evidence from the row's correlated entries: U -= theta D (H~ V)"""
+    torch.manual_seed(0)
+    K, r = 16, 4
+    V = torch.linalg.qr(torch.randn(K, r)).Q
+    st = {}
+    x = torch.randn(4096, K)
+    Vs = UP._hspend_basis(st, 1, x, V, {"hspend": 1.0})
+    assert float((Vs - V).norm() / V.norm()) < 0.1                     # white: C ~ I
+    st = {}
+    z = torch.randn(4096, 1); xc = torch.cat([z + 0.1 * torch.randn(4096, 1), z + 0.1 * torch.randn(4096, 1), torch.randn(4096, K - 2)], 1)
+    Vs = UP._hspend_basis(st, 1, xc, V, {"hspend": 1.0})
+    C = torch.corrcoef(xc.T)
+    assert torch.allclose(Vs, C @ V, atol=0.05)
+    assert torch.allclose(UP._hspend_basis({}, 1, xc, V, {"hspend": 0.0}), V)

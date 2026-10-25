@@ -756,7 +756,8 @@ def main():
         ts_cfg = dict(r=args.ttf_rank, lr_ratio=1.0, theta=args.ttf_theta, tau=args.ttf_tau, b2=args.ttf_b2, spend=args.ttf_spend,
                       store_a=store, offload=args.ttf_offload == "async",
                       theta_sched=(tuple(float(x) for x in args.ttf_theta_sched.split(":")) if args.ttf_theta_sched else None),
-                      progress=0.0, factored=args.factored_k, band=args.ttf_band, band_lo=args.ttf_band_lo)
+                      progress=0.0, factored=args.factored_k, band=args.ttf_band, band_lo=args.ttf_band_lo,
+                      hspend=args.ttf_hspend)
     if ttf and args.intk_emb and args.intk_update == "factored":   # the int-k matrices update inside their backward
         for m_ in _intk_lays(model):
             m_._ts_state, m_._ts_cfg = lr_state, ts_cfg
