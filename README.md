@@ -107,7 +107,7 @@ Add `--resume` to continue any run; any option on the command line overrides the
 --help` lists every option with its default (the measured best). Commands from before 17 Oct 2026 (the flags of tag
 `pre-consolidation-2026-10-17`) translate with `ttf.args.from_legacy`; [docs/OPTIONS_MAP.md](docs/OPTIONS_MAP.md)
 lists the correspondence. The earlier methods (the stateless flip rule, low-rank momentum, look-ahead, TTF with a
-short momentum) run as `python -m ttf.legacy.train` ([ttf/legacy/README.md](ttf/legacy/README.md)).
+short momentum) run from a checkout of that tag (`python -m bitnet.train` there; ttf/legacy, its copy, was removed from the core on 25 Oct).
 
 ## Main options
 
@@ -143,14 +143,13 @@ ttf/          the package
   master.py      BitNet b1.58 (--mode bitnet); tern_emb.py: ternary embeddings; opt_lean.py: LeanAdam
   model.py, config.py   Llama-style transformer, presets (small = 110M, d1024_l24 = 340M, d2048_l24 = 1.3B, b27)
   results.py     the results database (results/runs.jsonl): runs, events, results, notes
-  legacy/        the package as of 17 Oct 2026, frozen (the earlier update rules)
 recipes/       TOML defaults for the measured settings (scratch-110m, convert-110m, convert-qwen, convert-27b, continue-27b)
 scripts/
   results.py     the database's command line (status, table, show, find, note, ingest, validate)
   infer/         ttf_run.py (our models), ttf_qwen.py + ttf_kernels.py (converted Qwen, 2-bit dp4a decode)
   eval/          final_eval.py, compare.py, zeroshot*.py
   quant/, analysis/, data/, plots/   conversion tools, diagnostics, data preparation, figures
-  tests/         gate.sh (the core against ttf.legacy, per-step losses), kernel checks and benchmarks
+  tests/         kernel checks and benchmarks, det_run.py (deterministic runs)
 tests/         pytest (-m "not gpu" anywhere; the gpu tests on a CUDA machine); checks/: script checks
 docs/          see below
 ```

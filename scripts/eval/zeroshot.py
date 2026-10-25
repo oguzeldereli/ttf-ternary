@@ -50,7 +50,6 @@ def main():
     ap.add_argument("runs", nargs="+")
     ap.add_argument("--tasks", default="lambada,hellaswag,piqa,arc_easy,arc_challenge,winogrande")
     ap.add_argument("--dir", default="data/zeroshot/tok")
-    ap.add_argument("--mag_kind", default="add")
     a = ap.parse_args()
     assert torch.cuda.is_available(), "GPU only (never the laptop GPU)"
     STATE.updates_enabled = False
@@ -58,7 +57,7 @@ def main():
     for run in a.runs:
         t0 = time.time()
         path = next(p for p in (os.path.join(run, f) for f in ("eval.pt", "ckpt.pt", "ckpt_9154.pt")) if os.path.exists(p))
-        model, _ = load_model(path, "cuda", a.mag_kind)
+        model, _ = load_model(path, "cuda")
         res, arrays = {"run": os.path.basename(os.path.normpath(run))}, {}
         for t, ex in tasks.items():
             if t == "lambada":

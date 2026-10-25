@@ -242,7 +242,7 @@ def resolve(a):
 
 # ---- the trainer's flags before 17 Oct 2026 -> these (docs/OPTIONS_MAP.md) -------------------------------------------
 # old flag: (new flag, value map) for a renamed option; a callable f(value) -> list of new arguments for the rest;
-# None: removed with no effect at the values the recipes passed (or a feature now only in ttf.legacy, see LEGACY_ONLY)
+# None: removed with no effect at the values the recipes passed (or a feature only in the trainer at tag pre-consolidation-2026-10-17)
 _SAME = lambda new: (lambda v: [new] if v is True else [new, v])
 _FLAG = lambda new, val: (lambda v: [new, val])
 _LEGACY = {
@@ -309,7 +309,7 @@ _OLD_BOOL = {"--qk_temp", "--ts", "--init_stream", "--data_u32", "--ts_vdiag", "
 
 def from_legacy(argv):
     """an old trainer command line (list of strings) -> the same run in these options. Raises on a flag whose feature
-    is only in ttf.legacy (run that through python -m ttf.legacy.train)."""
+    is only in the old trainer (run that at tag pre-consolidation-2026-10-17: python -m bitnet.train there)."""
     out, seen, i, vd = [], set(), 0, [None, None]
     while i < len(argv):
         f = argv[i]
@@ -325,7 +325,7 @@ def from_legacy(argv):
         if f == "--ts_vdiag_every":
             vd[1] = v; continue
         if f not in _LEGACY:
-            raise ValueError(f"{f}: not in the core trainer (run it with python -m ttf.legacy.train)")
+            raise ValueError(f"{f}: not in the core trainer (the old trainer only: tag pre-consolidation-2026-10-17)")
         m = _LEGACY[f]
         if m is not None:
             out += [x for x in m(v) if x is not None]
@@ -340,7 +340,7 @@ def from_legacy(argv):
         out += ["--tail", "bf16"]
     mode = ([argv[j + 1] for j, x in enumerate(argv[:-1]) if x == "--mode"] or ["kernel"])[-1]   # (the last one counts)
     if mode == "kernel" and "--ts" not in seen:
-        raise ValueError("kernel mode without --ts (a flip rule): python -m ttf.legacy.train")
+        raise ValueError("kernel mode without --ts (a flip rule): the old trainer only (tag pre-consolidation-2026-10-17)")
     if mode == "kernel" and "--ts_nomom" not in seen:
-        raise ValueError("--ts without --ts_nomom (TTF with a short momentum): python -m ttf.legacy.train")
+        raise ValueError("--ts without --ts_nomom (TTF with a short momentum): the old trainer only (tag pre-consolidation-2026-10-17)")
     return out

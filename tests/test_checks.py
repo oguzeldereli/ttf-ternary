@@ -1,4 +1,4 @@
-"""The script checks in tests/checks (each exits non-zero on a failure), on a GPU. legacy_* test ttf.legacy."""
+"""The script checks in tests/checks (each exits non-zero on a failure), on a GPU."""
 import glob
 import os
 import subprocess

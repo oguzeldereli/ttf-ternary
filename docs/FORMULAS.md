@@ -1,7 +1,7 @@
 # Formulas
 
 Every update rule used in this project: the current recipe first, then each mechanism that was tried, with its flag
-and result. Flags are those of the trainer up to 17 Oct 2026 (`python -m ttf.legacy.train`; the current options of
+and result. Flags are those of the trainer up to 17 Oct 2026 (tag `pre-consolidation-2026-10-17`; the current options of
 the kept ones: [OPTIONS_MAP.md](OPTIONS_MAP.md)); results are final validation loss at 300M tokens (110M model,
 from scratch) unless noted. Run details: the results database (`python scripts/results.py show NAME`).
 

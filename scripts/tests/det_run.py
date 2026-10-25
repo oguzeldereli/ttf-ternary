@@ -1,4 +1,4 @@
-"""Run a module (e.g. ttf.train or ttf.legacy.train) with PyTorch in deterministic mode, for the consolidation gate:
+"""Run a module (e.g. ttf.train) with PyTorch in deterministic mode (the consolidation gate, determinism checks):
 deterministic algorithms (index_add_ and friends), a fixed cuBLAS workspace, attention through the math kernel (flash
 attention's backward accumulates with atomics), TF32 off. Two runs of the same arguments must then agree bit for bit.
   python scripts/tests/det_run.py ttf.train ARGS...

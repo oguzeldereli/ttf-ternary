@@ -3,7 +3,7 @@
 Its weight gradient is never applied here: with capture on (every TTF run) the backward hands it, or with --dw factored
 its factors (gy, x), to the layer's on_grad hook (the fused TTF update, train.ts_layer), or keeps it in .gw for the
 update after the backward. The earlier rules that flipped trits inside this backward (the stateless stochastic flip,
-the evidence counter, lockout, error feedback, the flip predictor) are in ttf.legacy.flip.
+the evidence counter, lockout, error feedback, the flip predictor) are at tag pre-consolidation-2026-10-17.
 """
 from __future__ import annotations
 import contextlib
@@ -381,7 +381,7 @@ class KernelTernaryLinear(nn.Module):
         unchanged at first) unless --adapter-init svd set it"""
         dev = self.wpacked.device
         self.mag_kind = kind
-        assert kind == "add", "the adapter is additive (the multiplicative and ternary kinds are in ttf.legacy)"
+        assert kind == "add", "the adapter is additive (the multiplicative and ternary kinds: tag pre-consolidation-2026-10-17)"
         mi_ = getattr(self, "_mag_init", None)
         if mi_ is not None:      # --adapter-init svd: the rounding error's best rank-r part (hf_init._mag_svd_init)
             assert kind == "add" and mi_[0].shape[1] == r, "--adapter-init svd: the fitted rank must equal --adapter-rank"

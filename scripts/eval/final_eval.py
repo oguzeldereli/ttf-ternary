@@ -24,40 +24,37 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-import importlib                                                  # noqa: E402
 from ttf.bitlinear import STATE                                   # noqa: E402
+from ttf.layers import KernelTernaryLinear, build_kernel_transformer, enable_rc_scales   # noqa: E402
+from ttf.master import MasterTernaryLinear, build_master_transformer                      # noqa: E402
+from ttf.model import Attention, BitTransformer, enable_moe                              # noqa: E402
+from ttf.tern_emb import enable_tern_emb                                                 # noqa: E402
 
 BYTES_PER_TOKEN_WIKI = 3.569
 BYTES_PER_TOKEN_FW = 4.003
 
 
-def load_model(path, device, mag_kind="add"):
+def load_model(path, device):
     ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)   # mmap: a 35 GB master checkpoint
     mc, mode, sd = ck["cfg"], ck["mode"], ck["model"]                         # need not fit in host memory
     # checkpoints of features the core no longer has (boost planes, rotated inputs, ternary or multiplicative adapters,
-    # the low-rank latent baseline) are read by ttf.legacy, the code they were trained with
-    legacy = mag_kind != "add" or any(k.endswith((".bpacked", ".rot_Q", "mag_At.col_scale", "lora_B")) for k in sd)
-    P = "ttf.legacy" if legacy else "ttf"
-    FL = importlib.import_module("ttf.legacy.flip" if legacy else "ttf.layers")
-    MA = importlib.import_module(P + ".master")
-    KernelTernaryLinear, MasterTernaryLinear = FL.KernelTernaryLinear, MA.MasterTernaryLinear
-    Attention = importlib.import_module(P + ".model").Attention
+    # the low-rank latent baseline): score them with this script at tag pre-consolidation-2026-10-17 (the bitnet package there)
+    old = [s_ for s_ in (".bpacked", ".rot_Q", "mag_At.col_scale", "lora_B") if any(k.endswith(s_) for k in sd)]
+    if old:
+        raise SystemExit(f"{path}: trained with features removed from the core ({', '.join(old)}): run "
+                         f"scripts/eval/final_eval.py from a checkout of tag pre-consolidation-2026-10-17")
     kw = dict(beta=ck.get("beta", False), int8=ck.get("int8", False), int8_dx=ck.get("int8_dx", False))
-    if legacy:
-        kw.update(rate=0.0, dw_mode=ck.get("dw_mode", "int8"), g_ref=ck.get("g_ref", 3.0))
     if mode == "kernel":
-        model = FL.build_kernel_transformer(mc, grad_checkpoint=False, **kw)
+        model = build_kernel_transformer(mc, grad_checkpoint=False, **kw)
     elif mode == "master":
         dt = next(v.dtype for k, v in sd.items() if k.endswith(".weight") and v.dim() == 2 and "tok_emb" not in k)
-        model = MA.build_master_transformer(mc, grad_checkpoint=False, dtype=dt)
+        model = build_master_transformer(mc, grad_checkpoint=False, dtype=dt)
     elif mode == "fp32":                                     # the full-precision reference (--mode fp32)
-        model = importlib.import_module(P + ".model").BitTransformer(
-            mc, grad_checkpoint=False, make_linear=lambda i, o: nn.Linear(i, o, bias=False))
+        model = BitTransformer(mc, grad_checkpoint=False, make_linear=lambda i, o: nn.Linear(i, o, bias=False))
     else:
         raise SystemExit(f"mode {mode} not supported")
     model = model.to(device)
     if "layers.0.ffn.router.weight" in sd:                   # --moe E:K:H (top-K from the run's arguments, else 2)
-        enable_moe = importlib.import_module(P + ".model").enable_moe
         E_ = sd["layers.0.ffn.router.weight"].shape[0]
         H_ = next(v.shape for k, v in sd.items() if k.startswith("layers.0.ffn.experts.0.w_gate.")
                   and k.split(".")[-1] in ("weight", "wpacked"))[0]
@@ -67,14 +64,10 @@ def load_model(path, device, mag_kind="add"):
         mk = (lambda i, o: MasterTernaryLinear(i, o, mc.act_bits, dtype=dt).to(device)) if mode == "master" else \
              (lambda i, o: KernelTernaryLinear(i, o, mc.act_bits, **kw).to(device))
         enable_moe(model, f"{E_}:{k_}:{H_}", mk)
-    if any(k.endswith(".bpacked") for k in sd):              # --ts_boost
-        FL.enable_boost(model)
     if "tok_emb.table.wpacked" in sd:                         # --tern-emb tied_wide:M
-        enable_tern_emb = importlib.import_module(P + ".tern_emb").enable_tern_emb
         M_ = sd["tok_emb.table.col_scale"].numel() // sd["tok_emb.proj.row_scale"].numel()
         enable_tern_emb(model, f"tied_wide:{M_}", "kernel")
     elif "tok_emb.wpacked" in sd or "tok_emb.latent" in sd:     # --tern-emb
-        enable_tern_emb = importlib.import_module(P + ".tern_emb").enable_tern_emb
         enable_tern_emb(model, "untied" if ("lm_head.wpacked" in sd or "lm_head.latent" in sd) else "tied",
                         "master" if mode == "master" else "kernel")
     if "tok_emb.m.codes" in sd:                               # --intk-emb E:H[:G]: int-k code embedding (/ head)
@@ -82,10 +75,6 @@ def load_model(path, device, mag_kind="add"):
         a_ = a_ if isinstance(a_, dict) else vars(a_)
         from ttf.intk_emb import enable_intk_emb_bt
         enable_intk_emb_bt(model, a_["intk_emb"], log=lambda m_: None)
-    if any(k.endswith(".rot_Q") for k in sd):                # --init_rot: rotated inputs
-        for n_, m_ in model.named_modules():
-            if isinstance(m_, KernelTernaryLinear) and f"{n_}.rot_Q" in sd:
-                m_.enable_rotation(sd[f"{n_}.rot_Q"].to(device))
     if any(k.endswith(".in_mean") for k in sd):              # --convert gptqc: centred layers
         for n_, m_ in model.named_modules():
             if isinstance(m_, KernelTernaryLinear) and f"{n_}.in_mean" in sd:
@@ -100,25 +89,13 @@ def load_model(path, device, mag_kind="add"):
                 if isinstance(m, MasterTernaryLinear):
                     m.enable_rc_scale()
         else:
-            FL.enable_rc_scales(model)
-    loras = [k for k in sd if k.endswith("lora_B")]       # --m_lora R: low-rank latent baseline
-    if loras:
-        r = sd[loras[0]].shape[1]
-        for m in model.modules():
-            if isinstance(m, MasterTernaryLinear):
-                m.enable_lora(r)
+            enable_rc_scales(model)
     mags = [k for k in sd if k.endswith("mag_A")]
     if mags:
         r = sd[mags[0]].shape[1]
         for m in model.modules():
             if isinstance(m, (KernelTernaryLinear, MasterTernaryLinear)):
-                m.enable_lowrank_mag(mag_kind, r)
-    tmags = [k for k in sd if k.endswith("mag_At.col_scale")]      # legacy --lowrank_mag taddw:R (trits, rank 20 R)
-    if tmags:
-        r = sd[tmags[0]].shape[0] // 20
-        for m in model.modules():
-            if isinstance(m, KernelTernaryLinear):
-                m.enable_lowrank_mag("taddw", r)
+                m.enable_lowrank_mag("add", r)
     model.load_state_dict(sd, strict=True)
     model.eval()
     return model, ck
@@ -164,7 +141,6 @@ def main():
     ap.add_argument("--fwval", default="data/fwedu32k_val.bin")
     ap.add_argument("--fw", type=int, default=2000, help="FineWeb-Edu windows (0: skip)")
     ap.add_argument("--seed", type=int, default=None, help="training seed (default: from the run name, else 1337)")
-    ap.add_argument("--mag_kind", default="add")
     ap.add_argument("--no_check", action="store_true")
     ap.add_argument("--check_val", default="", help="validation set of the training-time check (default --wiki; a run "
                     "trained on FineWeb-Edu logs its FINAL on --fwval: pass that)")
@@ -177,7 +153,7 @@ def main():
     for run in a.runs:
         t0 = time.time()
         path = next(p for p in (os.path.join(run, f) for f in ("eval.pt", "ckpt.pt", "ckpt_9154.pt")) if os.path.exists(p))
-        model, ck = load_model(path, device, a.mag_kind)
+        model, ck = load_model(path, device)
         L = 2048
         res = {"run": os.path.basename(os.path.normpath(run)), "ckpt": path, "step": ck.get("step"), "mode": ck["mode"]}
         w, wp = window_losses(model, wiki, L, 10 ** 9, device)
@@ -207,7 +183,7 @@ def main():
             res["logged_final"] = float(fin[-1]) if fin else None
             res["check_diff"] = None if not fin else res["train_protocol_loss"] - float(fin[-1])
             if res["check_diff"] is not None and abs(res["check_diff"]) > 1e-3:   # the model was not rebuilt as trained
-                res["check_failed"] = True                                        # (e.g. --mag_kind mul run read as add)
+                res["check_failed"] = True                                        # (e.g. a run's options not read back)
                 print(f"WARNING {res['run']}: rebuilt model's training-protocol loss {res['train_protocol_loss']:.4f} "
                       f"differs from the logged final {fin[-1]} by {res['check_diff']:+.4f}: the model is not rebuilt as "
                       f"trained (or the run's validation set is not the check's: --check_val)", flush=True)
