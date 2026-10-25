@@ -174,6 +174,8 @@ def build_parser():
     g.add_argument("--intk-update", default="factored", choices=["factored", "dense"],
                    help="--intk-emb: factored (no dense matrix or gradient: the head's loss in chunks from the codes, "
                    "the embedding's update on its rows) or dense (the bf16 matrix and an fp32 gradient sum per step)")
+    g.add_argument("--intk-theta-mult", type=float, default=1.0, help="--intk-emb: the codes' theta = --ttf-theta x this "
+                   "(inf: the codes frozen, only the group mins / steps train)")
     g.add_argument("--kd-cache", default="", help="precomputed teacher top-k targets (scripts/quant/teacher_topk.py)")
     g.add_argument("--kd-cache-mode", default="renorm", choices=["renorm", "rest", "sample", "windows"],
                    help="renorm: KL on the top k renormalised; rest: top k plus one bucket for the remaining mass; sample: "

@@ -20,6 +20,8 @@ dL/dW * s (one level is one step of s).
 --intk-update dense (the 25 Oct path): the dequantized matrix formed once per optimizer step as a bf16 leaf, its
   gradient summed in fp32 over the micro-batches, then one dense update per step (ts_layer / ttf_rows).
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,6 +42,7 @@ class IntKMatrix(nn.Module):
         self.track, self._ts_host, self._W = False, False, None
         self._parts, self.n_parts = [], 1            # --intk-update factored: the micro-batch's gradient factors (tied: 2)
         self._ts_state = self._ts_cfg = None         # (set by the trainer: lr_state, ts_cfg)
+        self.theta_mult = 1.0                        # --intk-theta-mult: the codes' theta x this (inf: codes frozen)
 
     def deq_rows(self, i, j, dtype=torch.bfloat16):
         """rows i:j of W = lo + s q (no autograd)"""
@@ -57,7 +60,7 @@ class IntKMatrix(nn.Module):
         self._parts.append(part)
         if len(self._parts) >= self.n_parts:
             parts, self._parts = self._parts, []
-            if self._ts_state is not None and self._ts_cfg is not None:
+            if self._ts_state is not None and self._ts_cfg is not None and math.isfinite(self.theta_mult):
                 _intk_update(self, parts, self._ts_state, self._ts_cfg)
 
     def dequant(self):
@@ -95,6 +98,9 @@ class IntKMatrix(nn.Module):
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()
         for p, gp in ((self.lo, gW.sum(-1)), (self.s, (gW * q).sum(-1))):
             p.grad = gp if p.grad is None else p.grad + gp
+        if not math.isfinite(self.theta_mult):        # --intk-theta-mult inf: only the group parameters train
+            return
+        c = dict(c, theta=c["theta"] * self.theta_mult)
         gq = (gW * self.s.detach()[..., None]).reshape(self.N, self.K)
         del gW, q, G_
         if self.N * self.K > CHUNKED_ABOVE[0]:
@@ -316,6 +322,7 @@ def _intk_update(l, parts, state, c):
     r = getattr(l, "ts_rank", None) or r
     if c.get("theta_sched"):
         theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
+    theta = theta * l.theta_mult
     M_ = int(c.get("micro") or 1)
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True
     st = state.setdefault("_ts", {})

@@ -322,3 +322,25 @@ def test_bf16_update():
     ch = (out[torch.float32] != _mat(N, K).codes).float().mean()
     agree = (out[torch.float32] == out[torch.bfloat16]).float().mean()
     assert float(ch) > 0.01 and float(agree) > 0.97, (float(ch), float(agree))
+
+
+@pytest.mark.parametrize("path", ["factored", "dense"])
+def test_theta_mult(path):
+    """--intk-theta-mult: inf freezes the codes (the group parameters still get their gradients); a larger theta fires
+    fewer codes"""
+    N, K = 100, 64
+    IE.ROWS[0] = 8192
+    moved = {}
+    for tm in (1.0, 4.0, math.inf):
+        m = _mat(N, K, s_const=False); m.theta_mult = tm; c0 = m.codes.clone(); st = {}
+        for step in range(3):
+            gy, x = _factors(16, N, K, step)
+            if path == "factored":
+                m._ts_state, m._ts_cfg = st, _cfg(theta=0.05)
+                m.add_part(("d", gy, x))
+            else:
+                m._G = gy.T @ x
+                m.step(U.ts_layer, st, _cfg(theta=0.05))
+                assert m.lo.grad is not None
+        moved[tm] = int((m.codes != c0).sum())
+    assert moved[1.0] > moved[4.0] > 0 and moved[math.inf] == 0, moved
