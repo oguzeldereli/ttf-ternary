@@ -97,6 +97,7 @@ class IntKMatrix(nn.Module):
         gW = G_.reshape(self.N, self.K // self.g, self.g)
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()
         for p, gp in ((self.lo, gW.sum(-1)), (self.s, (gW * q).sum(-1))):
+            gp = gp.to(p.dtype)                          # (bf16 lo / s on a bf16 / lean tail)
             p.grad = gp if p.grad is None else p.grad + gp
         if not math.isfinite(self.theta_mult):        # --intk-theta-mult inf: only the group parameters train
             return

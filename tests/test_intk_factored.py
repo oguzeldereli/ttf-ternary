@@ -344,3 +344,14 @@ def test_theta_mult(path):
                 assert m.lo.grad is not None
         moved[tm] = int((m.codes != c0).sum())
     assert moved[1.0] > moved[4.0] > 0 and moved[math.inf] == 0, moved
+
+
+def test_dense_step_bf16_group_parameters():
+    """--intk-update dense with bf16 lo / s (a bf16 / lean tail): step() hands their gradients in their dtype (25 Oct:
+    an fp32 gradient assigned to a bf16 parameter raised)"""
+    N, K = 64, 64
+    m = _mat(N, K); m.lo.data, m.s.data = m.lo.data.bfloat16(), m.s.data.bfloat16()
+    gy, x = _factors(8, N, K, 0)
+    m._G = gy.T @ x
+    m.step(U.ts_layer, {}, _cfg(theta=0.05))
+    assert m.lo.grad.dtype == torch.bfloat16 and m.s.grad.dtype == torch.bfloat16

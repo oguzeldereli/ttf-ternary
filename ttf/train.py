@@ -474,7 +474,8 @@ def main():
                    "weight_decay": tc.weight_decay}]
         if rc:
             groups.append({"params": rc, "weight_decay": 0.0, "rc_lr": args.rc_lr})
-        tail_opt = Adam8bit(groups, lr=tc.lr, betas=(tc.beta1, tc.beta2),
+        groups = _split_emb_group(model, groups, args.emb_wd, args.emb_lr_mult)   # (--emb-wd / --emb-lr-mult were ignored
+        tail_opt = Adam8bit(groups, lr=tc.lr, betas=(tc.beta1, tc.beta2),          # on this tail before 25 Oct)
                             weight_decay=tc.weight_decay)
 
     STATE.weight_decay = tc.weight_decay
@@ -611,6 +612,7 @@ def main():
         # to host memory: every piece is copied to its device below (on the GPU the whole checkpoint would sit next
         # to the model it is loaded into: the 27B's 10.5 GB did not fit)
         blob = torch.load(_load_path, map_location="cpu", weights_only=False, mmap=True)
+        _acc = 1.0                     # the accumulators' --ttf-acc-scale (set with the ternary layers' state below)
         if blob.get("beta", False) != use_beta:
             raise SystemExit(f"checkpoint beta={blob.get('beta', False)} but run beta="
                              f"{use_beta}: forward differs, refusing to resume")
@@ -713,6 +715,9 @@ def main():
         for _key, _lays_of in (("tern_emb_state", _tern_lays), ("intk_state", _intk_lays)):
           if not blob.get(_key):
             continue
+          if ttf and _acc != 1.0:     # (their accumulators are not rescaled: a changed theta would fire them in a burst)
+            raise SystemExit(f"--ttf-acc-scale {_acc}: not implemented for the {_key} accumulators; resume at the "
+                             f"checkpoint's theta")
           st_ = lr_state.setdefault("_ts", {})
           for m, (uv, d_) in zip(_lays_of(model), blob[_key]):
             if uv is not None:
