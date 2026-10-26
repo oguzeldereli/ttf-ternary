@@ -402,6 +402,9 @@ def ts_layer(l, g, state, c):
     st = state.setdefault("_ts", {})
     off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device  # --ttf-offload async (--ttf-offload-keep)
     key = id(l); t = _micro_t(l, st, key, M_, c)
+    if key in state and is_dense_state(state[key]):
+        raise SystemExit("--dw dense: this layer's TTF state is a dense accumulator (a --dw factored run's, "
+                         "update.dense_acc); resume it with --dw factored")
     mic_nm = M_ > 1
     if mic_nm:    # --accum M > 1: the accumulator takes every micro-batch's u, normalised by the v of the steps before
         # (this step's v needs all of its micro-batches); on the first step there is none, so each micro-batch uses its
@@ -802,7 +805,7 @@ def _ts_dense_acc(l, fgb, ia, state, st, key, t, M_, final_, lk, lr_ratio, theta
         A = A * lk
     xb = torch.empty(x.shape, dtype=x.dtype, device=x.device)          # (bf16 factors: x diag(ib) rounded to bf16)
     torch.mul(x, ib[None, :], out=xb)
-    term = _mmb(gy.T, xb) if gy.dtype == torch.bfloat16 else gy.T.float() @ xb.float(); del xb
+    term = _mmb(gy.T, xb) if gy.dtype == xb.dtype == torch.bfloat16 else gy.T.float() @ xb.float(); del xb
     A = (-lr_ratio) * ia[:, None] * term if A is None else torch.addcmul(A, ia[:, None], term, value=-lr_ratio)
     del term
     if not final_:

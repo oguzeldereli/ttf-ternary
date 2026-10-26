@@ -626,6 +626,14 @@ def test_dense_acc(N, K):
         A1 = U.load_dense(s1[id(l1)], l1); A0 = U.load_dense(s0[id(l0)], l0)
         rel = float((A1 - A0).norm() / A1.norm())
         assert (1e-3 < rel < 1.0) if N < K else rel < 2e-2, rel   # (ra = K: the low-rank basis spans all: exact)
+        # mixed factors (bf16 gy, fp32 x): the fp32 product
+        U.DENSE_ACC[0] = True
+        l4 = _layer(N, K, 0); l4._ts_idx = 1; s4 = {}; l4._ts_final = True
+        gy, x = data[0]
+        U.ts_layer(l4, (gy, x.float()), s4, _cfg(r=64, theta=1e9, factored=32, step=10))
+        assert U.is_dense_state(s4[id(l4)])
+        with pytest.raises(SystemExit):              # a dense state under --dw dense: refused
+            U.ts_layer(l4, (gy.T.float() @ x.float()).contiguous(), s4, _cfg(r=64, theta=1e9, step=11))
         # resume from a low-rank state: converted, then dense
         l2, s2 = run(True, 4, 1, state=s0)
         assert U.is_dense_state(s2[id(l2)])
