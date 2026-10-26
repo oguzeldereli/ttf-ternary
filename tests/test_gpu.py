@@ -772,3 +772,42 @@ def test_acc_gemm(T, N, K, ib, c):
     ref = -0.3 * a.double()[:, None] * term + (0.9 * C.double() if c else 0)
     o = Kn.acc_gemm(g, x, b, a, C, 0.9, -0.3)
     assert float((o.double() - ref).abs().max() / (0.3 * a.double()[:, None] * term).abs().max()) < 1e-5
+
+
+def test_intk_update_acc_gemm(monkeypatch):
+    """the int-k head's micro-batch accumulation through kernel.acc_gemm (one dense part on the GPU) against the same
+    update with acc_gemm replaced by its torch arithmetic (fp32 products of the same bf16 operands): U V^T within fp32
+    summation order"""
+    import ttf.kernel as Kn
+    from ttf import intk_emb as IE
+    N, K, T, M = 300, 128, 64, 3
+    fused = Kn.acc_gemm
+
+    def ref(g, x, ib, ia, C, cs, alpha):
+        xb = (x.float() * ib[None, :]).to(torch.bfloat16) if ib is not None else x
+        o = alpha * (ia.float()[:, None] * (g.float().T @ xb.float()))
+        return o if C is None else cs * C + o
+    res = {}
+    for name, f in (("fused", fused), ("ref", ref)):
+        monkeypatch.setattr(Kn, "acc_gemm", f)
+        torch.manual_seed(1)
+        m = IE.IntKMatrix(torch.randn(N, K), 2).to(dev); m._ts_idx = 2
+        st = {}
+        old = IE.ROWS[0]
+        try:
+            IE.ROWS[0] = 128
+            g = torch.Generator(device=dev).manual_seed(7)
+            for s in range(2):
+                for i in range(M):
+                    gy = (torch.randn(T, N, device=dev, generator=g) * 1e-2).to(torch.bfloat16)
+                    x = torch.randn(T, K, device=dev, generator=g).to(torch.bfloat16)
+                    m._ts_final = i == M - 1
+                    c = dict(r=16, lr_ratio=1.0, theta=1e9, tau=1000.0, b2=0.95, spend=1.0, store_a="", offload=False,
+                             theta_sched=None, progress=0.0, factored=16, start=0, step=10 + s, micro=M)
+                    IE._intk_update(m, [("d", gy, x)], st, c)
+            S = IE._Store(m, st, id(m), None, False, dev)
+            res[name] = torch.cat([S.u(cc) for cc in range(S.nch)]) @ S.v().T
+        finally:
+            IE.ROWS[0] = old
+    assert float((res["fused"] - res["ref"]).norm() / res["ref"].norm()) < 1e-3     # (2e-4: the turn and orth
+    # carry the order differences)

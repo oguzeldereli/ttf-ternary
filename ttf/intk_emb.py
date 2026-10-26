@@ -469,13 +469,23 @@ def _intk_update(l, parts, state, c):
         Us = [U @ P_ - lr_ratio * _dpm(rt(*S.rng(cc))) for cc, U in enumerate(Us)]
         _fire(l, S, Us, Vn, theta, c, st)
         return
-    rt = r_term(V)
+    # one dense part (the head) on the GPU: each chunk's term, its scale, the leak and the add in kernel.acc_gemm
+    fast = len(P.p) == 1 and P.p[0][0] == "d" and P.p[0][1].is_cuda and P.p[0][1].dtype == torch.bfloat16
+    if fast:
+        from .kernel import acc_gemm
+        y = P.prep(ib[:, None] * V)[0].to(torch.bfloat16)
+    else:
+        rt = r_term(V)
     Us = []
     for cc in range(S.nch):
         U = S.u(cc)
-        if (t - 1) % M_ == 0:
-            U = U * lk
-        U.add_(rt(*S.rng(cc)), alpha=-lr_ratio)     # (data parallel: this rank's term, averaged on the last micro-batch)
+        lk_ = lk if (t - 1) % M_ == 0 else 1.0
+        if fast:                # (data parallel: this rank's term, averaged on the last micro-batch)
+            i, j = S.rng(cc)
+            U = acc_gemm(P.p[0][1][:, i:j], y, None, ia[i:j], U, lk_, -lr_ratio)
+        else:
+            U = U * lk_ if lk_ != 1.0 else U
+            U.add_(rt(*S.rng(cc)), alpha=-lr_ratio)
         if final_:
             Us.append(_dpm(U))
         else:

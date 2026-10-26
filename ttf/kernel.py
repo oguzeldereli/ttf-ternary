@@ -1302,7 +1302,8 @@ def acc_gemm(g, x, ib, ia, C, cs, alpha):
     sums over T in the kernel's order (rounding level)"""
     T, N = g.shape
     K = x.shape[1]
-    g, x = g.contiguous(), x.contiguous()
+    g = g if g.stride(1) == 1 else g.contiguous()             # (a column slice of a wider g: read in place)
+    x = x if x.stride(1) == 1 else x.contiguous()
     o = torch.empty(N, K, dtype=torch.float32, device=g.device)
     C = C.contiguous() if C is not None else None
     BM, BN, BK = 64, 128, 32                                  # (laptop 4080: near the best at every 27B shape)
