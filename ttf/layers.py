@@ -69,7 +69,7 @@ class _AddRowFn(torch.autograd.Function):
 
 
 FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
-DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices
+DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices (int8: one)
 
 
 class _KernelTernFn(torch.autograd.Function):
@@ -126,6 +126,7 @@ class _KernelTernFn(torch.autograd.Function):
 
 
 def _grad_x(layer, gyf, wpacked):
+    assert DX_MODE[0] != "int8", "--dx int8: the fused layer only"
     if DX_MODE[0] == "int8x2":
         return tern_gemm_dx_i8x2(gyf, wpacked, layer.K)
     return tern_gemm_dx(gyf, wpacked, layer.K)
@@ -190,7 +191,7 @@ class _FusedTernFn(torch.autograd.Function):
         l = ctx.layer
         g2 = g.reshape(-1, l.N).contiguous()
         bb = (ctx.beta if ctx.beta is not None else torch.ones((), device=g.device)).reshape(()).to(torch.bfloat16)
-        sl = DX_MODE[0] == "int8x2"
+        sl = {"int8x2": 2, "int8": 1}.get(DX_MODE[0], 0)
         with _rf("tern.dx"):
             f, q1, q2, s, gbias, grow = _K.fused_bwd_rows(g2, t, rb, bb, sl)
             if sl:

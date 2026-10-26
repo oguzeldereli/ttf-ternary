@@ -337,8 +337,13 @@ def _band_fire(l, st, key, c, U, V, A_prev, u, lk, theta):
 
 
 def _orth(X):
-    with _rf("ttf.orth"):
-        return _orth_(X)
+    tf = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False      # (--tf32: the Gram products and QR need full fp32)
+    try:
+        with _rf("ttf.orth"):
+            return _orth_(X)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf
 
 
 STEP_FP32 = [False]   # --ttf-step-fp32: the accumulator's U in fp32 between a step's micro-batches (see _ts_layer_factored)

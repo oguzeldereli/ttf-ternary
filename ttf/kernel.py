@@ -1370,8 +1370,8 @@ def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t):
 def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, pb_ptr, pr_ptr, M, N,
                      SLICES: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
     """from the output gradient g [M, N]: gyf = bf16(bf16(g * r) * bf16(beta)) (the GEMM's gradient, stored), the
-    column sums of g (bias) and of bf16(g * t) (row scale) per row block, and with SLICES gyf's two int8 slices
-    (_slice2_kernel's arithmetic)"""
+    column sums of g (bias) and of bf16(g * t) (row scale) per row block, and with SLICES = 2 gyf's two int8 slices
+    (_slice2_kernel's arithmetic), SLICES = 1 the first only (--dx int8)"""
     pm = tl.program_id(0)
     rows = pm * BM + tl.arange(0, BM)
     bb = tl.load(bb_ptr).to(tl.float32)
@@ -1388,7 +1388,7 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
         amax = tl.maximum(amax, tl.max(tl.abs(f), axis=1))
         tl.store(pb_ptr + pm * N + cols, tl.sum(g, axis=0), mask=cols < N)
         tl.store(pr_ptr + pm * N + cols, tl.sum(_rbf(g * t), axis=0), mask=cols < N)
-    if SLICES:
+    if SLICES > 0:
         s = tl.maximum(amax, 1e-30) / 127.0
         tl.store(s_ptr + rows, s, mask=rows < M)
         for n0 in range(0, N, BN):
@@ -1399,35 +1399,39 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
             r = tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
             f = _rbf(_rbf(g * r[None, :]) * bb)
             q1 = tl.extra.cuda.libdevice.rint(f / s[:, None])
-            q2 = tl.extra.cuda.libdevice.rint((f - q1 * s[:, None]) / (s[:, None] / 254.0))
             tl.store(q1_ptr + off, tl.minimum(tl.maximum(q1, -127.0), 127.0).to(tl.int8), mask=m)
-            tl.store(q2_ptr + off, tl.minimum(tl.maximum(q2, -127.0), 127.0).to(tl.int8), mask=m)
+            if SLICES > 1:
+                q2 = tl.extra.cuda.libdevice.rint((f - q1 * s[:, None]) / (s[:, None] / 254.0))
+                tl.store(q2_ptr + off, tl.minimum(tl.maximum(q2, -127.0), 127.0).to(tl.int8), mask=m)
 
 
 def fused_bwd_rows(g, t, r_b, beta_b, slices):
-    """-> (gyf bf16 [M, N], q1, q2, s (None without slices), bias gradient fp32 [N], row-scale gradient fp32 [N])"""
+    """-> (gyf bf16 [M, N], q1, q2, s (None without slices; q2 None with one), bias gradient fp32 [N], row-scale
+    gradient fp32 [N]); slices: 0, 1 or 2 int8 slices of gyf"""
     M, N = g.shape
     f = torch.empty_like(g)
     BM, BN = 16, 256
     nb = triton.cdiv(M, BM)
     pb = torch.empty(nb, N, dtype=torch.float32, device=g.device); pr = torch.empty_like(pb)
     if slices:
-        q1 = torch.empty(M, N, dtype=torch.int8, device=g.device); q2 = torch.empty_like(q1)
+        q1 = torch.empty(M, N, dtype=torch.int8, device=g.device); q2 = torch.empty_like(q1) if slices > 1 else None
         s = torch.empty(M, dtype=torch.float32, device=g.device)
     else:
         q1 = q2 = s = None
-    _bwd_rows_kernel[(nb,)](g, t, r_b, beta_b, f, q1 if slices else f, q2 if slices else f, s if slices else pb,
-                            pb, pr, M, N, SLICES=slices, BM=BM, BN=BN)
+    _bwd_rows_kernel[(nb,)](g, t, r_b, beta_b, f, q1 if slices else f, q2 if q2 is not None else f,
+                            s if slices else pb, pb, pr, M, N, SLICES=int(slices), BM=BM, BN=BN)
     return f, q1, q2, s, pb.sum(0), pr.sum(0)
 
 
 @triton.jit
 def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, gx_ptr, pc_ptr, M, N, K, sam, sbk,
-                    HAS_MU: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr, GM: tl.constexpr):
+                    HAS_MU: tl.constexpr, TWO: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
+                    GM: tl.constexpr):
     """the input gradient on the int8 tensor cores with its epilogue in one kernel: y1 = q1 W, y2 = q2 W (gy's two int8
     slices [M, N] against the trits, b [K, N]: row k is column k of W; two int32 accumulators, exact), then as
     _dx2_epi_kernel + _scale_bwd_kernel: g = bf16((y1 + y2 / 254) s), gx = bf16(g c) and per BM-row block the column
-    sums of bf16(g x) (HAS_MU: x centred, bf16(x - mu)). No int32 [M, K] round trip; gx identical to the two-GEMM path"""
+    sums of bf16(g x) (HAS_MU: x centred, bf16(x - mu)). No int32 [M, K] round trip; gx identical to the two-GEMM path.
+    TWO False (--dx int8): q1 only, g = bf16(y1 s)"""
     pid = tl.program_id(0)
     npm = tl.cdiv(M, BM); npk = tl.cdiv(K, BK)
     gid = pid // (GM * npk); fm = gid * GM; gs = tl.minimum(npm - fm, GM)
@@ -1438,13 +1442,18 @@ def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, gx_ptr, 
         nn = n0 + rn
         am = (rows[:, None] < M) & (nn[None, :] < N)
         a1 = tl.load(a1_ptr + rows[:, None] * sam + nn[None, :], mask=am, other=0)
-        a2 = tl.load(a2_ptr + rows[:, None] * sam + nn[None, :], mask=am, other=0)
         b = tl.load(b_ptr + cols[None, :] * sbk + nn[:, None], mask=(cols[None, :] < K) & (nn[:, None] < N), other=0)
-        acc1 += tl.dot(a1, b, out_dtype=tl.int32); acc2 += tl.dot(a2, b, out_dtype=tl.int32)
+        acc1 += tl.dot(a1, b, out_dtype=tl.int32)
+        if TWO:
+            a2 = tl.load(a2_ptr + rows[:, None] * sam + nn[None, :], mask=am, other=0)
+            acc2 += tl.dot(a2, b, out_dtype=tl.int32)
     m = (rows[:, None] < M) & (cols[None, :] < K)
     off = rows[:, None] * K + cols[None, :]
     s = tl.load(s_ptr + rows, mask=rows < M, other=0.0)
-    g = _rbf((acc1.to(tl.float32) + acc2.to(tl.float32) * (1.0 / 254.0)) * s[:, None])
+    if TWO:
+        g = _rbf((acc1.to(tl.float32) + acc2.to(tl.float32) * (1.0 / 254.0)) * s[:, None])
+    else:
+        g = _rbf(acc1.to(tl.float32) * s[:, None])
     c = tl.load(c_ptr + cols, mask=cols < K, other=0.0).to(tl.float32)
     x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
     if HAS_MU:
@@ -1465,17 +1474,18 @@ def _dx2_tile(N, K):
 
 def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None):
     """(gx bf16 [M, K], the column scale's gradient fp32 [K]) from gy's int8 slices q1, q2 [M, N] and scale s [M]
-    (fused_bwd_rows), the trits w8t [K, N] (KernelTernaryLinear.w8(t=True)), the column scale c_b and the layer's
-    input x (centred here with mu_b)"""
+    (fused_bwd_rows; q2 None: one slice, --dx int8), the trits w8t [K, N] (KernelTernaryLinear.w8(t=True)), the column
+    scale c_b and the layer's input x (centred here with mu_b)"""
     M, N = q1.shape
     K = w8t.shape[0]
     gx = torch.empty(M, K, dtype=torch.bfloat16, device=q1.device)
     BM, BK, BN, nw = _dx2_tile(N, K)
     nb = triton.cdiv(M, BM)
     pc = torch.empty(nb, K, dtype=torch.float32, device=q1.device)
-    _dx2_col_kernel[(nb * triton.cdiv(K, BK),)](q1, q2, w8t, s, c_b, x, mu_b if mu_b is not None else c_b, gx, pc, M, N,
-                                                K, q1.stride(0), w8t.stride(0), HAS_MU=mu_b is not None, BM=BM, BK=BK,
-                                                BN=BN, GM=8, num_warps=nw, num_stages=3)
+    _dx2_col_kernel[(nb * triton.cdiv(K, BK),)](q1, q2 if q2 is not None else q1, w8t, s, c_b, x,
+                                                mu_b if mu_b is not None else c_b, gx, pc, M, N, K, q1.stride(0),
+                                                w8t.stride(0), HAS_MU=mu_b is not None, TWO=q2 is not None, BM=BM,
+                                                BK=BK, BN=BN, GM=8, num_warps=nw, num_stages=3)
     return gx, pc.sum(0)
 
 

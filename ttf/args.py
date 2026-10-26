@@ -109,9 +109,14 @@ def build_parser():
                         "the dense weight gradient instead (fewer flops and launches; exact g^2 sums, not bit-identical)")
 
     g = ap.add_argument_group("kernels and memory")
-    g.add_argument("--dx", default="int8x2", choices=["bf16", "int8x2"], help="the input gradient's GEMM "
+    g.add_argument("--dx", default="int8x2", choices=["bf16", "int8x2", "int8"], help="the input gradient's GEMM "
                    "(int8x2: gy in two int8 slices on the int8 tensor cores where the summed width is >= 4096, else "
-                   "bf16; as accurate as bf16, the 110M conversion recipe 2.6675 vs 2.6672 with it on every layer)")
+                   "bf16; as accurate as bf16, the 110M conversion recipe 2.6675 vs 2.6672 with it on every layer. "
+                   "int8: one slice, 7 bits per row of gy, half the GEMM; a 110M run on the old trainer diverged with "
+                   "it, 17 Oct (g_dx8): under test)")
+    g.add_argument("--tf32", action=ON, default=False, help="the fp32 matrix products on the TF32 tensor cores (10-bit "
+                   "mantissa products, fp32 sums: the accumulator's basis turn, the int-k head's products, the sketch "
+                   "cross terms); the orthonormalisation stays in full fp32. Under test")
     g.add_argument("--fused-layer", action=ON, default=True,
                    help="(default on; --no-fused-layer: the unfused path) int8 ternary layers with row / column scales: the centring, column scale and act-quant in one "
                         "kernel, the GEMM's epilogue with the row scale, bias and the sum of a converted layer's parts, "

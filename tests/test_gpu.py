@@ -737,6 +737,29 @@ def test_dx2_col(M, N, K):
     assert float((gc.double() - gc_ref).abs().max() / gc_ref.abs().max()) < 1e-5
 
 
+def test_dx_one_slice():
+    """--dx int8: fused_bwd_rows with one slice writes the two-slice path's q1 and s (no q2), and dx2_col with q2 None
+    gives bf16(bf16(q1 W s) c) exactly"""
+    import ttf.kernel as Kn
+    gen = torch.Generator(device=dev).manual_seed(7)
+    M, N, K = 300, 4096, 1000
+    g = (torch.randn(M, N, device=dev, generator=gen) * 1e-3).to(torch.bfloat16)
+    t = torch.randn(M, N, device=dev, generator=gen).to(torch.bfloat16)
+    r = (torch.rand(N, device=dev, generator=gen) + 0.5).to(torch.bfloat16); bb = torch.tensor(0.7, device=dev).to(torch.bfloat16)
+    f2, q1a, q2a, s2, b2, r2 = Kn.fused_bwd_rows(g, t, r, bb, 2)
+    f1, q1, q2, s1, b1, r1 = Kn.fused_bwd_rows(g, t, r, bb, 1)
+    assert q2 is None and torch.equal(q1, q1a) and torch.equal(s1, s2) and torch.equal(f1, f2)
+    assert torch.equal(b1, b2) and torch.equal(r1, r2)
+    w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8, generator=gen)
+    c = (torch.rand(K, device=dev, generator=gen) + 0.5).to(torch.bfloat16)
+    x = torch.randn(M, K, device=dev, generator=gen).to(torch.bfloat16)
+    gref = ((q1.double() @ w.double()).float() * s1[:, None]).to(torch.bfloat16).float()
+    gx, gc = Kn.dx2_col(q1, None, s1, w.t().contiguous(), c, x)
+    assert torch.equal(gx, (gref * c.float()[None, :]).to(torch.bfloat16))
+    gc_ref = (gref * x.float()).to(torch.bfloat16).double().sum(0)
+    assert float((gc.double() - gc_ref).abs().max() / gc_ref.abs().max()) < 1e-5
+
+
 @pytest.mark.parametrize("M,K,N,acc,bias", [(512, 1024, 768, False, True), (300, 208, 2048, True, False),
                                             (100, 2048, 20000, False, False), (64, 17000, 4096, True, True)])
 def test_fused_fwd_gemm(M, K, N, acc, bias):
@@ -811,3 +834,17 @@ def test_intk_update_acc_gemm(monkeypatch):
             IE.ROWS[0] = old
     assert float((res["fused"] - res["ref"]).norm() / res["ref"].norm()) < 1e-3     # (2e-4: the turn and orth
     # carry the order differences)
+
+
+def test_orth_fp32_under_tf32():
+    """--tf32: the orthonormalisation runs in full fp32 (the flag restored after), so its basis is the same as without"""
+    import ttf.update as U
+    X = torch.randn(5120, 256, device=dev, generator=torch.Generator(device=dev).manual_seed(3))
+    q0 = U._orth(X)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        q1 = U._orth(X)
+        assert torch.backends.cuda.matmul.allow_tf32
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = False
+    assert torch.equal(q0, q1)

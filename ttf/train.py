@@ -109,6 +109,9 @@ def main():
     store = args.ttf_store if args.ttf_store != "fp32" else ""      # the accumulator's codec ("": fp32)
     from .layers import DX_MODE as _DXM
     _DXM[0] = args.dx
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        print("--tf32: fp32 matrix products on the TF32 tensor cores (the orthonormalisation in full fp32)", flush=True)
     if os.environ.get("TERN_SYNCDBG"):   # report every host sync (location in the warning)
         torch.cuda.set_sync_debug_mode(1)
     LR_WSD[0] = int(args.lr_schedule.split(":")[1]) if args.lr_schedule.startswith("wsd:") else 0
