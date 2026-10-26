@@ -1031,7 +1031,12 @@ def main():
             save_ckpt(step)
             if not (_WS > 1 and _RK > 0):
                 shutil.copyfile(ckpt_path, os.path.join(tc.out_dir, f"ckpt_{step}.pt"))
-        if time.time() - last_save >= args.save_secs:
+        _due = time.time() - last_save >= args.save_secs
+        if _PP:   # --pipe: every stage saves (and stops) at the same step: each decided on its own clock and signal,
+            _fl = torch.tensor([float(_due), float(_last["stop"])], device=device)   # so the stages' parts could be
+            _dist.all_reduce(_fl, op=_dist.ReduceOp.MAX)                       # of different steps (no resume)
+            _due, _last["stop"] = bool(_fl[0] > 0), bool(_fl[1] > 0)
+        if _due:
             save_ckpt(step)
             last_save = time.time()
             print(f"  ---- checkpoint saved at step {step}", flush=True)
