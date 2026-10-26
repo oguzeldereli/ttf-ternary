@@ -37,6 +37,13 @@ def test_recipe_unknown_key(tmp_path):
         A.parse(["--recipe", str(p)])
 
 
+def test_recipe_value_outside_choices(tmp_path):
+    p = tmp_path / "bad.toml"     # (a removed value: before 26 Oct a recipe's values skipped argparse's choices check)
+    p.write_text('ttf-offload = "host"\n')
+    with pytest.raises(SystemExit, match="one of none, async"):
+        A.parse(["--recipe", str(p)])
+
+
 def test_from_legacy_ttf():
     a = A.parse(A.from_legacy(shlex.split(OLD_TTF)))
     assert (a.mode, a.ttf_rank, a.ttf_theta, a.adapter_rank, a.adapter_wd) == ("ttf", 64, 16.0, 16, 0.1)

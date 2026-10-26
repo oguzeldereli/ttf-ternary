@@ -191,6 +191,10 @@ def parse(argv=None):
         bad = sorted(set(rec) - known)
         if bad:
             raise SystemExit(f"recipe {pre.recipe}: unknown options {bad}")
+        for a_ in ap._actions:   # argparse checks choices on the command line only, not on defaults (a removed value
+            if a_.dest in rec and a_.choices is not None and rec[a_.dest] not in a_.choices:   # was taken silently)
+                raise SystemExit(f"recipe {pre.recipe}: {a_.option_strings[0]} {rec[a_.dest]!r}: one of "
+                                 f"{', '.join(map(str, a_.choices))}")
         ap.set_defaults(**rec)
     a = ap.parse_args(argv)
     return resolve(a)
