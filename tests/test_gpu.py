@@ -514,3 +514,14 @@ def test_qwen_fused_kernels(wdt):
     both(lambda x, z, w: KN.gated_norm_qwen(x, z, w, eps),
          lambda x, z, w: ((w * (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype))
                           * F.silu(z.float())).to(x.dtype), [x, z, wg])
+
+
+@pytest.mark.parametrize("opt", ["lean", "adamw_fused"])
+def test_deq_cache_cuda_optimizers(opt):
+    """deq_cache follows the tail optimizers that write through .data on CUDA (LeanAdam's batched 2-D path, fused
+    AdamW: no version bump)"""
+    import sys; sys.path.insert(0, os.path.dirname(__file__))
+    from test_intk_factored import _deq_cache_steps
+    from ttf.opt_lean import LeanAdam
+    _deq_cache_steps(dev, (lambda ps: LeanAdam(ps, lr=1e-2)) if opt == "lean" else
+                     (lambda ps: torch.optim.AdamW(ps, lr=1e-2, fused=True)))

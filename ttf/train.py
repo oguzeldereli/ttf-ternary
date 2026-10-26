@@ -787,6 +787,8 @@ def main():
         from .qwen import enable_fused_norm
         enable_fused_norm()
         print("Qwen: RMSNorm, gated norm and SwiGLU in fused kernels", flush=True)
+    from . import intk_emb as _IE
+    _IE.DEQ_GEN[0] = 0
     for step in range(start_step, end_step):
         if args.profile and step == start_step + 20:         # after autotune / warm-up
             from torch.profiler import profile, ProfilerActivity
@@ -938,6 +940,7 @@ def main():
                   f"({'in sync' if len({int(x.item()) for x in _cks}) == 1 else 'OUT OF SYNC'})", flush=True)
         with torch.profiler.record_function("tail.step"):
             tail_opt.step()
+        _IE.DEQ_GEN[0] += 1          # the int-k matrices' dequantized copies are stale now (lo / s, codes moved)
         _rfu.__exit__(None, None, None)
         if _prof is not None:
             torch.cuda.synchronize(); _pdt = time.time() - _pt0; _prof.__exit__(None, None, None)

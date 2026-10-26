@@ -394,3 +394,49 @@ def test_dequant_bf16_chunks(monkeypatch, dt):
         assert torch.equal(m.leaf(), ref)
     W = m.leaf()
     assert W.requires_grad and W.is_leaf and torch.equal(W.detach(), ref)
+
+
+def _deq_cache_steps(dev, opt):
+    """the step's bf16 dequantization cache against the per-chunk dequantization (loss, dL/dh, the group parameters'
+    gradients, the lookup: the same bits) over steps of a real tail optimizer, which writes lo / s through .data (no
+    version bump) while the codes move in place; the trainer advances DEQ_GEN after each optimizer step"""
+    N, K, T = 300, 128, 40
+    torch.manual_seed(0)
+    m = IE.IntKMatrix(torch.randn(N, K) * 0.1, 3).to(dev)
+    m.add_part = lambda p: None
+    h0 = torch.randn(T, K, device=dev).to(torch.bfloat16); tgt = torch.randint(0, N, (T,), device=dev)
+    idx = torch.randint(0, N, (5, 7), device=dev)
+    o = opt([m.lo, m.s])
+    IE.ROWS[0] = 64
+
+    def run(gen):
+        IE.DEQ_GEN[0] = gen
+        m.lo.grad = m.s.grad = None
+        h = h0.clone().requires_grad_(True)
+        loss = IE.head_loss(m, h, tgt, None, chunk=16); loss.backward()
+        return loss.detach(), h.grad, m.lo.grad.clone(), m.s.grad.clone(), m.deq_idx(idx.reshape(-1))
+    try:
+        for step in range(3):
+            a, b = run(None), run(step)
+            for x, y in zip(a, b):
+                assert torch.equal(x.reshape(-1), y.reshape(-1))
+            v = (m.lo._version, m.s._version)
+            o.step()                                     # (the gradients of run(step))
+            with torch.no_grad():
+                m.codes[step::7].add_(1).clamp_(0, m.levels)
+            IE.DEQ_GEN[0] = step + 1                     # (train.py, after tail_opt.step())
+            assert torch.equal(m.deq_cache(), m.dequant().detach().to(torch.bfloat16)), (step, v)
+    finally:
+        IE.DEQ_GEN[0] = None; IE.ROWS[0] = 8192
+
+
+@pytest.mark.parametrize("opt", ["lean", "adamw"])
+def test_deq_cache_exact_and_invalidated(opt):
+    from ttf.opt_lean import LeanAdam
+    _deq_cache_steps("cpu", (lambda ps: LeanAdam(ps, lr=1e-2)) if opt == "lean" else (lambda ps: torch.optim.AdamW(ps, lr=1e-2)))
+
+
+def test_deq_cache_off_outside_trainer():
+    m = IE.IntKMatrix(torch.randn(10, 64), 2)
+    assert IE.DEQ_GEN[0] is None and m.deq_cache() is None
+

@@ -50,8 +50,34 @@ class IntKMatrix(nn.Module):
         lo, s = self.lo.detach()[i:j], self.s.detach()[i:j]
         return (lo[..., None] + s[..., None] * q).reshape(j - i, self.K).to(dtype)
 
+    def deq_cache(self, make=True):
+        """W = lo + s q in bf16, formed once per optimizer step (DEQ_GEN, which the trainer advances after every step)
+        or change of the codes, and read by the head's logits and dL/dh (and by the lookup when it exists: a tied matrix,
+        eval). The same bits as deq_rows / deq_idx in bf16 (27B, 248k x 5120: 2.5 GB, instead of re-forming every
+        vocabulary chunk twice per token chunk: 512 times a step). Keyed on the trainer's step count, not on lo / s's
+        version counters: the tail optimizers write them through .data (LeanAdam's batched path, fused AdamW), which
+        bumps no version. Outside the trainer (DEQ_GEN None) nothing is cached; make False: None when not formed"""
+        if DEQ_GEN[0] is None:
+            return None
+        k = (DEQ_GEN[0], self.codes._version, self.codes.data_ptr(), self.lo.data_ptr(), self.s.data_ptr())
+        if getattr(self, "_dqk", None) != k:
+            if not make:
+                return None
+            self._dq = None
+            self._dq, self._dqk = self.dequant_bf16(), k
+        return self._dq
+
+    def deq_rows_c(self, i, j, dtype=torch.bfloat16):
+        """deq_rows from the step's cache (bf16; outside the trainer: deq_rows)"""
+        W = self.deq_cache() if dtype == torch.bfloat16 else None
+        return W[i:j] if W is not None else self.deq_rows(i, j, dtype)
+
     def deq_idx(self, idx, dtype=torch.bfloat16):
-        """the rows idx of W (the embedding's lookup)"""
+        """the rows idx of W (the embedding's lookup; from the step's cache only if one is formed already: the lookup
+        alone needs just the batch's rows, not a [V, d] copy)"""
+        W = self.deq_cache(make=False) if dtype == torch.bfloat16 else None
+        if W is not None:
+            return W[idx]
         q = self.codes[idx].reshape(-1, self.K // self.g, self.g).float()
         return (self.lo.detach()[idx][..., None] + self.s.detach()[idx][..., None] * q).reshape(-1, self.K).to(dtype)
 
@@ -83,7 +109,8 @@ class IntKMatrix(nn.Module):
         (bf16, rounded once) is moved by a post-accumulate hook into an fp32 sum (self._G), so the step's sum is fp32 and
         no bf16 .grad accumulates (at 27B: 2.5 GB per matrix instead of an fp32 leaf's 5 GB plus a bf16 copy)"""
         if not torch.is_grad_enabled():
-            return self.dequant_bf16()
+            W = self.deq_cache()                           # (eval in the trainer: the step's copy, no second one)
+            return W if W is not None else self.dequant_bf16()
         if self._W is None:
             self._W = self.dequant_bf16().requires_grad_(True)
             self._G = None
@@ -194,6 +221,7 @@ def ttf_rows(l, g, state, c, rows=16384):
 INTK_FACTORED = [True]   # --intk-update factored (default) | dense
 ROWS = [8192]            # rows per chunk of the factored update and of the head's vocabulary loops
 TOK_BYTES = [1 << 29]    # the int-k head loss: tokens per chunk such that the chunk's fp32 logits stay below this
+DEQ_GEN = [None]         # IntKMatrix.deq_cache: the trainer's optimizer-step count (None: no cache, per chunk)
 DENSE_G = [None]         # the int-k head's gradient to the update: None (by size), True (dense [V, d]), False (factors)
 
 
@@ -518,7 +546,7 @@ def _logits(m, h, dt):
     z = torch.empty(h.shape[0], m.N, dtype=torch.float32, device=h.device)
     for a in range(0, m.N, ROWS[0]):
         b = min(m.N, a + ROWS[0])
-        z[:, a:b] = F.linear(h, m.deq_rows(a, b, dt)).float()
+        z[:, a:b] = F.linear(h, m.deq_rows_c(a, b, dt)).float()
     return z
 
 
@@ -558,7 +586,7 @@ class _HeadLossFn(torch.autograd.Function):
             acc = torch.zeros(hc.shape[0], m.K, dtype=torch.float32, device=h.device)
             for a in range(0, m.N, ROWS[0]):
                 b = min(m.N, a + ROWS[0])
-                acc += _mmb(dzb[:, a:b], m.deq_rows(a, b))
+                acc += _mmb(dzb[:, a:b], m.deq_rows_c(a, b))
             dh[i:i + n] = acc; del acc, dzb
         ctx.m, ctx.gy, ctx.G, ctx.dh, ctx.h, ctx.dt = m, gy, G, dh, (None if dense else hb), dt
         return total
