@@ -187,6 +187,7 @@ class RunLog:
     def __init__(self, out_dir, name, config, purpose=None, data=None, steps=None, parent=None):
         self.path = os.path.join(out_dir, "records.jsonl")
         self.id = None
+        self.ended = False       # a finished / failed / stopped event written
         try:
             rec = make("run", name=name, purpose=purpose, commit=code_commit(), config=config, data=data, steps=steps,
                        parent=parent, ckpt=os.path.join(out_dir, "ckpt.pt"))
@@ -195,6 +196,7 @@ class RunLog:
             print(f"results: run record not written ({e})", flush=True)
 
     def event(self, status, step=None, reason=None):
+        self.ended = self.ended or status in ("finished", "failed", "stopped")
         if self.id:
             try:
                 append(make("event", run=self.id, status=status, step=step, reason=reason), self.path)

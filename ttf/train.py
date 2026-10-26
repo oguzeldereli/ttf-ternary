@@ -1052,7 +1052,10 @@ def cli():
     """python -m ttf.train / the ttf-train command: main(), with a 'failed' event in the run's records on an error"""
     try:
         main()
-    except SystemExit:
+    except SystemExit as e:      # (--profile's exit, a plug-in's; a run without an end event read as running forever)
+        if RUNLOG[0] is not None and not RUNLOG[0].ended:
+            ok = e.code in (None, 0)
+            RUNLOG[0].event("stopped" if ok else "failed", reason=None if ok else f"SystemExit: {str(e.code)[:300]}")
         raise
     except BaseException as e:
         if RUNLOG[0] is not None:

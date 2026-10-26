@@ -52,3 +52,32 @@ def test_notes_apart(tmp_path, monkeypatch):
     assert [r["type"] for r in R.load(R.DB)] == ["run", "result"]
     assert [r["type"] for r in R.load(R.NOTES)] == ["note"]
     assert len(R.load()) == 3
+
+
+@pytest.mark.parametrize("code,status", [(0, "stopped"), ("bad option", "failed")])
+def test_cli_records_an_exit(tmp_path, monkeypatch, code, status):
+    """a SystemExit after the run record (--profile, a plug-in) leaves an end event; a normal end is not doubled"""
+    from ttf import train as T
+    def fake_main():
+        T.RUNLOG[0] = R.RunLog(str(tmp_path), "r", {})
+        T.RUNLOG[0].event("running", 0)
+        raise SystemExit(code)
+    monkeypatch.setattr(T, "main", fake_main)
+    with pytest.raises(SystemExit):
+        T.cli()
+    ev = [r for r in R.load(str(tmp_path / "records.jsonl")) if r["type"] == "event"]
+    assert [e["status"] for e in ev] == ["running", status]
+    T.RUNLOG[0] = None
+
+
+def test_cli_does_not_double_an_end(tmp_path, monkeypatch):
+    from ttf import train as T
+    def fake_main():
+        T.RUNLOG[0] = R.RunLog(str(tmp_path), "r", {})
+        T.RUNLOG[0].event("stopped", 3, "signal")
+        raise SystemExit(0)
+    monkeypatch.setattr(T, "main", fake_main)
+    with pytest.raises(SystemExit):
+        T.cli()
+    assert [r["status"] for r in R.load(str(tmp_path / "records.jsonl")) if r["type"] == "event"] == ["stopped"]
+    T.RUNLOG[0] = None
