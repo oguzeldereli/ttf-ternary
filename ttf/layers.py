@@ -101,7 +101,8 @@ class _KernelTernFn(torch.autograd.Function):
         if not layer.capture:     # no update asked for: the input gradient only (the trits stay as they are)
             return gx.to(gy.dtype), None, None
         if getattr(layer, "cap_accum", False):   # --accum > 1: the update sees every micro-batch (no gradient kept
-            layer._ts_final = getattr(layer, "cap_final", True)   # across them); the turn and firing on the last one
+            layer._ts_final = getattr(layer, "cap_final", True)   # across them); the firing on the last one
+            layer._ts_micro = getattr(layer, "cap_micro", None)   # (the index: update._micro_t)
         xf = xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype)
         if FACTORED[0] and getattr(layer, "on_grad", None) is not None and not getattr(layer, "_dw_dense", False):
             layer.on_grad(layer, (gyf, xf))      # --dw factored: no dense weight gradient, the factors (gy, x), g = gy^T x
@@ -199,7 +200,7 @@ class _FusedTernFn(torch.autograd.Function):
                 gx, gc = _K.scale_bwd(_grad_x(l, f, l.wpacked), cb, xc_); del xc_
         if l.capture and getattr(l, "on_grad", None) is not None:    # (_fused_ok: the factored TTF update)
             if getattr(l, "cap_accum", False):
-                l._ts_final = getattr(l, "cap_final", True)
+                l._ts_final = getattr(l, "cap_final", True); l._ts_micro = getattr(l, "cap_micro", None)
             l.on_grad(l, (f, _K.dequant_i8(xq, xs)))
         return (gx.view(ctx.xshape), gc.to(ctx.cdt), grow.to(ctx.rdt), gbias.to(ctx.bdt) if ctx.has_bias else None,
                 g if ctx.has_acc else None, None)

@@ -874,7 +874,7 @@ def main():
                 if ttf and tc.grad_accum > 1:
                     for l_ in model.modules():
                         if isinstance(l_, KernelTernaryLinear):
-                            l_.cap_accum = True; l_.cap_final = i_ == tc.grad_accum - 1
+                            l_.cap_accum = True; l_.cap_final = i_ == tc.grad_accum - 1; l_.cap_micro = i_
                     for l_ in (_intk_lays(model) if args.intk_emb else ()):
                         l_._ts_final = i_ == tc.grad_accum - 1
             last_loss = model.pp_train(_bt, _pre_bwd, lambda: torch.autocast(device_type=device.split(":")[0],
@@ -884,7 +884,7 @@ def main():
             if ttf and tc.grad_accum > 1:      # TTF with accumulation: sum the captured micro-batch gradients
                 for l_ in model.modules():
                     if isinstance(l_, KernelTernaryLinear):
-                        l_.cap_accum = True; l_.cap_final = micro == tc.grad_accum - 1
+                        l_.cap_accum = True; l_.cap_final = micro == tc.grad_accum - 1; l_.cap_micro = micro
                 for l_ in (_intk_lays(model) if args.intk_emb else ()):
                     l_._ts_final = micro == tc.grad_accum - 1
             if args.kd_cache:          # --kd-cache: the next precomputed window, its tokens and the teacher's top k

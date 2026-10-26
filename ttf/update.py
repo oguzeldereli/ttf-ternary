@@ -243,6 +243,26 @@ out-of-basis mass carried ~sqrt(K / k) x its signal as noise and the moves ran a
 entries by step 96, loss 17). Before that (2858771) the turn dropped the mass outside V, one batch per step too."""
 
 
+def _micro_t(l, st, key, M_, c):
+    """a layer's update count t (in micro-batches with --accum M > 1). From the trainer's micro-batch index (l._ts_micro)
+    and step (c["step"]) when it gives them: a layer that sees no tokens in some micro-batches (an --moe expert) keeps
+    its count aligned with the step (the leak on the step's first call, the step's sketch seed in all its calls), and a
+    step it left without its last micro-batch drops that step's running v sums (no move, v not stepped for it). Without
+    gaps this is the count + 1, as without the index"""
+    t0 = st.get(("t", key), 0)
+    i = getattr(l, "_ts_micro", None) if M_ > 1 else None
+    if i is None or c.get("step") is None:
+        t = t0 + 1
+    else:
+        s0 = st.get(("ls", key))
+        ts = (t0 - 1) // M_ if (s0 == c["step"] and t0) else -(-t0 // M_)   # this step's index: as before, or the next
+        if s0 != c["step"] and t0 % M_:
+            st.pop(("mx", key), None)
+        t = ts * M_ + i + 1; st[("ls", key)] = c["step"]
+    st[("t", key)] = t
+    return t
+
+
 def _hspend_basis(st, key, x, V, c):
     """--ttf-hspend F: a move spends theta (D H~) instead of theta D, H~ = I + F (C - I), C the correlation of the layer's
     input factor x (an EMA, ~100 steps, of x^T x from the last micro-batch of each step; the second moment, not the
@@ -360,7 +380,7 @@ def ts_layer(l, g, state, c):
     sa = _store_codec(c.get("store_a", ""))                                            # --ttf-store: real storage
     st = state.setdefault("_ts", {})
     off, dev = (c.get("offload", False) if getattr(l, "_ts_host", True) else False), g.device  # --ttf-offload async (--ttf-offload-keep)
-    key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
+    key = id(l); t = _micro_t(l, st, key, M_, c)
     mic_nm = M_ > 1
     if mic_nm:    # --accum M > 1: the accumulator takes every micro-batch's u, normalised by the v of the steps before
         # (this step's v needs all of its micro-batches); on the first step there is none, so each micro-batch uses its
@@ -554,7 +574,7 @@ def _ts_layer_factored(l, fg, state, c):
     dev = gy.device
     off = c.get("offload", False) if getattr(l, "_ts_host", True) else False
     sa = _store_codec(c.get("store_a", ""))
-    key = id(l); t = st.get(("t", key), 0) + 1; st[("t", key)] = t
+    key = id(l); t = _micro_t(l, st, key, M_, c)
     lk = 1 - lr_ratio / tau
     k_ = int(c["factored"])
     ts_ = (t - 1) // M_

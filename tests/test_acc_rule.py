@@ -94,3 +94,40 @@ def test_one_batch_step_is_the_turn():
     A_ref = (Ul @ V0.T + u) @ Vn @ Vn.T
     U1, V1 = UP._load_pair(st[id(l)])
     assert float((U1 @ V1.T - A_ref).norm() / A_ref.norm()) < 1e-5
+
+
+def _run_idx(dense, skip=(), M=4, steps=3, idx=True):
+    """_run with the trainer's micro-batch index and step (update._micro_t); skip: (step, micro) calls left out"""
+    N, K, T = 40, 24, 16
+    l, st = _Stub(N, K), {}
+    ts = []
+    for s in range(steps):
+        g = torch.Generator().manual_seed(s)
+        fs = [(torch.randn(T, N, generator=g), torch.randn(T, K, generator=g) + 0.3) for _ in range(M)]
+        for i, (gy, x) in enumerate(fs):
+            if (s, i) in skip:
+                continue
+            l._ts_final = i == M - 1
+            if idx:
+                l._ts_micro = i
+            UP.ts_layer(l, (gy.T @ x) if dense else (gy, x), st, _cfg(micro=M, step=s))
+            ts.append(st["_ts"][("t", id(l))])
+    U, V = UP._load_pair(st[id(l)])
+    return U @ V.T, ts
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_micro_index_without_gaps_changes_nothing(dense):
+    A0, t0 = _run_idx(dense, idx=False)
+    A1, t1 = _run_idx(dense)
+    assert t0 == t1 == list(range(1, 13)) and torch.equal(A0, A1)
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_micro_index_keeps_the_count_aligned(dense):
+    """an --moe expert without tokens in some micro-batches (here step 1's micro-batches 1 and 3, its last): every call
+    keeps its place in the step (the leak on the step's first call, the step's sketch seed), the next step starts
+    clean (step 1's running v sums dropped)"""
+    A, ts = _run_idx(dense, skip={(1, 1), (1, 3)})
+    assert ts == [1, 2, 3, 4, 5, 7, 9, 10, 11, 12]
+    assert torch.isfinite(A).all()
