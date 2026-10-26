@@ -156,9 +156,6 @@ def build_parser():
                    "model, saved with --stop-after 0): step 0, a fresh optimizer and TTF state, the same --ext list")
     g.add_argument("--intk-emb", default="", help="E:H[:G]: token embedding / output head as E- / H-bit codes in "
                    "groups of G (64), trained by TTF (ttf/intk_emb.py), e.g. 2:3 (a tied matrix: E bits)")
-    g.add_argument("--intk-freeze-head-groups", action=ON, default=False, help="--intk-emb: the head's group mins / "
-                   "steps frozen at their conversion values (no gradient: the factored head skips its gy^T x product, "
-                   "one T V d GEMM per micro-batch); the codes still train. Under test")
     g.add_argument("--intk-update", default="factored", choices=["factored", "dense"],
                    help="--intk-emb: factored (no dense matrix or gradient: the head's loss in chunks from the codes, "
                    "the embedding's update on its rows) or dense (the bf16 matrix and an fp32 gradient sum per step)")

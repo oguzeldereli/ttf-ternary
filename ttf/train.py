@@ -363,14 +363,9 @@ def main():
         # frozen codes; noise-level pulls fired, as the leak passes |E u| > theta / tau)
         tm_ = 1.0 / args.emb_lr_mult if args.emb_lr_mult > 0 else math.inf
         assert tm_ == 1.0 or not args.ttf_theta_sched, "--intk-emb with --emb-lr-mult and a theta schedule"
-        _ms = _en(model, args.intk_emb, log=lambda m_: print(m_, flush=True))
-        for m_ in _ms:
+        for m_ in _en(model, args.intk_emb, log=lambda m_: print(m_, flush=True)):
             m_.dp_reduce = _WS > 1 and not _PP          # (data parallel only: --pipe stages are not replicas)
             m_.theta_mult = tm_
-        if args.intk_freeze_head_groups:
-            assert len(_ms) == 2, "--intk-freeze-head-groups: an untied head"
-            _ms[1].lo.requires_grad_(False); _ms[1].s.requires_grad_(False)
-            print("--intk-freeze-head-groups: the head's group mins / steps frozen", flush=True)
     if _QWEN and args.train_emb != "none":   # --train-emb: the head (and the embedding) join the float tail (the
         _te = [model.hf.lm_head.weight] + ([model.hf.model.embed_tokens.weight] if args.train_emb == "both" else [])
         for p_ in _te:                        # conversion and the resume freeze them; 0.8B, 22 Oct, theta 64: -0.085 wiki)

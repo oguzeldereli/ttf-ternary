@@ -473,27 +473,3 @@ def test_bf16_in_place():
             assert out.data_ptr() == p and torch.equal(out, ref), rows
     finally:
         IE.ROWS[0] = old
-
-
-def test_head_loss_frozen_groups():
-    """--intk-freeze-head-groups: with lo / s not requiring grad, the head loss's backward gives the same dL/dh and the
-    same factors to the update, and no group-parameter gradient"""
-    N, K, T = 300, 128, 40
-    torch.manual_seed(0)
-    out = []
-    for frozen in (False, True):
-        m = IE.IntKMatrix(torch.randn(N, K, generator=torch.Generator().manual_seed(1)) * 0.1, 3)
-        IE.ROWS[0] = 64
-        if frozen:
-            m.lo.requires_grad_(False); m.s.requires_grad_(False)
-        h = torch.randn(T, K, generator=torch.Generator().manual_seed(2)).requires_grad_(True)
-        tgt = torch.randint(0, N, (T,), generator=torch.Generator().manual_seed(3))
-        got = []
-        m.add_part = lambda p: got.append(p)
-        (IE.head_loss(m, h, tgt, None, chunk=64) / 7.0).backward()
-        IE.ROWS[0] = 8192
-        out.append((h.grad.clone(), got[0], m.lo.grad, m.s.grad))
-    (dh0, p0, glo0, _), (dh1, p1, glo1, gs1) = out
-    assert glo0 is not None and glo1 is None and gs1 is None
-    assert torch.equal(dh0, dh1) and p0[0] == p1[0] == "d"
-    assert torch.equal(p0[1], p1[1]) and torch.equal(p0[2], p1[2])
