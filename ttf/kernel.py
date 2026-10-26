@@ -1200,3 +1200,27 @@ def dequant_i8(q, s):
     _dq_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](q, s, o, M, K, BM=32, BK=128)
     return o
 
+
+@triton.jit
+def _group_sums_kernel(g_ptr, q_ptr, o0_ptr, o1_ptr, NG, G: tl.constexpr, BG: tl.constexpr):
+    """BG groups of G consecutive values: the sums of g and of g * q (q int8 codes), fp32"""
+    gi = tl.program_id(0) * BG + tl.arange(0, BG)
+    j = tl.arange(0, G)
+    m = gi[:, None] < NG
+    off = gi[:, None].to(tl.int64) * G + j[None, :]
+    g = tl.load(g_ptr + off, mask=m, other=0.0).to(tl.float32)
+    q = tl.load(q_ptr + off, mask=m, other=0).to(tl.float32)
+    tl.store(o0_ptr + gi, tl.sum(g, axis=1), mask=gi < NG)
+    tl.store(o1_ptr + gi, tl.sum(g * q, axis=1), mask=gi < NG)
+
+
+def group_sums(g, q, G):
+    """(sum over each group of G, sum of g * q) for g [n, K] (fp32, contiguous) and its int8 codes q [n, K]: [n, K / G]
+    each, fp32, in one pass (the int-k group parameters' gradients; was a product, a copy and two reductions)"""
+    n, K = g.shape
+    g, q = g.contiguous(), q.contiguous()
+    NG = n * (K // G)
+    o0 = torch.empty(n, K // G, dtype=torch.float32, device=g.device); o1 = torch.empty_like(o0)
+    BG = 64
+    _group_sums_kernel[(triton.cdiv(NG, BG),)](g, q, o0, o1, NG, G=G, BG=BG)
+    return o0, o1

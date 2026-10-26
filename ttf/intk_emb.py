@@ -235,7 +235,7 @@ class _Parts:
         self.p, self.rows = parts, rows or ROWS[0]       # (rows: the store's chunking, which a checkpoint fixes)
 
     def prep(self, M):
-        """x_p M for every part (M [K, c]); for a "g" part (the gradient itself, ("g", G [N, K] fp32, None): the head when
+        """x_p M for every part (M [K, c]); for a "g" part (the gradient itself, ("g", G [N, K] bf16, None): the head when
         its dense gradient is smaller than its factors) M itself"""
         from .update import _mmb
         return [M if k == "g" else _mmb(x, M) if k == "d" else x @ M for k, _, x in self.p]
@@ -246,7 +246,7 @@ class _Parts:
         out = None
         for (k, a, _), y in zip(self.p, xm):
             if k == "g":
-                o = a[i:j] @ y
+                o = _mmb(a[i:j], y)
             elif k == "d":
                 o = _mmb(a[:, i:j].T, y)
             else:
@@ -269,7 +269,7 @@ class _Parts:
             j = min(N, i + self.rows); W = rows_of(i, j)
             for (k, a, _), A in zip(self.p, acc):
                 if k == "g":
-                    A += a[i:j].T @ W.float()
+                    A += _mmb(a[i:j].T, W)
                 elif k == "d":
                     A += _mmb(a[:, i:j], W)
                 else:
@@ -550,13 +550,21 @@ class _EmbFn(torch.autograd.Function):
         (idx,) = ctx.saved_tensors; m = ctx.m
         u, Gu = _row_sums(idx.reshape(-1), go.reshape(-1, m.K), m.N)
         us = u.clamp(max=m.N - 1)                            # (the padding rows: zero sums, added to the last row)
-        Gg = Gu.view(-1, m.K // m.g, m.g)
-        q = m.codes[us].view(-1, m.K // m.g, m.g).float()
+        s0, s1 = _gsums(Gu, m.codes[us], m.g)
         f32 = dict(dtype=torch.float32, device=go.device)   # summed in fp32, returned in the parameters' dtype (bf16 at 27B)
-        glo = torch.zeros(m.lo.shape, **f32).index_add_(0, us, Gg.sum(-1)).to(m.lo.dtype)
-        gs = torch.zeros(m.s.shape, **f32).index_add_(0, us, (Gg * q).sum(-1)).to(m.s.dtype); del q, Gg
+        glo = torch.zeros(m.lo.shape, **f32).index_add_(0, us, s0).to(m.lo.dtype)
+        gs = torch.zeros(m.s.shape, **f32).index_add_(0, us, s1).to(m.s.dtype); del s0, s1
         m.add_part(("s", u, Gu))
         return None, glo, gs, None
+
+
+def _gsums(Gr, q, g):
+    """per group of g: (sum of Gr, sum of Gr * q), fp32 [n, K / g] (Gr [n, K] fp32, q its codes)"""
+    if Gr.is_cuda:
+        from .kernel import group_sums
+        return group_sums(Gr, q, g)
+    Gg = Gr.view(Gr.shape[0], -1, g)
+    return Gg.sum(-1), (Gg * q.view(Gg.shape).float()).sum(-1)
 
 
 def _logits(m, h, dt):
@@ -622,10 +630,9 @@ class _HeadLossFn(torch.autograd.Function):
             x = (h.float() * go.float()).to(torch.bfloat16)       # g = gy^T x carries grad_out (1 / tokens / accum)
         for a in range(0, m.N, ROWS[0]):
             b = min(m.N, a + ROWS[0])
-            Gg = (G[a:b] if G is not None else _mmb(gy[:, a:b].T, x)).view(b - a, Gn, m.g)
-            glo[a:b] = Gg.sum(-1)
-            gs[a:b] = (Gg * m.codes[a:b].view(b - a, Gn, m.g).float()).sum(-1); del Gg
-        m.add_part(("g", G, None) if G is not None else ("d", gy, x))
+            glo[a:b], gs[a:b] = _gsums(G[a:b] if G is not None else _mmb(gy[:, a:b].T, x), m.codes[a:b], m.g)
+        # the dense gradient to the update in bf16, as the factors (its products on the bf16 tensor cores, fp32 sums)
+        m.add_part(("g", G.to(torch.bfloat16), None) if G is not None else ("d", gy, x)); del G
         return (dh * go.float()).to(ctx.dt), glo, gs, None, None, None, None
 
 

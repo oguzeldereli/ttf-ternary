@@ -579,3 +579,11 @@ def test_deq_cache_cuda_optimizers(opt):
     from ttf.opt_lean import LeanAdam
     _deq_cache_steps(dev, (lambda ps: LeanAdam(ps, lr=1e-2)) if opt == "lean" else
                      (lambda ps: torch.optim.AdamW(ps, lr=1e-2, fused=True)))
+
+
+def test_group_sums():
+    from ttf.kernel import group_sums
+    g = torch.randn(300, 640, device=dev); q = torch.randint(0, 8, (300, 640), device=dev, dtype=torch.int8)
+    s0, s1 = group_sums(g, q, 64)
+    Gg = g.double().view(300, 10, 64)
+    assert torch.allclose(s0.double(), Gg.sum(-1), atol=1e-5) and torch.allclose(s1.double(), (Gg * q.view(300, 10, 64).double()).sum(-1), atol=1e-4)
