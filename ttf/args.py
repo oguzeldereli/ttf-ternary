@@ -111,8 +111,8 @@ def build_parser():
     g.add_argument("--dx", default="int8x2", choices=["bf16", "int8x2"], help="the input gradient's GEMM "
                    "(int8x2: gy in two int8 slices on the int8 tensor cores where the summed width is >= 4096, else "
                    "bf16; as accurate as bf16, the 110M conversion recipe 2.6675 vs 2.6672 with it on every layer)")
-    g.add_argument("--fused-layer", action=ON, default=False,
-                   help="int8 ternary layers with row / column scales: the centring, column scale and act-quant in one "
+    g.add_argument("--fused-layer", action=ON, default=True,
+                   help="(default on; --no-fused-layer: the unfused path) int8 ternary layers with row / column scales: the centring, column scale and act-quant in one "
                         "kernel, the GEMM's epilogue with the row scale, bias and the sum of a converted layer's parts, "
                         "the backward's elementwise work in two kernels (output, input gradient and the TTF factors "
                         "bit-identical; the scale / bias gradients summed in fp32)")
@@ -151,9 +151,10 @@ def build_parser():
     g.add_argument("--intk-theta-mult", type=float, default=1.0, help="--intk-emb: the codes' theta = --ttf-theta x this "
                    "(inf: the codes frozen, only the group mins / steps train)")
     g.add_argument("--kd-cache", default="", help="precomputed teacher top-k targets (scripts/quant/teacher_topk.py)")
-    g.add_argument("--kd-cache-mode", default="renorm", choices=["renorm", "rest", "sample"],
-                   help="renorm: KL on the top k renormalised; rest: top k plus one bucket for the remaining mass; sample: "
-                        "top k plus the cache's tail samples (unbiased)")
+    g.add_argument("--kd-cache-mode", default="sample", choices=["renorm", "rest", "sample"],
+                   help="sample (needs a cache with tail samples, teacher_topk.py --tail): top k plus the cache's tail "
+                        "samples (unbiased; 0.8B at 1k: within 0.0025-0.0045 of the live teacher); rest: top k plus one "
+                        "bucket for the remaining mass; renorm: KL on the top k renormalised")
     g.add_argument("--kd-cache-start", type=int, default=0, help="the step that reads the cache's window 0")
     g.add_argument("--moe", default="", help="E:K[:H]: mixture of E ternary experts, top-K routing")
     g.add_argument("--moe-aux", type=float, default=0.01, help="load-balancing loss weight")
@@ -295,7 +296,7 @@ _OLD_OFF = [("--qk_temp", ["--no-qk-temp"]), ("--rc_scale", ["--no-rc-scale"]), 
 _OLD_DEFAULTS = [("--mode", ["--mode", "ttf"]), ("--ts_tau", ["--ttf-tau", "300"]),
                  ("--ts_anneal", ["--ttf-step-p", "1.0"]), ("--lowrank", ["--ttf-rank", "0"]),
                  ("--init_hf_method", ["--convert", "als"]), ("--distill_w", ["--kd-weight", "1.0"]),
-                 ("--mag_wd", ["--adapter-wd", "0.0"])]
+                 ("--mag_wd", ["--adapter-wd", "0.0"]), ("--kd_mode", ["--kd-cache-mode", "renorm"])]
 _OLD_BOOL = {"--qk_temp", "--ts", "--init_stream", "--data_u32", "--ts_vdiag", "--ts_nomom", "--lr_linear",
              "--lean_batched", "--lean_tail", "--ts_fire_fused", "--fused_norm", "--fused_scales", "--ts_micro",
              "--ckpt_block", "--no_final_save", "--mem_report", "--ts_offload", "--ts_fused", "--ts_tau_anneal", "--tf32",

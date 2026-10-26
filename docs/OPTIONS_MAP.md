@@ -132,3 +132,4 @@ Removed on 25 Oct 2026 (the measured best is now the only path): an old command 
 | `--init_hf_method` | `--convert als` |
 | `--distill_w` | `--kd-weight 1.0` |
 | `--mag_wd` | `--adapter-wd 0.0` |
+| `--kd_mode` | `--kd-cache-mode renorm` |
