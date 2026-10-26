@@ -141,6 +141,10 @@ def test_dx_int8x2():
         ea = float((a.double() - ref).norm() / ref.norm()); eb = float((b.double() - ref).norm() / ref.norm())
         assert eb <= 1.25 * ea + 1e-6, (M, N, K, ea, eb)
         assert torch.equal(b, Kn.tern_gemm_dx_i8x2(g, p, K))
+        q1 = torch.empty(M, N, dtype=torch.int8, device=dev); q2 = torch.empty_like(q1); s = torch.empty(M, device=dev)
+        Kn._slice2_kernel[(M,)](g.contiguous(), q1, q2, s, N, N, N, BLOCK=1024)   # --dx int8: the first slice alone
+        c = Kn.tern_gemm_dx_i8x2(g, p, K, two=False)
+        assert torch.equal(c, ((q1.double() @ w.double()).float() * s[:, None]).to(torch.bfloat16))
 
 
 def test_lean_adam_batched():
@@ -727,7 +731,7 @@ def test_dx2_col(M, N, K):
     mu = (torch.randn(K, device=dev, generator=gen) * 0.1).to(torch.bfloat16)
     y1 = (q1.double() @ w.double()).to(torch.int32).contiguous(); y2 = (q2.double() @ w.double()).to(torch.int32).contiguous()
     g = torch.empty(M, K, dtype=torch.bfloat16, device=dev)          # (the two-GEMM path's epilogue: the same fp32 ops)
-    Kn._dx2_epi_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](y1, y2, s, g, M, K, BM=32, BK=128)
+    Kn._dx2_epi_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](y1, y2, s, g, M, K, TWO=True, BM=32, BK=128)
     g = g.float()
     gx_ref = (g * c.float()[None, :]).to(torch.bfloat16)
     xc = (x.float() - mu.float()[None, :]).to(torch.bfloat16).float()

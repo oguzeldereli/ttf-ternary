@@ -255,15 +255,16 @@ def _unpack_t_kernel(p_ptr, o_ptr, N, K, K5, spn, sok, BN: tl.constexpr, BK5: tl
 
 
 @triton.jit
-def _dx2_epi_kernel(y1_ptr, y2_ptr, s_ptr, o_ptr, M, K, BM: tl.constexpr, BK: tl.constexpr):
+def _dx2_epi_kernel(y1_ptr, y2_ptr, s_ptr, o_ptr, M, K, TWO: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr):
     offm = tl.program_id(0) * BM + tl.arange(0, BM)
     offk = tl.program_id(1) * BK + tl.arange(0, BK)
     mk = (offm[:, None] < M) & (offk[None, :] < K)
     idx = offm[:, None] * K + offk[None, :]
-    y1 = tl.load(y1_ptr + idx, mask=mk, other=0).to(tl.float32)
-    y2 = tl.load(y2_ptr + idx, mask=mk, other=0).to(tl.float32)
+    y = tl.load(y1_ptr + idx, mask=mk, other=0).to(tl.float32)
+    if TWO:
+        y = y + tl.load(y2_ptr + idx, mask=mk, other=0).to(tl.float32) * (1.0 / 254.0)
     s = tl.load(s_ptr + offm, mask=offm < M, other=0.0)
-    tl.store(o_ptr + idx, ((y1 + y2 * (1.0 / 254.0)) * s[:, None]).to(tl.bfloat16), mask=mk)
+    tl.store(o_ptr + idx, (y * s[:, None]).to(tl.bfloat16), mask=mk)
 
 
 def unpack_t_i8(wpacked: torch.Tensor, K: int) -> torch.Tensor:
@@ -275,9 +276,10 @@ def unpack_t_i8(wpacked: torch.Tensor, K: int) -> torch.Tensor:
     return out
 
 
-def tern_gemm_dx_i8x2(gy: torch.Tensor, wpacked: torch.Tensor, K: int) -> torch.Tensor:
+def tern_gemm_dx_i8x2(gy: torch.Tensor, wpacked: torch.Tensor, K: int, two: bool = True) -> torch.Tensor:
     """grad_x = gy @ decode(wpacked), gy [M, N] -> bf16 [M, K], on the int8 tensor cores with gy in two int8 slices
-    (--dx int8x2); shapes the int8 GEMM cannot take fall back to the bf16 path"""
+    (--dx int8x2; two False: the first slice only, --dx int8); shapes the int8 GEMM cannot take fall back to the bf16
+    path"""
     M, N = gy.shape
     if not (gy.is_cuda and M > 16 and N % 8 == 0 and K % 8 == 0):
         return tern_gemm_dx(gy, wpacked, K)
@@ -286,9 +288,9 @@ def tern_gemm_dx_i8x2(gy: torch.Tensor, wpacked: torch.Tensor, K: int) -> torch.
     sc = torch.empty(M, dtype=torch.float32, device=g.device)
     _slice2_kernel[(M,)](g, q1, q2, sc, N, g.stride(0), q1.stride(0), BLOCK=1024)
     wt = unpack_t_i8(wpacked, K).t()                     # [N, K], column-major: the layout torch._int_mm wants
-    y1 = torch._int_mm(q1, wt); y2 = torch._int_mm(q2, wt)
+    y1 = torch._int_mm(q1, wt); y2 = torch._int_mm(q2, wt) if two else y1
     out = torch.empty(M, K, dtype=torch.bfloat16, device=g.device)
-    _dx2_epi_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](y1, y2, sc, out, M, K, BM=32, BK=128)
+    _dx2_epi_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](y1, y2, sc, out, M, K, TWO=two, BM=32, BK=128)
     return out
 
 

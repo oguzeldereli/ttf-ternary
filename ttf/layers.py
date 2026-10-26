@@ -126,9 +126,8 @@ class _KernelTernFn(torch.autograd.Function):
 
 
 def _grad_x(layer, gyf, wpacked):
-    assert DX_MODE[0] != "int8", "--dx int8: the fused layer only"
-    if DX_MODE[0] == "int8x2":
-        return tern_gemm_dx_i8x2(gyf, wpacked, layer.K)
+    if DX_MODE[0] in ("int8x2", "int8"):
+        return tern_gemm_dx_i8x2(gyf, wpacked, layer.K, two=DX_MODE[0] == "int8x2")
     return tern_gemm_dx(gyf, wpacked, layer.K)
 
 
