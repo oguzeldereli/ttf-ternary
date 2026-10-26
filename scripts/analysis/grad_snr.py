@@ -118,9 +118,12 @@ for b in range(3 * n3):
 n = 3 * n3
 k_noise = a.batch / a.micro            # micro-batch noise variance / training-batch noise variance
 cg = cfg if isinstance(cfg, dict) else vars(cfg)
-p_, theta, tau = float(cg.get("ts_anneal", 0.5)), float(cg.get("ts_theta", 16.0)), float(cg.get("ts_tau", 1000.0))
-tan = bool(cg.get("ts_tau_anneal", False))
-# the leak per step is a / tau with --ttf-leak annealed (a = rho^p), 1 / tau otherwise: bar theta / (tau_eff a)
+if "ttf_theta" in cg:   # the current trainer (--ttf-step-p, the leak always annealed with the step)
+    p_, theta, tau, tan = float(cg["ttf_step_p"]), float(cg["ttf_theta"]), float(cg["ttf_tau"]), True
+else:                  # a checkpoint of the trainer before 17 Oct 2026 (its option names)
+    p_, theta, tau = float(cg.get("ts_anneal", 0.5)), float(cg.get("ts_theta", 16.0)), float(cg.get("ts_tau", 1000.0))
+    tan = bool(cg.get("ts_tau_anneal", False))
+# the leak per step is a / tau when annealed (a = rho^p), 1 / tau otherwise: bar theta / (tau_eff a)
 bar = (theta / tau if tan else theta / (tau * rho ** p_)) if rho else None
 print(f"\nrho {rho}, fire bar theta / (tau_eff a) = {bar} (theta {theta}, tau {tau}{' annealed' if tan else ''}, p {p_})")
 rows = []; MU, SIG, TH = [], [], []
