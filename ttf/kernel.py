@@ -1267,6 +1267,58 @@ def fused_epilogue(y32, xs, beta, r_b, bias_b, acc, save_t):
 
 
 @triton.jit
+def _fwd_gemm_kernel(a_ptr, w_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, t_ptr, o_ptr, M, N, K, sam, swn,
+                     HAS_BIAS: tl.constexpr, HAS_ACC: tl.constexpr, SAVE_T: tl.constexpr, BM: tl.constexpr,
+                     BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr):
+    """the fused layer's forward GEMM with its epilogue: y = xq W^T (int8 x trits, int32: exact) and then
+    _epi_fwd_kernel's arithmetic on the tile, so the int32 [M, N] is never written; bit-identical to the two kernels"""
+    pid = tl.program_id(0)
+    npm = tl.cdiv(M, BM); npn = tl.cdiv(N, BN)
+    gid = pid // (GM * npn); fm = gid * GM; gs = tl.minimum(npm - fm, GM)
+    pm = fm + (pid % (GM * npn)) % gs; pn = (pid % (GM * npn)) // gs
+    rows = pm * BM + tl.arange(0, BM); cols = pn * BN + tl.arange(0, BN); rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype=tl.int32)
+    for k0 in range(0, K, BK):
+        kk = k0 + rk
+        a = tl.load(a_ptr + rows[:, None] * sam + kk[None, :], mask=(rows[:, None] < M) & (kk[None, :] < K), other=0)
+        w = tl.load(w_ptr + cols[None, :] * swn + kk[:, None], mask=(cols[None, :] < N) & (kk[:, None] < K), other=0)
+        acc += tl.dot(a, w, out_dtype=tl.int32)
+    m = (rows[:, None] < M) & (cols[None, :] < N)
+    off = rows[:, None] * N + cols[None, :]
+    xs = tl.load(xs_ptr + rows, mask=rows < M, other=0.0)
+    t = _rbf((acc.to(tl.float32) * xs[:, None]) * tl.load(b_ptr))
+    if SAVE_T:
+        tl.store(t_ptr + off, t.to(tl.bfloat16), mask=m)
+    o = _rbf(t * tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)[None, :])
+    if HAS_BIAS:
+        o = _rbf(o + tl.load(bias_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)[None, :])
+    if HAS_ACC:
+        o = tl.load(acc_ptr + off, mask=m, other=0.0).to(tl.float32) + o
+    tl.store(o_ptr + off, o.to(tl.bfloat16), mask=m)
+
+
+def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t):
+    """xq int8 [M, K] (fused_prologue), the trits w8 int8 [N, K] (KernelTernaryLinear.w8()) -> (t, out) as
+    fused_epilogue(torch._int_mm(xq, w8.t()), ...) gives them, bit for bit. One Triton kernel (no int32 round trip)
+    for short reductions (K <= 2048: the adapters' up factors, whose int32 [M, N] and epilogue cost as much as their
+    GEMM); wider ones keep cutlass + fused_epilogue (in the 27B step the Triton GEMM lost more there than the round
+    trip saved: 5.98 -> 6.05 s on the laptop 4080). Tiles fixed by shape"""
+    M, K = xq.shape
+    N = w8.shape[0]
+    if K > 2048:
+        return fused_epilogue(torch._int_mm(xq, w8.t()), xs, beta, r_b, bias_b, acc, save_t)
+    o = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device)
+    t = torch.empty_like(o) if save_t else None
+    BM, BN, BK, nw = (64, 128, 64, 8) if N >= 16384 else (128, 64, 64, 4)
+    _fwd_gemm_kernel[(triton.cdiv(M, BM) * triton.cdiv(N, BN),)](
+        xq, w8, xs, _dev_scalar(beta, xq.device), r_b, bias_b if bias_b is not None else r_b,
+        acc if acc is not None else o, t if t is not None else o, o, M, N, K, xq.stride(0), w8.stride(0),
+        HAS_BIAS=bias_b is not None, HAS_ACC=acc is not None, SAVE_T=save_t, BM=BM, BN=BN, BK=BK, GM=8,
+        num_warps=nw, num_stages=3)
+    return t, o
+
+
+@triton.jit
 def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, pb_ptr, pr_ptr, M, N,
                      SLICES: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
     """from the output gradient g [M, N]: gyf = bf16(bf16(g * r) * bf16(beta)) (the GEMM's gradient, stored), the

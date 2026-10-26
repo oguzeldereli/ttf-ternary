@@ -156,10 +156,11 @@ def _fused_fwd(l, x2, acc2, save):
     cb, rb = l.col_scale.to(torch.bfloat16), l.row_scale.to(torch.bfloat16)
     ob = getattr(l, "out_bias", None)
     bb = ob.to(torch.bfloat16) if ob is not None else None
-    xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, l.act_bits, False)   # (the input itself is kept for the backward,
-    beta = l._cached_beta(l.wpacked) if l.use_beta else None          # which re-forms bf16(x - mu): one tensor for
-    y32 = torch._int_mm(xq, l.w8().t())                               # all the readers of one input, bit-identical)
-    t, o = _K.fused_epilogue(y32, xs, beta if beta is not None else 1.0, rb, bb, acc2, save)
+    # (the input itself is kept for the backward, which re-forms bf16(x - mu): one tensor for all the readers of one
+    # input, bit-identical)
+    xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, l.act_bits, False)
+    beta = l._cached_beta(l.wpacked) if l.use_beta else None
+    t, o = _K.fused_fwd_gemm(xq, l.w8(), xs, beta if beta is not None else 1.0, rb, bb, acc2, save)
     return o, ((xq, xs, x2, t, cb, rb, beta) if save else None)
 
 

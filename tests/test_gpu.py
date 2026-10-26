@@ -735,3 +735,23 @@ def test_dx2_col(M, N, K):
     gx, gc = Kn.dx2_col(q1, q2, s, w8t, c, x, mu)
     assert torch.equal(gx, gx_ref)
     assert float((gc.double() - gc_ref).abs().max() / gc_ref.abs().max()) < 1e-5
+
+
+@pytest.mark.parametrize("M,K,N,acc,bias", [(512, 1024, 768, False, True), (300, 208, 2048, True, False),
+                                            (100, 2048, 20000, False, False), (64, 17000, 4096, True, True)])
+def test_fused_fwd_gemm(M, K, N, acc, bias):
+    """kernel.fused_fwd_gemm (the GEMM and its epilogue in one kernel; the cutlass path for long reductions) against
+    torch._int_mm + fused_epilogue: t and the output bit-identical"""
+    import ttf.kernel as Kn
+    gen = torch.Generator(device=dev).manual_seed(M + K)
+    xq = torch.randint(-127, 128, (M, K), device=dev, dtype=torch.int8, generator=gen)
+    w8 = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8, generator=gen)
+    xs = torch.rand(M, device=dev, generator=gen) * 1e-2
+    rb = (torch.rand(N, device=dev, generator=gen) + 0.5).to(torch.bfloat16)
+    bb = torch.randn(N, device=dev, generator=gen).to(torch.bfloat16) if bias else None
+    a = torch.randn(M, N, device=dev, generator=gen).to(torch.bfloat16) if acc else None
+    beta = torch.full((), 0.7, device=dev)
+    for save in (True, False):
+        t0, o0 = Kn.fused_epilogue(torch._int_mm(xq, w8.t()), xs, beta, rb, bb, a, save)
+        t1, o1 = Kn.fused_fwd_gemm(xq, w8, xs, beta, rb, bb, a, save)
+        assert torch.equal(o0, o1) and (not save or torch.equal(t0, t1))
