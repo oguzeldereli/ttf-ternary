@@ -219,6 +219,7 @@ def ttf_rows(l, g, state, c, rows=16384):
 
 
 INTK_FACTORED = [True]   # --intk-update factored (default) | dense
+FUSED_FIRE = [True]      # _fire on the GPU through kernel.intk_fire; False: the torch ops (tests, A/B)
 ROWS = [8192]            # rows per chunk of the factored update and of the head's vocabulary loops
 TOK_BYTES = [1 << 29]    # the int-k head loss: tokens per chunk such that the chunk's fp32 logits stay below this
 DEQ_GEN = [None]         # IntKMatrix.deq_cache: the trainer's optimizer-step count (None: no cache, per chunk)
@@ -504,9 +505,18 @@ def _fire(l, S, Us, V, theta, c, st):
     S.put_v(V)
     for cc, U in enumerate(Us):
         i, j = S.rng(cc)
-        sc = l.s.detach()[i:j]           # signed: a group whose step went negative moves W down when its code moves up
-        rho = (sc / sc.square().mean(1, keepdim=True).sqrt().clamp_min(1e-30)).repeat_interleave(l.g, 1); del sc
-        A = (U @ V.T).mul_(rho); w0 = l.codes[i:j]
+        sc = l.s.detach()[i:j].float()   # signed: a group whose step went negative moves W down when its code moves up
+        rho = sc / sc.square().mean(1, keepdim=True).sqrt().clamp_min(1e-30); del sc
+        w0 = l.codes[i:j]
+        if U.is_cuda and FUSED_FIRE[0]:  # kernel.intk_fire: the same moves (bf16 A + bound, fp32 where uncertain)
+            from .kernel import intk_fire
+            dU, n_ = intk_fire(U, V, w0, rho, l.g, l.levels, theta); nf += n_
+            U = U - c["spend"] * theta * dU; del dU
+            S.put_u(cc, U)
+            Us[cc] = None
+            continue
+        rho = rho.repeat_interleave(l.g, 1)
+        A = (U @ V.T).mul_(rho)
         d = A.sign(); nw = w0.float() + d
         fire = (A.abs() >= theta) & (nw >= 0) & (nw <= l.levels) & (rho.abs() > 1e-6); del A, nw
         w0.add_(torch.where(fire, d, torch.zeros_like(d)).to(torch.int8)); nf += fire.sum()
@@ -515,6 +525,7 @@ def _fire(l, S, Us, V, theta, c, st):
         S.put_u(cc, U)
         Us[cc] = None
     S.flush()
+    torch.autograd.graph.increment_version(l.codes)   # (the kernel writes the codes in place: deq_cache's key moves)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
 
 

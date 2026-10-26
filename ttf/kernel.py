@@ -697,6 +697,179 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
 
 
 @triton.jit
+def _ifire_kernel(ub_ptr, vb_ptr, u_ptr, v_ptr, un_ptr, vn_ptr, c_ptr, rho_ptr, d_ptr, s_ptr, N, K, R, KG, sun, svk,
+                  scn, srn, sdn, theta, eb, levels, NPK, G: tl.constexpr, SLOTS: tl.constexpr, RC: tl.constexpr,
+                  BN: tl.constexpr, BK: tl.constexpr):
+    """intk_fire, one tile of codes: A_q = rho A (A = U V^T from bf16 copies, fp32 sums; rho per row and group of G
+    columns) with the entry's bound |rho| eb |u_n| |v_k|; as _fire_kernel: sure entries decided here (written to D: the
+    move's sign, or 0), uncertain ones listed in the tile's slots for _ifire_fix_kernel, a tile whose list would
+    overflow decided here with tf32x3. A move: |A_q| >= theta, the code + sign(A_q) within 0 .. levels, |rho| > 1e-6"""
+    pn = tl.program_id(0); pk = tl.program_id(1)
+    rows = pn * BN + tl.arange(0, BN)
+    k = pk * BK + tl.arange(0, BK)
+    rm = rows[:, None] < N
+    ok = rm & (k[None, :] < K)
+    a = tl.zeros((BN, BK), dtype=tl.float32)
+    for r0 in range(0, R, RC):
+        rr = r0 + tl.arange(0, RC)
+        u = tl.load(ub_ptr + rows[:, None] * sun + rr[None, :], mask=rm & (rr[None, :] < R), other=0.0)
+        v = tl.load(vb_ptr + k[:, None] * svk + rr[None, :], mask=(k[:, None] < K) & (rr[None, :] < R), other=0.0)
+        a += tl.dot(u, tl.trans(v))
+    rho = tl.load(rho_ptr + rows[:, None] * srn + (k // G)[None, :], mask=ok, other=0.0)
+    un = tl.load(un_ptr + rows, mask=rows < N, other=0.0)
+    vn = tl.load(vn_ptr + k, mask=k < K, other=0.0)
+    bd = eb * tl.abs(rho) * un[:, None] * vn[None, :]
+    ok = ok & (tl.abs(rho) > 1e-6)
+    aq = a * rho
+    amb = ok & (tl.abs(aq) + bd >= theta) & (tl.abs(aq) - bd < theta)
+    flat = tl.reshape(amb.to(tl.int32), (BN * BK,))
+    na = tl.sum(flat, axis=0)
+    if na > SLOTS:                                           # (rare: the tile decided with tf32x3 here)
+        a = tl.zeros((BN, BK), dtype=tl.float32)
+        for r0 in range(0, R, RC):
+            rr = r0 + tl.arange(0, RC)
+            u = tl.load(u_ptr + rows[:, None] * sun + rr[None, :], mask=rm & (rr[None, :] < R), other=0.0)
+            v = tl.load(v_ptr + k[:, None] * svk + rr[None, :], mask=(k[:, None] < K) & (rr[None, :] < R), other=0.0)
+            a += tl.dot(u, tl.trans(v), input_precision="tf32x3")
+        aq = a * rho
+        bd = tl.zeros((BN, BK), dtype=tl.float32)
+    else:
+        pos = tl.cumsum(flat, axis=0) - 1
+        ent = tl.reshape(rows[:, None].to(tl.int64) * K + k[None, :], (BN * BK,))
+        tl.store(s_ptr + (pn * NPK + pk).to(tl.int64) * SLOTS + pos, ent, mask=flat > 0)
+    code = tl.load(c_ptr + rows[:, None] * scn + k[None, :], mask=ok, other=0).to(tl.int32)
+    d = tl.where(aq > 0, 1, tl.where(aq < 0, -1, 0))
+    nw = code + d
+    fire = ok & (tl.abs(aq) - bd >= theta) & (nw >= 0) & (nw <= levels)
+    tl.store(d_ptr + rows[:, None] * sdn + k[None, :], tl.where(fire, d, 0).to(tl.int8), mask=rm & (k[None, :] < K))
+
+
+@triton.jit
+def _ifire_fix_kernel(u_ptr, v_ptr, c_ptr, rho_ptr, d_ptr, s_ptr, n_slots, K, R, sun, svk, scn, srn, sdn, theta,
+                      levels, G: tl.constexpr, BE: tl.constexpr, RC: tl.constexpr):
+    """the listed entries: A_nk = u_n . v_k in fp32 (FMAs), the move decided as in _ifire_kernel, written to D"""
+    pe = tl.program_id(0) * BE + tl.arange(0, BE)
+    ent = tl.load(s_ptr + pe, mask=pe < n_slots, other=-1)
+    live = ent >= 0
+    if tl.sum(live.to(tl.int32), axis=0) > 0:
+        n = tl.where(live, ent // K, 0); k = tl.where(live, ent % K, 0)
+        a = tl.zeros((BE,), dtype=tl.float32)
+        for r0 in range(0, R, RC):
+            rr = r0 + tl.arange(0, RC)
+            m = live[:, None] & (rr[None, :] < R)
+            u = tl.load(u_ptr + n[:, None] * sun + rr[None, :], mask=m, other=0.0)
+            v = tl.load(v_ptr + k[:, None] * svk + rr[None, :], mask=m, other=0.0)
+            a += tl.sum(u * v, axis=1)
+        rho = tl.load(rho_ptr + n * srn + k // G, mask=live, other=0.0)
+        aq = a * rho
+        code = tl.load(c_ptr + n * scn + k, mask=live, other=0).to(tl.int32)
+        d = tl.where(aq > 0, 1, tl.where(aq < 0, -1, 0))
+        nw = code + d
+        fire = live & (tl.abs(rho) > 1e-6) & (tl.abs(aq) >= theta) & (nw >= 0) & (nw <= levels)
+        tl.store(d_ptr + n * sdn + k, d.to(tl.int8), mask=fire)
+
+
+@triton.jit
+def _ifire_apply_kernel(c_ptr, rho_ptr, d_ptr, cnt_ptr, ek_ptr, ew_ptr, er_ptr, n_ptr, N, K, scn, srn, sdn, NPK,
+                        G: tl.constexpr, SL: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """the moves D applied to one tile's codes; their number into cnt; the tile's moves listed for _ifire_spend_kernel
+    (n: their number; ek the column, er the row in the tile, ew the spend's weight d / rho; more than SL: n only)"""
+    pn = tl.program_id(0); pk = tl.program_id(1)
+    rows = pn * BN + tl.arange(0, BN)
+    k = pk * BK + tl.arange(0, BK)
+    m = (rows[:, None] < N) & (k[None, :] < K)
+    dd = tl.load(d_ptr + rows[:, None] * sdn + k[None, :], mask=m, other=0).to(tl.int32)
+    mv = dd != 0
+    code = tl.load(c_ptr + rows[:, None] * scn + k[None, :], mask=m & mv, other=0).to(tl.int32)
+    tl.store(c_ptr + rows[:, None] * scn + k[None, :], (code + dd).to(tl.int8), mask=m & mv)
+    rho = tl.load(rho_ptr + rows[:, None] * srn + (k // G)[None, :], mask=m & mv, other=1.0)
+    t = pn * NPK + pk
+    flat = tl.reshape(mv.to(tl.int32), (BN * BK,))
+    pos = tl.cumsum(flat, axis=0) - 1
+    put = (flat > 0) & (pos < SL)
+    tl.store(ek_ptr + t * SL + pos, tl.reshape(k[None, :] + rows[:, None] * 0, (BN * BK,)), mask=put)
+    tl.store(er_ptr + t * SL + pos, tl.reshape(tl.arange(0, BN)[:, None] + k[None, :] * 0, (BN * BK,)), mask=put)
+    tl.store(ew_ptr + t * SL + pos, tl.reshape(dd.to(tl.float32) / rho, (BN * BK,)), mask=put)
+    nl = tl.sum(flat, axis=0)
+    tl.store(n_ptr + t, nl)
+    tl.atomic_add(cnt_ptr, nl)
+
+
+@triton.jit
+def _ifire_spend_kernel(d_ptr, rho_ptr, v_ptr, o_ptr, ek_ptr, ew_ptr, er_ptr, n_ptr, N, K, R, sdn, srn, svk, son, NPK,
+                        G: tl.constexpr, SL: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BR: tl.constexpr):
+    """(D / rho) V for a band of BM rows over the band's tiles that moved: a tile's listed moves as a [BM, SL] weighted
+    one-hot against their V rows (more than SL moves: the tile's D / rho); tf32x3 products (~fp32), fp32 sums in a
+    fixed order"""
+    pn = tl.program_id(0)
+    rows = pn * BM + tl.arange(0, BM)
+    rr = tl.program_id(1) * BR + tl.arange(0, BR)
+    acc = tl.zeros((BM, BR), dtype=tl.float32)
+    sl = tl.arange(0, SL)
+    for pk in range(0, NPK):
+        t = pn * NPK + pk
+        n = tl.load(n_ptr + t)
+        if n > 0:
+            if n <= SL:
+                ek = tl.load(ek_ptr + t * SL + sl, mask=sl < n, other=0)
+                er = tl.load(er_ptr + t * SL + sl, mask=sl < n, other=-1)
+                ew = tl.load(ew_ptr + t * SL + sl, mask=sl < n, other=0.0)
+                oh = tl.where(tl.arange(0, BM)[:, None] == er[None, :], ew[None, :], 0.0)
+                v = tl.load(v_ptr + ek[:, None] * svk + rr[None, :], mask=(sl < n)[:, None] & (rr[None, :] < R), other=0.0)
+                acc += tl.dot(oh, v, input_precision="tf32x3")
+            else:
+                for c0 in range(0, BK, 32):
+                    kk = pk * BK + c0 + tl.arange(0, 32)
+                    mk = (rows[:, None] < N) & (kk[None, :] < K)
+                    d = tl.load(d_ptr + rows[:, None] * sdn + kk[None, :], mask=mk, other=0).to(tl.float32)
+                    rho = tl.load(rho_ptr + rows[:, None] * srn + (kk // G)[None, :], mask=mk, other=1.0)
+                    v = tl.load(v_ptr + kk[:, None] * svk + rr[None, :], mask=(kk[:, None] < K) & (rr[None, :] < R),
+                                other=0.0)
+                    acc += tl.dot(d / rho, v, input_precision="tf32x3")
+    tl.store(o_ptr + rows[:, None] * son + rr[None, :], acc, mask=(rows[:, None] < N) & (rr[None, :] < R))
+
+
+IFIRE_SLOTS = 32
+
+
+def intk_fire(U, V, codes, rho, G, levels, theta):
+    """int-k firing (intk_emb._fire) for a chunk of rows: A_q = rho A, A = U V^T (U [n, r], V [K, r] fp32), rho [n, K / G]
+    (per row and group); every move (|A_q| >= theta, code + sign within 0 .. levels, |rho| > 1e-6) applied to codes
+    (int8 [n, K], in place). Returns ((D / rho) V [n, r] fp32 for the spend, the number of moves (device)). As
+    ttf_fire: A from bf16 copies with a per-entry bound, the uncertain entries in fp32, the spend over the moved tiles"""
+    N, R = U.shape
+    K = V.shape[0]
+    U = U.contiguous().float(); V = V.contiguous().float(); rho = rho.contiguous().float()
+    assert codes.stride(1) == 1 and rho.shape == (N, K // G)
+    Ub, Vb = U.to(torch.bfloat16), V.to(torch.bfloat16)
+    un, vn = U.norm(dim=1), V.norm(dim=1)
+    D = torch.empty(N, K, dtype=torch.int8, device=U.device)
+    BN, BK, RC = 64, 64, 64
+    g = (triton.cdiv(N, BN), triton.cdiv(K, BK))
+    S = torch.full((g[0] * g[1] * IFIRE_SLOTS,), -1, dtype=torch.int64, device=U.device)
+    _ifire_kernel[g](Ub, Vb, U, V, un, vn, codes, rho, D, S, N, K, R, K // G, U.stride(0), V.stride(0), codes.stride(0),
+                     rho.stride(0), D.stride(0), float(theta), FIRE_EB, int(levels), g[1], G=G, SLOTS=IFIRE_SLOTS,
+                     RC=RC, BN=BN, BK=BK, num_warps=4, num_stages=3)
+    BE = 64
+    _ifire_fix_kernel[(triton.cdiv(S.numel(), BE),)](U, V, codes, rho, D, S, S.numel(), K, R, U.stride(0), V.stride(0),
+                                                      codes.stride(0), rho.stride(0), D.stride(0), float(theta),
+                                                      int(levels), G=G, BE=BE, RC=64)
+    cnt = torch.zeros(1, dtype=torch.int32, device=U.device)
+    AN, AK, SL = 16, 128, 16
+    ga = (triton.cdiv(N, AN), triton.cdiv(K, AK))
+    ek = torch.empty(ga[0] * ga[1] * SL, dtype=torch.int32, device=U.device); er = torch.empty_like(ek)
+    ew = torch.empty(ga[0] * ga[1] * SL, dtype=torch.float32, device=U.device)
+    nmv = torch.empty(ga[0] * ga[1], dtype=torch.int32, device=U.device)
+    _ifire_apply_kernel[ga](codes, rho, D, cnt, ek, ew, er, nmv, N, K, codes.stride(0), rho.stride(0), D.stride(0),
+                            ga[1], G=G, SL=SL, BN=AN, BK=AK)
+    dU = torch.empty(N, R, dtype=torch.float32, device=U.device)
+    BR = 128
+    _ifire_spend_kernel[(ga[0], triton.cdiv(R, BR))](D, rho, V, dU, ek, ew, er, nmv, N, K, R, D.stride(0), rho.stride(0),
+                                                    V.stride(0), dU.stride(0), ga[1], G=G, SL=SL, BM=AN, BK=AK, BR=BR)
+    return dU, cnt[0]
+
+
+@triton.jit
 def _pack12_kernel(x_ptr, s_ptr, o_ptr, N, n, np2, sxn, son, BN: tl.constexpr, BP: tl.constexpr):
     """X [N, n] fp32 / scale [n] -> fp16 -> 12 bits (sign, 5 exponent, 6 mantissa; nearest, ties to even) -> two values
     in 3 bytes: the integer operations of train._pack12, so the codes are identical"""

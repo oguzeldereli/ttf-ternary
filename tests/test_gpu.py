@@ -645,3 +645,70 @@ def test_dense_acc(N, K):
         assert moved > 0 and moved <= int(s3["_ts"]["_nf"])
     finally:
         U.DENSE_ACC[0] = True
+
+
+@pytest.mark.parametrize("slots", [32, 1])
+def test_intk_fire(slots):
+    """kernel.intk_fire against intk_emb._fire's fp32 arithmetic: the same moves and codes (entries planted at
+    theta (1 +- 2e-4) and rows with negative or tiny rho), (D / rho) V within fp32 rounding; slots 1: the tf32x3
+    fallback for most tiles"""
+    from ttf import kernel as KN
+    n, K, r, G, levels = 200, 448, 96, 64, 3
+    gen = torch.Generator(device=dev).manual_seed(3)
+    U = torch.randn(n, r, device=dev, generator=gen) * 0.3
+    V = torch.linalg.qr(torch.randn(K, r, device=dev, generator=gen)).Q
+    rho = torch.randn(n, K // G, device=dev, generator=gen).abs() + 0.5
+    rho[::7] *= -1; rho[5, 2] = 1e-8
+    codes = torch.randint(0, levels + 1, (n, K), device=dev, generator=gen, dtype=torch.int8)
+    rf = rho.repeat_interleave(G, 1)
+    A = (U @ V.T) * rf
+    theta = float(A.abs().quantile(0.97))
+    # entries planted near theta: U row n += c v_k so that A_q(n, k) = theta (1 +- 2e-4)
+    for i in range(40):
+        a, b = (i * 37) % n, (i * 101) % K
+        tgt = theta * (1 + (2e-4 if i % 2 else -2e-4)) * (1 if i % 3 else -1)
+        U[a] += ((tgt / rf[a, b]) - (U[a] @ V[b])) * V[b]
+    A = (U @ V.T) * rf
+    d = A.sign(); nw = codes.float() + d
+    fire = (A.abs() >= theta) & (nw >= 0) & (nw <= levels) & (rf.abs() > 1e-6)
+    c_ref = codes + torch.where(fire, d, 0).to(torch.int8)
+    dU_ref = torch.where(fire, d / rf, 0) @ V
+    old = KN.IFIRE_SLOTS
+    try:
+        KN.IFIRE_SLOTS = slots
+        c2 = codes.clone()
+        dU, nf = KN.intk_fire(U, V, c2, rho, G, levels, theta)
+    finally:
+        KN.IFIRE_SLOTS = old
+    assert torch.equal(c2, c_ref) and int(nf) == int(fire.sum()), (int((c2 != c_ref).sum()), int(nf), int(fire.sum()))
+    assert float((dU - dU_ref).norm() / dU_ref.norm()) < 1e-5
+
+
+def test_intk_fire_wired():
+    """intk_emb._fire through kernel.intk_fire (FUSED_FIRE) against its torch ops, on a CUDA matrix in two row chunks
+    with signed, varying s: the same codes, the same stored U within fp32 rounding, deq_cache's key moved"""
+    from ttf import intk_emb as IE
+    N, K, r = 300, 192, 32
+    out = {}
+    for fused in (True, False):
+        torch.manual_seed(1)
+        m = IE.IntKMatrix(torch.randn(N, K), 2).to(dev); m._ts_idx = 2
+        m.s.data.mul_(torch.randn_like(m.s) + 0.3)
+        st = {"_ts": {}}
+        oldr, oldf = IE.ROWS[0], IE.FUSED_FIRE[0]
+        try:
+            IE.ROWS[0] = 160; IE.FUSED_FIRE[0] = fused
+            S = IE._Store(m, st, id(m), None, False, dev); S.t = [None] * (S.ne * (1 + S.nch))
+            g = torch.Generator(device=dev).manual_seed(4)
+            V = torch.linalg.qr(torch.randn(K, r, device=dev, generator=g)).Q
+            Us = [torch.randn(j - i, r, device=dev, generator=g) for i, j in map(S.rng, range(S.nch))]
+            v0 = m.codes._version
+            IE._fire(m, S, Us, V, 1.5, dict(spend=1.0), st["_ts"])
+            assert m.codes._version != v0
+            S2 = IE._Store(m, st, id(m), None, False, dev)
+            out[fused] = (m.codes.clone(), torch.cat([S2.u(c) for c in range(S2.nch)]), int(st["_ts"]["_nf"]))
+        finally:
+            IE.ROWS[0], IE.FUSED_FIRE[0] = oldr, oldf
+    (c1, U1, n1), (c0, U0, n0) = out[True], out[False]
+    assert n0 > 0 and n1 == n0 and torch.equal(c1, c0)
+    assert float((U1 - U0).norm() / U0.norm()) < 1e-5
