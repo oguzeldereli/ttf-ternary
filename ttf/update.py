@@ -550,16 +550,20 @@ def _fg_mm_r(fg, a, W):
     return a[:, None] * _mmb(gy.T, _mmb(x, b[:, None] * W))
 
 
-def _fg_add_r(U, fg, a, W, alpha):
-    """U + alpha (a * (gy^T (x (b W)))), the accumulator's term from one micro-batch: with bf16 factors in fewer passes
-    (b W written straight to bf16, x (b W) out of the GEMM in bf16, the scale and the add in one addcmul); the same
-    products, rounded at the same points, except the GEMM's bf16 output and addcmul's fp32 order"""
+def _fg_add_r(U, fg, a, W, alpha, cs=1.0):
+    """cs U + alpha (a * (gy^T (x (b W)))), the accumulator's term from one micro-batch (cs: the step's leak on its first
+    one): with bf16 factors in fewer passes (b W written straight to bf16, x (b W) out of the GEMM in bf16, the second
+    product, the scale and the add in one kernel: kernel.acc_gemm); the same products, rounded at the same points,
+    except the GEMM's bf16 output and the fp32 order"""
     gy, x, b = fg
     if gy.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
-        return U + alpha * _fg_mm_r(fg, a, W)
+        return cs * U + alpha * _fg_mm_r(fg, a, W)
     bw = torch.empty(W.shape, dtype=torch.bfloat16, device=W.device)
     torch.mul(b[:, None], W, out=bw)
-    return torch.addcmul(U, a[:, None], torch.mm(gy.T, torch.mm(x, bw), out_dtype=torch.float32), value=alpha)
+    if gy.is_cuda:
+        from .kernel import acc_gemm
+        return acc_gemm(gy, torch.mm(x, bw), None, a, U, cs, alpha)
+    return torch.addcmul(cs * U, a[:, None], torch.mm(gy.T, torch.mm(x, bw), out_dtype=torch.float32), value=alpha)
 
 
 def _fg_mm_l(fg, a, W):
@@ -701,9 +705,8 @@ def _ts_layer_factored(l, fg, state, c):
         U = -lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
     elif M_ > 1:   # basis fixed within the step (every micro-batch's u enters on it), turned on the last (_acc_turn)
         U, V = _load_pair(_host_get(state, key, dev, off))
-        if (t - 1) % M_ == 0:
-            U = U * lk
-        U = _fg_add_r(U, fgb, ia, V, -lr_ratio)    # (data parallel: this rank's term, averaged on the last one)
+        U = _fg_add_r(U, fgb, ia, V, -lr_ratio, lk if (t - 1) % M_ == 0 else 1.0)   # (data parallel: this rank's term,
+        # averaged on the last one)
         if final_:
             # data parallel: the micro-batches' terms are linear in g and V is fixed within the step, so each rank
             # summed its own and one mean here replaces a mean per micro-batch (N x r per layer: 16 x less traffic)
@@ -801,13 +804,16 @@ def _ts_dense_acc(l, fgb, ia, state, st, key, t, M_, final_, lk, lr_ratio, theta
     from .kernel import unpack_rows, pack_rows
     gy, x, ib = fgb
     A = load_dense(_host_get(state, key, dev, off), l) if key in state else None
-    if A is not None and (t - 1) % M_ == 0:
-        A = A * lk
-    xb = torch.empty(x.shape, dtype=x.dtype, device=x.device)          # (bf16 factors: x diag(ib) rounded to bf16)
-    torch.mul(x, ib[None, :], out=xb)
-    term = _mmb(gy.T, xb) if gy.dtype == xb.dtype == torch.bfloat16 else gy.T.float() @ xb.float(); del xb
-    A = (-lr_ratio) * ia[:, None] * term if A is None else torch.addcmul(A, ia[:, None], term, value=-lr_ratio)
-    del term
+    cs = lk if (t - 1) % M_ == 0 else 1.0
+    if gy.is_cuda and gy.dtype == x.dtype == torch.bfloat16:   # (kernel.acc_gemm: x diag(ib) rounded to bf16 on load)
+        from .kernel import acc_gemm
+        A = acc_gemm(gy, x, ib, ia, A, cs, -lr_ratio)
+    else:
+        xb = torch.empty(x.shape, dtype=x.dtype, device=x.device)      # (bf16 factors: x diag(ib) rounded to bf16)
+        torch.mul(x, ib[None, :], out=xb)
+        term = _mmb(gy.T, xb) if gy.dtype == xb.dtype == torch.bfloat16 else gy.T.float() @ xb.float(); del xb
+        A = (-lr_ratio) * ia[:, None] * term if A is None else torch.addcmul(A * cs, ia[:, None], term, value=-lr_ratio)
+        del term
     if not final_:
         _host_put(state, key, store_dense(None if STEP_FP32[0] and not off else sa, A), off)
         return

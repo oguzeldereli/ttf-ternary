@@ -1267,6 +1267,53 @@ def fused_epilogue(y32, xs, beta, r_b, bias_b, acc, save_t):
 
 
 @triton.jit
+def _acc_gemm_kernel(g_ptr, x_ptr, ib_ptr, ia_ptr, c_ptr, o_ptr, T, N, K, sgt, sxt, cs, alpha, HAS_C: tl.constexpr,
+                     HAS_IB: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr):
+    """o [N, K] = cs c + alpha ia (g^T bf16(x ib)): g [T, N], x [T, K] bf16 (ib per column of x, applied and rounded to
+    bf16 as the operand is loaded), fp32 sums over T"""
+    pid = tl.program_id(0)
+    npm = tl.cdiv(N, BM); npn = tl.cdiv(K, BN)
+    gid = pid // (GM * npn); fm = gid * GM; gs = tl.minimum(npm - fm, GM)
+    pm = fm + (pid % (GM * npn)) % gs; pn = (pid % (GM * npn)) // gs
+    rn = pm * BM + tl.arange(0, BM); rk = pn * BN + tl.arange(0, BN); rt = tl.arange(0, BK)
+    if HAS_IB:
+        ib = tl.load(ib_ptr + rk, mask=rk < K, other=0.0)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for t0 in range(0, T, BK):
+        tt = t0 + rt
+        a = tl.load(g_ptr + tt[None, :] * sgt + rn[:, None], mask=(tt[None, :] < T) & (rn[:, None] < N), other=0.0)
+        b = tl.load(x_ptr + tt[:, None] * sxt + rk[None, :], mask=(tt[:, None] < T) & (rk[None, :] < K), other=0.0)
+        if HAS_IB:
+            b = (b.to(tl.float32) * ib[None, :]).to(tl.bfloat16)
+        acc = tl.dot(a, b, acc)
+    m = (rn[:, None] < N) & (rk[None, :] < K)
+    off = rn[:, None] * K + rk[None, :]
+    ia = tl.load(ia_ptr + rn, mask=rn < N, other=0.0)
+    v = alpha * (ia[:, None] * acc)
+    if HAS_C:
+        v = cs * tl.load(c_ptr + off, mask=m, other=0.0) + v
+    tl.store(o_ptr + off, v, mask=m)
+
+
+def acc_gemm(g, x, ib, ia, C, cs, alpha):
+    """the accumulator's term from one micro-batch in one kernel: cs C + alpha diag(ia) (g^T (x diag(ib))) (fp32 [N, K];
+    C None: the term alone; ib None: x as is). g [T, N], x [T, K] bf16 on the GPU. Replaces the scaled copy of x, the
+    GEMM's fp32 [N, K] output and the addcmul (and a leak's C * lk); the operands rounded as before (x ib to bf16), the
+    sums over T in the kernel's order (rounding level)"""
+    T, N = g.shape
+    K = x.shape[1]
+    g, x = g.contiguous(), x.contiguous()
+    o = torch.empty(N, K, dtype=torch.float32, device=g.device)
+    C = C.contiguous() if C is not None else None
+    BM, BN, BK = 64, 128, 32                                  # (laptop 4080: near the best at every 27B shape)
+    _acc_gemm_kernel[(triton.cdiv(N, BM) * triton.cdiv(K, BN),)](
+        g, x, ib if ib is not None else ia, ia.contiguous().float(), C if C is not None else o, o, T, N, K, g.stride(0),
+        x.stride(0), float(cs), float(alpha), HAS_C=C is not None, HAS_IB=ib is not None, BM=BM, BN=BN, BK=BK, GM=8,
+        num_warps=4, num_stages=4)
+    return o
+
+
+@triton.jit
 def _fwd_gemm_kernel(a_ptr, w_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, t_ptr, o_ptr, M, N, K, sam, swn,
                      HAS_BIAS: tl.constexpr, HAS_ACC: tl.constexpr, SAVE_T: tl.constexpr, BM: tl.constexpr,
                      BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr):

@@ -755,3 +755,20 @@ def test_fused_fwd_gemm(M, K, N, acc, bias):
         t0, o0 = Kn.fused_epilogue(torch._int_mm(xq, w8.t()), xs, beta, rb, bb, a, save)
         t1, o1 = Kn.fused_fwd_gemm(xq, w8, xs, beta, rb, bb, a, save)
         assert torch.equal(o0, o1) and (not save or torch.equal(t0, t1))
+
+
+@pytest.mark.parametrize("T,N,K,ib,c", [(256, 300, 200, True, True), (100, 64, 520, False, True), (512, 1000, 96, True, False)])
+def test_acc_gemm(T, N, K, ib, c):
+    """kernel.acc_gemm = cs C + alpha diag(ia) (g^T bf16(x diag(ib))) within fp32 summation order"""
+    import ttf.kernel as Kn
+    gen = torch.Generator(device=dev).manual_seed(T + N)
+    g = (torch.randn(T, N, device=dev, generator=gen) * 1e-2).to(torch.bfloat16)
+    x = torch.randn(T, K, device=dev, generator=gen).to(torch.bfloat16)
+    b = torch.rand(K, device=dev, generator=gen) + 0.5 if ib else None
+    a = torch.rand(N, device=dev, generator=gen) + 0.5
+    C = torch.randn(N, K, device=dev, generator=gen) if c else None
+    xb = (x.float() * b[None, :]).to(torch.bfloat16) if ib else x
+    term = g.double().T @ xb.double()
+    ref = -0.3 * a.double()[:, None] * term + (0.9 * C.double() if c else 0)
+    o = Kn.acc_gemm(g, x, b, a, C, 0.9, -0.3)
+    assert float((o.double() - ref).abs().max() / (0.3 * a.double()[:, None] * term).abs().max()) < 1e-5
