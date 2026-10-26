@@ -1218,6 +1218,7 @@ def group_sums(g, q, G):
     """(sum over each group of G, sum of g * q) for g [n, K] (fp32, contiguous) and its int8 codes q [n, K]: [n, K / G]
     each, fp32, in one pass (the int-k group parameters' gradients; was a product, a copy and two reductions)"""
     n, K = g.shape
+    assert G & (G - 1) == 0 and K % G == 0, f"group_sums: the group size {G} must be a power of 2 dividing {K}"
     g, q = g.contiguous(), q.contiguous()
     NG = n * (K // G)
     o0 = torch.empty(n, K // G, dtype=torch.float32, device=g.device); o1 = torch.empty_like(o0)

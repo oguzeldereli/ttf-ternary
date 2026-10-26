@@ -558,6 +558,18 @@ class _EmbFn(torch.autograd.Function):
         return None, glo, gs, None
 
 
+def _bf16_in_place(G):
+    """fp32 G [n, K] (contiguous) -> its bf16 copy in the first half of G's own storage, by row chunks (each chunk read
+    whole before its bf16 rows are written; those overlap only rows already read): no second [n, K] buffer"""
+    n, K = G.shape
+    assert G.is_contiguous()
+    out = G.view(-1).view(torch.bfloat16)[:n * K].view(n, K)
+    for a in range(0, n, ROWS[0]):
+        b = min(n, a + ROWS[0])
+        out[a:b].copy_(G[a:b].to(torch.bfloat16))
+    return out
+
+
 def _gsums(Gr, q, g):
     """per group of g: (sum of Gr, sum of Gr * q), fp32 [n, K / g] (Gr [n, K] fp32, q its codes)"""
     if Gr.is_cuda:
@@ -632,7 +644,7 @@ class _HeadLossFn(torch.autograd.Function):
             b = min(m.N, a + ROWS[0])
             glo[a:b], gs[a:b] = _gsums(G[a:b] if G is not None else _mmb(gy[:, a:b].T, x), m.codes[a:b], m.g)
         # the dense gradient to the update in bf16, as the factors (its products on the bf16 tensor cores, fp32 sums)
-        m.add_part(("g", G.to(torch.bfloat16), None) if G is not None else ("d", gy, x)); del G
+        m.add_part(("g", _bf16_in_place(G), None) if G is not None else ("d", gy, x)); del G
         return (dh * go.float()).to(ctx.dt), glo, gs, None, None, None, None
 
 

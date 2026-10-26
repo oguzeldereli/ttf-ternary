@@ -457,3 +457,19 @@ def test_row_sums_deterministic():
         a = [IE._row_sums(idx.cuda(), go.cuda(), N) for _ in range(3)]
         assert all(torch.equal(a[0][1], b[1]) for b in a[1:])
         assert torch.allclose(a[0][1].cpu(), G, atol=1e-6)
+
+
+def test_bf16_in_place():
+    """_bf16_in_place: the same values as .to(bf16), in G's own storage"""
+    from ttf import intk_emb as IE
+    old = IE.ROWS[0]
+    try:
+        for rows in (3, 7, 64):
+            IE.ROWS[0] = rows
+            G = torch.randn(37, 24)
+            ref = G.to(torch.bfloat16)
+            p = G.data_ptr()
+            out = IE._bf16_in_place(G)
+            assert out.data_ptr() == p and torch.equal(out, ref), rows
+    finally:
+        IE.ROWS[0] = old
