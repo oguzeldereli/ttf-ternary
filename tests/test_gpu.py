@@ -587,3 +587,52 @@ def test_group_sums():
     s0, s1 = group_sums(g, q, 64)
     Gg = g.double().view(300, 10, 64)
     assert torch.allclose(s0.double(), Gg.sum(-1), atol=1e-5) and torch.allclose(s1.double(), (Gg * q.view(300, 10, 64).double()).sum(-1), atol=1e-4)
+
+
+def test_dense_acc():
+    """a layer whose rank covers its rows (N <= r, N < K) holds a dense accumulator: after one micro-batch it equals the
+    low-rank one (whose first basis spans u's rows: exact there); over a step of 4 micro-batches it is lk A + the sum of
+    the u (the low-rank one drops the evidence outside its fixed basis); a low-rank state from an earlier run becomes
+    U V^T; the firing moves where |A| >= theta (legal) and spends theta"""
+    from ttf import update as U
+    from ttf.kernel import unpack_rows
+    N, K, T = 48, 160, 256
+    gen = torch.Generator(device=dev).manual_seed(5)
+    data = [((torch.randn(T, N, device=dev, generator=gen) * 1e-3).to(torch.bfloat16),
+             torch.randn(T, K, device=dev, generator=gen).to(torch.bfloat16)) for _ in range(8)]
+
+    def run(dense, M, steps, theta=1e9, state=None):
+        U.DENSE_ACC[0] = dense
+        l = _layer(N, K, 0); l._ts_idx = 1; state = {} if state is None else state
+        for s in range(steps):
+            for i in range(M):
+                l._ts_final = i == M - 1
+                U.ts_layer(l, data[(s * M + i) % 8], state, _cfg(r=64, theta=theta, factored=32, step=10 + s, micro=M))
+        return l, state
+    try:
+        l1, s1 = run(True, 1, 1); l0, s0 = run(False, 1, 1)
+        A1 = U.load_dense(s1[id(l1)], l1); A0 = U.load_dense(s0[id(l0)], l0)
+        assert U.is_dense_state(s1[id(l1)], N) and not U.is_dense_state(s0[id(l0)], N)
+        R, C = s1["_ts"][("v", id(l1))]                    # the step's v: u = -lr g / (a_i b_j), in fp64
+        c_ = _cfg(); b2 = c_["b2"]
+        a = (R.double() / R.double().mean() / (1 - b2)).sqrt(); b = C.double().sqrt()
+        gy, x = data[0]
+        u = -c_["lr_ratio"] * (gy.double().T @ x.double()) / a[:, None] / b[None, :]
+        e1, e0 = float((A1 - u).norm() / u.norm()), float((A0 - u).norm() / u.norm())
+        assert e1 < 5e-3 and e1 < e0, (e1, e0)             # (the low-rank's first basis: bf16 products, conditioning)
+        # 4 micro-batches: the dense sum against the low-rank's: differs (its basis drops evidence), same scale
+        l1, s1 = run(True, 4, 2); l0, s0 = run(False, 4, 2)
+        A1 = U.load_dense(s1[id(l1)], l1); A0 = U.load_dense(s0[id(l0)], l0)
+        rel = float((A1 - A0).norm() / A1.norm())
+        assert 1e-3 < rel < 1.0, rel
+        # resume from a low-rank state: converted, then dense
+        l2, s2 = run(True, 4, 1, state=s0)
+        assert U.is_dense_state(s2[id(l2)], N)
+        # firing: theta at A's 99th percentile
+        A_ = U.load_dense(s1[id(l1)], l1); th = float(A_.abs().quantile(0.99))
+        l3, s3 = run(True, 4, 2, theta=th)
+        w = unpack_rows(l3.wpacked, K).float()
+        moved = int((w != unpack_rows(_layer(N, K, 0).wpacked, K).float()).sum())
+        assert moved > 0 and moved <= int(s3["_ts"]["_nf"])
+    finally:
+        U.DENSE_ACC[0] = True

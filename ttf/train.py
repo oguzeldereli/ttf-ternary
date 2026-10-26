@@ -35,7 +35,7 @@ from .args import parse
 from .data import get_batch, _kd_cache_batch
 from .eval import evaluate
 from .schedule import lr_at, _ts_scale, resume_acc_scale, LR_LINEAR, LR_REWARM, LR_WSD
-from .update import (ts_layer, ts_step, _load_pair, _orth, _store_codec, _store_pair,
+from .update import (ts_layer, ts_step, _load_pair, is_dense_state, load_dense, _orth, _store_codec, _store_pair,
                      _ts_on_host, _ts_state_bytes)
 
 
@@ -634,8 +634,8 @@ def main():
                 _sa = _store_codec(store)
                 _ng = 0
                 for i_, m in enumerate(lays):
-                    if id(m) not in lr_state or m.wpacked.is_meta:
-                        continue
+                    if id(m) not in lr_state or m.wpacked.is_meta or is_dense_state(lr_state[id(m)], m.N):
+                        continue                                        # (a dense A: no rank to grow)
                     U_, V_ = _load_pair(lr_state[id(m)])
                     ra_ = min(getattr(m, "ts_rank", None) or args.ttf_rank, m.N, m.K)
                     if V_.shape[1] >= ra_:
@@ -657,7 +657,11 @@ def main():
             if ttf and _acc != 1.0:   # --ttf-acc-scale F (a new theta = F x the run's): every accumulator x F,
                 _sa = _store_codec(store)   # so each entry keeps its distance to the bar (no burst of moves)
                 for m in lays:
-                    if id(m) in lr_state and not m.wpacked.is_meta:
+                    if id(m) in lr_state and not m.wpacked.is_meta and is_dense_state(lr_state[id(m)], m.N):
+                        A_ = load_dense(lr_state[id(m)], m); dv_ = A_.device
+                        A_ = A_.to(device).float() * _acc
+                        lr_state[id(m)] = tuple(t.to(dv_) for t in (_sa(A_) if _sa else (A_,)))
+                    elif id(m) in lr_state and not m.wpacked.is_meta:
                         U_, V_ = _load_pair(lr_state[id(m)]); dv_ = U_.device
                         U_ = U_.to(device).float() * _acc; V_ = V_.to(device).float()
                         pr_ = _store_pair(_sa, U_, V_) if _sa else (U_, V_)
