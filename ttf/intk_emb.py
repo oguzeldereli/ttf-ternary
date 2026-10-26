@@ -134,9 +134,10 @@ class IntKMatrix(nn.Module):
             dist.all_reduce(G_); G_.div_(dist.get_world_size())   # move on the mean gradient (the same on every rank)
         gW = G_.reshape(self.N, self.K // self.g, self.g)
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()
-        for p, gp in ((self.lo, gW.sum(-1)), (self.s, (gW * q).sum(-1))):
-            gp = gp.to(p.dtype)                          # (bf16 lo / s on a bf16 / lean tail)
-            p.grad = gp if p.grad is None else p.grad + gp
+        for p, f in ((self.lo, lambda: gW.sum(-1)), (self.s, lambda: (gW * q).sum(-1))):
+            if p.requires_grad:                          # (--intk-freeze-head-groups: the head's are not)
+                gp = f().to(p.dtype)                     # (bf16 lo / s on a bf16 / lean tail)
+                p.grad = gp if p.grad is None else p.grad + gp
         if not math.isfinite(self.theta_mult):        # --emb-lr-mult 0: only the group parameters train
             return
         c = dict(c, theta=c["theta"] * self.theta_mult)
@@ -655,15 +656,16 @@ class _HeadLossFn(torch.autograd.Function):
         from .update import _mmb
         m, gy, G, dh, h = ctx.m, ctx.gy, ctx.G, ctx.dh, ctx.h
         ctx.gy = ctx.G = ctx.dh = ctx.h = None
-        glo, gs = torch.empty_like(m.lo), torch.empty_like(m.s)
-        Gn = m.K // m.g
         if G is not None:
             G.mul_(go.float())
         else:
             x = (h.float() * go.float()).to(torch.bfloat16)       # g = gy^T x carries grad_out (1 / tokens / accum)
-        for a in range(0, m.N, ROWS[0]):
-            b = min(m.N, a + ROWS[0])
-            glo[a:b], gs[a:b] = _gsums(G[a:b] if G is not None else _mmb(gy[:, a:b].T, x), m.codes[a:b], m.g)
+        glo = gs = None
+        if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:   # (--intk-freeze-head-groups: no T V d product here)
+            glo, gs = torch.empty_like(m.lo), torch.empty_like(m.s)
+            for a in range(0, m.N, ROWS[0]):
+                b = min(m.N, a + ROWS[0])
+                glo[a:b], gs[a:b] = _gsums(G[a:b] if G is not None else _mmb(gy[:, a:b].T, x), m.codes[a:b], m.g)
         # the dense gradient to the update in bf16, as the factors (its products on the bf16 tensor cores, fp32 sums)
         m.add_part(("g", _bf16_in_place(G), None) if G is not None else ("d", gy, x)); del G
         return (dh * go.float()).to(ctx.dt), glo, gs, None, None, None, None
