@@ -11,8 +11,9 @@ The float parts (token embedding, output head, RMSNorm gains) are copied. Each l
             absmean  T = round(clip(W / mean|W|)) per tensor, the output scale mean|W| (BitNet b1.58)
             als      W ~ a_i c_j T_ij, row and column scales by alternating least squares (needs --rc-scale)
             scratch  nothing loaded, only the shape (the from-scratch baseline for the same model)
-          the scales go into row_scale / col_scale (with --rc-scale) over the layer's beta = 1 / sqrt(K rho);
-          without --rc-scale only the per-tensor part is kept (row and column factors are averaged out).
+          the scales go into row_scale / col_scale over the layer's beta = 1 / sqrt(K rho) (kernel mode needs
+          --rc-scale: the trits have no other scale to hold the weight's magnitude).
+(fp32 / master / kernel: the checkpoint's mode names for --mode fp32 / bitnet / ttf.)
 
 HF Llama stores q / k rows permuted for rotate_half RoPE; this model rotates interleaved pairs (Meta layout), so the
 q / k rows are permuted back."""
@@ -318,8 +319,6 @@ def init_from_hf(model, path, mode, method="als", rc=False, log=print, hess=None
                 kept.append(_mag_svd_init(lin, W, T, a, c, beta, hess, i, name, method, GPTQ_OPTS["mag_svd"], dev))
             if rc and lin.row_scale is not None:
                 lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
-            elif lin.row_scale is not None:
-                lin.row_scale.fill_(float(a.mean()) / beta); lin.col_scale.fill_(1.0)
             else:
                 raise SystemExit("--init-hf on kernel mode needs --rc-scale (the layer has no other scale to hold the "
                                  "weight's magnitude)")
