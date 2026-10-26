@@ -1,6 +1,6 @@
 """Kernels against dense references (needs a CUDA GPU):
 
-    python tests/test_kernel_ref.py
+    python tests/checks/kernel_ref.py
 
 Checks pack/unpack, trit_beta, the ternary GEMMs (the int8 forward, the bf16 and two-slice int8 input gradients) on
 shapes whose K is not a multiple of 5, and the kernel layer's forward / backward against

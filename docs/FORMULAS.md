@@ -152,7 +152,7 @@ paper Appendix "Index of mechanisms and results" and docs/RUN_INDEX.md (tag pre-
 | `--eval_first_n N` | before training, the loss over the first N val windows in order (as `scripts/quant/qwen_check.py`) |
 | `--lr_rewarm S:W:F` | re-warm a decayed run from step S over W steps to F times the peak |
 
-## 2b. What master cannot do without (master from scratch with one ingredient changed, `--m_*`, `ttf/master_opt.py`)
+## 2b. What master cannot do without (master from scratch with one ingredient changed, `--m_*`, `bitnet/master_opt.py` at tag `pre-consolidation-2026-10-17`)
 
 | flag | change | final (master 2.7513) |
 |---|---|---|
