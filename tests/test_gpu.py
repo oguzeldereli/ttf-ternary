@@ -7,6 +7,7 @@ import sys
 
 import numpy as np
 import pytest
+import triton
 import torch
 
 pytestmark = pytest.mark.gpu
@@ -131,19 +132,15 @@ def test_dx_int8x2():
     """--dx int8x2: gy in two int8 slices on the int8 tensor cores is at least as accurate as the bf16 GEMM (whose output
     is rounded to bf16), deterministic, and shapes the int8 GEMM cannot take fall back to the bf16 path"""
     import ttf.kernel as Kn
-    old = Kn.DX_I8X2_MIN_N[0]; Kn.DX_I8X2_MIN_N[0] = 0
-    try:
-        for M, N, K in ((512, 1024, 768), (300, 768, 2048), (40, 1000, 512)):
-            w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8); p = Kn.pack_rows(w)
-            assert torch.equal(Kn.unpack_t_i8(p, K), w.t().contiguous())
-            g = (torch.randn(M, N, device=dev) * torch.exp(2 * torch.randn(M, N, device=dev))).to(torch.bfloat16)
-            ref = g.double() @ w.double()
-            a, b = Kn.tern_gemm_dx(g, p, K), Kn.tern_gemm_dx_i8x2(g, p, K)
-            ea = float((a.double() - ref).norm() / ref.norm()); eb = float((b.double() - ref).norm() / ref.norm())
-            assert eb <= 1.25 * ea + 1e-6, (M, N, K, ea, eb)
-            assert torch.equal(b, Kn.tern_gemm_dx_i8x2(g, p, K))
-    finally:
-        Kn.DX_I8X2_MIN_N[0] = old
+    for M, N, K in ((512, 1024, 768), (300, 768, 2048), (40, 1000, 512)):
+        w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8); p = Kn.pack_rows(w)
+        assert torch.equal(Kn.unpack_t_i8(p, K), w.t().contiguous())
+        g = (torch.randn(M, N, device=dev) * torch.exp(2 * torch.randn(M, N, device=dev))).to(torch.bfloat16)
+        ref = g.double() @ w.double()
+        a, b = Kn.tern_gemm_dx(g, p, K), Kn.tern_gemm_dx_i8x2(g, p, K)
+        ea = float((a.double() - ref).norm() / ref.norm()); eb = float((b.double() - ref).norm() / ref.norm())
+        assert eb <= 1.25 * ea + 1e-6, (M, N, K, ea, eb)
+        assert torch.equal(b, Kn.tern_gemm_dx_i8x2(g, p, K))
 
 
 def test_lean_adam_batched():
@@ -425,8 +422,8 @@ def test_fused_layer(K, N, dx):
     import ttf.layers as L
     from ttf.layers import KernelTernaryLinear
     dev, T = "cuda", 512
-    old = (L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], KN.DX_I8X2_MIN_N[0])
-    L.DX_MODE[0], L.FACTORED[0], KN.DX_I8X2_MIN_N[0] = dx, True, 1024
+    old = (L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0])
+    L.DX_MODE[0], L.FACTORED[0] = dx, True
     try:
         torch.manual_seed(0)
 
@@ -467,7 +464,7 @@ def test_fused_layer(K, N, dx):
         for (ga, xa), (gb, xb) in zip(A[4], B[4]):
             assert torch.equal(ga, gb) and torch.equal(xa, xb)
     finally:
-        L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], KN.DX_I8X2_MIN_N[0] = old
+        L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0] = old
 
 
 def test_intk_codes_fire_in_range():
@@ -712,3 +709,29 @@ def test_intk_fire_wired():
     (c1, U1, n1), (c0, U0, n0) = out[True], out[False]
     assert n0 > 0 and n1 == n0 and torch.equal(c1, c0)
     assert float((U1 - U0).norm() / U0.norm()) < 1e-5
+
+
+@pytest.mark.parametrize("M,N,K", [(512, 1024, 768), (300, 208, 2048), (2048, 5120, 1024), (100, 40, 4096)])
+def test_dx2_col(M, N, K):
+    """kernel.dx2_col (one kernel: both slices' int8 GEMMs + the dx epilogue) against the two-GEMM path: the input
+    gradient bit-identical; the column scale's gradient within fp32 summation order"""
+    import ttf.kernel as Kn
+    gen = torch.Generator(device=dev).manual_seed(M + N)
+    gy = (torch.randn(M, N, device=dev, generator=gen) * 1e-3).to(torch.bfloat16)
+    w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8, generator=gen)
+    w8t = w.t().contiguous()
+    q1 = torch.empty(M, N, dtype=torch.int8, device=dev); q2 = torch.empty_like(q1); s = torch.empty(M, device=dev)
+    Kn._slice2_kernel[(M,)](gy, q1, q2, s, N, gy.stride(0), q1.stride(0), BLOCK=1024)
+    c = (torch.rand(K, device=dev, generator=gen) + 0.5).to(torch.bfloat16)
+    x = torch.randn(M, K, device=dev, generator=gen).to(torch.bfloat16)
+    mu = (torch.randn(K, device=dev, generator=gen) * 0.1).to(torch.bfloat16)
+    y1 = (q1.double() @ w.double()).to(torch.int32).contiguous(); y2 = (q2.double() @ w.double()).to(torch.int32).contiguous()
+    g = torch.empty(M, K, dtype=torch.bfloat16, device=dev)          # (the two-GEMM path's epilogue: the same fp32 ops)
+    Kn._dx2_epi_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](y1, y2, s, g, M, K, BM=32, BK=128)
+    g = g.float()
+    gx_ref = (g * c.float()[None, :]).to(torch.bfloat16)
+    xc = (x.float() - mu.float()[None, :]).to(torch.bfloat16).float()
+    gc_ref = (g * xc).to(torch.bfloat16).double().sum(0)
+    gx, gc = Kn.dx2_col(q1, q2, s, w8t, c, x, mu)
+    assert torch.equal(gx, gx_ref)
+    assert float((gc.double() - gc_ref).abs().max() / gc_ref.abs().max()) < 1e-5

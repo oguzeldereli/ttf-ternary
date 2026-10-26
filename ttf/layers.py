@@ -189,13 +189,12 @@ class _FusedTernFn(torch.autograd.Function):
         l = ctx.layer
         g2 = g.reshape(-1, l.N).contiguous()
         bb = (ctx.beta if ctx.beta is not None else torch.ones((), device=g.device)).reshape(()).to(torch.bfloat16)
-        sl = DX_MODE[0] == "int8x2" and l.N >= _K.DX_I8X2_MIN_N[0]
+        sl = DX_MODE[0] == "int8x2"
         with _rf("tern.dx"):
             f, q1, q2, s, gbias, grow = _K.fused_bwd_rows(g2, t, rb, bb, sl)
             if sl:
-                wt = l.w8(t=True).t()
-                gx, gc = _K.fused_dx_col(torch._int_mm(q1, wt), torch._int_mm(q2, wt), s, cb, xc, ctx.mu_b)
-                del wt, q1, q2
+                gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xc, ctx.mu_b)
+                del q1, q2
             else:
                 gx, gc = _K.scale_bwd(_grad_x(l, f, l.wpacked), cb, xc, ctx.mu_b)   # (the centring in the kernel)
         if l.capture and getattr(l, "on_grad", None) is not None:    # (_fused_ok: the factored TTF update)
