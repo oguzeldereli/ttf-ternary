@@ -231,40 +231,16 @@ def _ts_state_bytes(lr_state):
     return n
 
 
-def _acc_turn(U, V, S_, mass=None):
-    """the basis turn at the end of a step: one subspace iteration of the step's whole tally A' = A + sum u, and A' kept
-    on the new basis (A <- A' Vn Vn^T). Here from U = lk U_0 + sum u V (the step's u entered on its basis, the
-    micro-batch path: U_0 is not kept): X = A'^T U = V (U^T U) + (I - V V^T) (sum u)^T U with S_ = (sum u)^T U
-    [K, r] (_sketch_cross), and A' Vn = U V^T Vn + sum u (I - V V^T) Vn: mass(W) = sum u W (_sketch_mass). A one-batch
-    step turns from U_0 itself (X = A'^T U_0, A' Vn = U_0 V^T Vn + u Vn: exact, two products of u). The micro rule
-    before turned from M u_M^T U (the last micro-batch's u x M: 16 x the noise of the step's sum; a converted Qwen
-    0.8B's down_proj kept ~10 steps of memory and moved no trit) and dropped the mass outside V. Returns (U, V)"""
-    S_ = S_ - V @ (V.T @ S_)
-    Vn = _orth(V @ (U.T @ U) + S_); del S_
-    P_ = V.T @ Vn
-    Un = U @ P_
-    if mass is not None:
-        Un = Un + mass(Vn - V @ P_)
-    return Un, Vn
-
-
-def _sketch_cross(U, SPt, Sc, ia, ib, lr_ratio):
-    """(sum u)^T U [K, r] without sum u: through the step's own k-row sketch of its gradient, SPt = (Sc sum g)^T [K, k],
-    which the update keeps for v anyway (E[Sc^T Sc] = I; Sc regenerated from its seed), with the step's v (ia, ib):
-    -lr diag(ib) SPt (Sc diag(ia) U)"""
-    return (-lr_ratio) * ib[:, None] * (SPt.float() @ (Sc @ (ia[:, None] * U)))
-
-
-def _sketch_mass(PS, Sr, ia, ib, lr_ratio):
-    """W -> (sum u) W [N, r] without sum u: through the step's k-column sketch PS = (sum g) Sr [N, k], kept for v as
-    well (E[Sr Sr^T] = I): -lr diag(ia) PS (Sr^T diag(ib) W)"""
-    return lambda W: (-lr_ratio) * ia[:, None] * (PS.float() @ (Sr.T @ (ib[:, None] * W)))
-
-
-def _step_scale(R, C, b2, n):
-    """1 / a_i, 1 / b_j of the step's v (R, C after n steps), as the update's u uses them"""
-    a = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** n)).sqrt(); b = C.sqrt()
-    return 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30), 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)
+_TURN = """the accumulator's turn, one rule for every batch the update sees (the step's one batch, or each of its
+micro-batches): with the tally A' = lk A + u (A = U V^T; lk the leak, applied once per step, before its first batch),
+one subspace iteration from U: Vn = orth(A'^T U) = orth(V (U^T U) + u^T U), and A' kept on the new basis,
+U <- A' Vn = U (V^T Vn) + u Vn (A <- A' Vn Vn^T). Two thin products of u, exact (no sketch); the factored paths form
+them from the gradient's factors (update._fg_mm_l / _fg_mm_r), int-k by row chunk (intk_emb). The moves fire on the
+step's last batch only. With micro-batches u uses the second moment of the steps before (v is stepped on the last).
+History: until 26 Oct 2026 the micro-batch u entered on the step's fixed basis (U += u V), the basis turned on the last
+micro-batch from k = 256 sketches of the step's gradient (accfix 0412490); at 0.8B (K up to 3584) the sketched
+out-of-basis mass carried ~sqrt(K / k) x its signal as noise and the moves ran away (q08m: flips 1e-4 -> 6% of the
+entries by step 96, loss 17). Before that (2858771) the turn dropped the mass outside V, one batch per step too."""
 
 
 def _hspend_basis(st, key, x, V, c):
@@ -329,7 +305,7 @@ def _orth(X):
         return _orth_(X)
 
 
-STEP_FP32 = [False]   # --ttf-step-fp32: the accumulator's U in fp32 between a step's micro-batches (see _ts_layer_factored)
+STEP_FP32 = [False]   # --ttf-step-fp32: the accumulator's U and V in fp32 between a step's micro-batches (see _ts_layer_factored)
 ORTH = ["qr"]   # --ttf-orth: qr (Householder), cholqr2 (two Cholesky QR passes, QR where they would fail), or spanqr
 _SPANQR = [None]  # (the spanqr package's orth: robust shifted Cholesky QR, no host sync; for r <= 512, cholqr2 above)
 
@@ -431,7 +407,6 @@ def ts_layer(l, g, state, c):
             else:
                 R, C = (1 - b2o) * rs, (1 - b2o) * cs
             _host_put(st, ("v", key), (R, C), off)
-            turn_ = (SP.T, PS) + _step_scale(R, C, b2o, t // M_)       # (Sc sum g)^T, (sum g) Sr: the basis turn's sketches
             # the full [N, K] v only where it is read: --ttf-vdiag (the micro-batch u uses the factored v of the steps before)
             v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2o ** (t // M_)) if c.get("vdiag") else None
         else:
@@ -467,24 +442,15 @@ def ts_layer(l, g, state, c):
     del v
     ra = min(r, l.N, l.K)
     lk = 1 - lr_ratio / tau   # the leak, annealed with the learning rate: the memory is a distance, not a step count
-    if mic_nm and key in state:   # --accum M > 1: the basis stays fixed within the step (every micro-batch's u is projected
-        # on it: U += u_i V), and turns once, on the last micro-batch (_acc_turn); turning it per micro-batch lets each
-        # micro-batch's noisier u rotate the evidence away (110M r512: 5.64 vs 4.42 at 600 steps)
-        U, V = _load_pair(_host_get(state, key, dev, off))
-        if (t - 1) % M_ == 0:
-            U = U * lk
-        U = U + u @ V
-        if final_:
-            SPt, PS_, ia_, ib_ = turn_
-            U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio), _sketch_mass(PS_, Sr, ia_, ib_, lr_ratio))
-    elif key not in state:
+    if key not in state:
         gen = torch.Generator(device=g.device).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
         V = _orth(u.T @ torch.randn(l.N, ra, device=g.device, generator=gen))
         U = u @ V
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
-        U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
-        Vn = _orth(V @ (U.T @ U) + u.T @ U)
+        if (t - 1) % M_ == 0:                         # the leak once per step (before its first micro-batch)
+            U = U * lk
+        Vn = _orth(V @ (U.T @ U) + u.T @ U)           # the turn on the whole tally lk A + u, exact (_TURN)
         U = U @ (V.T @ Vn) + u @ Vn; V = Vn
     if mic_nm and not final_:   # --accum M > 1: not the last micro-batch: keep the accumulator, no firing
         _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
@@ -617,7 +583,6 @@ def _ts_layer_factored(l, fg, state, c):
             else:
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
-            turn_ = (SP, PS) + _step_scale(R, C, b2, ts_ + 1)       # (Sc sum g)^T [K, k], (sum g) Sr: the turn's sketches
         else:
             st[("mx", key)] = (PS, SP, rs, cs, ds, es)
         del PS, SP
@@ -647,7 +612,6 @@ def _ts_layer_factored(l, fg, state, c):
                 else:
                     R, C = (1 - b2) * rs, (1 - b2) * cs
                 _host_put(st, ("v", key), (R, C), off)
-                turn_ = (SP.T, PS) + _step_scale(R, C, b2, ts_ + 1)
                 if c.get("vdiag"):   # --ttf-vdiag: this micro-batch's g^2 against v (the u extremes need the dense u: not kept)
                     sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** (t // M_))).clamp_min(1e-30))
                     _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
@@ -677,34 +641,19 @@ def _ts_layer_factored(l, fg, state, c):
         g_ = torch.Generator(device=dev).manual_seed(4_000_001 + 2 * getattr(l, "_ts_idx", 0))
         V = _orth(-lr_ratio * _dpm(_fg_mm_l(fgb, ia, torch.randn(l.N, ra, device=dev, generator=g_))))
         U = -lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
-    elif M_ > 1:   # basis fixed within the step (every micro-batch's u enters on it), turned on the last (_acc_turn)
-        U, V = _load_pair(_host_get(state, key, dev, off))
-        if (t - 1) % M_ == 0:
-            U = U * lk
-        U = _fg_add_r(U, fgb, ia, V, -lr_ratio)    # (data parallel: this rank's term, averaged on the last one)
-        if final_:
-            # data parallel: the micro-batches' terms are linear in g and V is fixed within the step, so each rank
-            # summed its own and one mean here replaces a mean per micro-batch (N x r per layer: 16 x less traffic)
-            U = _dpm(U)
-            SPt, PS_, ia_, ib_ = turn_
-            U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio), _sketch_mass(PS_, Sr, ia_, ib_, lr_ratio))
-    else:
-        U, V = _load_pair(_host_get(state, key, dev, off))
+    else:          # every micro-batch (or the step's one batch) turns the basis on the whole tally, exact (_TURN);
+        U, V = _load_pair(_host_get(state, key, dev, off))   # data parallel: the two thin products averaged per call
         A_prev = U @ V.T if c.get("band") else None
-        U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
+        if (t - 1) % M_ == 0:                         # the leak once per step (before its first micro-batch)
+            U = U * lk
         Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
         U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
     if not final_:
-        if STEP_FP32[0] and sa and not off:   # --ttf-step-fp32: within the step U stays fp32 (V is fixed until the last
-            # micro-batch: kept as stored); encoded once, on the last micro-batch. Skips U's encode / decode per micro-batch
-            enc_ = st.get(("venc", key))
-            if enc_ is None or (t - 1) % M_ == 0:
-                enc_ = st[("venc", key)] = sa(V)
-            _host_put(state, key, (U,) + tuple(enc_), off)
+        if STEP_FP32[0] and sa and not off:   # --ttf-step-fp32: within the step U and V stay fp32, encoded once, on
+            _host_put(state, key, (U, V), off)  # the last micro-batch (skips the encode / decode per micro-batch)
         else:
             _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
-    st.pop(("venc", key), None)
     from .kernel import unpack_rows, pack_rows
     before = l.wpacked.clone() if l.track else None
     Vs = _hspend_basis(st, key, x, V, c) if c.get("hspend") else V
