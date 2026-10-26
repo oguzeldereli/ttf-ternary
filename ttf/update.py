@@ -343,7 +343,7 @@ def _orth(X):
 
 STEP_FP32 = [False]   # --ttf-step-fp32: the accumulator's U in fp32 between a step's micro-batches (see _ts_layer_factored)
 ORTH = ["qr"]   # --ttf-orth: qr (Householder), cholqr2 (two Cholesky QR passes, QR where they would fail), or spanqr
-_SPANQR = [None]  # (the spanqr package's orth: robust shifted Cholesky QR, no host sync; for r <= 512, cholqr2 above)
+_SPANQR = [None]  # (the spanqr package's orth: robust shifted Cholesky QR, no host sync; above r 512 block Gram-Schmidt)
 
 
 def _orth_(X):
@@ -354,9 +354,14 @@ def _orth_(X):
     One host sync per call for that check."""
     if ORTH[0] == "qr" or X.dtype != torch.float32 or X.shape[0] < X.shape[1]:
         return torch.linalg.qr(X)[0]
-    if ORTH[0] == "spanqr" and X.shape[1] <= 512 and X.shape[1] % 32 == 0 and X.is_cuda:
-        # spanqr (github.com/oguzeldereli/spanqr) at the shapes it is fastest at (4080 laptop, 5120 x 256: 0.90 ms
-        # against cholqr2's 1.11 and Householder's 3.47; at r 1024 its own Cholesky is slower than cholqr2's)
+    if ORTH[0] == "spanqr":
+        # spanqr (github.com/oguzeldereli/spanqr; 4080 laptop, 5120 x 256: 0.90 ms against cholqr2's 1.11 and
+        # Householder's 3.47). Above r 512 (r a multiple of 256) its block Gram-Schmidt over 256-column blocks (spanqr
+        # 4986987: 22/22 robustness cases at 5120 / 6144 / 17408 x 1024; 5120 x 1024 10.5 ms against Householder's
+        # 11.9). The shapes it does not take (r not a multiple of 32, r > 512 not a multiple of 256, CPU): Householder
+        r = X.shape[1]
+        if not (X.is_cuda and r % 32 == 0 and (r <= 512 or r % 256 == 0)):
+            return torch.linalg.qr(X)[0]
         if _SPANQR[0] is None:
             from orth import orth as _o
             _SPANQR[0] = _o

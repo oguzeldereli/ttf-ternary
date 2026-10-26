@@ -74,7 +74,8 @@ def build_parser():
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
     g.add_argument("--ttf-orth", default="qr", choices=["qr", "cholqr2", "spanqr"],
                    help="the accumulator basis' orthonormalisation: Householder QR, Cholesky QR twice (QR where it would "
-                        "fail), or spanqr for ranks <= 512 (the spanqr package on PYTHONPATH) and cholqr2 above")
+                        "fail), or spanqr (the spanqr package on PYTHONPATH; above rank 512 its block Gram-Schmidt, needs rank % 256 "
+                        "== 0; other shapes Householder)")
     g.add_argument("--ttf-theta", type=float, default=16.0, help="firing threshold (in units of the step)")
     g.add_argument("--ttf-theta-sched", default="", help="T0:T1[:START]: theta T0 until fraction START, then linear to T1")
     g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant (steps at the "

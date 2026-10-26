@@ -243,9 +243,13 @@ def test_orth_cholqr2():
         except ImportError:
             return
         U.ORTH[0] = "spanqr"
-        for Y in (X, Xz, Xp):
+        Xw = torch.randn(5120, 1024, device=dev, generator=g)          # above r 512: spanqr's block Gram-Schmidt
+        Xwz = Xw.clone(); Xwz[:, 300:340] = 0
+        for Y in (X, Xz, Xp, Xw, Xwz, X[:, :200]):                      # (r 200: Householder)
             Q = U._orth_(Y)
             assert float((Q.T @ Q - torch.eye(Q.shape[1], device=dev)).abs().max()) < 1e-4
+        Q = U._orth_(Xw); Q0 = torch.linalg.qr(Xw)[0]
+        assert float((Q @ (Q.T @ Q0) - Q0).abs().max()) < 1e-4          # same span
     finally:
         U.ORTH[0] = old
 
