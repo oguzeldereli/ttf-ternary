@@ -1,6 +1,6 @@
 """Memory of a ~23B-parameter ternary model (width 5120, 83 layers, MLP 13824, 8 KV heads of 128) trained with the
 two-timescale rule, for different ranks and storage formats of the state. Estimate: weights, float tail (16-bit values,
-gradients and 8-bit Adam, ~1.6 GiB), the gradient of the largest layer (update inside the backward) and the state;
+gradients and an 8-bit first moment as LeanAdam keeps, ~1.6 GiB), the gradient of the largest layer (update inside the backward) and the state;
 activations are extra (~3 GiB at micro-batch 1 x 2048 with full checkpointing).
 The second table is the budget on a 16 GB card anchored on what was measured (b27 smoke on barbel, 3 Oct: ranks 256,
 int8 / fp16 state on the host, fp32 float tail + AdamW: torch peak 14.10 GiB, persistent 8.61 GiB, host RSS 13.7 GiB),

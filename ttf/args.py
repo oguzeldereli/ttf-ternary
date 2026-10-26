@@ -49,9 +49,9 @@ def build_parser():
     g.add_argument("--lr-rewarm", default="", help="S:W[:F]: from step S a linear warmup over W steps from --min-lr to "
                    "F x the peak, then a cosine (continuing a decayed run)")
     g.add_argument("--weight-decay", type=float, default=None, help="the embedding / head group (default 0.1)")
-    g.add_argument("--tail", default="fp32", choices=["fp32", "lean", "bf16"],
+    g.add_argument("--tail", default="fp32", choices=["fp32", "lean"],
                    help="the float parameters: fp32 + AdamW; lean: bf16 / fp16 + LeanAdam (int8 first moment, factored "
-                        "second moment); bf16: bf16 + 8-bit Adam (norm gains cannot train in bf16)")
+                        "second moment)")
 
     g = ap.add_argument_group("float extras of the ternary layers")
     g.add_argument("--rc-scale", action=ON, default=True, help="per-row and per-column scales (W = beta r_i c_j q_ij)")
@@ -330,9 +330,9 @@ def from_legacy(argv):
     for f, new in _OLD_OFF + _OLD_DEFAULTS:
         if f not in seen:
             out += new
-    if "--tail_fp32" not in seen and "--lean_tail" not in seen:
-        out += ["--tail", "bf16"]
     mode = ([argv[j + 1] for j, x in enumerate(argv[:-1]) if x == "--mode"] or ["kernel"])[-1]   # (the last one counts)
+    if mode == "kernel" and "--tail_fp32" not in seen and "--lean_tail" not in seen:   # (master: always fp32 AdamW)
+        raise ValueError(f"the bf16 float tail (no --tail_fp32 / --lean_tail): removed 26 Oct 2026 ({_TAG})")
     if mode == "kernel" and "--ts" not in seen:
         raise ValueError("kernel mode without --ts (a flip rule): the old trainer only (tag pre-consolidation-2026-10-17)")
     if mode == "kernel" and "--ts_nomom" not in seen:

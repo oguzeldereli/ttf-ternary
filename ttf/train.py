@@ -405,7 +405,7 @@ def main():
         tail_opt = LeanAdam(tail_groups, lr=tc.lr, betas=(tc.beta1, tc.beta2))
         print(f"lean float tail: {sum(p.numel() for p in emb)/1e6:.1f}M bf16 + {sum(p.numel() for p in small)/1e3:.1f}k fp16, "
               f"LeanAdam (int8 m, factored v, stochastic rounding)", flush=True)
-    elif args.tail == "fp32":
+    else:   # --tail fp32
         # float tail kept in fp32 with a standard AdamW, exactly like master mode. In
         # bf16 an Adam step (~lr <= 1.5e-3) on a norm gain of 1.0 is below half the
         # representable gap (2^-7) and always rounds away: the gains never train.
@@ -427,23 +427,6 @@ def main():
         tail_opt = torch.optim.AdamW(tail_groups, lr=tc.lr, betas=(tc.beta1, tc.beta2))
         print(f"fp32 float tail: {sum(p.numel() for p in emb)/1e6:.1f}M emb + "
               f"{sum(p.numel() for p in norms)/1e3:.1f}k norm gains, AdamW fp32 states", flush=True)
-    else:
-        # float tail (embeddings + norms + flip predictor): bf16 params + 8-bit Adam.
-        # NOTE: norm gains cannot train in bf16 (see --tail fp32).
-        from .opt8 import Adam8bit
-        rc = [p for n, p in model.named_parameters() if n.endswith(("row_scale", "col_scale"))]
-        rcid = {id(p) for p in rc}
-        for p in model.float_tail_parameters():
-            if id(p) not in rcid:                 # scales stay fp32: bf16 would freeze them
-                p.data = p.data.to(torch.bfloat16)
-        tail = model.float_tail_parameters()
-        groups = [{"params": [p for p in tail if id(p) not in rcid],
-                   "weight_decay": tc.weight_decay}]
-        if rc:
-            groups.append({"params": rc, "weight_decay": 0.0, "rc_lr": args.rc_lr})
-        groups = _split_emb_group(model, groups, args.emb_wd, args.emb_lr_mult)   # (--emb-wd / --emb-lr-mult were ignored
-        tail_opt = Adam8bit(groups, lr=tc.lr, betas=(tc.beta1, tc.beta2),          # on this tail before 25 Oct)
-                            weight_decay=tc.weight_decay)
 
     if args.track_flips:
         n = enable_flip_tracking(model)
