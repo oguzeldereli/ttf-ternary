@@ -141,7 +141,7 @@ class QwenTern(nn.Module):
             self._skip_set = False
         elif not ckpt and m.gradient_checkpointing:
             self.hf.gradient_checkpointing_disable()
-        if ckpt and self.ckpt_skip and not getattr(self, "_skip_set", False):   # --ckpt-skip N: the last N decoder
+        if ckpt and not getattr(self, "_skip_set", False):                     # --ckpt-skip N: the last N decoder
             n_ = len(m.layers) if self.pp is None else self.pp["hi"]             # layers (--pipe: of each stage) keep
             for i_, l_ in enumerate(m.layers):                                   # their activations (no recompute),
                 l_.gradient_checkpointing = i_ < n_ - self.ckpt_skip             # memory permitting

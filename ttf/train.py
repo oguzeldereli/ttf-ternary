@@ -248,8 +248,9 @@ def main():
         n_te = enable_tern_emb(model, te, "master" if args.mode == "bitnet" else "kernel")
         assert args.mode == "bitnet" or (ttf and tc.grad_accum == 1), "--tern-emb with --mode ttf: --accum 1"
         print(f"--tern-emb {te}: {n_te / 1e6:.1f}M ternary embedding weights (+ row / column scales)", flush=True)
-    if args.ckpt_skip:
-        model.ckpt_skip = args.ckpt_skip
+    _ck_auto = None     # --ckpt-skip auto: chosen per step from the measured peak (memplan.py), else the last N blocks
+    if args.ckpt_skip != "auto":
+        model.ckpt_skip = int(args.ckpt_skip)
     if args.ckpt == "block":
         for b_ in model.layers:
             b_.ckpt_block = True
@@ -787,6 +788,10 @@ def main():
         from .qwen import enable_fused_norm
         enable_fused_norm()
         print("Qwen: RMSNorm, gated norm and SwiGLU in fused kernels", flush=True)
+    if args.ckpt_skip == "auto" and device == "cuda" and tc.grad_checkpoint and hasattr(model, "layers"):
+        from .memplan import CkptAuto
+        _ck_auto = CkptAuto(model, args.mem_cap_gib)
+    _peak_all = 0
     from . import intk_emb as _IE
     _IE.DEQ_GEN[0] = 0
     for step in range(start_step, end_step):
@@ -987,7 +992,7 @@ def main():
 
         if step % tc.log_interval == 0:
             dt = time.time() - t0
-            mem = torch.cuda.max_memory_allocated() / 1024**3 if device == "cuda" else 0
+            mem = max(_peak_all, torch.cuda.max_memory_allocated()) / 1024**3 if device == "cuda" else 0
             extra = ""
             if fs:
                 extra += (f"| flip {fs['flip_frac_total']*100:.3f}% "
@@ -1004,9 +1009,13 @@ def main():
                 mr = mem_report(model, tail_opt, lr_state)
                 log_metrics({"step": step, **mr})
                 print("  memory (MiB): " + ", ".join(f"{k[4:-3]} {v:.1f}" for k, v in mr.items()), flush=True)
+        if _ck_auto is not None:
+            _peak_all = max(_peak_all, _ck_auto.after_step())
         if step > 0 and step % tc.eval_interval == 0:
             vl = evaluate(model, val_data, tc, device)
             log_metrics({"step": step, "val_loss": vl, "val_ppl": math.exp(vl)})
+            if _ck_auto is not None:     # (the eval's peak is not a training step's)
+                _peak_all = max(_peak_all, torch.cuda.max_memory_allocated()); torch.cuda.reset_peak_memory_stats()
             print(f"  ---- val loss {vl:.3f} | ppl {math.exp(vl):.1f}", flush=True)
         if args.snap_every and step > 0 and step % args.snap_every == 0:
             save_ckpt(step)

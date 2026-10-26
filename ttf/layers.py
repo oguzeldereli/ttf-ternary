@@ -131,6 +131,8 @@ def _grad_x(layer, gyf, wpacked):
     return tern_gemm_dx(gyf, wpacked, layer.K)
 
 
+W8_CACHE = [False]       # KernelTernaryLinear.w8: the int8 trits kept between their changes (turned on by --ckpt-skip
+                         # auto when the memory allows: 2 bytes per trit; False: unpacked per use)
 FUSED_LAYER = [False]    # --fused-layer: centring, column scale, act-quant, GEMM epilogue, row scale, bias and the adapter
                          # sum in a few kernels each way (_FusedTernFn); bit-identical output and input grad
 
@@ -156,8 +158,7 @@ def _fused_fwd(l, x2, acc2, save):
     bb = ob.to(torch.bfloat16) if ob is not None else None
     xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, l.act_bits, False)   # (the input itself is kept for the backward,
     beta = l._cached_beta(l.wpacked) if l.use_beta else None          # which re-forms bf16(x - mu): one tensor for
-    w8 = unpack_fast(l.wpacked, l.K)                                   # all the readers of one input, bit-identical)
-    y32 = torch._int_mm(xq, w8.t()); del w8
+    y32 = torch._int_mm(xq, l.w8().t())                               # all the readers of one input, bit-identical)
     t, o = _K.fused_epilogue(y32, xs, beta if beta is not None else 1.0, rb, bb, acc2, save)
     return o, ((xq, xs, x2, t, cb, rb, beta) if save else None)
 
@@ -192,7 +193,7 @@ class _FusedTernFn(torch.autograd.Function):
         with _rf("tern.dx"):
             f, q1, q2, s, gbias, grow = _K.fused_bwd_rows(g2, t, rb, bb, sl)
             if sl:
-                wt = _K.unpack_t_i8(l.wpacked, l.K).t()
+                wt = l.w8(t=True).t()
                 gx, gc = _K.fused_dx_col(torch._int_mm(q1, wt), torch._int_mm(q2, wt), s, cb, xc, ctx.mu_b)
                 del wt, q1, q2
             else:
@@ -247,9 +248,23 @@ class KernelTernaryLinear(nn.Module):
             self._nnz = trit_nnz(wpacked, self.K); self._beta_val = beta_from_nnz(self._nnz, self.N); self._beta_key = k
         return self._beta_val
 
+    def w8(self, t=False):
+        """the trits as int8 for the step's GEMMs, [N, K] (t: the [K, N] copy dx reads), unpacked once per change of the
+        trits and kept until the next (the fused firing writes them in place: _after_fire counts it) instead of on every
+        forward, recompute and dx (27B FFN: 16 micro-batches x 3 unpacks a step). W8_CACHE False: unpacked per use"""
+        if not W8_CACHE[0]:
+            return _K.unpack_t_i8(self.wpacked, self.K) if t else unpack_fast(self.wpacked, self.K)
+        k = (self._wkey(self.wpacked), getattr(self, "_nfire", 0))
+        c = self.__dict__.setdefault("_w8c", {})
+        if t not in c or c[t][0] != k:
+            c.pop(t, None)
+            c[t] = (k, _K.unpack_t_i8(self.wpacked, self.K) if t else unpack_fast(self.wpacked, self.K))
+        return c[t][1]
+
     def _after_fire(self, dnnz):
         """after the fused firing (trits written in place, no version bump): the nonzero count moves by dnnz, so a
         valid cached beta is updated exactly instead of recomputed from all the trits"""
+        self._nfire = getattr(self, "_nfire", 0) + 1
         if getattr(self, "_beta_key", None) is not None and self._beta_key == self._wkey(self.wpacked):
             self._nnz = self._nnz + dnnz; self._beta_val = beta_from_nnz(self._nnz, self.N)
         else:
@@ -257,6 +272,7 @@ class KernelTernaryLinear(nn.Module):
 
     def _invalidate(self):
         self._beta_key = None
+        self.__dict__.pop("_w8c", None)
 
     def enable_tracking(self):
         """Track per-step flip count and which trits have ever changed since init.

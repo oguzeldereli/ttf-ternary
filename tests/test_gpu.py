@@ -516,6 +516,30 @@ def test_qwen_fused_kernels(wdt):
                           * F.silu(z.float())).to(x.dtype), [x, z, wg])
 
 
+def test_w8_cache_follows_trits():
+    """KernelTernaryLinear.w8: the cached int8 trits (both layouts) equal a fresh unpack after the fused firing (in place,
+    no version bump) and after a copy_ into the packed buffer"""
+    from ttf import update as U
+    from ttf.kernel import unpack_fast, unpack_t_i8, pack_rows
+    N, K, T = 256, 320, 512
+    l = _layer(N, K, 3); l._ts_idx = 1
+    from ttf import layers as L
+    L.W8_CACHE[0] = True
+    w0, t0 = l.w8().clone(), l.w8(t=True).clone()
+    assert torch.equal(w0, unpack_fast(l.wpacked, K)) and torch.equal(t0, unpack_t_i8(l.wpacked, K))
+    gen = torch.Generator(device=dev).manual_seed(5); state = {}
+    for s in range(3):
+        gy = (torch.randn(T, N, device=dev, generator=gen)).to(torch.bfloat16)
+        x = torch.randn(T, K, device=dev, generator=gen).to(torch.bfloat16)
+        l._ts_final = True
+        U.ts_layer(l, (gy, x), state, _cfg(r=16, theta=1e-3, factored=64, step=10 + s))
+    assert not torch.equal(unpack_fast(l.wpacked, K), w0)                    # trits moved
+    assert torch.equal(l.w8(), unpack_fast(l.wpacked, K)) and torch.equal(l.w8(t=True), unpack_t_i8(l.wpacked, K))
+    l.wpacked.copy_(pack_rows(torch.zeros(N, K, dtype=torch.int8, device=dev)))
+    assert torch.equal(l.w8(), torch.zeros(N, K, dtype=torch.int8, device=dev)) and not l.w8(t=True).any()
+    L.W8_CACHE[0] = False
+
+
 @pytest.mark.parametrize("opt", ["lean", "adamw_fused"])
 def test_deq_cache_cuda_optimizers(opt):
     """deq_cache follows the tail optimizers that write through .data on CUDA (LeanAdam's batched 2-D path, fused

@@ -119,7 +119,9 @@ def build_parser():
                         "bit-identical; the scale / bias gradients summed in fp32)")
     g.add_argument("--ckpt", default="layer", choices=["layer", "block"],
                    help="activation checkpointing: attention and MLP separately, or each block once (half the memory)")
-    g.add_argument("--ckpt-skip", type=int, default=0, help="the last K blocks without checkpointing")
+    g.add_argument("--ckpt-skip", default="auto",
+                   help="the last K blocks without checkpointing; auto: as many as the measured memory allows, then the "
+                        "int8 trit cache (ttf/memplan.py)")
     g.add_argument("--loss-chunk", type=int, default=2048, help="tokens per output-head chunk (memory only)")
     g.add_argument("--mem-cap-gib", type=float, default=0.0, help="cap PyTorch's GPU memory (0: no cap)")
     g.add_argument("--pipe", action=ON, default=False, help="Qwen under torchrun: pipeline parallel over the ranks")
@@ -293,7 +295,7 @@ _LEGACY = {
 _OLD_OFF = [("--qk_temp", ["--no-qk-temp"]), ("--rc_scale", ["--no-rc-scale"]), ("--lowrank_mag", ["--adapter-rank", "0"]),
             ("--ts_factored", ["--dw", "dense"]), ("--init_stream", ["--no-convert-stream"])]
 # old defaults that differ from the new ones
-_OLD_DEFAULTS = [("--mode", ["--mode", "ttf"]), ("--ts_tau", ["--ttf-tau", "300"]),
+_OLD_DEFAULTS = [("--mode", ["--mode", "ttf"]), ("--ckpt_skip", ["--ckpt-skip", "0"]), ("--ts_tau", ["--ttf-tau", "300"]),
                  ("--ts_anneal", ["--ttf-step-p", "1.0"]), ("--lowrank", ["--ttf-rank", "0"]),
                  ("--init_hf_method", ["--convert", "als"]), ("--distill_w", ["--kd-weight", "1.0"]),
                  ("--mag_wd", ["--adapter-wd", "0.0"]), ("--kd_mode", ["--kd-cache-mode", "renorm"])]

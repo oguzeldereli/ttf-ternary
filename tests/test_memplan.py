@@ -1,0 +1,56 @@
+"""--ckpt-skip auto (ttf/memplan.py): the controller's choices from simulated peaks (CPU; torch.cuda's memory
+calls replaced by a model of the step's peak: base + d per kept block + the trit cache's bytes)"""
+import torch
+
+from ttf import layers as L
+from ttf import memplan as MP
+
+
+class _Lin(L.KernelTernaryLinear):
+    def __init__(self, N, K):
+        torch.nn.Module.__init__(self)
+        self.N, self.K = N, K
+
+
+class _Model(torch.nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(n)])
+        self.lin = _Lin(1 << 14, 1 << 14)                 # trit cache: 512 MiB
+        self.ckpt_skip = 0
+
+
+def _run(monkeypatch, n, avail, base, d, steps=12):
+    G = 2**30
+    m = _Model(n)
+    st = {"peak": 0}
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (avail, avail))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: st["peak"])
+    ck = MP.CkptAuto(m, log=lambda s: None)
+    try:
+        for _ in range(steps):
+            st["peak"] = int(base + d * m.ckpt_skip + (2 * m.lin.N * m.lin.K if L.W8_CACHE[0] else 0))
+            assert st["peak"] <= ck.budget or m.ckpt_skip <= 1     # never planned past the budget (after measuring)
+            ck.after_step()
+        return m.ckpt_skip, L.W8_CACHE[0]
+    finally:
+        L.W8_CACHE[0] = False
+
+
+def test_all_blocks_then_trit_cache(monkeypatch):
+    G = 2**30
+    assert _run(monkeypatch, 8, 20 * G, 4 * G, 1 * G) == (8, True)       # 4 + 8 + 0.5 fits 17.6
+
+
+def test_partial_when_short(monkeypatch):
+    G = 2**30
+    k, w8 = _run(monkeypatch, 32, 20 * G, 4 * G, 1 * G)
+    assert not w8 and 9 <= k <= 13                                      # (17.6 - 4) / 1.25 .. / 1
+
+
+def test_backs_off_when_over(monkeypatch):
+    G = 2**30
+    k, w8 = _run(monkeypatch, 32, 12 * G, 11 * G, 1 * G)                # base above the budget: no block kept
+    assert k == 0 and not w8
