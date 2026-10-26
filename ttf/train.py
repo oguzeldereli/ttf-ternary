@@ -713,6 +713,11 @@ def main():
         del blob
         torch.cuda.empty_cache()
 
+    if _PP:   # --pipe: every stage resumes from the same step (a stage's part of another step would train on silently)
+        _st = torch.tensor([start_step, -start_step], device=device)
+        _dist.all_reduce(_st, op=_dist.ReduceOp.MAX)
+        assert int(_st[0]) == -int(_st[1]) == start_step, \
+            f"--pipe: the stages' checkpoints are of different steps (from {-int(_st[1])} to {int(_st[0])}; this stage {start_step})"
     # save on SIGTERM/SIGINT so `kill` (or Ctrl-C) leaves a fresh resumable ckpt
     import signal
     # the checkpoint's "step" is the last COMPLETED step (resume starts at step + 1), so the
