@@ -146,7 +146,7 @@ scripts/
   results.py     the database's command line (status, table, show, find, note, ingest, validate)
   infer/         ttf_run.py (our models), ttf_qwen.py + ttf_kernels.py (converted Qwen, 2-bit dp4a decode)
   eval/          final_eval.py, compare.py, zeroshot*.py
-  quant/, analysis/, data/, plots/   conversion tools, diagnostics, data preparation, figures
+  quant/, analysis/, data/   conversion tools, diagnostics, data preparation
   tests/         kernel checks and benchmarks, det_run.py (deterministic runs)
 tests/         pytest (-m "not gpu" anywhere; the gpu tests on a CUDA machine); checks/: script checks
 docs/          see below
@@ -156,7 +156,7 @@ docs/          see below
 
 - `results/runs.jsonl`, `python scripts/results.py`: every run with its configuration, events and results (`table`,
   `show`, `find`); notes are kept outside the repository (`ttf/results.py`, `TTF_NOTES`).
-- [docs/FORMULAS.md](docs/FORMULAS.md): every update rule used, with its flag.
+- [docs/FORMULAS.md](docs/FORMULAS.md): the current update with its options, then every rule tried (old flags).
 - [docs/OPTIONS_MAP.md](docs/OPTIONS_MAP.md): the old flags and the current options.
 - [docs/CONVERT_27B.md](docs/CONVERT_27B.md): converting a 27B model on one 24 GB GPU (data, teacher cache, training,
   packing, inference).

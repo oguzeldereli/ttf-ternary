@@ -1,12 +1,48 @@
 # Formulas
 
-Every update rule used in this project: the current recipe first, then each mechanism that was tried, with its flag
-and result. Flags are those of the trainer up to 17 Oct 2026 (tag `pre-consolidation-2026-10-17`; the current options of
-the kept ones: [OPTIONS_MAP.md](OPTIONS_MAP.md)); results are final validation loss at 300M tokens (110M model,
-from scratch) unless noted. Run details: the results database (`python scripts/results.py show NAME`).
+Section 0 is the update the current trainer runs (`python -m ttf.train`, its options and defaults). Sections 1-6 are
+the history: every update rule used in this project, with its flag and result, the flags being those of the trainer up
+to 17 Oct 2026 (tag `pre-consolidation-2026-10-17`; the current options of the kept ones:
+[OPTIONS_MAP.md](OPTIONS_MAP.md)); results there are final validation loss at 300M tokens (110M model, from scratch)
+unless noted. Run details: the results database (`python scripts/results.py show NAME`).
 
 Notation, per ternary layer: trits $T\in\{-1,0,1\}^{N\times K}$; the batch gradient with respect to the trits
 $g=\partial L/\partial T$ ($N\times K$, one batch of $16\times2048$ tokens); the momentum $M$; step $t$ of $T_{\max}=9155$.
+
+## 0. The current trainer (`--mode ttf`)
+
+Per ternary layer and step, with $\rho_t=(\text{lr}_t/\text{lr}_\text{peak})^{p}$ (`--ttf-step-p` $p$, 0.75):
+
+- **Second moment**, factored (`--ttf-b2` 0.95, bias-corrected): $R_i\leftarrow\beta_2R_i+(1-\beta_2)\overline{g_{i\cdot}^2}$,
+  $C_j$ likewise, $v_{ij}=R_iC_j/\overline R$. With `--dw factored` (the default) $g=g_y^\top x$ is never formed: the
+  sums of $g^2$ come from a `--dw-sketch` $k$-column random sketch (256) and every product with $g$ from the factors.
+- **Step**: $u=-\rho_t\,g/(\sqrt v+\epsilon)$ (no momentum).
+- **Accumulator** $A\approx UV^\top$ at rank $r$ (`--ttf-rank`, 512), leak $\lambda=1-\rho_t/\tau$ (`--ttf-tau` 1000), one
+  subspace iteration per step on the whole tally $\tilde A=\lambda A+u$:
+  $$V'=\operatorname{orth}\big(\tilde A^\top U\big)=\operatorname{orth}\big(V(U^\top U)+u^\top U\big),\qquad U'=\tilde AV'=U(V^\top V')+uV'$$
+  ($U$ here already leaked; `--ttf-orth` the orthonormalisation).
+- **Firing** at $\theta$ (`--ttf-theta`, 16 from scratch; conversions use larger): $D=\operatorname{sign}(A)\odot
+  \mathbb 1[|A|\ge\theta]$ where the trit stays in $\{-1,0,1\}$, $T\leftarrow T+D$; **spend**
+  $U\leftarrow U-c\,\theta\,(DV)$ (`--ttf-spend` $c$, 1). $A$ is formed one tile at a time inside the firing kernel.
+- **Micro-batches** (`--accum M` > 1): micro-batch $i$'s $u_i$ uses $\tilde v_i=\beta_2\hat v_{t-1}+(1-\beta_2)M^2\overline{g_i^2}$
+  and enters on the step's basis, $U\leftarrow U+u_iV$ (the leak once, before the first). After the last one the basis
+  turns once on the step's whole tally $\tilde A=\lambda A+\sum_iu_i$: $\tilde A^\top U=V(U^\top U)+(I-VV^\top)(\sum u)^\top U$
+  and $\tilde AV'=UV^\top V'+(\sum u)(I-VV^\top)V'$, the two products with $\sum u$ read from the $k$-row and $k$-column
+  sketches of $\sum g$ that $v$ keeps anyway (no dense sum). Firing and the spend once per step. (Before that the micro-batch turn
+  used $M\,u_M^\top U$ from the last micro-batch alone.)
+- **History of the turn**: from ttf-core 2858771 until 26 Oct the turn kept only the part of the step inside the old
+  basis ($A\leftarrow A_{\text{in }V}V'V'^\top$), for one batch per step as well: at 110M from scratch 39% of the trits
+  had never moved by step 2000 against 30% with the rule above, and the validation loss was 0.0085 worse (3.2483 vs
+  3.2398 at 2000 steps), most of it in the MLP down projection (ever moved 25% vs 69%).
+- **Options under evaluation** (off by default): `--ttf-band F` keeps the exact tally on the share F of entries nearest
+  $\theta$ (one batch per step); `--ttf-hspend F` spends a move also from the row's input-correlated entries
+  ($V_s=V+F(CV-V)$, $C$ the correlation of an EMA of $x^\top x$).
+- **Float parts** (embedding, norm gains, row / column scales, adapters, attention temperature): AdamW in fp32
+  (`--tail fp32`; `lean`: LeanAdam, the 27B recipes' lean optimizer state). `--intk-emb E:H` instead keeps the embedding / head as E- / H-bit codes in
+  groups trained by the same rule (threshold `--ttf-theta` x `--intk-theta-mult`).
+- **Ternary layer**: $y=\beta\,(r\odot(T\,(c\odot(x-\mu))))+\text{bias}$, $\beta=1/\sqrt{K\rho}$ from the trits'
+  nonzero share $\rho$, 8-bit per-token activations, int8 tensor-core GEMMs (exact), the input gradient as two int8
+  slices (`--dx int8x2`).
 
 ## 1. The model
 
