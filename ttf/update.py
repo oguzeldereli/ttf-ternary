@@ -363,8 +363,8 @@ def ts_layer(l, g, state, c):
     Per layer: v, the factored row x column EMA of g^2 (decay b2); u = -lr_ratio g / sqrt(v); A, the accumulator, rank
     r: A <- (1 - lr_ratio^p / tau) A + u projected on its basis (V turns with the evidence); a trit moves by sign(A_ij)
     when |A_ij| >= theta (and stays in {-1, 0, 1}), and the move spends theta: A -= theta D (kept low-rank: U -= theta
-    D V). With --accum M > 1 every micro-batch's u enters the accumulator, normalised by the v of the steps
-    before; v, the basis turn, the firing and the spend once per step, on the last micro-batch."""
+    D V). With --accum M > 1 every micro-batch's u enters the accumulator and turns its basis (_TURN), normalised by
+    the v of the steps before; v, the firing and the spend once per step, on the last micro-batch."""
     from .kernel import unpack_rows, pack_rows
     if not torch.is_tensor(g):           # --dw factored: the backward passed (gy, x) instead of the dense gradient
         return _ts_layer_factored(l, g, state, c)

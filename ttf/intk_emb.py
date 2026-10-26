@@ -13,8 +13,8 @@ dL/dW * s (one level is one step of s).
   - embedding: the forward gathers the dequantized rows of the batch's tokens; the gradient is the scatter of dL/dh into
     those rows, g = P^T G (P the one-hot rows of the distinct tokens, G their summed dL/dh): only those rows are touched.
   - a tied matrix sums both (the update runs once both factors of the micro-batch are in).
-  The update (_intk_update) is _ts_layer_factored's (micro-batch u into U on the step's fixed basis, the factored v from
-  a k-column sketch, the basis turn, firing and spend on the last micro-batch) with every [N, .] product taken in row
+  The update (_intk_update) is _ts_layer_factored's (every micro-batch turns the basis on the whole tally, the factored v
+  from a k-column sketch, firing and spend on the last micro-batch) with every [N, .] product taken in row
   chunks of ROWS: U is stored per row chunk (each its own codec scale), so the largest temporaries are [ROWS, d]. The
   group parameters' gradients come from the same factors (per vocabulary chunk, gy_c^T x: one more head-sized GEMM).
 --intk-update dense (the 25 Oct path): the dequantized matrix formed once per optimizer step as a bf16 leaf, its
@@ -324,8 +324,7 @@ class _Store:
 def _intk_update(l, parts, state, c):
     """--intk-update factored: one micro-batch's TTF update of an int-k matrix from its gradient factors (see _Parts):
     _ts_layer_factored's maths (its torch branch: the factored v from a k-column sketch of g, u = -lr diag(1/a) g
-    diag(1/b), with --accum M > 1 each micro-batch's u V into U on the step's fixed basis, the turn, firing and spend on
-    the last), with every [N, .] product in row chunks; a code moves one level within 0 .. levels"""
+    diag(1/b), with --accum M > 1 every micro-batch's turn (update._TURN), firing and spend on the last), with every [N, .] product in row chunks; a code moves one level within 0 .. levels"""
     from .update import _orth, _dpm, _store_codec, _host_get, _host_put, _layer_gen
     from .schedule import _theta_at
     P = _Parts(parts)
