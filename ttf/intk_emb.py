@@ -13,8 +13,8 @@ dL/dW * s (one level is one step of s).
   - embedding: the forward gathers the dequantized rows of the batch's tokens; the gradient is the scatter of dL/dh into
     those rows, g = P^T G (P the one-hot rows of the distinct tokens, G their summed dL/dh): only those rows are touched.
   - a tied matrix sums both (the update runs once both factors of the micro-batch are in).
-  The update (_intk_update) is _ts_layer_factored's (every micro-batch turns the basis on the whole tally, the factored v
-  from a k-column sketch, firing and spend on the last micro-batch) with every [N, .] product taken in row
+  The update (_intk_update) is _ts_layer_factored's (micro-batch u into U on the step's fixed basis, the factored v from
+  a k-column sketch, the basis turn, firing and spend on the last micro-batch) with every [N, .] product taken in row
   chunks of ROWS: U is stored per row chunk (each its own codec scale), so the largest temporaries are [ROWS, d]. The
   group parameters' gradients come from the same factors (per vocabulary chunk, gy_c^T x: one more head-sized GEMM).
 --intk-update dense (the 25 Oct path): the dequantized matrix formed once per optimizer step as a bf16 leaf, its
@@ -129,7 +129,7 @@ def ttf_rows(l, g, state, c, rows=16384):
     """update.ts_layer's dense update (one call per step) for int-k codes in row chunks: the temporaries are
     [rows, K] instead of [N, K] (at 27B's 248320 x 5120 the full ones were ~30 GB). The same steps: v = R C / mean R
     (row / column EMAs of g^2, decay b2, bias-corrected), u = -lr g / (sqrt v + 1e-8), the rank-r accumulator A = U V^T
-    (leak, then the basis turned on the tally: update._TURN), a code moves one level where |A| >= theta (within 0 .. levels),
+    (leak, u on the basis, then the basis turned: update._acc_turn), a code moves one level where |A| >= theta (within 0 .. levels),
     each move spends theta. V's first basis comes from a chunk-wise random projection (not ts_layer's single draw)."""
     from .update import _orth
     N, K = g.shape
@@ -162,7 +162,7 @@ def ttf_rows(l, g, state, c, rows=16384):
     else:
         U, V = state[key]
         U = U * (1 - lr / tau)
-        X = V @ (U.T @ U)                              # update._TURN
+        X = V @ (U.T @ U)                              # update._acc_turn, a one-batch step: the turn from U_0
         for i in range(0, N, rows):
             X += u_of(i).T @ U[i:i + rows]
         Vn = _orth(X); del X
@@ -324,8 +324,9 @@ class _Store:
 def _intk_update(l, parts, state, c):
     """--intk-update factored: one micro-batch's TTF update of an int-k matrix from its gradient factors (see _Parts):
     _ts_layer_factored's maths (its torch branch: the factored v from a k-column sketch of g, u = -lr diag(1/a) g
-    diag(1/b), with --accum M > 1 every micro-batch's turn (update._TURN), firing and spend on the last), with every [N, .] product in row chunks; a code moves one level within 0 .. levels"""
-    from .update import _orth, _dpm, _store_codec, _host_get, _host_put, _layer_gen
+    diag(1/b), with --accum M > 1 each micro-batch's u V into U on the step's fixed basis, the turn, firing and spend on
+    the last), with every [N, .] product in row chunks; a code moves one level within 0 .. levels"""
+    from .update import _orth, _dpm, _store_codec, _host_get, _host_put, _layer_gen, _step_scale
     from .schedule import _theta_at
     P = _Parts(parts)
     N, K = l.N, l.K
@@ -378,6 +379,7 @@ def _intk_update(l, parts, state, c):
             else:
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
+            turn_ = (SP, PS) + _step_scale(R, C, b2, ts_ + 1)   # Sc sum g [k, K], (sum g) Sr [N, k]: the turn's sketches
         else:
             st[("mx", key)] = (PS.to(torch.bfloat16), SP.to(torch.bfloat16), rs, cs, ds, es)
         del PS, SP
@@ -418,20 +420,38 @@ def _intk_update(l, parts, state, c):
             S.flush(); return
         _fire(l, S, Us, V, theta, c, st)
         return
-    # update._TURN by row chunk: every micro-batch (or the step's one batch) turns the basis on the whole tally, exact
+    # update._acc_turn by row chunk: a one-batch step turns from U_0 (exact); with micro-batches every micro-batch's u
+    # enters on the step's basis and the basis turns on the last, from U and the step's sketches
     V = S.v()
-    Us = [S.u(cc) for cc in range(S.nch)]
-    if (t - 1) % M_ == 0:                             # the leak once per step (before its first micro-batch)
-        Us = [U * lk for U in Us]
-    UtU = sum(U.T @ U for U in Us)
-    Vn = _orth(V @ UtU - lr_ratio * _dpm(l_term(lambda i, j: Us[i // S.rows]))); del UtU
-    rt = r_term(Vn); P_ = V.T @ Vn
-    Us = [U @ P_ - lr_ratio * _dpm(rt(*S.rng(cc))) for cc, U in enumerate(Us)]
-    if not final_:
-        S.put_v(Vn)
-        for cc, U in enumerate(Us):
+    if M_ == 1:
+        Us = [S.u(cc) * lk for cc in range(S.nch)]
+        UtU = sum(U.T @ U for U in Us)
+        Vn = _orth(V @ UtU - lr_ratio * _dpm(l_term(lambda i, j: Us[i // S.rows]))); del UtU
+        rt = r_term(Vn); P_ = V.T @ Vn
+        Us = [U @ P_ - lr_ratio * _dpm(rt(*S.rng(cc))) for cc, U in enumerate(Us)]
+        _fire(l, S, Us, Vn, theta, c, st)
+        return
+    rt = r_term(V)
+    Us = []
+    for cc in range(S.nch):
+        U = S.u(cc)
+        if (t - 1) % M_ == 0:
+            U = U * lk
+        U.add_(rt(*S.rng(cc)), alpha=-lr_ratio)     # (data parallel: this rank's term, averaged on the last micro-batch)
+        if final_:
+            Us.append(_dpm(U))
+        else:
             S.put_u(cc, U)
+    if not final_:
         S.flush(); return
+    SP_, PS_, ia_, ib_ = turn_
+    UtU = sum(U.T @ U for U in Us)
+    Y = sum(Sc[:, i:j] @ (ia_[i:j, None] * U) for U, (i, j) in zip(Us, map(S.rng, range(S.nch))))
+    S_ = (-lr_ratio) * ib_[:, None] * (SP_.float().T @ Y); del Y          # update._sketch_cross
+    S_ = S_ - V @ (V.T @ S_)
+    Vn = _orth(V @ UtU + S_); del S_, UtU
+    P_ = V.T @ Vn
+    Us = [U @ P_ for U in Us]
     _fire(l, S, Us, Vn, theta, c, st)
 
 

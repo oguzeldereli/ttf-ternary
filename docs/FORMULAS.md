@@ -25,18 +25,19 @@ Per ternary layer and step, with $\rho_t=(\text{lr}_t/\text{lr}_\text{peak})^{p}
   \mathbb 1[|A|\ge\theta]$ where the trit stays in $\{-1,0,1\}$, $T\leftarrow T+D$; **spend**
   $U\leftarrow U-c\,\theta\,(DV)$ (`--ttf-spend` $c$, 1). $A$ is formed one tile at a time inside the firing kernel.
 - **Micro-batches** (`--accum M` > 1): micro-batch $i$'s $u_i$ uses $\tilde v_i=\beta_2\hat v_{t-1}+(1-\beta_2)M^2\overline{g_i^2}$
-  (the steps before plus its own squares; $v$ itself is stepped after the last, its cross terms from $k$-dim sketches of
-  the running sum), and each micro-batch turns the basis with the rule above on $\tilde A=A+u_i$ (the leak once per step,
-  before the first; exact, two thin products of $u_i$ from the factors). Firing and the spend once per step, after the
-  last micro-batch.
-- **History of the turn**: from ttf-core 2858771 until 26 Oct the turn kept only the part of the step inside the old
-  basis ($A\leftarrow A_{\text{in }V}V'V'^\top$), for one batch per step as well: at 110M from scratch 39% of the trits
-  had never moved by step 2000 against 30% with the rule above, and the validation loss was 0.0085 worse (3.2483 vs
-  3.2398 at 2000 steps), most of it in the MLP down projection (ever moved 25% vs 69%). With micro-batches the rule
-  before 26 Oct kept the basis fixed within the step ($U\leftarrow U+u_iV$) and turned it once after the last, the
-  products with $\sum_iu_i$ read from $k=256$ sketches of $\sum g$; at Qwen 0.8B ($K$ up to 3584) their noise,
-  $\sim\sqrt{K/k}$ times the signal, made the moves run away (flips $10^{-4}\to6\%$ of the entries by step 96). Before
-  that the micro-batch turn used $M\,u_M^\top U$ from the last micro-batch alone.
+  and enters on the step's basis, $U\leftarrow U+u_iV$ (the leak once, before the first). After the last one the basis
+  turns once: $V'=\operatorname{orth}\big(V(U^\top U)+(I-VV^\top)(\sum u)^\top U\big)$, the product with $\sum u$ read
+  from the $k$-row sketch of $\sum g$ that $v$ keeps anyway (no dense sum), and $U'=U(V^\top V')$ (the step's mass
+  outside $V$ is not kept). Firing and the spend once per step.
+- **History of the turn**: from ttf-core 2858771 until 26 Oct the one-batch turn kept only the part of the step inside
+  the old basis ($A\leftarrow A_{\text{in }V}V'V'^\top$): at 110M from scratch 39% of the trits had never moved by step
+  2000 against 30% with the exact turn above, and the validation loss was 0.0085 worse (3.2483 vs 3.2398 at 2000
+  steps), most of it in the MLP down projection (ever moved 25% vs 69%). With micro-batches, at Qwen 0.8B (P2h recipe,
+  $1\times16$, 1000 steps) two exact variants did worse than the rule above: adding the step's mass outside $V$ from
+  $k=256$ sketches of $\sum g$ (noise $\sim\sqrt{K/k}$ times the signal) ran the moves away within 100 steps (flips
+  $10^{-4}\to6\%$ of the entries per step), and the exact one-batch turn at every micro-batch trained +0.08 worse over
+  steps 300-576 with twice the moves, at 2.5-5x the update's cost at 27B shapes. The rule above is ahead of the one
+  before it, which turned from $M\,u_M^\top U$ of the last micro-batch alone (wiki 2.9478 vs 2.9536 at step 999).
 - **Options under evaluation** (off by default): `--ttf-band F` keeps the exact tally on the share F of entries nearest
   $\theta$ (one batch per step); `--ttf-hspend F` spends a move also from the row's input-correlated entries
   ($V_s=V+F(CV-V)$, $C$ the correlation of an EMA of $x^\top x$).

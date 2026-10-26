@@ -253,8 +253,8 @@ def test_orth_cholqr2():
 def test_micro_fused_matches_torch():
     """--accum M > 1: kernel.micro_sketch (the sketch sides' statistics in four kernels) against the torch ops,
     over 3 steps x 4 micro-batches (shapes that are not tile multiples): v agrees to fp32 rounding (the sums run in
-    another order), the accumulator to the running sketch's bf16 rounding (v's cross terms read it; the two paths keep
-    it in bf16 and round it at other points). fp32 factors: with bf16 ones the products round their right-hand side to bf16
+    another order), the accumulator to the running sketch's bf16 rounding (the basis turn reads it: update._sketch_cross;
+    the two paths keep it in bf16 and round it at other points: 0.3% of A here). fp32 factors: with bf16 ones the products round their right-hand side to bf16
     (_mmb), so a 1e-7 difference in 1 / b flips some roundings and the two paths drift apart chaotically (~0.5% of A
     after 12 micro-batches here), as any two summation orders do"""
     from ttf import update as U
