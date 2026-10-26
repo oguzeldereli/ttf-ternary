@@ -197,8 +197,7 @@ class _FusedTernFn(torch.autograd.Function):
                 gx, gc = _K.fused_dx_col(torch._int_mm(q1, wt), torch._int_mm(q2, wt), s, cb, xc, ctx.mu_b)
                 del wt, q1, q2
             else:
-                xc_ = xc if ctx.mu_b is None else (xc.float() - ctx.mu_b.float()).to(torch.bfloat16)
-                gx, gc = _K.scale_bwd(_grad_x(l, f, l.wpacked), cb, xc_); del xc_
+                gx, gc = _K.scale_bwd(_grad_x(l, f, l.wpacked), cb, xc, ctx.mu_b)   # (the centring in the kernel)
         if l.capture and getattr(l, "on_grad", None) is not None:    # (_fused_ok: the factored TTF update)
             if getattr(l, "cap_accum", False):
                 l._ts_final = getattr(l, "cap_final", True); l._ts_micro = getattr(l, "cap_micro", None)

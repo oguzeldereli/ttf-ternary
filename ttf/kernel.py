@@ -787,15 +787,19 @@ def _addrow_fwd_kernel(y_ptr, a_ptr, r_ptr, t_ptr, o_ptr, M, N, BM: tl.constexpr
 
 
 @triton.jit
-def _scale_bwd_kernel(g_ptr, s_ptr, x_ptr, gx_ptr, part_ptr, M, N, BM: tl.constexpr, BN: tl.constexpr):
+def _scale_bwd_kernel(g_ptr, s_ptr, x_ptr, mu_ptr, gx_ptr, part_ptr, M, N, BM: tl.constexpr, BN: tl.constexpr,
+                      HAS_MU: tl.constexpr):
     """the backward of out = x * s (s per column, bf16): gx = bf16(g * s), and per row block the column sums of
-    bf16(g * x) in fp32 (the scale's gradient, summed over the blocks afterwards)"""
+    bf16(g * x) in fp32 (the scale's gradient, summed over the blocks afterwards); HAS_MU: x is bf16(x - mu) (mu per
+    column, bf16; the difference in fp32, as (x.float() - mu.float()).to(bf16))"""
     pm = tl.program_id(0); pn = tl.program_id(1)
     rows = pm * BM + tl.arange(0, BM); cols = pn * BN + tl.arange(0, BN)
     m = (rows[:, None] < M) & (cols[None, :] < N)
     off = rows[:, None] * N + cols[None, :]
     g = tl.load(g_ptr + off, mask=m, other=0.0).to(tl.float32)
     x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
+    if HAS_MU:
+        x = (x - tl.load(mu_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)[None, :]).to(tl.bfloat16).to(tl.float32)
     s = tl.load(s_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
     tl.store(gx_ptr + off, (g * s[None, :]).to(tl.bfloat16), mask=m)
     gs = (g * x).to(tl.bfloat16).to(tl.float32)
@@ -810,14 +814,16 @@ def addrow_fwd(y, a, r_bf16):
     return t, o
 
 
-def scale_bwd(g, s_bf16, x):
-    """(bf16(g * s), column sums of bf16(g * x)) for out = x * s, s a per-column bf16 vector; deterministic"""
+def scale_bwd(g, s_bf16, x, mu=None):
+    """(bf16(g * s), column sums of bf16(g * x)) for out = x * s, s a per-column bf16 vector; deterministic. mu (bf16,
+    per column): x is taken as bf16(x - mu)"""
     M, N = g.shape
     gx = torch.empty_like(g)
     BM, BN = 64, 128
     nb = triton.cdiv(M, BM)
     part = torch.empty(nb, N, dtype=torch.float32, device=g.device)
-    _scale_bwd_kernel[(nb, triton.cdiv(N, BN))](g, s_bf16, x, gx, part, M, N, BM=BM, BN=BN)
+    _scale_bwd_kernel[(nb, triton.cdiv(N, BN))](g, s_bf16, x, mu if mu is not None else x, gx, part, M, N, BM=BM, BN=BN,
+                                                HAS_MU=mu is not None)
     return gx, part.sum(0)
 
 
@@ -1193,3 +1199,4 @@ def dequant_i8(q, s):
     o = torch.empty(M, K, dtype=torch.bfloat16, device=q.device)
     _dq_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](q, s, o, M, K, BM=32, BK=128)
     return o
+
