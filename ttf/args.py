@@ -109,14 +109,16 @@ def build_parser():
                         "the dense weight gradient instead (fewer flops and launches; exact g^2 sums, not bit-identical)")
 
     g = ap.add_argument_group("kernels and memory")
-    g.add_argument("--dx", default="int8x2", choices=["bf16", "int8x2", "int8"], help="the input gradient's GEMM "
-                   "(int8x2: gy in two int8 slices on the int8 tensor cores where the summed width is >= 4096, else "
-                   "bf16; as accurate as bf16, the 110M conversion recipe 2.6675 vs 2.6672 with it on every layer. "
-                   "int8: one slice, 7 bits per row of gy, half the GEMM; a 110M run on the old trainer diverged with "
-                   "it, 17 Oct (g_dx8): under test)")
+    g.add_argument("--dx", default="int8", choices=["bf16", "int8x2", "int8"], help="the input gradient's GEMM "
+                   "(int8: gy in one int8 slice per row, 7 bits, on the int8 tensor cores where the summed width is "
+                   ">= 4096, else bf16; 0.8B 1000 steps on goldbug, 26 Oct: wiki / chat / mix +0.0003 / +0.0002 / "
+                   "+0.0023 vs int8x2, the paired train-loss gap -0.003..+0.007 throughout; 27B slice 5.77 -> 5.27 "
+                   "s/step on the laptop. int8x2: two slices, as accurate as bf16, the 110M conversion recipe 2.6675 "
+                   "vs 2.6672)")
     g.add_argument("--tf32", action=ON, default=False, help="the fp32 matrix products on the TF32 tensor cores (10-bit "
                    "mantissa products, fp32 sums: the accumulator's basis turn, the int-k head's products, the sketch "
-                   "cross terms); the orthonormalisation stays in full fp32. Under test")
+                   "cross terms); the orthonormalisation stays in full fp32. 0.8B 1000 steps on goldbug, 26 Oct: level with "
+                   "fp32 (passed, user); off by default, on in the goldbug runs (user)")
     g.add_argument("--fused-layer", action=ON, default=True,
                    help="(default on; --no-fused-layer: the unfused path) int8 ternary layers with row / column scales: the centring, column scale and act-quant in one "
                         "kernel, the GEMM's epilogue with the row scale, bias and the sum of a converted layer's parts, "
@@ -283,7 +285,7 @@ _LEGACY = {
     "--ts_fused": None, "--ts_anneal": _SAME("--ttf-step-p"),
     "--ts_tau_anneal_pow": _keep_if(lambda v: float(v) == 1, lambda v: [], "--ts_tau_anneal_pow"), "--ts_tau_anneal": None,
     "--ts_tau": _SAME("--ttf-tau"), "--ts_b2": _SAME("--ttf-b2"), "--tf32": None,
-    "--int8": None, "--int8_dx": _gone("--int8_dx (the input gradient in one int8 slice)"), "--stop_after": _SAME("--stop-after"),
+    "--int8": None, "--int8_dx": _FLAG("--dx", "int8"), "--stop_after": _SAME("--stop-after"),
     "--snap_every": _SAME("--snap-every"), "--tail_fp32": _FLAG("--tail", "fp32"), "--seed": _SAME("--seed"),
     "--track_flips": _FLAG("--track-flips", None), "--resume": _FLAG("--resume", None), "--out_dir": _SAME("--out-dir"),
     "--lr": _SAME("--lr"), "--warmup": _SAME("--warmup"), "--extend_to": _keep_if(lambda v: int(v) == 0, lambda v: [], "--extend_to"),
@@ -306,7 +308,8 @@ _OLD_OFF = [("--qk_temp", ["--no-qk-temp"]), ("--rc_scale", ["--no-rc-scale"]), 
 _OLD_DEFAULTS = [("--mode", ["--mode", "ttf"]), ("--ckpt_skip", ["--ckpt-skip", "0"]), ("--ts_tau", ["--ttf-tau", "300"]),
                  ("--ts_anneal", ["--ttf-step-p", "1.0"]), ("--lowrank", ["--ttf-rank", "0"]),
                  ("--init_hf_method", ["--convert", "als"]), ("--distill_w", ["--kd-weight", "1.0"]),
-                 ("--mag_wd", ["--adapter-wd", "0.0"]), ("--kd_mode", ["--kd-cache-mode", "renorm"])]
+                 ("--mag_wd", ["--adapter-wd", "0.0"]), ("--kd_mode", ["--kd-cache-mode", "renorm"]),
+                 ("--int8_dx", ["--dx", "int8x2"])]
 _OLD_BOOL = {"--qk_temp", "--ts", "--init_stream", "--data_u32", "--ts_vdiag", "--ts_nomom", "--lr_linear",
              "--lean_batched", "--lean_tail", "--ts_fire_fused", "--fused_norm", "--fused_scales", "--ts_micro",
              "--ckpt_block", "--no_final_save", "--mem_report", "--ts_offload", "--ts_fused", "--ts_tau_anneal", "--tf32",

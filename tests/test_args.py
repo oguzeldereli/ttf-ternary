@@ -19,7 +19,7 @@ def test_defaults_are_the_recipe():
     a = A.parse([])
     assert (a.mode, a.ttf_rank, a.ttf_theta, a.ttf_tau, a.ttf_step_p) == ("ttf", 512, 16.0, 1000.0, 0.75)
     assert a.adapter_rank == 16 and a.adapter_wd == 0.1 and a.qk_temp and a.rc_scale
-    assert a.factored_k == 256 and a.tail == "fp32" and a.dx == "int8x2"
+    assert a.factored_k == 256 and a.tail == "fp32" and a.dx == "int8"
 
 
 @pytest.mark.parametrize("path", sorted(glob.glob(os.path.join(A.RECIPES, "*.toml"))))
@@ -60,7 +60,13 @@ def test_from_legacy_fast_and_master():
     assert m.mode == "bitnet"
 
 
-@pytest.mark.parametrize("extra", ["", " --ts_nomom_x 1", " --lr_spend 1", " --int8_dx", " --dw_fp32", " --hid_kd 0.1",
+def test_from_legacy_dx():
+    """the old trainer's input gradient: --int8_dx one int8 slice; without it bf16, whose equal here is int8x2"""
+    assert A.parse(A.from_legacy(shlex.split(OLD_TTF))).dx == "int8x2"
+    assert A.parse(A.from_legacy(shlex.split(OLD_TTF + " --int8_dx"))).dx == "int8"
+
+
+@pytest.mark.parametrize("extra", ["", " --ts_nomom_x 1", " --lr_spend 1", " --dw_fp32", " --hid_kd 0.1",
                                    " --ts_store_a int8", " --init_hf_method row", " --ts_tau_anneal_pow 0.5",
                                    " --extend_to 9000", " --master_dtype bf16", "-int8", "-ts_tau_anneal", "-tail_fp32", " --grad_accum 2"])
 def test_from_legacy_rejects(extra):
