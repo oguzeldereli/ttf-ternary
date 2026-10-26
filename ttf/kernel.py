@@ -497,84 +497,203 @@ def micro_sketch(G, P, rs, ds, v, M, n_other, b2, bc, norm):
 
 
 @triton.jit
-def _fire_kernel(u_ptr, v_ptr, p_ptr, d_ptr, c_ptr, N, K, K5, R, sun, svk, spn, sdn, theta,
-                 RC: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr, PREC: tl.constexpr):
-    """one tile of packed bytes: for each of the 5 trit digits, A = U V^T on those columns (fp32 accumulation; PREC
-    'tf32x3' keeps fp32 accuracy on the tensor cores), the legal moves applied to the digit, the moves written to D
-    (int8), the bytes stored back; the tile's number of moves and change of the nonzero count added to c[0], c[1]"""
+def _fire_kernel(ub_ptr, vb_ptr, u_ptr, v_ptr, un_ptr, vn_ptr, p_ptr, d_ptr, s_ptr, N, K, K5, R, sun, svk, spn, sdn,
+                 theta, eb, NPK, SLOTS: tl.constexpr, RC: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr):
+    """one tile of packed bytes, for each of the 5 trit digits: A = U V^T on those columns from bf16 copies (fp32
+    accumulation), with the entry's bound on the bf16 error, eb |u_n| |v_k| (Cauchy-Schwarz; eb covers the two bf16
+    roundings and the fp32 sums). Sure entries are decided here (|A| - bound >= theta: the move, the sign is certain;
+    |A| + bound < theta: none) and written to D; the rest (real data: 1e-6 .. 6e-4 of the entries) are listed in the
+    tile's SLOTS slots (s, the entry's n K + k; -1 empty) for _fire_fix_kernel's exact fp32 dot. A digit whose list
+    would overflow the slots is decided here with tf32x3 instead. The trits are not written (_fire_apply_kernel)."""
+    pn = tl.program_id(0); pk = tl.program_id(1)
+    rows = pn * BN + tl.arange(0, BN)
+    k5 = pk * BK5 + tl.arange(0, BK5)
+    rm = rows[:, None] < N
+    pm = rm & (k5[None, :] < K5)
+    b = tl.load(p_ptr + rows[:, None] * spn + k5[None, :], mask=pm, other=0).to(tl.int32)
+    un = tl.load(un_ptr + rows, mask=rows < N, other=0.0)
+    sbase = (pn * NPK + pk).to(tl.int64) * SLOTS
+    nsl = 0
+    pw = 1
+    for i in tl.static_range(5):
+        k = k5 * 5 + i
+        km = k[None, :] < K
+        dig = (b // pw) % 3
+        a = tl.zeros((BN, BK5), dtype=tl.float32)
+        for r0 in range(0, R, RC):
+            rr = r0 + tl.arange(0, RC)
+            u = tl.load(ub_ptr + rows[:, None] * sun + rr[None, :], mask=rm & (rr[None, :] < R), other=0.0)
+            v = tl.load(vb_ptr + k[:, None] * svk + rr[None, :], mask=(k[:, None] < K) & (rr[None, :] < R), other=0.0)
+            a += tl.dot(u, tl.trans(v))
+        vn = tl.load(vn_ptr + k, mask=k < K, other=0.0)
+        bd = eb * un[:, None] * vn[None, :]
+        ok = pm & km
+        amb = ok & (tl.abs(a) + bd >= theta) & (tl.abs(a) - bd < theta)
+        flat = tl.reshape(amb.to(tl.int32), (BN * BK5,))
+        na = tl.sum(flat, axis=0)
+        if nsl + na > SLOTS:                                  # (rare: the digit decided with tf32x3 here)
+            a = tl.zeros((BN, BK5), dtype=tl.float32)
+            for r0 in range(0, R, RC):
+                rr = r0 + tl.arange(0, RC)
+                u = tl.load(u_ptr + rows[:, None] * sun + rr[None, :], mask=rm & (rr[None, :] < R), other=0.0)
+                v = tl.load(v_ptr + k[:, None] * svk + rr[None, :], mask=(k[:, None] < K) & (rr[None, :] < R), other=0.0)
+                a += tl.dot(u, tl.trans(v), input_precision="tf32x3")
+            bd = tl.zeros((BN, BK5), dtype=tl.float32)
+            amb = ok & (a != a)                               # (none)
+        else:
+            pos = nsl + tl.cumsum(flat, axis=0) - 1
+            ent = tl.reshape(rows[:, None].to(tl.int64) * K + k[None, :], (BN * BK5,))
+            tl.store(s_ptr + sbase + pos, ent, mask=flat > 0)
+            nsl += na
+        d = tl.where(a > 0, 1, tl.where(a < 0, -1, 0))
+        fire = ok & (tl.abs(a) - bd >= theta) & (tl.abs(dig - 1 + d) <= 1)
+        tl.store(d_ptr + rows[:, None] * sdn + k[None, :], tl.where(fire, d, 0).to(tl.int8), mask=rm & km)
+        pw = pw * 3
+
+
+@triton.jit
+def _fire_fix_kernel(u_ptr, v_ptr, p_ptr, d_ptr, s_ptr, n_slots, K, R, sun, svk, spn, sdn, theta,
+                     BE: tl.constexpr, RC: tl.constexpr):
+    """the listed entries: A_nk = u_n . v_k in fp32 (FMAs), the move decided as in _fire_kernel, written to D"""
+    pe = tl.program_id(0) * BE + tl.arange(0, BE)
+    ent = tl.load(s_ptr + pe, mask=pe < n_slots, other=-1)
+    live = ent >= 0
+    if tl.sum(live.to(tl.int32), axis=0) > 0:
+        n = tl.where(live, ent // K, 0); k = tl.where(live, ent % K, 0)
+        a = tl.zeros((BE,), dtype=tl.float32)
+        for r0 in range(0, R, RC):
+            rr = r0 + tl.arange(0, RC)
+            m = live[:, None] & (rr[None, :] < R)
+            u = tl.load(u_ptr + n[:, None] * sun + rr[None, :], mask=m, other=0.0)
+            v = tl.load(v_ptr + k[:, None] * svk + rr[None, :], mask=m, other=0.0)
+            a += tl.sum(u * v, axis=1)
+        byte = tl.load(p_ptr + n * spn + k // 5, mask=live, other=0).to(tl.int32)
+        pw = tl.where(k % 5 == 0, 1, tl.where(k % 5 == 1, 3, tl.where(k % 5 == 2, 9, tl.where(k % 5 == 3, 27, 81))))
+        dig = (byte // pw) % 3
+        d = tl.where(a > 0, 1, tl.where(a < 0, -1, 0))
+        fire = live & (tl.abs(a) >= theta) & (tl.abs(dig - 1 + d) <= 1)
+        tl.store(d_ptr + n * sdn + k, d.to(tl.int8), mask=fire)
+
+
+@triton.jit
+def _fire_apply_kernel(p_ptr, d_ptr, c_ptr, ek_ptr, er_ptr, n_ptr, N, K, K5, spn, sdn, NPK,
+                       SL: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr):
+    """the moves D applied to the packed trits of one tile; the number of moves and the change of the nonzero count
+    into c; the tile's moves listed for _spend_kernel (n: their number; ek: the column, er: the row in the tile, sign in
+    its bit 8; more than SL: n only, the spend reads the tile's D)"""
     pn = tl.program_id(0); pk = tl.program_id(1)
     rows = pn * BN + tl.arange(0, BN)
     k5 = pk * BK5 + tl.arange(0, BK5)
     pm = (rows[:, None] < N) & (k5[None, :] < K5)
     b = tl.load(p_ptr + rows[:, None] * spn + k5[None, :], mask=pm, other=0).to(tl.int32)
+    t = pn * NPK + pk
     nb = tl.zeros((BN, BK5), dtype=tl.int32)
     nmv = tl.zeros((BN, BK5), dtype=tl.int32); dnz = tl.zeros((BN, BK5), dtype=tl.int32)
+    nl = 0
     pw = 1
     for i in tl.static_range(5):
         k = k5 * 5 + i
         dig = (b // pw) % 3
-        a = tl.zeros((BN, BK5), dtype=tl.float32)
-        for r0 in range(0, R, RC):
-            rr = r0 + tl.arange(0, RC)
-            u = tl.load(u_ptr + rows[:, None] * sun + rr[None, :], mask=(rows[:, None] < N) & (rr[None, :] < R), other=0.0)
-            v = tl.load(v_ptr + k[:, None] * svk + rr[None, :], mask=(k[:, None] < K) & (rr[None, :] < R), other=0.0)
-            a += tl.dot(u, tl.trans(v), input_precision=PREC)
-        d = tl.where(a > 0, 1, tl.where(a < 0, -1, 0))
-        fire = (tl.abs(a) >= theta) & (tl.abs(dig - 1 + d) <= 1) & (k[None, :] < K) & pm
-        dd = tl.where(fire, d, 0)
-        nmv += tl.where(fire, 1, 0)
-        dnz += tl.where(fire, tl.where(dig - 1 + dd != 0, 1, 0) - tl.where(dig - 1 != 0, 1, 0), 0)
+        dd = tl.load(d_ptr + rows[:, None] * sdn + k[None, :], mask=pm & (k[None, :] < K), other=0).to(tl.int32)
+        mv = dd != 0
+        nmv += tl.where(mv, 1, 0)
+        dnz += tl.where(mv, tl.where(dig - 1 + dd != 0, 1, 0) - tl.where(dig - 1 != 0, 1, 0), 0)
         nb += (dig + dd) * pw
-        tl.store(d_ptr + rows[:, None] * sdn + k[None, :], dd.to(tl.int8), mask=(rows[:, None] < N) & (k[None, :] < K))
+        flat = tl.reshape(mv.to(tl.int32), (BN * BK5,))
+        pos = nl + tl.cumsum(flat, axis=0) - 1
+        put = (flat > 0) & (pos < SL)
+        tl.store(ek_ptr + t * SL + pos, tl.reshape(k[None, :] + rows[:, None] * 0, (BN * BK5,)), mask=put)
+        er = tl.arange(0, BN)[:, None] + tl.where(dd < 0, 256, 0)
+        tl.store(er_ptr + t * SL + pos, tl.reshape(er, (BN * BK5,)), mask=put)
+        nl += tl.sum(flat, axis=0)
         pw = pw * 3
     tl.store(p_ptr + rows[:, None] * spn + k5[None, :], nb.to(tl.uint8), mask=pm)
+    tl.store(n_ptr + t, nl)
     tl.atomic_add(c_ptr, tl.sum(tl.sum(nmv, axis=1), axis=0))
     tl.atomic_add(c_ptr + 1, tl.sum(tl.sum(dnz, axis=1), axis=0))
 
 
+@triton.jit
+def _spend_kernel(d_ptr, v_ptr, o_ptr, ek_ptr, er_ptr, n_ptr, N, K, R, sdn, svk, son, NPK,
+                  SL: tl.constexpr, BM: tl.constexpr, BK5: tl.constexpr, BR: tl.constexpr):
+    """D V (D the int8 moves [N, K], V fp32 [K, R]) for a band of BM rows (the apply tiles' rows): over the band's
+    tiles that moved only, a tile's listed moves as a [BM, SL] signed one-hot against their V rows (a tile with more
+    than SL moves: its D); V split into three bf16 parts (high / middle / low: ~fp32, the products with D exact),
+    fp32 sums in a fixed order"""
+    pn = tl.program_id(0)
+    rows = pn * BM + tl.arange(0, BM)
+    rr = tl.program_id(1) * BR + tl.arange(0, BR)
+    acc = tl.zeros((BM, BR), dtype=tl.float32)
+    sl = tl.arange(0, SL)
+    for pk in range(0, NPK):
+        t = pn * NPK + pk
+        n = tl.load(n_ptr + t)
+        if n > 0:
+            if n <= SL:
+                ek = tl.load(ek_ptr + t * SL + sl, mask=sl < n, other=0)
+                er = tl.load(er_ptr + t * SL + sl, mask=sl < n, other=0)
+                sg = tl.where(er >= 256, -1.0, 1.0)
+                oh = tl.where((tl.arange(0, BM)[:, None] == (er % 256)[None, :]) & (sl < n)[None, :], sg[None, :], 0.0)
+                v = tl.load(v_ptr + ek[:, None] * svk + rr[None, :], mask=(sl < n)[:, None] & (rr[None, :] < R), other=0.0)
+                db = oh.to(tl.bfloat16)
+                vh = v.to(tl.bfloat16); r1 = v - vh.to(tl.float32); vm = r1.to(tl.bfloat16)
+                vl = (r1 - vm.to(tl.float32)).to(tl.bfloat16)
+                acc += tl.dot(db, vh) + tl.dot(db, vm) + tl.dot(db, vl)
+            else:
+                for c0 in range(0, BK5 * 5, 32):
+                    kk = pk * BK5 * 5 + c0 + tl.arange(0, 32)
+                    d = tl.load(d_ptr + rows[:, None] * sdn + kk[None, :], mask=(rows[:, None] < N) & (kk[None, :] < K),
+                                other=0)
+                    v = tl.load(v_ptr + kk[:, None] * svk + rr[None, :], mask=(kk[:, None] < K) & (rr[None, :] < R),
+                                other=0.0)
+                    db = d.to(tl.bfloat16)
+                    vh = v.to(tl.bfloat16); r1 = v - vh.to(tl.float32); vm = r1.to(tl.bfloat16)
+                    vl = (r1 - vm.to(tl.float32)).to(tl.bfloat16)
+                    acc += tl.dot(db, vh) + tl.dot(db, vm) + tl.dot(db, vl)
+    tl.store(o_ptr + rows[:, None] * son + rr[None, :], acc, mask=(rows[:, None] < N) & (rr[None, :] < R))
+
+
 FIRE_TILE = None          # ttf_fire tiles (rows, packed bytes of 5 columns, rank chunk); None: by rank
-FIRE_PREC = ["tf32x3"]     # ttf_fire's A: "tf32x3" (tensor cores, ~fp32 accuracy) or "ieee" (fp32 FMAs, slower)
-FIRE_SPEND = ["dense"]     # ttf_fire's D V: "dense" (no host sync: three bf16 GEMMs of the int8 moves against V split into
-                           # high / middle / low parts, ~fp32 accuracy) or "sparse" (the moves' indices: one host sync per
-                           # layer, which stalls the CPU's queue of launches; before 23 Oct)
+FIRE_SLOTS = 32           # ttf_fire: listed (uncertain) entries per tile before the tile decides itself in tf32x3
+FIRE_EB = 2.0 ** -7 * 1.05    # the bf16 bound's factor: two roundings of 2^-8 each (+ their product, the fp32 sums: 5%)
 
 
 def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, theta: float, Vs=None):
-    """TTF firing in one pass: A = U V^T (fp32 accumulation), every legal move (|A| >= theta, the trit stays in
-    {-1, 0, 1}) applied to the packed trits in place; returns D V (D the moves, {-1, 0, 1}; from the moves alone, a
-    sparse product) for the spend, and the number of moves (a device tensor). The fp32 [N, K] accumulator and the
-    unpacked trits are never formed (D is int8). Differences from the unfused path: A's sums in another order and
-    precision (rounding level), so an entry within rounding of theta may decide otherwise. Vs [K, r]: the spend's
-    basis (D Vs instead of D V: --ttf-hspend)"""
+    """TTF firing: A = U V^T, every legal move (|A| >= theta, the trit stays in {-1, 0, 1}) applied to the packed trits
+    in place; returns D V (D the moves, {-1, 0, 1}) for the spend, the number of moves and the change of the nonzero
+    count (device tensors; no host sync). A is formed from bf16 copies with a per-entry error bound; only the entries
+    the bound leaves uncertain are recomputed in fp32 (_fire_kernel / _fire_fix_kernel), so a decision is the fp32
+    one (sums in another order: rounding level). The fp32 [N, K] accumulator and the unpacked trits are never formed
+    (D is int8); D V runs over D's nonzero tiles only (_spend_kernel). Vs [K, r]: the spend's basis (D Vs instead of
+    D V: --ttf-hspend)"""
     N, R = U.shape
     K5 = packed.shape[1]
     U = U.contiguous().float(); V = V.contiguous().float()
+    Ub, Vb = U.to(torch.bfloat16), V.to(torch.bfloat16)
+    un, vn = U.norm(dim=1), V.norm(dim=1)
     D = torch.empty(N, K, dtype=torch.int8, device=U.device)
+    BN, BK5, RC = FIRE_TILE if FIRE_TILE else (64, 32, 64)            # (best measured, laptop 4080: 27B shapes)
+    g = (triton.cdiv(N, BN), triton.cdiv(K5, BK5))
+    S = torch.full((g[0] * g[1] * FIRE_SLOTS,), -1, dtype=torch.int64, device=U.device)
+    _fire_kernel[g](Ub, Vb, U, V, un, vn, packed, D, S, N, K, K5, R, U.stride(0), V.stride(0), packed.stride(0),
+                    D.stride(0), float(theta), FIRE_EB, g[1], SLOTS=FIRE_SLOTS, RC=RC, BN=BN, BK5=BK5,
+                    num_warps=4, num_stages=3)
+    BE = 64
+    _fire_fix_kernel[(triton.cdiv(S.numel(), BE),)](U, V, packed, D, S, S.numel(), K, R, U.stride(0), V.stride(0),
+                                                     packed.stride(0), D.stride(0), float(theta), BE=BE, RC=64)
     cnt = torch.zeros(2, dtype=torch.int32, device=U.device)          # (the number of moves, the change of nonzeros)
-    BN, BK5, RC = FIRE_TILE if FIRE_TILE else ((64, 32, 32) if R <= 512 else (64, 64, 32))   # best measured (4070 Ti S)
-    _fire_kernel[(triton.cdiv(N, BN), triton.cdiv(K5, BK5))](U, V, packed, D, cnt, N, K, K5, R, U.stride(0), V.stride(0),
-                                                              packed.stride(0), D.stride(0), float(theta),
-                                                              RC=RC, BN=BN, BK5=BK5, PREC=FIRE_PREC[0])
+    AN, AK5, SL = 16, 32, 16                                           # (the apply tile: the spend's band and list)
+    ga = (triton.cdiv(N, AN), triton.cdiv(K5, AK5))
+    ek = torch.empty(ga[0] * ga[1] * SL, dtype=torch.int32, device=U.device); er = torch.empty_like(ek)
+    nmv = torch.empty(ga[0] * ga[1], dtype=torch.int32, device=U.device)
+    _fire_apply_kernel[ga](packed, D, cnt, ek, er, nmv, N, K, K5, packed.stride(0), D.stride(0), ga[1],
+                           SL=SL, BN=AN, BK5=AK5)
     Vs = V if Vs is None else Vs.contiguous().float()
-    if FIRE_SPEND[0] == "dense":                                       # D V without the moves' indices (no host sync)
-        Vh = Vs.to(torch.bfloat16); r_ = Vs - Vh.float(); Vm = r_.to(torch.bfloat16); Vl = (r_ - Vm.float()).to(torch.bfloat16)
-        dU = torch.empty(N, R, dtype=torch.float32, device=U.device)
-        for a0 in range(0, N, 8192):                                   # (row chunks: the bf16 copy of D stays small)
-            Db = D[a0:a0 + 8192].to(torch.bfloat16)                    # (exact: D is -1 / 0 / 1)
-            dU[a0:a0 + 8192] = (torch.mm(Db, Vh, out_dtype=torch.float32) + torch.mm(Db, Vm, out_dtype=torch.float32)
-                                + torch.mm(Db, Vl, out_dtype=torch.float32))
-        return dU, cnt[0], cnt[1]
-    nz = D.nonzero()                                                    # the moves (one host sync)
-    dU = torch.zeros(N, R, dtype=torch.float32, device=U.device)
-    for c0 in range(0, nz.shape[0], 1 << 16):                          # in chunks: moves x r floats at a time
-        z_ = nz[c0:c0 + (1 << 16)]
-        dU.index_add_(0, z_[:, 0], D[z_[:, 0], z_[:, 1]].float()[:, None] * Vs[z_[:, 1]])
-    # the change of the nonzero count, from the moved entries alone (a move is one level: it ends on a nonzero trit
-    # (+1) or on zero (-1)), so the layer's beta follows exactly without a scan of all the trits
-    byte = packed[nz[:, 0], torch.div(nz[:, 1], 5, rounding_mode="floor")].long()
-    new_t = torch.div(byte, torch.pow(3, nz[:, 1] % 5), rounding_mode="floor") % 3 - 1
-    dnnz = 2 * (new_t != 0).sum() - nz.shape[0]
-    return dU, torch.tensor(nz.shape[0], device=U.device), dnnz
+    dU = torch.empty(N, R, dtype=torch.float32, device=U.device)
+    BR = 256
+    _spend_kernel[(ga[0], triton.cdiv(R, BR))](D, Vs, dU, ek, er, nmv, N, K, R, D.stride(0), Vs.stride(0), dU.stride(0),
+                                              ga[1], SL=SL, BM=AN, BK5=AK5, BR=BR)
+    return dU, cnt[0], cnt[1]
 
 
 @triton.jit

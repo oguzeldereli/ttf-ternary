@@ -74,27 +74,57 @@ def test_codec_fp12():
         assert torch.equal((U._unpack12(ref, n).float() * sc).view(torch.int32), unpack12_scaled(new, sc).view(torch.int32))
 
 
-def test_fire_fused():
+@pytest.mark.parametrize("slots", [32, 1])
+def test_fire_fused(slots):
+    """ttf_fire against the fp64 decisions: the moves equal them outside a rounding band of theta, the trits, the
+    move count, the nonzero count and D V follow the kernel's own moves; slots 1: the tiles overflow their list and
+    decide in tf32x3"""
     from ttf import kernel as K_
     from ttf.kernel import ttf_fire, pack_rows, unpack_rows, trit_nnz
-    for N, K, r in ((300, 203, 40), (1024, 777, 64)):
-        Uu = torch.randn(N, r, device=dev); V = torch.linalg.qr(torch.randn(K, r, device=dev))[0]
-        A = Uu @ V.T
-        theta = float(A.abs().flatten()[::7].quantile(0.99))
-        w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8); p = pack_rows(w)
-        d = A.sign(); fire = (A.abs() >= theta) & ((w.float() + d).abs() <= 1)
-        D = torch.where(fire, d, torch.zeros_like(d)); p_ref = pack_rows(w + D.to(torch.int8))
-        for spend in ("dense", "sparse"):                                # (dense: no host sync, the default since 23 Oct)
-            K_.FIRE_SPEND[0] = spend
+    K_.FIRE_SLOTS = slots
+    try:
+        for N, K, r in ((300, 203, 40), (1024, 777, 64), (700, 1500, 1024)):
+            g = torch.Generator(device=dev).manual_seed(N)
+            Uu = torch.randn(N, r, device=dev, generator=g)
+            V = torch.linalg.qr(torch.randn(K, r, device=dev, generator=g))[0]
+            A = Uu.double() @ V.double().T
+            theta = float(A.abs().flatten()[::7].quantile(0.99))
+            w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8, generator=g); p = pack_rows(w)
+            d = A.sign(); fire = (A.abs() >= theta) & ((w.double() + d).abs() <= 1)
+            D = torch.where(fire, d, torch.zeros_like(d))
             p2 = p.clone(); dU, nf, dnnz = ttf_fire(Uu, V, p2, K, theta)
-            assert int(trit_nnz(p2, K)) == int(trit_nnz(p, K)) + int(dnnz), (N, K, r, spend)   # beta's count follows
-            near = int(((A.abs() - theta).abs() < 1e-5 * theta).sum())
-            moved = unpack_rows(p2, K) != unpack_rows(p, K)
-            assert int((unpack_rows(p2, K) != unpack_rows(p_ref, K)).sum()) <= near
-            assert int(nf) == int(moved.sum()), (int(nf), int(moved.sum()), spend)
-            Dk = (unpack_rows(p2, K).float() - unpack_rows(p, K).float())   # (the kernel's own moves)
-            assert float((dU - Dk @ V).norm() / (Dk @ V).norm().clamp_min(1e-30)) < 1e-5, spend
-        K_.FIRE_SPEND[0] = "dense"
+            assert int(trit_nnz(p2, K)) == int(trit_nnz(p, K)) + int(dnnz), (N, K, r)
+            Dk = (unpack_rows(p2, K).double() - unpack_rows(p, K).double())   # (the kernel's own moves)
+            near = (A.abs() - theta).abs() < 1e-5 * theta
+            assert int(((Dk != D) & ~near).sum()) == 0, (N, K, r, int(((Dk != D) & ~near).sum()))
+            assert int(nf) == int((Dk != 0).sum())
+            assert float((dU.double() - Dk @ V.double()).norm() / (Dk @ V.double()).norm().clamp_min(1e-30)) < 1e-6
+    finally:
+        K_.FIRE_SLOTS = 32
+
+
+def test_fire_near_theta():
+    """entries placed within 1e-4 .. 1e-2 of theta (relative), far inside the bf16 error: the decisions are the fp64
+    ones except within 1e-6 of theta"""
+    from ttf.kernel import ttf_fire, pack_rows, unpack_rows
+    N, K, r = 512, 640, 640                                # (square V: A0 is in its span)
+    g = torch.Generator(device=dev).manual_seed(3)
+    V = torch.linalg.qr(torch.randn(K, r, device=dev, generator=g, dtype=torch.float64))[0]
+    A0 = torch.randn(N, K, device=dev, generator=g, dtype=torch.float64)
+    theta = 1.0
+    sel = torch.rand(N, K, device=dev, generator=g) < 0.05
+    off = 10 ** (-2 - 2 * torch.rand(N, K, device=dev, generator=g, dtype=torch.float64))
+    sg = torch.where(torch.rand(N, K, device=dev, generator=g) < 0.5, -1.0, 1.0).double()
+    A0 = torch.where(sel, A0.sign() * theta * (1 + sg * off), A0 * 0.3)
+    Uu = (A0 @ V).float()                                  # A = U V^T: the part of A0 in V's span
+    A = Uu.double() @ V.double().T
+    w = torch.zeros(N, K, device=dev, dtype=torch.int8); p = pack_rows(w)
+    D = torch.where(A.abs() >= theta, A.sign(), torch.zeros_like(A))
+    p2 = p.clone(); ttf_fire(Uu, V.float(), p2, K, theta)
+    Dk = unpack_rows(p2, K).double()
+    near = (A.abs() - theta).abs() < 1e-6
+    assert int(((A.abs() - theta).abs() < 1e-2).sum()) > 1000             # (the test has uncertain entries)
+    assert int(((Dk != D) & ~near).sum()) == 0
 
 
 def test_dx_int8x2():
