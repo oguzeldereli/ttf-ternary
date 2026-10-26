@@ -21,6 +21,9 @@ def test_supersedes_and_ingest(tmp_path):
     n1 = R.add("note", db, text="a")
     R.add("note", db, text="b", supersedes=n1)
     assert R.current(R.load(db))[n1]["text"] == "b"
+    n3 = R.add("note", db, text="c", supersedes=R.load(db)[-1]["id"])   # a correction of the correction
+    cur = R.current(R.load(db))
+    assert cur[n1]["text"] == "c" and cur[n1]["id"] == n3 and len(cur) == 1
     rid = R.add("run", other, name="y")
     assert R.ingest([other], db) == (1, 0)
     assert R.ingest([other], db) == (0, 1)          # idempotent

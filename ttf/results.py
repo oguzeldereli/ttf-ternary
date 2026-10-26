@@ -157,10 +157,14 @@ def load(path=None):
 
 
 def current(records):
-    """the records in force: {id: record}, a record that supersedes another replacing it under the old id"""
-    cur = {}
+    """the records in force: {id: record}, a record that supersedes another replacing it under the first id of the
+    chain (a correction of a correction replaces both)"""
+    cur, first = {}, {}
     for r in records:
-        cur[r.get("supersedes") or r["id"]] = r
+        s = r.get("supersedes")
+        k = first.get(s, s) if s else r["id"]
+        first[r["id"]] = k
+        cur[k] = r
     return cur
 
 
