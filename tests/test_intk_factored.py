@@ -348,6 +348,28 @@ def test_theta_mult(path):
     assert moved[1.0] > moved[4.0] > 0 and moved[math.inf] == 0, moved
 
 
+@pytest.mark.parametrize("path", ["factored", "dense"])
+def test_moves_per_matrix(path):
+    """update.ts_step logs the step's code moves per int-k matrix (intk_moves_emb / intk_moves_head); one step: each
+    moved code moved once"""
+    N, K = 100, 64
+    IE.ROWS[0] = 8192
+    st, want = {}, {}
+    for idx, name in ((20_000, "emb"), (20_001, "head")):
+        m = _mat(N, K, idx=idx, s_const=False); c0 = m.codes.clone()
+        gy, x = _factors(16, N, K, idx)
+        if path == "factored":
+            m._ts_state, m._ts_cfg = st, _cfg(theta=0.05)
+            m.add_part(("d", gy, x))
+        else:
+            m._G = gy.T @ x
+            m.step(U.ts_layer, st, _cfg(theta=0.05))
+        want["intk_moves_" + name] = int((m.codes != c0).sum())
+    info = U.ts_step(None, st, {})
+    assert all(info[k] == v for k, v in want.items()) and min(want.values()) > 0, (info, want)
+    assert info["ts_frac"] == sum(want.values()) / (2 * N * K)
+
+
 def test_dense_step_bf16_group_parameters():
     """--intk-update dense with bf16 lo / s (a bf16 / lean tail): step() hands their gradients in their dtype (25 Oct:
     an fp32 gradient assigned to a bf16 parameter raised)"""

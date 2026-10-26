@@ -61,7 +61,7 @@ class IntKMatrix(nn.Module):
         if len(self._parts) >= self.n_parts:
             parts, self._parts = self._parts, []
             if self._ts_state is not None and self._ts_cfg is not None and math.isfinite(self.theta_mult):
-                _intk_update(self, parts, self._ts_state, self._ts_cfg)
+                _counted(self, self._ts_state, _intk_update, self, parts, self._ts_state, self._ts_cfg)
 
     def dequant(self):
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()
@@ -116,9 +116,18 @@ class IntKMatrix(nn.Module):
         gq = (gW * self.s.detach()[..., None]).reshape(self.N, self.K)
         del gW, q, G_
         if self.N * self.K > CHUNKED_ABOVE[0]:
-            ttf_rows(self, gq, state, c)
+            _counted(self, state, ttf_rows, self, gq, state, c)
         else:
-            ts_layer(self, gq, state, dict(c, micro=1))
+            _counted(self, state, ts_layer, self, gq, state, dict(c, micro=1))
+
+
+def _counted(l, state, fn, *a):
+    """fn(*a), an update of int-k matrix l; its code moves also counted per matrix (st["_intk_nf"], logged by
+    update.ts_step as intk_moves_emb / intk_moves_head: the share of trits moved, ts_frac, includes them)"""
+    st = state.setdefault("_ts", {}); n0 = st.get("_nf", 0)
+    fn(*a)
+    k = "intk_moves_" + ("head" if getattr(l, "_ts_idx", 0) == 20_001 else "emb")   # (a tied matrix: emb)
+    d = st.setdefault("_intk_nf", {}); d[k] = d.get(k, 0) + (st.get("_nf", 0) - n0)
 
 
 CHUNKED_ABOVE = [400_000_000]   # entries: larger matrices (27B: 248320 x 5120) take ttf_rows (bounded temporaries)

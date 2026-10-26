@@ -778,6 +778,8 @@ def ts_step(model, state, c):
     st = state.setdefault("_ts", {})
     nf, nt = st.pop("_nf", 0), st.pop("_nt", 0)
     info = {"ts_frac": float(nf) / max(nt, 1)}
+    for k_, n_ in st.pop("_intk_nf", {}).items():          # --intk-emb: code moves this step, per matrix
+        info[k_] = int(n_)
     for k_, (tot, n_) in st.pop("_dg", {}).items():      # --ttf-vdiag: means over layers this step
         info["dg_" + k_] = tot / max(n_, 1)
     for k_, x_ in st.pop("_dgmax", {}).items():           # --ttf-vdiag: maxima over layers this step
