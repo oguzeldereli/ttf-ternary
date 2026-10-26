@@ -589,14 +589,15 @@ def test_group_sums():
     assert torch.allclose(s0.double(), Gg.sum(-1), atol=1e-5) and torch.allclose(s1.double(), (Gg * q.view(300, 10, 64).double()).sum(-1), atol=1e-4)
 
 
-def test_dense_acc():
+@pytest.mark.parametrize("N,K", [(48, 160), (160, 48)], ids=["rows", "cols"])
+def test_dense_acc(N, K):
     """a layer whose rank covers its rows (N <= r, N < K) holds a dense accumulator: after one micro-batch it equals the
     low-rank one (whose first basis spans u's rows: exact there); over a step of 4 micro-batches it is lk A + the sum of
     the u (the low-rank one drops the evidence outside its fixed basis); a low-rank state from an earlier run becomes
     U V^T; the firing moves where |A| >= theta (legal) and spends theta"""
     from ttf import update as U
     from ttf.kernel import unpack_rows
-    N, K, T = 48, 160, 256
+    T = 256
     gen = torch.Generator(device=dev).manual_seed(5)
     data = [((torch.randn(T, N, device=dev, generator=gen) * 1e-3).to(torch.bfloat16),
              torch.randn(T, K, device=dev, generator=gen).to(torch.bfloat16)) for _ in range(8)]
@@ -612,7 +613,7 @@ def test_dense_acc():
     try:
         l1, s1 = run(True, 1, 1); l0, s0 = run(False, 1, 1)
         A1 = U.load_dense(s1[id(l1)], l1); A0 = U.load_dense(s0[id(l0)], l0)
-        assert U.is_dense_state(s1[id(l1)], N) and not U.is_dense_state(s0[id(l0)], N)
+        assert U.is_dense_state(s1[id(l1)]) and not U.is_dense_state(s0[id(l0)])
         R, C = s1["_ts"][("v", id(l1))]                    # the step's v: u = -lr g / (a_i b_j), in fp64
         c_ = _cfg(); b2 = c_["b2"]
         a = (R.double() / R.double().mean() / (1 - b2)).sqrt(); b = C.double().sqrt()
@@ -624,10 +625,10 @@ def test_dense_acc():
         l1, s1 = run(True, 4, 2); l0, s0 = run(False, 4, 2)
         A1 = U.load_dense(s1[id(l1)], l1); A0 = U.load_dense(s0[id(l0)], l0)
         rel = float((A1 - A0).norm() / A1.norm())
-        assert 1e-3 < rel < 1.0, rel
+        assert (1e-3 < rel < 1.0) if N < K else rel < 2e-2, rel   # (ra = K: the low-rank basis spans all: exact)
         # resume from a low-rank state: converted, then dense
         l2, s2 = run(True, 4, 1, state=s0)
-        assert U.is_dense_state(s2[id(l2)], N)
+        assert U.is_dense_state(s2[id(l2)])
         # firing: theta at A's 99th percentile
         A_ = U.load_dense(s1[id(l1)], l1); th = float(A_.abs().quantile(0.99))
         l3, s3 = run(True, 4, 2, theta=th)

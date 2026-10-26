@@ -760,24 +760,33 @@ DENSE_ACC = [True]     # the dense accumulator where the rank covers the rows (d
 
 
 def dense_acc(l, ra):
-    """the layer's accumulator is held dense, A [N, K]: its rank covers every row (ra = N < K: the adapters' down
-    factors at rank 1024). A U V^T of that rank holds more numbers ((N + K) N) than A (N K), and its fixed basis V within
-    a step drops the step's evidence outside span(V) (_acc_turn); dense, A + u is exact and needs no orth, sketch or
-    turn"""
-    return DENSE_ACC[0] and ra == l.N < l.K
+    """the layer's accumulator is held dense, A [N, K]: its rank is full, ra = min(N, K) (the adapters' factors at
+    rank 1024, the 1024-row projections). A U V^T of that rank holds more numbers than A ((N + K) ra against N K); with
+    ra = N < K its fixed basis V within a step drops the step's evidence outside span(V) (_acc_turn), with ra = K it is
+    exact but pays the basis' products, orth and turn. Dense, A + u is exact and needs none of them"""
+    return DENSE_ACC[0] and ra == min(l.N, l.K)
 
 
-def is_dense_state(t, N):
-    """a stored accumulator tuple is a dense A (not a pair): its first tensor is [N, K] (K > N) or K's 12-bit codes"""
-    w = t[0].shape[1]
-    return w > (3 * ((N + 1) // 2) if t[0].dtype == torch.uint8 else N)
+def _dense_mark(dev):
+    return torch.zeros(0, dtype=torch.int8, device=dev)
+
+
+def is_dense_state(t):
+    """a stored accumulator tuple is a dense A (its codes and an empty int8 marker last), not a low-rank pair"""
+    return len(t) >= 2 and t[-1].numel() == 0 and t[-1].dtype == torch.int8
+
+
+def store_dense(sa, A):
+    """A [N, K] -> the stored tuple: its codes (the --ttf-store codec, or fp32) and the marker"""
+    return (sa(A) if sa else (A,)) + (_dense_mark(A.device),)
 
 
 def load_dense(t, l):
     """the dense A from its stored tuple; from a low-rank pair (an earlier run's state): U V^T"""
-    if not is_dense_state(t, l.N):
+    if not is_dense_state(t):
         U, V = _load_pair(t)
         return U @ V.T
+    t = t[:-1]
     return t[0].float() if len(t) == 1 else _decode(t[0], t[1])
 
 
@@ -791,13 +800,13 @@ def _ts_dense_acc(l, fgb, ia, state, st, key, t, M_, final_, lk, lr_ratio, theta
     A = load_dense(_host_get(state, key, dev, off), l) if key in state else None
     if A is not None and (t - 1) % M_ == 0:
         A = A * lk
-    xb = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    xb = torch.empty(x.shape, dtype=x.dtype, device=x.device)          # (bf16 factors: x diag(ib) rounded to bf16)
     torch.mul(x, ib[None, :], out=xb)
     term = _mmb(gy.T, xb) if gy.dtype == torch.bfloat16 else gy.T.float() @ xb.float(); del xb
     A = (-lr_ratio) * ia[:, None] * term if A is None else torch.addcmul(A, ia[:, None], term, value=-lr_ratio)
     del term
     if not final_:
-        _host_put(state, key, (A,) if (STEP_FP32[0] and sa and not off) or not sa else sa(A), off)
+        _host_put(state, key, store_dense(None if STEP_FP32[0] and not off else sa, A), off)
         return
     A = _dpm(A)            # data parallel: the micro-batches' terms are linear in g: one mean of the step's sum
     before = l.wpacked.clone() if l.track else None
@@ -808,7 +817,7 @@ def _ts_dense_acc(l, fgb, ia, state, st, key, t, M_, final_, lk, lr_ratio, theta
     nf = fire.sum(); del fire
     l.wpacked.copy_(pack_rows(w0 + D.to(torch.int8))); del w0
     A = A.sub_(D, alpha=c["spend"] * theta); del D
-    _host_put(state, key, sa(A) if sa else (A,), off)
+    _host_put(state, key, store_dense(sa, A), off)
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
     if before is not None:
         l._record_flips(before, l.wpacked)

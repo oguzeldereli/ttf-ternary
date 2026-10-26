@@ -24,8 +24,7 @@ class _Stub:
 
 
 def _tally(l, st):
-    U, V = UP._load_pair(st[id(l)])
-    A = U @ V.T
+    A = UP.load_dense(st[id(l)], l)                     # (a pair: U V^T; the full-rank reference: dense)
     bd = st["_ts"].get(("bd", id(l)))
     if bd is not None:
         A.view(-1)[bd[0]] += bd[1]
