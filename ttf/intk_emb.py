@@ -42,7 +42,7 @@ class IntKMatrix(nn.Module):
         self.track, self._ts_host, self._W = False, False, None
         self._parts, self.n_parts = [], 1            # --intk-update factored: the micro-batch's gradient factors (tied: 2)
         self._ts_state = self._ts_cfg = None         # (set by the trainer: lr_state, ts_cfg)
-        self.theta_mult = 1.0                        # --intk-theta-mult: the codes' theta x this (inf: codes frozen)
+        self.theta_mult = 1.0                        # the codes' theta x this: 1 / --emb-lr-mult (inf: codes frozen)
 
     def deq_rows(self, i, j, dtype=torch.bfloat16):
         """rows i:j of W = lo + s q (no autograd)"""
@@ -110,7 +110,7 @@ class IntKMatrix(nn.Module):
         for p, gp in ((self.lo, gW.sum(-1)), (self.s, (gW * q).sum(-1))):
             gp = gp.to(p.dtype)                          # (bf16 lo / s on a bf16 / lean tail)
             p.grad = gp if p.grad is None else p.grad + gp
-        if not math.isfinite(self.theta_mult):        # --intk-theta-mult inf: only the group parameters train
+        if not math.isfinite(self.theta_mult):        # --emb-lr-mult 0: only the group parameters train
             return
         c = dict(c, theta=c["theta"] * self.theta_mult)
         gq = (gW * self.s.detach()[..., None]).reshape(self.N, self.K)

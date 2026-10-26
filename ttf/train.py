@@ -355,10 +355,13 @@ def main():
         assert args.train_emb == "none", "--intk-emb trains the embedding / head itself"
         assert args.mode == "ttf", "--intk-emb: the codes are TTF-trained (--mode ttf)"
         _en = enable_intk_emb if _QWEN else enable_intk_emb_bt
-        assert args.intk_theta_mult == 1.0 or not args.ttf_theta_sched, "--intk-theta-mult with a theta schedule"
+        # the codes at the embedding / head rate, theta / --emb-lr-mult (0.8B 26 Oct: at the body's theta, +0.140 wiki vs
+        # frozen codes; noise-level pulls fired, as the leak passes |E u| > theta / tau)
+        tm_ = 1.0 / args.emb_lr_mult if args.emb_lr_mult > 0 else math.inf
+        assert tm_ == 1.0 or not args.ttf_theta_sched, "--intk-emb with --emb-lr-mult and a theta schedule"
         for m_ in _en(model, args.intk_emb, log=lambda m_: print(m_, flush=True)):
             m_.dp_reduce = _WS > 1 and not _PP          # (data parallel only: --pipe stages are not replicas)
-            m_.theta_mult = args.intk_theta_mult
+            m_.theta_mult = tm_
     if _QWEN and args.train_emb != "none":   # --train-emb: the head (and the embedding) join the float tail (the
         _te = [model.hf.lm_head.weight] + ([model.hf.model.embed_tokens.weight] if args.train_emb == "both" else [])
         for p_ in _te:                        # conversion and the resume freeze them; 0.8B, 22 Oct, theta 64: -0.085 wiki)

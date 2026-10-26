@@ -141,7 +141,8 @@ def build_parser():
                         "the conversion leaves them frozen")
     g.add_argument("--emb-wd", type=float, default=0.0, help="weight decay of the trained embedding / head and the "
                    "int-k group parameters (their own group; 24 Oct: they shared the 0.1 of the float tail)")
-    g.add_argument("--emb-lr-mult", type=float, default=1.0, help="their learning rate x this")
+    g.add_argument("--emb-lr-mult", type=float, default=1.0, help="their learning rate x this; --intk-emb codes: "
+                   "theta / this (the codes move at the embedding / head rate; 0: frozen)")
     g.add_argument("--init-ckpt", default="", help="start a run from a checkpoint's weights (e.g. a pre-converted "
                    "model, saved with --stop-after 0): step 0, a fresh optimizer and TTF state, the same --ext list")
     g.add_argument("--intk-emb", default="", help="E:H[:G]: token embedding / output head as E- / H-bit codes in "
@@ -149,8 +150,6 @@ def build_parser():
     g.add_argument("--intk-update", default="factored", choices=["factored", "dense"],
                    help="--intk-emb: factored (no dense matrix or gradient: the head's loss in chunks from the codes, "
                    "the embedding's update on its rows) or dense (the bf16 matrix and an fp32 gradient sum per step)")
-    g.add_argument("--intk-theta-mult", type=float, default=1.0, help="--intk-emb: the codes' theta = --ttf-theta x this "
-                   "(inf: the codes frozen, only the group mins / steps train)")
     g.add_argument("--kd-cache", default="", help="precomputed teacher top-k targets (scripts/quant/teacher_topk.py)")
     g.add_argument("--kd-cache-mode", default="sample", choices=["renorm", "rest", "sample"],
                    help="sample (needs a cache with tail samples, teacher_topk.py --tail): top k plus the cache's tail "

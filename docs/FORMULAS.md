@@ -43,7 +43,7 @@ Per ternary layer and step, with $\rho_t=(\text{lr}_t/\text{lr}_\text{peak})^{p}
   ($V_s=V+F(CV-V)$, $C$ the correlation of an EMA of $x^\top x$).
 - **Float parts** (embedding, norm gains, row / column scales, adapters, attention temperature): AdamW in fp32
   (`--tail fp32`; `lean`: LeanAdam, the 27B recipes' lean optimizer state). `--intk-emb E:H` instead keeps the embedding / head as E- / H-bit codes in
-  groups trained by the same rule (threshold `--ttf-theta` x `--intk-theta-mult`).
+  groups trained by the same rule (threshold `--ttf-theta` / `--emb-lr-mult`: the codes move at the embedding / head learning rate).
 - **Ternary layer**: $y=\beta\,(r\odot(T\,(c\odot(x-\mu))))+\text{bias}$, $\beta=1/\sqrt{K\rho}$ from the trits'
   nonzero share $\rho$, 8-bit per-token activations, int8 tensor-core GEMMs (exact), the input gradient as two int8
   slices (`--dx int8x2`).

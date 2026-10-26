@@ -328,7 +328,7 @@ def test_bf16_update():
 
 @pytest.mark.parametrize("path", ["factored", "dense"])
 def test_theta_mult(path):
-    """--intk-theta-mult: inf freezes the codes (the group parameters still get their gradients); a larger theta fires
+    """theta_mult (1 / --emb-lr-mult): inf freezes the codes (the group parameters still get their gradients); a larger theta fires
     fewer codes"""
     N, K = 100, 64
     IE.ROWS[0] = 8192
