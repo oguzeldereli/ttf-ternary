@@ -382,6 +382,9 @@ def _orth_(X):
     return torch.linalg.solve_triangular(L2.T, Q, upper=True, left=False)
 
 
+DEFER = [None]   # --pipe, a stage after the first: the last micro-batch's per-layer updates collected here (qwen.pp_train)
+
+
 def ts_layer(l, g, state, c):
     """one layer of TTF (the no-momentum update): g is this layer's gradient (fp32), or its factors (gy, x) with
     --dw factored; c holds the settings and lr_ratio. Called from the layer's backward right after its input gradient
@@ -393,6 +396,9 @@ def ts_layer(l, g, state, c):
     v, the basis turn (_acc_turn), the firing and the spend once per step, on the last micro-batch."""
     from .kernel import unpack_rows, pack_rows
     if getattr(l, "ts_frozen", False):   # (a plug-in's frozen layer: its trits stay, no state)
+        return
+    if DEFER[0] is not None and getattr(l, "_ts_final", True) and int(c.get("micro") or 1) > 1:
+        DEFER[0].append((l, g, state, c))   # (run after the stage's input gradient is sent: same inputs, later)
         return
     if not torch.is_tensor(g):           # --dw factored: the backward passed (gy, x) instead of the dense gradient
         return _ts_layer_factored(l, g, state, c)

@@ -263,6 +263,8 @@ class QwenTern(nn.Module):
         separate ops stage r's send of micro-batch i + 1 waited behind stage r + 1's send of the gradient of i, and that
         behind stage r's receive of it (a deadlock once a message exceeds NCCL's buffer: 27B, 2 x L40S, 25 Oct). Returns
         the last micro-batch's loss (what the loop logs) on every stage. batches: [(x, y, kd_topk or None)]"""
+        from . import update as _U
+        from .layers import _rf
         P = self.pp; r, n = P["rank"], P["n"]; M = len(batches)
         self._ckpt_setup()
         keep, pend = {}, []
@@ -284,10 +286,14 @@ class QwenTern(nn.Module):
 
         def bwd(i, g):
             """backward of micro-batch i with the received gradient g (the last stage: None); returns the gradient for
-            the previous stage (stage 0: None)"""
+            the previous stage (stage 0: None). A stage after the first holds its layers' last-micro-batch updates
+            (the step's basis turn, firing and spend) until that gradient is sent (handover): the previous stage
+            waited for them otherwise (27B r1536, 2 stages: ~4.7 s of orthonormalisation per step in series)"""
             nonlocal last
             hin, out = keep.pop(i)
             pre_bwd(i)
+            if r > 0 and i == M - 1:
+                _U.DEFER[0] = []
             with torch.profiler.record_function("model.bwd"):
                 if r == n - 1:
                     (out / M).backward(); last = out.detach().float()
@@ -306,6 +312,13 @@ class QwenTern(nn.Module):
             pend.append(_pp_isend(fwd(i, recv_f(i)), r + 1))
         hin = recv_f(nw) if nw < M else None
         fi, bi = nw, 0
+        def handover():
+            """the held updates, once the last input gradient is on its way"""
+            d, _U.DEFER[0] = _U.DEFER[0], None
+            for l_, g_, s_, c_ in d or ():
+                with _rf("ttf.update"):
+                    _U.ts_layer(l_, g_, s_, c_)
+
         while fi < M:
             h = fwd(fi, hin); fi += 1
             g = _pp_sendrecv(h, r + 1, *g_meta(bi), dev, pend) if r < n - 1 else None
@@ -316,11 +329,15 @@ class QwenTern(nn.Module):
                     hin = _pp_sendrecv(gin, r - 1, *self._h_meta(batches[fi][0]), dev, pend)
                 else:
                     pend.append(_pp_isend(gin, r - 1))
+                if bi == M:
+                    handover()
         while bi < M:
             g = _pp_recv(*g_meta(bi), r + 1, dev) if r < n - 1 else None
             gin = bwd(bi, g); bi += 1
             if r > 0:
                 pend.append(_pp_isend(gin, r - 1))
+                if bi == M:
+                    handover()
         for w, _buf in pend:
             w.wait()
         return _pp_bcast(last, n - 1)
