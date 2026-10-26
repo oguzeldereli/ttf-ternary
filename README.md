@@ -72,8 +72,9 @@ is an early 60-step probe; a release model (about 40M tokens of recovery with di
 - **Qwen3.8-27B on one 24 GB GPU** (RTX 3090 Ti): converted layer by layer and trained at 32k tokens per step (2 × 8 ×
   2048) in 68.9 s per step, peak 19.7 GB (`recipes/convert-27b.toml`; the whole pipeline: [docs/CONVERT_27B.md](docs/CONVERT_27B.md)).
 - **Micro-batches without a dense gradient** (with `--accum M`): each micro-batch's gradient enters the state and is
-  discarded; 4 × 4 micro-batches match one pass of batch 16 over the full schedule (2.6733 vs 2.6728) at 3.1 instead of
-  7.4 GiB.
+  discarded, and each turns the accumulator's basis exactly as a one-batch step does. 4 × 4 micro-batches matched one
+  pass of batch 16 over the full schedule (2.6733 vs 2.6728, with the basis then held within the step) at 3.1 instead
+  of 7.4 GiB; turning it at every micro-batch is ahead at 600 steps (4.3852 vs 4.4146).
 - **State formats:** a 12-bit accumulator (`--ttf-store fp12s`: per-column scale, sign, 5 exponent and 6 mantissa
   bits, two values in 3 bytes) matches 32 bits; at fixed memory a higher rank in 12 bits beats a lower rank in 32
   (rank 340 at 12 bits 2.7086 vs rank 128 at 32 bits 2.8410).
