@@ -250,9 +250,9 @@ class _Parts:
             elif k == "d":
                 o = _mmb(a[:, i:j].T, y)
             else:
-                sel = (a >= i) & (a < j)
-                o = torch.zeros(j - i, y.shape[1], device=y.device, dtype=torch.float32)
-                o.index_add_(0, a[sel] - i, y[sel].float())
+                sel = ((a >= i) & (a < j))[:, None]        # (masked, not selected: no host sync; the rows are distinct,
+                o = torch.zeros(j - i, y.shape[1], device=y.device, dtype=torch.float32)   # the others add zeros)
+                o.index_add_(0, (a - i).clamp(0, j - i - 1), torch.where(sel, y.float(), 0.0))
             out = o if out is None else out.add_(o)
         return out
 
@@ -273,8 +273,8 @@ class _Parts:
                 elif k == "d":
                     A += _mmb(a[:, i:j], W)
                 else:
-                    sel = (a >= i) & (a < j)
-                    A[sel] = W[a[sel] - i].float()
+                    sel = ((a >= i) & (a < j))[:, None]
+                    A.copy_(torch.where(sel, W[(a - i).clamp(0, j - i - 1)].float(), A))
         out = None
         for (k, _, x), A in zip(self.p, acc):
             o = A if k == "g" else _mmb(x.T, A) if k == "d" else x.T @ A
@@ -518,6 +518,25 @@ def _fire(l, S, Us, V, theta, c, st):
     st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
 
 
+def _row_sums(idx, go, N):
+    """the lookup's gradient by distinct row, with no host sync and the same bits on every run: u [T] the distinct rows
+    of idx [T] in ascending order, padded with N (no row); G [T, K] fp32 their summed go [T, K] rows (zero on the padding).
+    The sums come from an fp64 running sum over the sorted tokens (differences at the segment ends), not from atomics:
+    torch.unique's size is a host sync per micro-batch (2.5 s a step at 27B, the CPU stalled while the GPU drains)
+    and index_add_ over repeated rows adds in a different order on every run"""
+    T = idx.numel()
+    si, perm = torch.sort(idx, stable=True)
+    new = torch.ones(T, dtype=torch.bool, device=idx.device); new[1:] = si[1:] != si[:-1]
+    seg = torch.cumsum(new, 0) - 1                                        # the sorted token's distinct-row index
+    u = torch.full((T,), N, dtype=idx.dtype, device=idx.device).scatter_(0, seg, si)
+    C = torch.cumsum(go[perm].double(), 0)
+    last = torch.full((T,), -1, dtype=torch.long, device=idx.device)
+    last.scatter_reduce_(0, seg, torch.arange(T, device=idx.device), "amax")   # each distinct row's last sorted token
+    Cl = torch.where((last >= 0)[:, None], C[last.clamp(min=0)], 0.0)
+    G = (Cl - torch.cat([torch.zeros_like(Cl[:1]), Cl[:-1]])).float()          # (padding: 0 - the previous, masked below)
+    return u, torch.where((last >= 0)[:, None], G, 0.0)
+
+
 class _EmbFn(torch.autograd.Function):
     """--intk-update factored: the embedding's lookup from the codes (only the batch's rows dequantized); the backward
     hands the TTF update its gradient as the distinct rows' summed dL/dh and returns the group parameters' gradients"""
@@ -529,14 +548,13 @@ class _EmbFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, go):
         (idx,) = ctx.saved_tensors; m = ctx.m
-        u, inv = torch.unique(idx.reshape(-1), return_inverse=True)
-        Gu = torch.zeros(u.numel(), m.K, device=go.device, dtype=torch.float32)
-        Gu.index_add_(0, inv, go.reshape(-1, m.K).float())
+        u, Gu = _row_sums(idx.reshape(-1), go.reshape(-1, m.K), m.N)
+        us = u.clamp(max=m.N - 1)                            # (the padding rows: zero sums, added to the last row)
         Gg = Gu.view(-1, m.K // m.g, m.g)
-        q = m.codes[u].view(-1, m.K // m.g, m.g).float()
+        q = m.codes[us].view(-1, m.K // m.g, m.g).float()
         f32 = dict(dtype=torch.float32, device=go.device)   # summed in fp32, returned in the parameters' dtype (bf16 at 27B)
-        glo = torch.zeros(m.lo.shape, **f32).index_add_(0, u, Gg.sum(-1)).to(m.lo.dtype)
-        gs = torch.zeros(m.s.shape, **f32).index_add_(0, u, (Gg * q).sum(-1)).to(m.s.dtype); del q, Gg
+        glo = torch.zeros(m.lo.shape, **f32).index_add_(0, us, Gg.sum(-1)).to(m.lo.dtype)
+        gs = torch.zeros(m.s.shape, **f32).index_add_(0, us, (Gg * q).sum(-1)).to(m.s.dtype); del q, Gg
         m.add_part(("s", u, Gu))
         return None, glo, gs, None
 

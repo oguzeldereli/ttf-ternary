@@ -167,7 +167,8 @@ def test_embedding_lookup_grads():
     gob = go.to(y.dtype).float()                       # (the lookup's output is bf16: its gradient arrives rounded)
     gW = torch.zeros(N, K).index_add_(0, idx.reshape(-1), gob.reshape(-1, K))
     _, u, Gu = got[0]
-    gW2 = torch.zeros(N, K); gW2[u] = Gu
+    assert torch.all(u[1:] >= u[:-1]) and torch.all(Gu[u == N] == 0)   # ascending distinct rows, padded with N
+    gW2 = torch.zeros(N, K); gW2[u[u < N]] = Gu[u < N]
     assert torch.allclose(gW, gW2, atol=1e-5)
     assert torch.allclose(m.lo.grad, gW.view(N, 1, 64).sum(-1), atol=1e-4)
     assert torch.allclose(m.s.grad, (gW.view(N, 1, 64) * m.codes.view(N, 1, 64).float()).sum(-1), atol=1e-4)
@@ -440,3 +441,19 @@ def test_deq_cache_off_outside_trainer():
     m = IE.IntKMatrix(torch.randn(10, 64), 2)
     assert IE.DEQ_GEN[0] is None and m.deq_cache() is None
 
+
+def test_row_sums_deterministic():
+    """the lookup's per-row sums: distinct rows ascending (padded with N), sums equal to a sequential fp64 sum, the same
+    bits on every call (no atomics)"""
+    torch.manual_seed(0)
+    N, K, T = 50, 64, 400
+    idx = torch.randint(0, N, (T,)); go = torch.randn(T, K).to(torch.bfloat16)
+    u, G = IE._row_sums(idx, go, N)
+    ref = torch.zeros(N, K, dtype=torch.float64).index_add_(0, idx, go.double())
+    v = u[u < N]
+    assert torch.equal(v, torch.unique(idx)) and torch.all(u[len(v):] == N)
+    assert torch.allclose(G[:len(v)].double(), ref[v], atol=1e-6) and torch.all(G[len(v):] == 0)
+    if torch.cuda.is_available():
+        a = [IE._row_sums(idx.cuda(), go.cuda(), N) for _ in range(3)]
+        assert all(torch.equal(a[0][1], b[1]) for b in a[1:])
+        assert torch.allclose(a[0][1].cpu(), G, atol=1e-6)
