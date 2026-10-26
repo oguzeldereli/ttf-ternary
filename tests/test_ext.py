@@ -73,3 +73,15 @@ def test_kd_sampled_weights():
         w = np.exp(lw[0]); assert abs(w.sum() - 1) < 2e-3
         np.add.at(est, ids[0], w / n)
     assert np.abs(est - p).max() < 0.01
+
+
+def test_ts_frozen_layer_skipped():
+    """a plug-in's frozen layer (ts_frozen, ttfconv.adapter_ctl): ts_layer returns before reading the gradient or
+    making any state"""
+    import types
+    import torch
+    from ttf.update import ts_layer
+    st = {}
+    ts_layer(types.SimpleNamespace(ts_frozen=True), torch.zeros(4, 4), st, {})
+    ts_layer(types.SimpleNamespace(ts_frozen=True), (torch.zeros(2, 4), torch.zeros(2, 4)), st, {})
+    assert st == {}

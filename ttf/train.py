@@ -804,6 +804,9 @@ def main():
         from .memplan import CkptAuto
         _ck_auto = CkptAuto(model, args.mem_cap_gib)
     _peak_all = 0
+    from . import ext as _X
+    for f_ in _X.having("setup"):    # --ext plug-ins: after the weights are loaded, before the first step
+        f_(model, lambda m_: print(m_, flush=True))
     from . import intk_emb as _IE
     _IE.DEQ_GEN[0] = 0
     for step in range(start_step, end_step):

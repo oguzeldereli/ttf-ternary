@@ -16,6 +16,10 @@ or later changed which wrappers were active). A plug-in module defines
                                                           on what they left
                                                           (adapters, a second ternary layer)
   end(model, log)                                         after the last layer
+  setup(model, log)                                       before the first step, after the weights are loaded (fresh
+                                                          start, --init-ckpt and resume alike): what trains, not the
+                                                          structure (e.g. layers frozen: their ts_frozen and their
+                                                          parameters' requires_grad)
 
 The spec string is the plug-in's own (e.g. "rank=0.2,alt=1"); it is saved with the run's arguments, and a resume must
 pass the same --ext list (train.py refuses a different one). Only build may change the structure or what trains: the
