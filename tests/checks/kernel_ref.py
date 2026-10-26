@@ -1,4 +1,4 @@
-"""Kernels against dense references (GPU; run on a lab PC, never the laptop GPU):
+"""Kernels against dense references (needs a CUDA GPU):
 
     python tests/test_kernel_ref.py
 

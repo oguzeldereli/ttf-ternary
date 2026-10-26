@@ -2,15 +2,15 @@
 
     python scripts/eval/final_eval.py RUN_DIR [RUN_DIR ...] [--fw 2000] [--seed N]
 
-RUN_DIR holds eval.pt (from scripts/eval/rescue.sh) or ckpt.pt / ckpt_9154.pt. Writes RUN_DIR/final_eval.json and
+RUN_DIR holds eval.pt, ckpt.pt or ckpt_9154.pt (the first found). Writes RUN_DIR/final_eval.json and
 RUN_DIR/final_eval.npz:
   - wiki: every non-overlapping 2048-token window of data/wiki32k_val.bin (974 windows, 2.0M tokens);
   - fw:   the first --fw non-overlapping windows of data/fwedu32k_val.bin (FineWeb-Edu, another domain);
   per-window mean loss (for paired comparisons, scripts/eval/compare.py), per-position mean loss, overall mean and
   bits per byte (bytes per token measured on the val sets with the same tokenizer, EOT counted as a token:
   Wikipedia 3.569, FineWeb-Edu 4.003; the earlier docs used 3.58 for Wikipedia).
-Check: the training-time evaluation (30 random batches of 16 seeded with the run's seed + 12345, see train.py
-evaluate) is recomputed and compared with the FINAL val loss in train.log, so a wrongly rebuilt model shows up.
+Check: the training-time evaluation (the run's --eval-iters batches of 16 random windows seeded with the run's seed
++ 12345, ttf/eval.py) is recomputed and compared with the FINAL val loss in train.log, so a wrongly rebuilt model shows up.
 
 The model is rebuilt from the checkpoint alone: mode, config and layer options are saved in it, and the float extras
 (row / column scales, additive low-rank adapter, attention temperature) are switched on when their parameters are in
@@ -149,7 +149,7 @@ def main():
                     "trained on FineWeb-Edu logs its FINAL on --fwval: pass that)")
     a = ap.parse_args()
     device = "cuda"
-    assert torch.cuda.is_available(), "GPU only (never the laptop GPU: run on a lab PC / 4090 / Myriad)"
+    assert torch.cuda.is_available(), "final_eval: needs a CUDA GPU"
     wiki = np.memmap(a.wiki, dtype=np.uint16, mode="r")
     fw = np.memmap(a.fwval, dtype=np.uint16, mode="r") if a.fw and os.path.exists(a.fwval) else None
     for run in a.runs:

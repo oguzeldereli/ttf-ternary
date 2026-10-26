@@ -1,5 +1,5 @@
-"""pytest -m "not gpu" runs the CPU tests anywhere; the gpu ones (kernels, the TTF update, the script checks) on a lab
-PC with a CUDA GPU (never the laptop's)."""
+"""pytest -m "not gpu" runs the CPU tests anywhere; the gpu ones (kernels, the TTF update, the script checks) on a
+machine with a CUDA GPU."""
 import os
 import sys
 

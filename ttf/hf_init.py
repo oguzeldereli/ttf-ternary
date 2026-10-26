@@ -63,7 +63,7 @@ _ST_DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16
 
 
 def _read_safetensors(fn):
-    """safetensors without the package (Myriad's image lacks it): 8-byte little-endian header size, a JSON header
+    """safetensors without the package (some cluster images lack it): 8-byte little-endian header size, a JSON header
     {name: {dtype, shape, data_offsets}}, then the raw little-endian data"""
     with open(fn, "rb") as f:
         n = int.from_bytes(f.read(8), "little")

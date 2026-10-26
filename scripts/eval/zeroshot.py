@@ -1,4 +1,4 @@
-"""Zero-shot evaluation (GPU; run on a lab PC / 4090 / Myriad, never the laptop GPU):
+"""Zero-shot evaluation (needs a CUDA GPU):
 
     python scripts/eval/zeroshot.py RUN_DIR [RUN_DIR ...] [--tasks lambada,hellaswag,piqa,arc_easy,arc_challenge,winogrande]
 
@@ -50,7 +50,7 @@ def main():
     ap.add_argument("--tasks", default="lambada,hellaswag,piqa,arc_easy,arc_challenge,winogrande")
     ap.add_argument("--dir", default="data/zeroshot/tok")
     a = ap.parse_args()
-    assert torch.cuda.is_available(), "GPU only (never the laptop GPU)"
+    assert torch.cuda.is_available(), "zeroshot: needs a CUDA GPU"
     tasks = {t: json.load(open(os.path.join(a.dir, t + ".json"))) for t in a.tasks.split(",")}
     for run in a.runs:
         t0 = time.time()

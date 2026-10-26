@@ -1,4 +1,4 @@
-"""GPU tests (lab PC): the kernels against their references, the TTF update's invariants, the factored update against
+"""GPU tests: the kernels against their references, the TTF update's invariants, the factored update against
 the dense one, and a short training run resumed half way against the same run straight through."""
 import json
 import os
