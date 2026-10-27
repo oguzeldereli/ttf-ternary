@@ -58,6 +58,6 @@ def test_backs_off_when_over(monkeypatch):
 
 
 def test_pipe_grows_two_a_step(monkeypatch):
-    G = 2**30           # --pipe: stage 0's first measure 0.6 of the real d (27B goldbug: 1.38 vs 2.33 GiB): without the cap
+    G = 2**30           # --pipe: stage 0's first measure 0.6 of the real d (27B on 2 GPUs: 1.38 vs 2.33 GiB): without the cap
     k, w8 = _run(monkeypatch, 32, 40 * G, 10 * G, 2 * G, steps=20, pp={"lo": 0, "hi": 32}, d_first=1.2 * G)
     assert not w8 and 9 <= k <= 12                                      # (35.2 - 10) / 2.5 .. / 2, never past the budget

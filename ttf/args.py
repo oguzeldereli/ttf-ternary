@@ -111,13 +111,13 @@ def build_parser():
     g = ap.add_argument_group("kernels and memory")
     g.add_argument("--dx", default="int8", choices=["bf16", "int8x2", "int8"], help="the input gradient's GEMM "
                    "(int8: gy in one int8 slice per row, 7 bits, on the int8 tensor cores where the summed width is "
-                   ">= 4096, else bf16; 0.8B 1000 steps on goldbug, 26 Oct: wiki / chat / mix +0.0003 / +0.0002 / "
+                   ">= 4096, else bf16; 0.8B 1000 steps, 26 Oct: wiki / chat / mix +0.0003 / +0.0002 / "
                    "+0.0023 vs int8x2, the paired train-loss gap -0.003..+0.007 throughout; 27B slice 5.77 -> 5.27 "
                    "s/step on the laptop. int8x2: two slices, as accurate as bf16, the 110M conversion recipe 2.6675 "
                    "vs 2.6672)")
     g.add_argument("--tf32", action=ON, default=False, help="the fp32 matrix products on the TF32 tensor cores (10-bit "
                    "mantissa products, fp32 sums: the accumulator's basis turn, the int-k head's products, the sketch "
-                   "cross terms); the orthonormalisation stays in full fp32. 0.8B 1000 steps on goldbug, 26 Oct: level with "
+                   "cross terms); the orthonormalisation stays in full fp32. 0.8B 1000 steps, 26 Oct: level with "
                    "fp32; off by default (on in the 27B recovery runs)")
     g.add_argument("--fused-layer", action=ON, default=True,
                    help="(default on; --no-fused-layer: the unfused path) int8 ternary layers with row / column scales: the centring, column scale and act-quant in one "
