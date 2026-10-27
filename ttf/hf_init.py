@@ -237,23 +237,34 @@ def mag_svd_fit(lin, W, T, a, c, beta, Hc, r):
     best rank-R fit in the input covariance's norm, |(G - A B^T) L|_F with L L^T = H' (H' the covariance of x'; Hc the
     covariance of the layer's input as GPTQ rounded against: centred for gptqc), = truncated SVD of G L, then
     B^T = V_R^T L^-1. Stored on the layer for enable_lowrank_mag ('add', same R). Returns the share of the output
-    error |G L|_F^2 it removes."""
+    error |G L|_F^2 it removes. The K x K factors are float64; G and G L (N x K) float32, built in place, and their
+    top R by a randomized SVD (R + 16 columns, 8 power iterations): a full float64 SVD of G L took ~4 x N K x 8 bytes
+    beside the 27B streaming conversion's 21.5 GiB and ran out of a 24 GB card (27 Oct)"""
     cd = c.double().clamp_min(1e-12)
     Hp = cd[:, None] * Hc.double() * cd[None, :]
     Hp.diagonal().add_(1e-4 * Hp.diagonal().mean() + 1e-30)
-    G = (beta / a.double().clamp_min(1e-12))[:, None] * (W.double() - a.double()[:, None] * c.double()[None, :] * T.double()) / cd[None, :]
     L, info = torch.linalg.cholesky_ex(Hp)
     if int(info) == 0:
-        U, S, Vh = torch.linalg.svd(G @ L, full_matrices=False)
-        B = torch.linalg.solve_triangular(L.T, Vh[:r].T, upper=True)      # L^-T V_R: (x' @ B) = V_R^T L^-1 x'
+        Linv_t = None    # B = L^-T V_R: (x' @ B) = V_R^T L^-1 x'
     else:                # numerically singular covariance: the symmetric square root, eigenvalues clamped
         lam, Q = torch.linalg.eigh(Hp)
         lam = lam.clamp_min(1e-6 * float(lam.max()))
-        U, S, Vh = torch.linalg.svd(G @ ((Q * lam.sqrt()) @ Q.T), full_matrices=False)
-        B = ((Q / lam.sqrt()) @ Q.T) @ Vh[:r].T
+        L, Linv_t = (Q * lam.sqrt()) @ Q.T, (Q / lam.sqrt()) @ Q.T
+        del lam, Q
+    del Hp
+    G = T.float().mul_(c.float()[None, :]).mul_(-a.float()[:, None]).add_(W.float())   # W - a c T
+    G.div_(c.float().clamp_min(1e-12)[None, :]).mul_((beta / a.float().clamp_min(1e-12))[:, None])
+    M = G @ L.float(); del G
+    tot = float(torch.linalg.vector_norm(M)) ** 2
+    with torch.random.fork_rng(devices=[M.device] if M.is_cuda else []):   # its own draws: the global RNG (stochastic
+        torch.manual_seed(0)                                               # rounding, later options) is left as it was
+        U, S, V = torch.svd_lowrank(M, q=min(r + 16, *M.shape), niter=8)
+    del M
+    Vr = V[:, :r].double()
+    B = torch.linalg.solve_triangular(L.T, Vr, upper=True) if Linv_t is None else Linv_t @ Vr
     A = U[:, :r] * S[:r]
     lin._mag_init = (A.float().contiguous(), B.float().contiguous())
-    return float((S[:r] ** 2).sum() / (S ** 2).sum().clamp_min(1e-300))
+    return float((S[:r].double() ** 2).sum() / max(tot, 1e-300))
 
 
 def _mag_svd_init(lin, W, T, a, c, beta, hess, i, name, method, r, dev):
