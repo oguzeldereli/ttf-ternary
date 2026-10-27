@@ -118,7 +118,7 @@ def build_parser():
     g.add_argument("--tf32", action=ON, default=False, help="the fp32 matrix products on the TF32 tensor cores (10-bit "
                    "mantissa products, fp32 sums: the accumulator's basis turn, the int-k head's products, the sketch "
                    "cross terms); the orthonormalisation stays in full fp32. 0.8B 1000 steps on goldbug, 26 Oct: level with "
-                   "fp32 (passed, user); off by default, on in the goldbug runs (user)")
+                   "fp32; off by default (on in the 27B recovery runs)")
     g.add_argument("--fused-layer", action=ON, default=True,
                    help="(default on; --no-fused-layer: the unfused path) int8 ternary layers with row / column scales: the centring, column scale and act-quant in one "
                         "kernel, the GEMM's epilogue with the row scale, bias and the sum of a converted layer's parts, "
