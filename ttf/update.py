@@ -709,7 +709,8 @@ def _ts_layer_factored(l, fg, state, c):
     if c.get("start") and c.get("step", 0) < c["start"]:                  # --ttf-start: frozen, v keeps learning
         return
     ra = min(r, l.N, l.K)
-    if dense_acc(l, ra) and not c.get("band") and not c.get("hspend"):
+    if (dense_acc(l, ra) or (key in state and is_dense_state(state[key]))) and not c.get("band") and not c.get("hspend"):
+        # (a dense state from a run at full rank stays dense at a lower --ttf-rank: no pair to read from it)
         return _ts_dense_acc(l, fgb, ia, state, st, key, t, M_, final_, lk, lr_ratio, theta, c, sa, off, dev)
     A_prev = None
     if key not in state:
