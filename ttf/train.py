@@ -280,6 +280,19 @@ def main():
     _resuming = args.resume and os.path.exists(_resume_path)
     _init_ck = bool(args.init_ckpt) and not _resuming   # (a run started with --init-ckpt resumes from its own ckpt.pt)
     _from_ckpt = _resuming or _init_ck
+    _init_left, _init_missing = {}, []    # --init-ckpt: its tensors whose modules an option builds later (_load_init_left);
+    # the model's tensors it lacked (allowed only where an option then replaces the module: the int-k embedding / head)
+
+    def _load_init_left(what):
+        """the --init-ckpt tensors of modules built since its load (the int-k codes, the adapter factors)"""
+        have = model.state_dict()
+        sub = {k_: v_ for k_, v_ in _init_left.items() if k_ in have}
+        if sub:
+            model.load_state_dict(sub, strict=False)
+            for k_ in sub:
+                del _init_left[k_]
+            print(f"--init-ckpt: {len(sub)} tensors of the {what} loaded", flush=True)
+
     if _init_ck:   # --init-ckpt: a converted checkpoint's weights, a fresh run (step 0, no optimizer / TTF state)
         _resume_path = args.init_ckpt
     if args.init_hf and _from_ckpt:   # the checkpoint holds the converted model (trits, scales, float parts)
@@ -297,10 +310,15 @@ def main():
             del _ck
         if _init_ck:   # the weights now, before the optimizer and the embedding / head options (--intk-emb
             _blob = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)   # quantizes these)
-            model.load_state_dict(_blob["model"])
-            print(f"--init-ckpt: weights of {_resume_path} (its step {_blob.get('step')}), a fresh run from step 0",
-                  flush=True)
-            del _blob
+            _r = model.load_state_dict(_blob["model"], strict=False)
+            # the parts the options below build (--intk-emb codes, --adapter-rank's factors) load once they exist
+            _init_left.update({k_: _blob["model"][k_] for k_ in _r.unexpected_keys})
+            _init_missing[:] = _r.missing_keys
+            print(f"--init-ckpt: weights of {_resume_path} (its step {_blob.get('step')}), a fresh run from step 0"
+                  + (f"; {len(_r.unexpected_keys)} tensors wait for their modules" if _r.unexpected_keys else "")
+                  + (f"; not in it: {', '.join(_r.missing_keys[:4])}{' ...' if len(_r.missing_keys) > 4 else ''}"
+                     if _r.missing_keys else ""), flush=True)
+            del _blob, _r
     if args.init_hf and not _from_ckpt:
         if _PP:   # (each stage holds its own layers only: the conversion's calibration stream needs them all)
             raise SystemExit("--pipe: no conversion here; convert on one GPU first (--stop-after 0, e.g. lab "
@@ -369,6 +387,7 @@ def main():
         for m_ in _en(model, args.intk_emb, log=lambda m_: print(m_, flush=True)):
             m_.dp_reduce = _WS > 1 and not _PP          # (data parallel only: --pipe stages are not replicas)
             m_.theta_mult = tm_
+        _load_init_left("int-k embedding / head")
     if _QWEN and args.train_emb != "none":   # --train-emb: the head (and the embedding) join the float tail (the
         _te = [model.hf.lm_head.weight] + ([model.hf.model.embed_tokens.weight] if args.train_emb == "both" else [])
         for p_ in _te:                        # conversion and the resume freeze them; 0.8B, 22 Oct, theta 64: -0.085 wiki)
@@ -740,6 +759,16 @@ def main():
     # after any resume, so 'net' counts from the weights this run starts at
     if mag and not mag_on[0]:
         enable_mag(start_step)
+    if _init_left:
+        _load_init_left("adapters")
+    _miss = [k_ for k_ in _init_missing if k_ in model.state_dict()]
+    if _miss:
+        raise SystemExit(f"--init-ckpt {args.init_ckpt}: {len(_miss)} of this model's tensors are not in it (e.g. "
+                         f"{', '.join(_miss[:4])})")
+    if _init_left:
+        raise SystemExit(f"--init-ckpt {args.init_ckpt}: {len(_init_left)} tensors with no module in this run (e.g. "
+                         f"{', '.join(list(_init_left)[:4])}): the options that built them differ (--intk-emb, "
+                         f"--adapter-rank, --ext)")
     t0 = time.time()
     last_save = time.time()
     end_step = tc.max_steps if args.stop_after is None else min(tc.max_steps, args.stop_after)
