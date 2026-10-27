@@ -357,6 +357,26 @@ def test_resume_new_theta_needs_acc_scale(tmp_path):
     assert "accumulators x 0.5 (checkpoint theta 16.0, now 8.0)" in r.stdout, r.stdout[-1500:]
 
 
+def test_resume_new_emb_lr_mult(tmp_path):
+    """--intk-emb resumed with another --emb-lr-mult: the embedding group takes this command line's multiplier (the
+    optimizer load had restored the checkpoint's silently), and the codes' evidence, built against the old bar
+    theta / mult, starts anew instead of firing in a burst; an unchanged resume keeps it"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    ik = ["--intk-emb", "2:3", "--emb-wd", "0"]
+    _train(str(tmp_path / "b"), ik + ["--emb-lr-mult", "0.05"], 3, data)
+    r = _run(str(tmp_path / "b"), ik + ["--emb-lr-mult", "0.05", "--resume"], 4, data)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    assert "resumed the intk_state TTF state" in r.stdout and "starts anew" not in r.stdout, r.stdout[-1500:]
+    r = _run(str(tmp_path / "b"), ik + ["--emb-lr-mult", "0.25", "--resume"], 6, data)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    assert "lr x0.05 -> x0.25" in r.stdout, r.stdout[-1500:]
+    assert "int-k codes' threshold 320 -> 64: their TTF state (evidence, counts) starts anew" in r.stdout, r.stdout[-1500:]
+    assert "resumed the intk_state TTF state" not in r.stdout
+    ck = torch.load(tmp_path / "b" / "ckpt.pt", map_location="cpu", weights_only=False)
+    assert [g["emb_mult"] for g in ck["opt"]["param_groups"] if "emb_mult" in g] == [0.25], ck["opt"]["param_groups"]
+
+
 def test_train_resume_fp32(tmp_path):
     """--mode fp32 saved and resumed (also from step 0): the same per-step losses (the default adapter rank once added
     an empty optimizer group that the resume could not match, 18 Oct)"""

@@ -650,6 +650,13 @@ def main():
             model.load_state_dict(blob["model"])
             if "opt" in blob:
                 tail_opt.load_state_dict(blob["opt"])
+        # the embedding / head group's lr multiplier and decay from this command line: load_state_dict restores the
+        # saved group settings, so a resume with a changed --emb-lr-mult / --emb-wd kept the old ones silently
+        for g_ in tail_opt.param_groups:
+            if "emb_mult" in g_ and (g_["emb_mult"], g_["weight_decay"]) != (args.emb_lr_mult, args.emb_wd):
+                print(f"embedding / head group: lr x{g_['emb_mult']} -> x{args.emb_lr_mult}, weight decay "
+                      f"{g_['weight_decay']} -> {args.emb_wd} (this command line, not the checkpoint's)", flush=True)
+                g_["emb_mult"], g_["weight_decay"] = args.emb_lr_mult, args.emb_wd
         start_step = int(blob.get("step", 0)) + 1
         # fast-forward the data streams, so a resumed run sees the batches the uninterrupted
         # run would have (not the step-0 batches again)
@@ -710,6 +717,15 @@ def main():
             raise SystemExit(f"--ttf-acc-scale {_acc}: not implemented for the {_key} accumulators; resume at the "
                              f"checkpoint's theta")
           st_ = lr_state.setdefault("_ts", {})
+          if _key == "intk_state":    # the codes' threshold theta / --emb-lr-mult: when it changed since the save, the
+              _ba_ = blob.get("args") or {}   # evidence (built against the old bar) would fire in a burst; start it anew
+              _bar = lambda th_, em_: th_ / em_ if em_ > 0 else math.inf
+              _old, _new = _bar(_ba_.get("ttf_theta", args.ttf_theta), _ba_.get("emb_lr_mult", args.emb_lr_mult)), \
+                  _bar(args.ttf_theta, args.emb_lr_mult)
+              if _old != _new:
+                  print(f"int-k codes' threshold {_old:g} -> {_new:g}: their TTF state (evidence, counts) starts anew",
+                        flush=True)
+                  continue
           for m, (uv, d_) in zip(_lays_of(model), blob[_key]):
             if uv is not None:
                 lr_state[id(m)] = tuple(t.to(device) for t in uv)
