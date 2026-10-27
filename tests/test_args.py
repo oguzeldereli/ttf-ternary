@@ -93,3 +93,9 @@ def test_from_legacy_restored_options():
     a = A.parse(A.from_legacy(shlex.split(OLD_TTF + " --ts_offload --ts_offload_async --w_cache int8 --ts_store_a fp12s")))
     assert a.ttf_offload == "async" and a.ttf_store == "fp12s"
     assert A.parse(A.from_legacy(shlex.split(OLD_TTF + " --ts_offload"))).ttf_offload == "async"     # (host: now async)
+
+
+def test_from_legacy_tf32():
+    """the old --tf32 set allow_tf32 (bitnet/train.py at the tag); the core's --tf32 is off by default (bb12682)"""
+    assert A.parse(A.from_legacy(shlex.split(OLD_TTF + " --tf32"))).tf32 is True
+    assert A.parse(A.from_legacy(shlex.split(OLD_TTF))).tf32 is False

@@ -48,7 +48,8 @@ def build_parser():
                    help="cosine | linear | wsd:D (warmup, the peak lr until step D, then a cosine to --min-lr)")
     g.add_argument("--lr-rewarm", default="", help="S:W[:F]: from step S a linear warmup over W steps from --min-lr to "
                    "F x the peak, then a cosine (continuing a decayed run)")
-    g.add_argument("--weight-decay", type=float, default=None, help="the embedding / head group (default 0.1)")
+    g.add_argument("--weight-decay", type=float, default=None, help="decoupled weight decay of the float parameters, norms and scales excluded "
+                   "(default 0.1; --mode ttf: the embedding / head take --emb-wd, the adapters --adapter-wd)")
     g.add_argument("--tail", default="fp32", choices=["fp32", "lean"],
                    help="the float parameters: fp32 + AdamW; lean: bf16 / fp16 + LeanAdam (int8 first moment, factored "
                         "second moment)")
@@ -283,7 +284,7 @@ _LEGACY = {
     "--dw_fp32": _gone("--dw_fp32 (the dense weight gradient's GEMM in fp32)"), "--w_cache": None, "--ts_offload_keep": _SAME("--ttf-offload-keep"),
     "--ts_fused": None, "--ts_anneal": _SAME("--ttf-step-p"),
     "--ts_tau_anneal_pow": _keep_if(lambda v: float(v) == 1, lambda v: [], "--ts_tau_anneal_pow"), "--ts_tau_anneal": None,
-    "--ts_tau": _SAME("--ttf-tau"), "--ts_b2": _SAME("--ttf-b2"), "--tf32": None,
+    "--ts_tau": _SAME("--ttf-tau"), "--ts_b2": _SAME("--ttf-b2"), "--tf32": _FLAG("--tf32", None),
     "--int8": None, "--int8_dx": _FLAG("--dx", "int8"), "--stop_after": _SAME("--stop-after"),
     "--snap_every": _SAME("--snap-every"), "--tail_fp32": _FLAG("--tail", "fp32"), "--seed": _SAME("--seed"),
     "--track_flips": _FLAG("--track-flips", None), "--resume": _FLAG("--resume", None), "--out_dir": _SAME("--out-dir"),
@@ -295,7 +296,7 @@ _LEGACY = {
     "--pipe_split": _SAME("--pipe-split"), "--ckpt_skip": _SAME("--ckpt-skip"), "--temp_check": _SAME("--temp-check"),
     # no effect in the TTF recipes (the stateless flip rule's knobs, the dense weight gradient, look-ahead off, the
     # short momentum's rank under --ts_nomom); above, None also marks a speed switch whose path is now the only one
-    # (the int8 GEMMs, the fused kernels, the update inside the backward, the batched LeanAdam, TF32, compile, the
+    # (the int8 GEMMs, the fused kernels, the update inside the backward, the batched LeanAdam, compile, the
     # trit cache) or a diagnostic that went (--eval_first_n)
     "--rate": None, "--rate_peak": None, "--rate_warmup": None, "--rate_schedule": None, "--g_ref": None,
     "--dw_mode": None, "--lookahead": None, "--ts_rank_s": None,
