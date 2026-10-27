@@ -377,6 +377,25 @@ def test_resume_new_emb_lr_mult(tmp_path):
     assert [g["emb_mult"] for g in ck["opt"]["param_groups"] if "emb_mult" in g] == [0.25], ck["opt"]["param_groups"]
 
 
+def test_intk_code_mult(tmp_path):
+    """--intk-code-mult sets the int-k codes' threshold apart from the group parameters' --emb-lr-mult: 0 freezes the
+    codes (no moves at a rate where they move), and a resume that raises --emb-lr-mult but keeps the codes' bar keeps
+    their evidence"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    ik = ["--intk-emb", "2:3", "--emb-wd", "0"]
+    moves = lambda d: sum(json.loads(l_).get("intk_moves_emb", 0) + json.loads(l_).get("intk_moves_head", 0)
+                          for l_ in open(tmp_path / d / "metrics.jsonl") if l_.startswith("{"))
+    _train(str(tmp_path / "a"), ik + ["--emb-lr-mult", "1", "--ttf-theta", "0.25"], 4, data)
+    _train(str(tmp_path / "f"), ik + ["--emb-lr-mult", "1", "--ttf-theta", "0.25", "--intk-code-mult", "0"], 4, data)
+    assert moves("a") > 0 and moves("f") == 0, (moves("a"), moves("f"))
+    _train(str(tmp_path / "b"), ik + ["--emb-lr-mult", "0.05"], 3, data)
+    r = _run(str(tmp_path / "b"), ik + ["--emb-lr-mult", "0.25", "--intk-code-mult", "0.05", "--resume"], 4, data)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    assert "lr x0.05 -> x0.25" in r.stdout and "starts anew" not in r.stdout, r.stdout[-1500:]
+    assert "resumed the intk_state TTF state" in r.stdout, r.stdout[-1500:]
+
+
 def test_train_resume_fp32(tmp_path):
     """--mode fp32 saved and resumed (also from step 0): the same per-step losses (the default adapter rank once added
     an empty optimizer group that the resume could not match, 18 Oct)"""

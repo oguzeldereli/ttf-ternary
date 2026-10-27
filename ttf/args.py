@@ -152,6 +152,8 @@ def build_parser():
                    "int-k group parameters (their own group; 24 Oct: they shared the 0.1 of the float tail)")
     g.add_argument("--emb-lr-mult", type=float, default=1.0, help="their learning rate x this; --intk-emb codes: "
                    "theta / this (the codes move at the embedding / head rate; 0: frozen)")
+    g.add_argument("--intk-code-mult", type=float, default=None, help="--intk-emb: the codes' threshold theta / this "
+                   "instead of theta / --emb-lr-mult (0: frozen codes; the group parameters keep --emb-lr-mult)")
     g.add_argument("--init-ckpt", default="", help="start a run from a checkpoint's weights (e.g. a pre-converted "
                    "model, saved with --stop-after 0): step 0, a fresh optimizer and TTF state, the same --ext list")
     g.add_argument("--intk-emb", default="", help="E:H[:G]: token embedding / output head as E- / H-bit codes in "

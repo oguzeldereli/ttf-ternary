@@ -17,6 +17,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _code_mult(args):
+    """the int-k codes' rate: --intk-code-mult, else --emb-lr-mult (their threshold is theta / this)"""
+    return args.emb_lr_mult if getattr(args, "intk_code_mult", None) is None else args.intk_code_mult
+
+
 def gpu_temp():
     """Current GPU temperature in Celsius via nvidia-smi, or None if unavailable."""
     try:
@@ -392,7 +397,8 @@ def main():
         _en = enable_intk_emb if _QWEN else enable_intk_emb_bt
         # the codes at the embedding / head rate, theta / --emb-lr-mult (0.8B 26 Oct: at the body's theta, +0.140 wiki vs
         # frozen codes; noise-level pulls fired, as the leak passes |E u| > theta / tau)
-        tm_ = 1.0 / args.emb_lr_mult if args.emb_lr_mult > 0 else math.inf
+        cm_ = _code_mult(args)               # (--intk-code-mult: the codes' rate apart from the group parameters')
+        tm_ = 1.0 / cm_ if cm_ > 0 else math.inf
         assert tm_ == 1.0 or not args.ttf_theta_sched, "--intk-emb with --emb-lr-mult and a theta schedule"
         for m_ in _en(model, args.intk_emb, log=lambda m_: print(m_, flush=True)):
             m_.dp_reduce = _WS > 1 and not _PP          # (data parallel only: --pipe stages are not replicas)
@@ -717,11 +723,12 @@ def main():
             raise SystemExit(f"--ttf-acc-scale {_acc}: not implemented for the {_key} accumulators; resume at the "
                              f"checkpoint's theta")
           st_ = lr_state.setdefault("_ts", {})
-          if _key == "intk_state":    # the codes' threshold theta / --emb-lr-mult: when it changed since the save, the
-              _ba_ = blob.get("args") or {}   # evidence (built against the old bar) would fire in a burst; start it anew
+          if _key == "intk_state":    # the codes' threshold theta / --intk-code-mult (--emb-lr-mult): when it changed since
+              _ba_ = blob.get("args") or {}   # the save, the evidence (built against the old bar) would fire in a burst
               _bar = lambda th_, em_: th_ / em_ if em_ > 0 else math.inf
-              _old, _new = _bar(_ba_.get("ttf_theta", args.ttf_theta), _ba_.get("emb_lr_mult", args.emb_lr_mult)), \
-                  _bar(args.ttf_theta, args.emb_lr_mult)
+              _cm_old = _ba_.get("intk_code_mult")
+              _cm_old = _ba_.get("emb_lr_mult", args.emb_lr_mult) if _cm_old is None else _cm_old
+              _old, _new = _bar(_ba_.get("ttf_theta", args.ttf_theta), _cm_old), _bar(args.ttf_theta, _code_mult(args))
               if _old != _new:
                   print(f"int-k codes' threshold {_old:g} -> {_new:g}: their TTF state (evidence, counts) starts anew",
                         flush=True)
