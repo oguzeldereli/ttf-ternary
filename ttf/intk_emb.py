@@ -96,7 +96,7 @@ class IntKMatrix(nn.Module):
             j = min(self.N, i + self.DEQ_ROWS)
             w = W[i:j].float()
             num += float((self.deq_rows(i, j, torch.float32) - w).square().sum()); den += float(w.square().sum())
-        return (num / den) ** 0.5
+        return (num / den) ** 0.5 if den > 0 else float("nan")   # (a resume: W not loaded yet, zeros)
 
     def dequant(self):
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()

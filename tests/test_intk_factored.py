@@ -483,3 +483,4 @@ def test_rel_err_chunked(monkeypatch):
     monkeypatch.setattr(IE.IntKMatrix, "DEQ_ROWS", 64)
     ref = float((m.dequant() - W.float()).norm() / W.float().norm())
     assert abs(m.rel_err(W) - ref) < 1e-5 * ref
+    assert math.isnan(m.rel_err(torch.zeros_like(W)))    # (a resume builds the codes before its weights load)
