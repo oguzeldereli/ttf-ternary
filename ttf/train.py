@@ -300,14 +300,24 @@ def main():
         if _QWEN:   # as the conversion leaves them: embedding and head frozen (the optimizer is built below)
             model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
         if args.convert == "gptqc":   # centred layers: their buffers and bias
-            _ck = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)["model"]
-            _nc = 0                                             # exist before the optimizer is built
+            _cb = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)
+            _ck, _cn = _cb["model"], set()                       # exist before the optimizer is built
+            if _PP:   # a stage checkpoint holds its own layers: the others' centred layers, from their stages
+                _all = [None] * _dist.get_world_size()
+                _dist.all_gather_object(_all, [k_[:-len(".in_mean")] for k_ in _ck if k_.endswith(".in_mean")])
+                _cn = {n_ for l_ in _all for n_ in l_}
+            _nc = 0
             for n_, m_ in model.named_modules():
-                _dv = "meta" if isinstance(m_, KernelTernaryLinear) and m_.wpacked.is_meta else device   # --pipe
-                if isinstance(m_, KernelTernaryLinear) and f"{n_}.in_mean" in _ck:
+                if not isinstance(m_, KernelTernaryLinear):
+                    continue
+                if f"{n_}.in_mean" in _ck:
+                    _dv = "meta" if m_.wpacked.is_meta else device                       # --pipe: others' on meta
                     m_.enable_centering(_ck[f"{n_}.in_mean"].to(_dv), _ck[f"{n_}.out_bias"].to(_dv)); _nc += 1
+                elif n_ in _cn and m_.wpacked.is_meta:   # (its values are on its stage; here only the parameter, so
+                    m_.enable_centering(torch.empty(m_.K, device="meta"), torch.empty(m_.N, device="meta"))
+                    _nc += 1                             # every stage's optimizer groups match the saved ones)
             print(f"resume: {_nc} centred layers restored", flush=True)
-            del _ck
+            del _cb, _ck
         if _init_ck:   # the weights now, before the optimizer and the embedding / head options (--intk-emb
             _blob = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)   # quantizes these)
             _r = model.load_state_dict(_blob["model"], strict=False)
