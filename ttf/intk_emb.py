@@ -89,6 +89,15 @@ class IntKMatrix(nn.Module):
             if self._ts_state is not None and self._ts_cfg is not None and math.isfinite(self.theta_mult):
                 _counted(self, self._ts_state, _intk_update, self, parts, self._ts_state, self._ts_cfg)
 
+    def rel_err(self, W):
+        """|dequant() - W| / |W| (fp32), in row chunks: no [V, d] fp32 copy (27B: two 4.7 GiB ones at enable)"""
+        num = den = 0.0
+        for i in range(0, self.N, self.DEQ_ROWS):
+            j = min(self.N, i + self.DEQ_ROWS)
+            w = W[i:j].float()
+            num += float((self.deq_rows(i, j, torch.float32) - w).square().sum()); den += float(w.square().sum())
+        return (num / den) ** 0.5
+
     def dequant(self):
         q = self.codes.reshape(self.N, self.K // self.g, self.g).float()
         return (self.lo[..., None] + self.s[..., None] * q).reshape(self.N, self.K)
@@ -721,8 +730,8 @@ def enable_intk_emb(model, spec, log=print):
     for i, m in enumerate((me, mh)):
         m._ts_idx = 20_000 + i
     hf.model.embed_tokens = _Emb(me); hf.lm_head = _Head(mh)
-    err = [float((m.dequant() - W.float()).norm() / W.float().norm()) if not W.is_meta else float("nan")   # (--pipe:
-           for m, W in ((me, E.data), (mh, H.data))]                                                         # another stage's)
+    err = [m.rel_err(W) if not W.is_meta else float("nan") for m, W in ((me, E.data), (mh, H.data))]   # (--pipe: another
+    # stage's)
     log(f"--intk-emb {spec}: embedding {eb}-bit, head {hb}-bit codes in groups of {g} (rel err {err[0]:.4f} / "
         f"{err[1]:.4f}), trained by TTF ({'factored' if INTK_FACTORED[0] else 'dense'} update); "
         f"{(me.lo.numel() + me.s.numel() + mh.lo.numel() + mh.s.numel()) / 1e6:.1f}M group parameters in the float tail")

@@ -473,3 +473,13 @@ def test_bf16_in_place():
             assert out.data_ptr() == p and torch.equal(out, ref), rows
     finally:
         IE.ROWS[0] = old
+
+
+def test_rel_err_chunked(monkeypatch):
+    """IntKMatrix.rel_err (the log line at --intk-emb, in row chunks) equals the whole-matrix fp32 error"""
+    torch.manual_seed(3)
+    W = torch.randn(300, 128).to(torch.bfloat16)
+    m = IE.IntKMatrix(W, 2)
+    monkeypatch.setattr(IE.IntKMatrix, "DEQ_ROWS", 64)
+    ref = float((m.dequant() - W.float()).norm() / W.float().norm())
+    assert abs(m.rel_err(W) - ref) < 1e-5 * ref
