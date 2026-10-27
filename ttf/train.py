@@ -302,6 +302,9 @@ def main():
                   flush=True)
             del _blob
     if args.init_hf and not _from_ckpt:
+        if _PP:   # (each stage holds its own layers only: the conversion's calibration stream needs them all)
+            raise SystemExit("--pipe: no conversion here; convert on one GPU first (--stop-after 0, e.g. lab "
+                             "preconv27.sh), then start every stage from it with --init-ckpt")
         from .hf_init import init_from_hf, GPTQ_OPTS as _GO
         _GO["mag_svd"] = args.svd_rank
         _hess = None
