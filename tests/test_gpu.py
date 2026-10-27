@@ -396,6 +396,22 @@ def test_intk_code_mult(tmp_path):
     assert "resumed the intk_state TTF state" in r.stdout, r.stdout[-1500:]
 
 
+def test_rank_ratio_resume_cuts_dense(tmp_path):
+    """--ttf-rank-ratio: a run at full rank (every accumulator dense) resumed at ratio 0.3 cuts each A to its best
+    rank-r part and trains on (the 27B switch, 27 Oct); a fresh start reports the per-layer ranks"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    _train(str(tmp_path / "a"), ["--ttf-rank", "4096"], 3, data)
+    r = _run(str(tmp_path / "a"), ["--ttf-rank", "4096", "--ttf-rank-ratio", "0.3", "--resume"], 5, data)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    assert "--ttf-rank-ratio 0.3: accumulator ranks" in r.stdout, r.stdout[-1500:]
+    assert "cut to their best rank-r part" in r.stdout, r.stdout[-1500:]
+    ls = [json.loads(l)["loss"] for l in open(tmp_path / "a" / "metrics.jsonl") if '"loss"' in l]
+    assert len(ls) == 5 and all(np.isfinite(ls)), ls
+    r = _run(str(tmp_path / "a"), ["--ttf-rank", "4096", "--ttf-rank-ratio", "0.3", "--resume"], 6, data)
+    assert r.returncode == 0 and "cut to their best" not in r.stdout, r.stdout[-1500:]   # (saved low-rank: no second cut)
+
+
 def test_train_resume_fp32(tmp_path):
     """--mode fp32 saved and resumed (also from step 0): the same per-step losses (the default adapter rank once added
     an empty optimizer group that the resume could not match, 18 Oct)"""

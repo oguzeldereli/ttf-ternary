@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import shutil
 import json
+import collections
 import math
 import time
 import subprocess
@@ -247,6 +248,13 @@ def main():
     elif args.mode == "bitnet":
         model = build_master_transformer(mc, grad_checkpoint=tc.grad_checkpoint, dtype=torch.float32)
     model = model.to(device) if not _PP else model._apply(lambda t_: t_ if t_.is_meta else t_.to(device))   # --pipe: others' stay meta
+    if args.ttf_rank_ratio > 0:   # --ttf-rank-ratio R: rank R min(N, K) per layer (a plug-in's ts_rank stays)
+        _rr = collections.Counter()
+        for m_ in model.modules():
+            if isinstance(m_, KernelTernaryLinear) and getattr(m_, "ts_rank", None) is None:
+                m_.ts_rank = max(1, round(args.ttf_rank_ratio * min(m_.N, m_.K))); _rr[m_.ts_rank] += 1
+        print(f"--ttf-rank-ratio {args.ttf_rank_ratio}: accumulator ranks (rank: layers) "
+              f"{dict(sorted(_rr.items()))}", flush=True)
     try:   # counted from the modules (mc.report() above is the preset's formula)
         n_t_ = sum(m_.N * m_.K for m_ in model.modules() if getattr(m_, "wpacked", None) is not None and hasattr(m_, "N"))
         n_f_ = sum(p_.numel() for p_ in model.parameters())
@@ -711,6 +719,37 @@ def main():
                 if _ng:
                     print(f"--ttf-rank {args.ttf_rank}: grew the accumulators of {_ng} layers from the checkpoint's rank",
                           flush=True)
+            if ttf and args.ttf_rank:   # a lower rank than the checkpoint's (--ttf-rank-ratio): each accumulator becomes
+                # its best rank-r part, A = P S Q^T truncated (V = Q_r, U = P_r S_r), so the update continues on the
+                # low-rank path; a dense A (a full-rank layer's) included. The part dropped is mostly the integrated noise
+                _sa = _store_codec(store)
+                _ns, _ek, _et = 0, 0.0, 0.0
+                for m in lays:
+                    if id(m) not in lr_state or m.wpacked.is_meta:
+                        continue
+                    t_ = lr_state[id(m)]; dn_ = is_dense_state(t_)
+                    ra_ = min(getattr(m, "ts_rank", None) or args.ttf_rank, m.N, m.K)
+                    if dn_ and ra_ == min(m.N, m.K):
+                        continue                                        # (still full rank: stays dense)
+                    if not dn_:
+                        U_, V_ = _load_pair(t_)
+                        if V_.shape[1] <= ra_:
+                            continue
+                    dv_ = t_[0].device
+                    if dn_:
+                        P_, S_, Qh_ = torch.linalg.svd(load_dense(t_, m).to(device).float(), full_matrices=False)
+                        V2 = Qh_[:ra_].T.contiguous()
+                    else:   # A = U V^T = Pu Su (V Wu)^T (V orthonormal)
+                        P_, S_, Wh_ = torch.linalg.svd(U_.to(device).float(), full_matrices=False)
+                        V2 = (V_.to(device).float() @ Wh_.T)[:, :ra_].contiguous()
+                    U2 = P_[:, :ra_] * S_[:ra_]
+                    _ek += float((S_[:ra_] ** 2).sum()); _et += float((S_ ** 2).sum())
+                    pr_ = _store_pair(_sa, U2, V2) if _sa else (U2, V2)
+                    lr_state[id(m)] = tuple(t.to(dv_) for t in pr_); _ns += 1
+                    del P_, S_, U2, V2
+                if _ns:
+                    print(f"TTF rank below the checkpoint's: the accumulators of {_ns} layers cut to their best rank-r "
+                          f"part (truncated SVD; {100 * _ek / max(_et, 1e-30):.1f}% of their squared norm kept)", flush=True)
             _ba = blob.get("args") or {}   # (checkpoints before 17 Oct: the old option names)
             _acc, _amsg = resume_acc_scale(_ba.get("ttf_theta", _ba.get("ts_theta")), args.ttf_theta, args.ttf_acc_scale,
                                            _ba.get("ttf_theta_sched", _ba.get("ts_theta_sched")),

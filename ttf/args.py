@@ -71,6 +71,12 @@ def build_parser():
 
     g = ap.add_argument_group("TTF (--mode ttf)")
     g.add_argument("--ttf-rank", type=int, default=512, help="rank of each layer's accumulator A = U V^T")
+    g.add_argument("--ttf-rank-ratio", type=float, default=0.0,
+                   help="R > 0: each ternary layer's accumulator rank is R min(N, K) instead of --ttf-rank (a plug-in's own "
+                        "rank, e.g. the adapters' ttf_rank, still wins): no layer reaches full rank, whose dense exact "
+                        "accumulator also integrates the per-step noise (27B at --ttf-rank 1536: the 1024-row k / v and the "
+                        "adapter factors moved 28-40%% of their trits in 1000 steps, oscillating). A resume below the "
+                        "checkpoint's rank keeps each accumulator's best rank-r part (truncated SVD)")
     g.add_argument("--ttf-step-fp32", action=ON, default=False, help="--accum M > 1: keep U in fp32 between a step's "
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
     g.add_argument("--ttf-orth", default="qr", choices=["qr", "cholqr2", "spanqr"],
