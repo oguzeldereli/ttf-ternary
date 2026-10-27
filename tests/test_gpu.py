@@ -685,6 +685,29 @@ def test_intk_fire(slots):
     assert float((dU - dU_ref).norm() / dU_ref.norm()) < 1e-5
 
 
+def test_intk_fire_zero_rho():
+    """kernel.intk_fire with a zero rho (a row of zero group steps, one zero group) in tiles of many moves (the spend's
+    per-tile D / rho path, more than SL moves): dU finite and equal to the reference (0 / 0 was NaN there)"""
+    from ttf import kernel as KN
+    n, K, r, G, levels = 64, 256, 32, 64, 3
+    gen = torch.Generator(device=dev).manual_seed(5)
+    U = torch.randn(n, r, device=dev, generator=gen)
+    V = torch.linalg.qr(torch.randn(K, r, device=dev, generator=gen)).Q
+    rho = torch.randn(n, K // G, device=dev, generator=gen).abs() + 0.5
+    rho[3] = 0.0; rho[9, 1] = 0.0
+    codes = torch.full((n, K), 1, device=dev, dtype=torch.int8)
+    rf = rho.repeat_interleave(G, 1)
+    A = (U @ V.T) * rf
+    theta = float(A.abs().quantile(0.3))                 # most entries move: every apply tile above SL moves
+    d = A.sign(); nw = codes.float() + d
+    fire = (A.abs() >= theta) & (nw >= 0) & (nw <= levels) & (rf.abs() > 1e-6)
+    dU_ref = torch.where(fire, d / rf, 0) @ V
+    c2 = codes.clone()
+    dU, nf = KN.intk_fire(U, V, c2, rho, G, levels, theta)
+    assert torch.isfinite(dU).all() and int(nf) == int(fire.sum())
+    assert float((dU - dU_ref).norm() / dU_ref.norm()) < 1e-5
+
+
 def test_intk_fire_wired():
     """intk_emb._fire through kernel.intk_fire (FUSED_FIRE) against its torch ops, on a CUDA matrix in two row chunks
     with signed, varying s: the same codes, the same stored U within fp32 rounding, deq_cache's key moved"""

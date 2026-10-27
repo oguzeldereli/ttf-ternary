@@ -824,7 +824,8 @@ def _ifire_spend_kernel(d_ptr, rho_ptr, v_ptr, o_ptr, ek_ptr, ew_ptr, er_ptr, n_
                     rho = tl.load(rho_ptr + rows[:, None] * srn + (kk // G)[None, :], mask=mk, other=1.0)
                     v = tl.load(v_ptr + kk[:, None] * svk + rr[None, :], mask=(kk[:, None] < K) & (rr[None, :] < R),
                                 other=0.0)
-                    acc += tl.dot(d / rho, v, input_precision="tf32x3")
+                    acc += tl.dot(tl.where(d != 0, d / rho, 0.0), v, input_precision="tf32x3")   # (0 / rho: a zero rho is
+                    # possible, e.g. a constant group's step; the moves themselves need |rho| > 1e-6)
     tl.store(o_ptr + rows[:, None] * son + rr[None, :], acc, mask=(rows[:, None] < N) & (rr[None, :] < R))
 
 
