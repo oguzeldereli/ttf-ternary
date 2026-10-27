@@ -122,7 +122,9 @@ class _PinnedPool:
         return t
 
     def owns(self, t):
-        return t.is_pinned() or t.data_ptr() in self.ptrs
+        # (an empty tensor, the dense state's marker, has no storage and reads as not pinned: the write-back then took the
+        # whole tuple for new buffers at every put, never freed; 27B r1536 lab, 27 Oct: a 30 GB PC's RAM gone in ~25 steps)
+        return t.numel() == 0 or t.is_pinned() or t.data_ptr() in self.ptrs
 
 
 _PINNED = _PinnedPool()

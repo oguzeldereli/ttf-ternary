@@ -431,6 +431,23 @@ def test_beta_follows_fused_fire():
     assert abs(float(l._cached_beta(l.wpacked)) - fresh) < 1e-7
 
 
+def test_offload_put_reuses_buffers():
+    """--ttf-offload async: writing a state tuple back again reuses its pinned host buffers, also for a dense
+    accumulator's tuple, whose last entry is an empty int8 marker (it read as not pinned, and every put took new buffers)"""
+    import ttf.update as U
+    dev = "cuda"
+    for tup in [(torch.randn(256, 64, device=dev).bfloat16(), torch.randn(512, 64, device=dev).bfloat16()),
+                (torch.randn(1024, 512, device=dev).bfloat16(), U._dense_mark(dev))]:
+        d, off = {}, U._AsyncOffload()
+        off.put(d, "k", tup); torch.cuda.synchronize()
+        first, reg = [t.data_ptr() for t in d["k"]], U._PINNED.reg
+        for _ in range(3):
+            y = off.get(d, "k", dev)
+            off.put(d, "k", tuple(t.clone() for t in y)); torch.cuda.synchronize()
+        assert [t.data_ptr() for t in d["k"]] == first and U._PINNED.reg == reg
+        assert all(torch.equal(a.cpu(), b) for a, b in zip(tup, d["k"]))
+
+
 @pytest.mark.parametrize("extra", [["--ttf-offload", "async"]], ids=["offload_async"])
 def test_same_losses(tmp_path, extra):
     """options that must not change the numbers: per-step losses identical to the plain run (deterministic mode)"""
