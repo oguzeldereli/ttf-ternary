@@ -656,7 +656,6 @@ class _HeadLossFn(torch.autograd.Function):
         m, gy, G, dh, h = ctx.m, ctx.gy, ctx.G, ctx.dh, ctx.h
         ctx.gy = ctx.G = ctx.dh = ctx.h = None
         glo, gs = torch.empty_like(m.lo), torch.empty_like(m.s)
-        Gn = m.K // m.g
         if G is not None:
             G.mul_(go.float())
         else:

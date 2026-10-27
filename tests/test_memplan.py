@@ -21,7 +21,6 @@ class _Model(torch.nn.Module):
 
 
 def _run(monkeypatch, n, avail, base, d, steps=12, pp=None, d_first=None):
-    G = 2**30
     m = _Model(n)
     m.pp = pp
     st = {"peak": 0}
