@@ -74,6 +74,19 @@ def _intk_lays(model):
     return intk_layers(model)
 
 
+def _mark_micro(model, i, M, te, intk):
+    """--accum M > 1: micro-batch i of the step, for the TTF updates of its backward (the firing, the spend and v's step
+    on the last one). The ternary embedding's update (tern_emb_step, after each micro-batch's backward) reads the same
+    flags; before 27 Oct it had none, so with --tern-emb and --accum M it fired M times a step"""
+    for l_ in model.modules():
+        if isinstance(l_, KernelTernaryLinear):
+            l_.cap_accum = True; l_.cap_final = i == M - 1; l_.cap_micro = i
+    for l_ in (_tern_lays(model) if te else ()):
+        l_._ts_final = i == M - 1; l_._ts_micro = i
+    for l_ in (_intk_lays(model) if intk else ()):
+        l_._ts_final = i == M - 1
+
+
 def mem_report(model, tail_opt, lr_state):
     """--mem-report: MiB held by each part of training (tensors counted by their own size; CUDA context excluded)"""
     MB = 2 ** 20
@@ -946,22 +959,14 @@ def main():
 
             def _pre_bwd(i_):
                 if ttf and tc.grad_accum > 1:
-                    for l_ in model.modules():
-                        if isinstance(l_, KernelTernaryLinear):
-                            l_.cap_accum = True; l_.cap_final = i_ == tc.grad_accum - 1; l_.cap_micro = i_
-                    for l_ in (_intk_lays(model) if args.intk_emb else ()):
-                        l_._ts_final = i_ == tc.grad_accum - 1
+                    _mark_micro(model, i_, tc.grad_accum, te, args.intk_emb)
             last_loss, sum_loss = model.pp_train(_bt, _pre_bwd, lambda: torch.autocast(device_type=device.split(":")[0],
                                                                                        dtype=torch.bfloat16))
             last_loss, sum_loss = last_loss.item(), sum_loss.item() * tc.grad_accum
             del _bt
         for micro in range(0 if _PP else tc.grad_accum):
             if ttf and tc.grad_accum > 1:      # TTF with accumulation: sum the captured micro-batch gradients
-                for l_ in model.modules():
-                    if isinstance(l_, KernelTernaryLinear):
-                        l_.cap_accum = True; l_.cap_final = micro == tc.grad_accum - 1; l_.cap_micro = micro
-                for l_ in (_intk_lays(model) if args.intk_emb else ()):
-                    l_._ts_final = micro == tc.grad_accum - 1
+                _mark_micro(model, micro, tc.grad_accum, te, args.intk_emb)
             if args.kd_cache:          # --kd-cache: the next precomputed window, its tokens and the teacher's top k
                 # data parallel: each rank its own windows (rank 0 of 1 reads what a single run always read)
                 x, y, model.kd_topk = _kd_cache_batch(args, ((step - args.kd_cache_start) * tc.grad_accum + micro) * _WS + _RK,
