@@ -20,9 +20,10 @@ class _Model(torch.nn.Module):
         self.ckpt_skip = 0
 
 
-def _run(monkeypatch, n, avail, base, d, steps=12):
+def _run(monkeypatch, n, avail, base, d, steps=12, pp=None, d_first=None):
     G = 2**30
     m = _Model(n)
+    m.pp = pp
     st = {"peak": 0}
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (avail, avail))
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
@@ -31,7 +32,8 @@ def _run(monkeypatch, n, avail, base, d, steps=12):
     ck = MP.CkptAuto(m, log=lambda s: None)
     try:
         for _ in range(steps):
-            st["peak"] = int(base + d * m.ckpt_skip + (2 * m.lin.N * m.lin.K if L.W8_CACHE[0] else 0))
+            dk = d if d_first is None or m.ckpt_skip != 1 else d_first     # (d_first: the step-1 measure, low)
+            st["peak"] = int(base + dk * m.ckpt_skip + (2 * m.lin.N * m.lin.K if L.W8_CACHE[0] else 0))
             assert st["peak"] <= ck.budget or m.ckpt_skip <= 1     # never planned past the budget (after measuring)
             ck.after_step()
         return m.ckpt_skip, L.W8_CACHE[0]
@@ -54,3 +56,9 @@ def test_backs_off_when_over(monkeypatch):
     G = 2**30
     k, w8 = _run(monkeypatch, 32, 12 * G, 11 * G, 1 * G)                # base above the budget: no block kept
     assert k == 0 and not w8
+
+
+def test_pipe_grows_two_a_step(monkeypatch):
+    G = 2**30           # --pipe: stage 0's first measure 0.6 of the real d (27B goldbug: 1.38 vs 2.33 GiB): without the cap
+    k, w8 = _run(monkeypatch, 32, 40 * G, 10 * G, 2 * G, steps=20, pp={"lo": 0, "hi": 32}, d_first=1.2 * G)
+    assert not w8 and 9 <= k <= 12                                      # (35.2 - 10) / 2.5 .. / 2, never past the budget

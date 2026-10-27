@@ -25,6 +25,7 @@ class CkptAuto:
         self.model, self.log, self.L = model, log, L
         lo, hi = (model.pp["lo"], model.pp["hi"]) if getattr(model, "pp", None) else (0, len(model.layers))
         self.n = hi - lo
+        self.pp = bool(getattr(model, "pp", None))
         free, _ = torch.cuda.mem_get_info()
         avail = free + torch.cuda.memory_reserved()
         if cap_gib:
@@ -59,6 +60,8 @@ class CkptAuto:
             self._set(1)                       # measure d
         elif k < self.n and self.d:
             add = int((self.budget - peak) // (MARGIN * self.d))
+            if self.pp:   # --pipe: a stage holds several micro-batches in flight, and the step-1 measure of d missed
+                add = min(add, 2)   # some (27B stage 0: 1.38 GiB against 2.33): at most 2 blocks a step, each re-measured
             if add > 0:
                 self._set(min(self.n, k + add))
         elif k == self.n and not w8 and peak + MARGIN * self.w8_bytes < self.budget and \
