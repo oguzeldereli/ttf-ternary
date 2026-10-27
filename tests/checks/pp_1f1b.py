@@ -54,10 +54,11 @@ fake._h_meta = lambda x: ((x.shape[0], x.shape[1], H), dt)
 fake._head_loss = lambda h, y: ((h - y) ** 2).mean()
 order = []
 batches = [(xs[i].to(dev), ys[i].to(dev), None) for i in range(M)]
-last = QwenTern.pp_train(fake, batches, order.append, contextlib.nullcontext)
+last, mean = QwenTern.pp_train(fake, batches, order.append, contextlib.nullcontext)
 err = float((w[r].grad - ref_g).norm() / ref_g.norm())
-ok = order == list(range(M)) and err < 1e-5 and abs(float(last) - ref_loss[-1]) < 1e-5 * max(1, abs(ref_loss[-1]))
-print(f"rank {r}/{n} {be} M={M} H={H} T={T}: grad rel err {err:.2e}, last loss {float(last):.6f} vs {ref_loss[-1]:.6f}, "
+ok = order == list(range(M)) and err < 1e-5 and abs(float(last) - ref_loss[-1]) < 1e-5 * max(1, abs(ref_loss[-1])) \
+    and abs(float(mean) - sum(ref_loss) / M) < 1e-5 * max(1, abs(sum(ref_loss) / M))
+print(f"rank {r}/{n} {be} M={M} H={H} T={T}: grad rel err {err:.2e}, last loss {float(last):.6f} vs {ref_loss[-1]:.6f}, mean {float(mean):.6f} vs {sum(ref_loss) / M:.6f}, "
       f"backward order {order}: {'OK' if ok else 'FAIL'}", flush=True)
 dist.destroy_process_group()
 raise SystemExit(0 if ok else 1)

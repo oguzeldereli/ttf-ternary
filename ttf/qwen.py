@@ -262,7 +262,7 @@ class QwenTern(nn.Module):
         the next forward's receive likewise: NCCL runs a rank pair's sends and receives in order on one stream, so as
         separate ops stage r's send of micro-batch i + 1 waited behind stage r + 1's send of the gradient of i, and that
         behind stage r's receive of it (a deadlock once a message exceeds NCCL's buffer: 27B, 2 x L40S, 25 Oct). Returns
-        the last micro-batch's loss (what the loop logs) on every stage. batches: [(x, y, kd_topk or None)]"""
+        (the last micro-batch's loss, the mean loss of all M) on every stage. batches: [(x, y, kd_topk or None)]"""
         from . import update as _U
         from .layers import _rf
         P = self.pp; r, n = P["rank"], P["n"]; M = len(batches)
@@ -270,6 +270,7 @@ class QwenTern(nn.Module):
         keep, pend = {}, []
         dev = batches[0][0].device
         last = torch.zeros((), device=dev)
+        tot = torch.zeros((), device=dev)
 
         def fwd(i, hin):
             """forward of micro-batch i from the received hidden states hin (stage 0: None); returns what goes to the
@@ -289,14 +290,14 @@ class QwenTern(nn.Module):
             the previous stage (stage 0: None). A stage after the first holds its layers' last-micro-batch updates
             (the step's basis turn, firing and spend) until that gradient is sent (handover): the previous stage
             waited for them otherwise (27B r1536, 2 stages: ~4.7 s of orthonormalisation per step in series)"""
-            nonlocal last
+            nonlocal last, tot
             hin, out = keep.pop(i)
             pre_bwd(i)
             if r > 0 and i == M - 1:
                 _U.DEFER[0] = []
             with torch.profiler.record_function("model.bwd"):
                 if r == n - 1:
-                    (out / M).backward(); last = out.detach().float()
+                    (out / M).backward(); last = out.detach().float(); tot += last
                 else:
                     out.backward(g)
             return hin.grad if r > 0 else None
@@ -340,7 +341,8 @@ class QwenTern(nn.Module):
                     handover()
         for w, _buf in pend:
             w.wait()
-        return _pp_bcast(last, n - 1)
+        both = _pp_bcast(torch.stack([last, tot / M]), n - 1)
+        return both[0], both[1]
 
     def float_tail_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
@@ -415,10 +417,10 @@ def _pp_recv(shape, dtype, src, dev):
 
 def _pp_bcast(t, src):
     import torch.distributed as dist
-    b = t.detach().float().reshape(1)
+    b = t.detach().float().reshape(-1)
     b = b.cpu() if _pp_gloo() else b
     dist.broadcast(b, src)
-    return b.to(t.device)[0]
+    return b.to(t.device).reshape(t.shape)
 
 
 def pp_split(n_layers, n_stages, spec=""):

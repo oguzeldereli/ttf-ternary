@@ -917,6 +917,7 @@ def main():
             g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0) * g.get("emb_mult", 1.0)
         tail_opt.zero_grad(set_to_none=True)
         last_loss = 0.0
+        sum_loss = 0.0         # all micro-batches' losses: the step's loss over its grad_accum windows ("loss_mean")
         if args.ttf_rank:          # TTF: every ternary layer hands its gradient to the update (ts_layer)
             for l in model.modules():
                 if isinstance(l, KernelTernaryLinear): l.capture = True
@@ -943,8 +944,9 @@ def main():
                             l_.cap_accum = True; l_.cap_final = i_ == tc.grad_accum - 1; l_.cap_micro = i_
                     for l_ in (_intk_lays(model) if args.intk_emb else ()):
                         l_._ts_final = i_ == tc.grad_accum - 1
-            last_loss = model.pp_train(_bt, _pre_bwd, lambda: torch.autocast(device_type=device.split(":")[0],
-                                                                             dtype=torch.bfloat16)).item()
+            last_loss, sum_loss = model.pp_train(_bt, _pre_bwd, lambda: torch.autocast(device_type=device.split(":")[0],
+                                                                                       dtype=torch.bfloat16))
+            last_loss, sum_loss = last_loss.item(), sum_loss.item() * tc.grad_accum
             del _bt
         for micro in range(0 if _PP else tc.grad_accum):
             if ttf and tc.grad_accum > 1:      # TTF with accumulation: sum the captured micro-batch gradients
@@ -981,8 +983,11 @@ def main():
                 for m_ in intk_layers(model):
                     m_.step(ts_layer, lr_state, ts_cfg)
             last_loss = loss.detach()          # read once after the last micro-batch (a .item() here synced every one)
+            sum_loss = sum_loss + last_loss.float()
         if torch.is_tensor(last_loss):
             last_loss = last_loss.item()
+        if torch.is_tensor(sum_loss):
+            sum_loss = sum_loss.item()
         if TIME:
             torch.cuda.synchronize(); _t1 = time.time()
             _m1, _p1 = torch.cuda.memory_allocated() / 2**30, torch.cuda.max_memory_allocated() / 2**30
@@ -1051,7 +1056,9 @@ def main():
                   flush=True)
             torch.cuda.reset_peak_memory_stats()
 
-        rec = {"step": step, "loss": last_loss, "lr": lr, "touched_origin": _touched_origin["v"],
+        # "loss": the last micro-batch's (one window of batch_size x seq_len tokens: at batch 1 its spread over the
+        # data's documents, 0.2 .. 5 at 27B, hides the trend); "loss_mean": all grad_accum micro-batches' mean
+        rec = {"step": step, "loss": last_loss, "loss_mean": sum_loss / tc.grad_accum, "lr": lr, "touched_origin": _touched_origin["v"],
                "tokens": (step + 1) * tc.grad_accum * tc.batch_size * tc.seq_len}
         fs = collect_flip_stats(model) if args.track_flips else {}
         if rs_info is not None:
@@ -1070,7 +1077,7 @@ def main():
             if fs:
                 extra += (f"| flip {fs['flip_frac_total']*100:.3f}% "
                           f"| never {fs['never_frac_total']*100:.1f}% ")
-            print(f"step {step:6d} | loss {last_loss:6.3f} | lr {lr:.2e} {extra}"
+            print(f"step {step:6d} | loss {last_loss:6.3f} (mean {sum_loss / tc.grad_accum:6.3f}) | lr {lr:.2e} {extra}"
                   f"| {dt:6.1f}s | peakVRAM {mem:.2f}GiB", flush=True)
             if ttf and step in (10, 1000):
                 print(f"  TTF state: {_ts_state_bytes(lr_state) / 2**20:.1f} MiB stored", flush=True)
