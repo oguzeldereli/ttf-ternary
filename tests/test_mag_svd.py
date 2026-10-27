@@ -1,6 +1,7 @@
 """hf_init.mag_svd_fit (--adapter-init svd, CPU): the float32 randomized top-R fit matches the full float64 SVD it
 replaced (27 Oct: that one ran a 24 GB card out of memory in the 27B streaming conversion), for a positive-definite
 covariance (Cholesky) and a singular one (eigh fallback), and leaves the global RNG as it was."""
+import pytest
 import torch
 
 from ttf.hf_init import mag_svd_fit, ternarize
@@ -54,3 +55,12 @@ def test_global_rng_untouched():
     torch.manual_seed(123); x0 = torch.rand(4)
     torch.manual_seed(123); mag_svd_fit(_Lin(), W, T, a, c, 1.0, H, 4); x1 = torch.rand(4)
     assert torch.equal(x0, x1)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_factors_kept_on_host():
+    W, T, a, c, H = (t.cuda() for t in _case(48, 40, 128, seed=5))
+    lin = _Lin()
+    mag_svd_fit(lin, W, T, a, c, 1.0, H, 4)
+    assert all(t.device.type == "cpu" for t in lin._mag_init)

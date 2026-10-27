@@ -263,7 +263,8 @@ def mag_svd_fit(lin, W, T, a, c, beta, Hc, r):
     Vr = V[:, :r].double()
     B = torch.linalg.solve_triangular(L.T, Vr, upper=True) if Linv_t is None else Linv_t @ Vr
     A = U[:, :r] * S[:r]
-    lin._mag_init = (A.float().contiguous(), B.float().contiguous())
+    lin._mag_init = (A.float().cpu(), B.float().cpu())   # (on the host until enable_lowrank_mag: 400 layers' factors on
+    # the GPU, ~0.6 GB at 27B rank 16, took the streaming conversion out of a 24 GB card at layer 33, 27 Oct)
     return float((S[:r].double() ** 2).sum() / max(tot, 1e-300))
 
 
