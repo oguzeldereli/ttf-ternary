@@ -24,6 +24,9 @@ for f, m in A._LEGACY.items():
     if note.startswith("removed"):
         rows.append((f, note + " (the run cannot be repeated with the core)"))
         continue
+    if note.startswith("moved"):
+        rows.append((f, note + " (the conversion: python -m ttfconv.convert, then --init-ckpt)"))
+        continue
     new = " ".join(x for x in m(v) if x is not None)
     rows.append((f if v is True else f"{f} {v}", (new or "(nothing)") + (f"; {note}" if note else "")))
 rows.append(("--ts_vdiag --ts_vdiag_every N", "--ttf-vdiag N"))
@@ -35,7 +38,7 @@ out = ["# Options map: the trainer's flags before 17 Oct 2026 and the current op
        "e.g. a run's config in the results database). Flags of features that are no longer in the core (the flip "
        "rules, low-rank momentum, look-ahead, TTF with a short momentum and the other experiments) are those of "
        "the trainer at tag `pre-consolidation-2026-10-17` (`python -m bitnet.train` there).", "",
-       "| old | new |", "|---|---|"] + [f"| `{a}` | {b if b.startswith(('removed', 'implied', '(')) else '`' + b.split('; ')[0] + '`' + ('; ' + b.split('; ', 1)[1] if '; ' in b else '')} |" for a, b in rows]
+       "| old | new |", "|---|---|"] + [f"| `{a}` | {b if b.startswith(('removed', 'implied', '(', 'moved')) else '`' + b.split('; ')[0] + '`' + ('; ' + b.split('; ', 1)[1] if '; ' in b else '')} |" for a, b in rows]
 out += ["", "Removed on 25 Oct 2026 (the measured best is now the only path): an old command line that left out `--int8` "
         "(the bf16 forward) or `--ts_tau_anneal` (the fixed leak), or, in kernel mode, both `--tail_fp32` and `--lean_tail` (the bf16 float tail with 8-bit Adam, removed 26 Oct), or ran `--grad_accum` > 1 without `--ts_micro` (one "
         "update from the summed micro-batch gradients), is refused by `from_legacy`, as are the values marked above."]

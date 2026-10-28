@@ -50,9 +50,10 @@ At 600M tokens of FineWeb-Edu TTF leads master + extras by 0.056 (3.0423 vs 3.09
 TTF's gap to master is a smooth function of the size of its state and closes at 0.57–0.70 numbers of state per weight
 at every size (about one byte per weight at the 12 bits the accumulator tolerates, against 12 bytes for master).
 
-**Converting pretrained models** (`--init-hf`): trits chosen by GPTQ onto the ternary grid, frozen while the float
-parts calibrate, then moved by TTF at a threshold four times the from-scratch one (a smaller threshold triggers an
-avalanche of harmful moves after a conversion).
+**Converted pretrained models:** trits chosen by GPTQ onto the ternary grid, frozen while the float parts calibrate,
+then moved by TTF at a threshold four times the from-scratch one (a smaller threshold triggers an avalanche of harmful
+moves after a conversion). Since 28 Oct 2026 the conversion itself is the separate ttf-conversion package; its ternary
+checkpoints train here (`--arch-hf DIR --init-ckpt CKPT`).
 
 | model, recovery tokens | full precision | converted, before training | after |
 |---|---|---|---|
@@ -60,7 +61,7 @@ avalanche of harmful moves after a conversion).
 | Qwen3.5-0.8B-Base, 50M | 2.556 | 4.96 | 2.8503 (distillation does not help at this size) |
 | Qwen3.8-27B, 2M (probe) | 1.9034 | 3.8507 | 2.3644 (8 windows) |
 
-Qwen3.8-27B is converted layer by layer (streaming, about 20 minutes) and trained on one 24 GB GPU (peak 21.2 GiB);
+Qwen3.8-27B is converted layer by layer (about 20 minutes) and trained on one 24 GB GPU (peak 21.2 GiB);
 the converted model runs on a 12 GB laptop GPU at 22.7 tokens per second (`scripts/infer/ttf_qwen.py`). The 27B row
 is an early 60-step probe; a release model (about 40M tokens of recovery with distillation) is in training.
 
@@ -69,8 +70,8 @@ is an early 60-step probe; a release model (about 40M tokens of recovery with di
 - A 23.0B-parameter model (22.85B ternary) trains on one 16 GB GPU (11.1–11.6 GiB at ranks 256–1024, state in host memory with
   asynchronous copies, `--ttf-offload async`; measured with `scripts/lab/b27_lean.sh` at tag `pre-consolidation-2026-10-17`).
   At its leanest it peaks at 9.73 GiB.
-- **Qwen3.8-27B on one 24 GB GPU** (RTX 3090 Ti): converted layer by layer and trained at 32k tokens per step (2 × 8 ×
-  2048) in 68.9 s per step, peak 19.7 GB (`recipes/convert-27b.toml`; the whole pipeline: [docs/CONVERT_27B.md](docs/CONVERT_27B.md)).
+- **Qwen3.8-27B on one 24 GB GPU** (RTX 3090 Ti): a ternary checkpoint trained at 32k tokens per step (2 × 8 × 2048) in
+  68.9 s per step, peak 19.7 GB (`recipes/continue-27b.toml`).
 - **Micro-batches without a dense gradient** (with `--accum M`): each micro-batch's gradient enters the state and is
   discarded (the basis held within the step, turned once after the last); 4 × 4 micro-batches match one pass of batch 16
   over the full schedule (2.6733 vs 2.6728) at 3.1 instead of 7.4 GiB.
@@ -97,10 +98,8 @@ python scripts/eval/final_eval.py runs/ttf runs/bitnet
 python scripts/eval/compare.py runs/ttf runs/bitnet --set fw
 python3 scripts/eval/zeroshot_tok.py && python scripts/eval/zeroshot.py runs/ttf
 
-# convert a pretrained model (Llama architecture or Qwen3.5 / 3.8)
-python -m ttf.train --recipe convert-110m --out-dir runs/convert
-python -m ttf.train --recipe convert-qwen --init-hf PATH/TO/Qwen3.5-0.8B-Base --out-dir runs/qwen
-python -m ttf.train --recipe convert-27b --init-hf PATH/TO/Qwen3.8-27B --kd-cache KD_DIR --out-dir runs/qw27   # docs/CONVERT_27B.md
+# train a converted model (a ternary checkpoint from the ttf-conversion package; Llama architecture or Qwen3.5 / 3.8)
+python -m ttf.train --recipe continue-27b --arch-hf PATH/TO/Qwen3.8-27B --init-ckpt CKPT --kd-cache KD_DIR --out-dir runs/qw27
 ```
 
 Add `--resume` to continue any run; any option on the command line overrides the recipe's. `python -m ttf.train
@@ -114,14 +113,14 @@ short momentum) run from a checkout of that tag (`python -m bitnet.train` there;
 | option | what |
 |---|---|
 | `--mode ttf / bitnet / fp32` | TTF; BitNet b1.58 (latent weights, STE, AdamW); the full-precision model |
-| `--recipe NAME` | defaults for a setting (`recipes/`: scratch-110m, convert-110m, convert-qwen, convert-27b, continue-27b) |
+| `--recipe NAME` | defaults for a setting (`recipes/`: scratch-110m, continue-27b) |
 | `--ttf-rank R` | rank of each layer's accumulator (512) |
 | `--ttf-theta`, `--ttf-tau`, `--ttf-step-p P` | threshold, leak, step scale ρ^P (ρ = lr / peak lr); the leak scales with the step |
 | `--dw factored / dense`, `--dw-sketch K` | the update from the gradient's factors, the dense weight gradient never formed |
 | `--ttf-store fp32 / bf16 / fp12s` | compressed accumulator |
 | `--ttf-offload async`, `--ttf-offload-keep F` | state in pinned host memory (all but the first share F of layers), copies overlapped with the backward |
-| `--adapter-rank R`, `--adapter-init zero / svd` | rank-R float adapter beside the trits (16) |
-| `--init-hf DIR`, `--convert gptqc / gptq / als / absmean / scratch` | convert a pretrained model (Llama, Qwen3.5 / 3.8, layer by layer) |
+| `--adapter-rank R` | rank-R float adapter beside the trits (16) |
+| `--arch-hf DIR`, `--init-ckpt CKPT` | a Hugging Face architecture (Llama, Qwen3.5 / 3.8) and a ternary checkpoint of it to start from |
 | `--teacher DIR`, `--kd-weight W`, `--kd-cache DIR` | distillation from the full-precision model, or from cached top-k targets |
 | `--ttf-start S` | trits frozen until step S (conversion) |
 | `--tern-emb tied / untied / tied_wide:M` | ternary token embedding (and head), trained by TTF |
@@ -136,17 +135,17 @@ ttf/          the package
   layers.py      the ternary layer (packed trits, scales, adapter, gradient capture / fused hooks)
   kernel.py      Triton kernels (int8 / bf16 GEMMs, input gradient, packing, firing, codecs, fused norms)
   schedule.py, data.py, eval.py   lr and TTF schedules, batches and KD-cache windows, validation loss
-  hf_init.py     conversion of pretrained Llama models (ALS, GPTQ onto the ternary grid, centred GPTQ)
-  qwen.py        Qwen3.5 / 3.8 (Gated DeltaNet + attention) with ternary linears; streaming conversion
+  hf_load.py     Hugging Face Llama shapes and full-precision weights (--mode fp32 / bitnet, the --teacher)
+  qwen.py        Qwen3.5 / 3.8 (Gated DeltaNet + attention) with ternary linears, pipeline stages, chunked loss / KD
   master.py      BitNet b1.58 (--mode bitnet); tern_emb.py: ternary embeddings; opt_lean.py: LeanAdam
   model.py, config.py   Llama-style transformer, presets (small = 110M, d1024_l24 = 340M, d2048_l24 = 1.3B, b27)
   results.py     the results database (results/runs.jsonl): runs, events, results, notes
-recipes/       TOML defaults for the measured settings (scratch-110m, convert-110m, convert-qwen, convert-27b, continue-27b)
+recipes/       TOML defaults for the measured settings (scratch-110m, continue-27b)
 scripts/
   results.py     the database's command line (status, table, show, find, note, ingest, validate)
   infer/         ttf_run.py (our models), ttf_qwen.py + ttf_kernels.py (converted Qwen, 2-bit dp4a decode)
   eval/          final_eval.py, compare.py, zeroshot*.py
-  quant/, analysis/, data/   conversion tools, diagnostics, data preparation
+  quant/, analysis/, data/   teacher caches, diagnostics (gradient and rank spectra, memory), data preparation
   tests/         kernel checks and benchmarks, det_run.py (deterministic runs)
 tests/         pytest (-m "not gpu" anywhere; the gpu tests on a CUDA machine); checks/: script checks
 docs/          see below
@@ -158,8 +157,6 @@ docs/          see below
   `show`, `find`); notes are kept outside the repository (`ttf/results.py`, `TTF_NOTES`).
 - [docs/FORMULAS.md](docs/FORMULAS.md): the current update with its options, then every rule tried (old flags).
 - [docs/OPTIONS_MAP.md](docs/OPTIONS_MAP.md): the old flags and the current options.
-- [docs/CONVERT_27B.md](docs/CONVERT_27B.md): converting a 27B model on one 24 GB GPU (data, teacher cache, training,
-  packing, inference).
 - [docs/research/](docs/research/): early results summary, related work, analysis outputs (rank spectra, gaps,
   zero-shot).
 

@@ -3,7 +3,7 @@
 
 Every large linear of the decoder is a TTF layer,
     y = r * ( beta * (Q(c * x) @ T^T)  +  ((c * x) @ B) @ A^T )  [+ b]
-(centred conversions, --convert gptqc: x - mu in place of x and a float bias b, both from the checkpoint)
+(centred conversions, gptqc: x - mu in place of x and a float bias b, both from the checkpoint)
 with trits T stored 5 per byte and re-packed at load to 2 bits each; a few tokens (decoding, short prompts) go through a
 dp4a int8 x trit GEMV with the scales and the low-rank adapter fused into its epilogue (ttf_kernels.py), longer prompts
 through a per-layer expansion to bf16. The rest of the model (Gated DeltaNet, gated attention, norms, embedding, head)

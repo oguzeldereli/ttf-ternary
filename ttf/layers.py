@@ -303,23 +303,17 @@ class KernelTernaryLinear(nn.Module):
 
     def enable_lowrank_mag(self, kind, r):
         """Low-rank float adapter beyond the trits: W = beta*T + A B^T, r (N + K) floats; A starts at 0 (the layer is
-        unchanged at first) unless --adapter-init svd set it"""
+        unchanged at first; a converted checkpoint's adapters load with its weights)"""
         dev = self.wpacked.device
         self.mag_kind = kind
         assert kind == "add", "the adapter is additive (the multiplicative and ternary kinds: tag pre-consolidation-2026-10-17)"
-        mi_ = getattr(self, "_mag_init", None)
-        if mi_ is not None:      # --adapter-init svd: the rounding error's best rank-r part (hf_init._mag_svd_init)
-            assert kind == "add" and mi_[0].shape[1] == r, "--adapter-init svd: the fitted rank must equal --adapter-rank"
-            self.mag_A = nn.Parameter(mi_[0].to(dev).clone()); self.mag_B = nn.Parameter(mi_[1].to(dev).clone())
-            del self._mag_init
-            return [self.mag_A, self.mag_B]
         self.mag_A = nn.Parameter(torch.zeros(self.N, r, device=dev))
         std = (1.0 / self.K) ** 0.5
         self.mag_B = nn.Parameter(torch.randn(self.K, r, device=dev) * std)
         return [self.mag_A, self.mag_B]
 
     def enable_centering(self, mu, bias):
-        """--convert gptqc: y = layer(x - mu) + bias, mu a fixed buffer, bias a float parameter (init W mu)"""
+        """centred layer (a gptqc conversion): y = layer(x - mu) + bias, mu a fixed buffer, bias a float parameter (init W mu)"""
         self.register_buffer("in_mean", mu.detach().clone().float())
         self.out_bias = nn.Parameter(bias.detach().clone().float())
 

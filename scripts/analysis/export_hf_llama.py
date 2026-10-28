@@ -1,7 +1,7 @@
 """Export one of our fp32 checkpoints (mode fp32, e.g. checkpoints/fp32_baseline) as a Hugging Face Llama directory, so
-the trainer's --init-hf (and GPTQ conversion) can start from it: config.json + model.safetensors, q / k rows permuted
-to HF's rotate_half layout (the inverse of hf_init._unpermute). Checks the round trip: the export loaded back through
-init_from_hf("fp32") gives the original model's loss on the first --check windows of --val.
+a conversion (the ttf-conversion package) or --arch-hf can start from it: config.json + model.safetensors, q / k rows permuted
+to HF's rotate_half layout (the inverse of hf_load._unpermute). Checks the round trip: the export loaded back through
+load_hf_fp gives the original model's loss on the first --check windows of --val.
 
   python scripts/analysis/export_hf_llama.py checkpoints/fp32_baseline/ckpt.pt OUT_DIR [--val data/wiki32k_val.bin]
 """
@@ -12,7 +12,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from ttf.model import BitTransformer                                  # noqa: E402
-from ttf.hf_init import init_from_hf, model_config_from_hf, _LIN     # noqa: E402
+from ttf.hf_load import load_hf_fp, model_config_from_hf, _LIN     # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("ckpt"); ap.add_argument("out"); ap.add_argument("--val", default="data/wiki32k_val.bin")
@@ -58,7 +58,7 @@ mk = lambda: BitTransformer(c, grad_checkpoint=False, make_linear=lambda i, o: n
 m0 = mk(); m0.load_state_dict(sd, strict=True)
 m1 = BitTransformer(model_config_from_hf(a.out, c.max_seq_len), grad_checkpoint=False,
                     make_linear=lambda i, o: nn.Linear(i, o, bias=False)).to(dev).eval()
-init_from_hf(m1, a.out, "fp32", log=lambda *_: None)
+load_hf_fp(m1, a.out, log=lambda *_: None)
 val = np.memmap(a.val, dtype=np.uint16, mode="r")
 with torch.no_grad():
     for i in range(a.check):

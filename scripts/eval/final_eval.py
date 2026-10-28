@@ -78,7 +78,7 @@ def load_model(path, device):
         a_ = a_ if isinstance(a_, dict) else vars(a_)
         from ttf.intk_emb import enable_intk_emb_bt
         enable_intk_emb_bt(model, a_["intk_emb"], log=lambda m_: None)
-    if any(k.endswith(".in_mean") for k in sd):              # --convert gptqc: centred layers
+    if any(k.endswith(".in_mean") for k in sd):              # centred layers (a gptqc conversion)
         for n_, m_ in model.named_modules():
             if isinstance(m_, KernelTernaryLinear) and f"{n_}.in_mean" in sd:
                 m_.enable_centering(sd[f"{n_}.in_mean"].to(device), sd[f"{n_}.out_bias"].to(device))

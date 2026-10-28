@@ -1,38 +1,28 @@
-"""--ext MODULE[:SPEC] (repeatable): structure and conversion plug-ins, loaded by name, in the order given. Replaces the
-import-order monkeypatching of ttf.qwen / ttf.hf_init that the experiment scripts relied on (a script imported earlier
-or later changed which wrappers were active). A plug-in module defines
+"""--ext MODULE[:SPEC] (repeatable): structure plug-ins, loaded by name, in the order given. Replaces the import-order
+monkeypatching of ttf.qwen that the experiment scripts relied on (a script imported earlier or later changed which
+wrappers were active). A plug-in module defines
 
-    ttf_ext(spec: str) -> an object with any of these methods (all optional):
+    ttf_ext(spec: str) -> an object with any of these methods (both optional):
 
   build(model, swapped, make_linear, log) -> swapped      after build_qwen, on a fresh start and on resume: wrap or add
-                                                          layers. A wrapper keeps its ternary layer as .lin; the
-                                                          conversion rounds .lin and puts the wrapper back at the end
-  begin(model, files, dev, log)                           streaming conversion: after the float parts are loaded, before
-                                                          the calibration inputs (e.g. a residual-stream fold)
-  weight(name, W, layer_idx) -> W                         the fp weight (float32) that is rounded (e.g. the fold)
-  refine(name, W, Hc, T, a, c) -> (T, a, c)               after GPTQ (e.g. coordinate descent)
-  fitted(name, wrapper, W, Hc, mu, T, a, c)               after the layer's own trits, scales and centring are written
-                                                          (a: the row magnitude before the 1 / beta of row_scale): fits
-                                                          on what they left
-                                                          (adapters, a second ternary layer)
-  end(model, log)                                         after the last layer
+                                                          layers (a wrapper keeps its ternary layer as .lin), so that a
+                                                          checkpoint written with them loads
   setup(model, log)                                       before the first step, after the weights are loaded (fresh
                                                           start, --init-ckpt and resume alike): what trains, not the
                                                           structure (e.g. layers frozen: their ts_frozen and their
                                                           parameters' requires_grad)
 
 The spec string is the plug-in's own (e.g. "rank=0.2,alt=1"); it is saved with the run's arguments, and a resume must
-pass the same --ext list (train.py refuses a different one). Only build may change the structure or what trains: the
-conversion hooks do not run again on resume. Plug-ins that add parameters must do so in build (the optimizer is built
-after it). The conversion hooks run in the centred streaming conversion (--convert gptqc --convert-stream); the trainer
-refuses plug-ins with conversion hooks otherwise."""
+pass the same --ext list (train.py refuses a different one). Only build may change the structure; plug-ins that add
+parameters must do so in build (the optimizer is built after it). The conversion's hooks (begin / weight / refine /
+fitted / end) left the core with the conversion on 28 Oct 2026 (the ttf-conversion package)."""
 import importlib
 
 _ACTIVE = []
 
 
 def load(specs):
-    """--ext values -> plug-in objects (also kept as the active list for the conversion)"""
+    """--ext values -> plug-in objects (also kept as the active list)"""
     _ACTIVE.clear()
     for s in specs or ():
         mod, _, spec = s.partition(":")

@@ -7,7 +7,6 @@ The rest: the TTF update's kernels (firing, sketches, the fp12 codec) and the fu
 of Qwen's norms.
 """
 from __future__ import annotations
-import os
 import torch
 import triton
 import triton.language as tl

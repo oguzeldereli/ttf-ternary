@@ -1,4 +1,4 @@
-"""Qwen3.5 / Qwen3.8 (model_type qwen3_5: Gated DeltaNet + gated full attention) with ternary linears, for --init-hf.
+"""Qwen3.5 / Qwen3.8 (model_type qwen3_5: Gated DeltaNet + gated full attention) with ternary linears, for --arch-hf.
 
 The Hugging Face implementation (transformers >= 5.8, fla kernels for the delta rule) runs the model; every large
 linear of the text decoder becomes a KernelTernaryLinear, so TTF's update, the row / column scales and the low-rank
@@ -97,19 +97,6 @@ def model_config(path, max_seq_len=2048):
                        n_heads=nh, n_kv_heads=t.num_key_value_heads,
                        hidden_dim=t.intermediate_size, max_seq_len=max_seq_len,
                        tie_embeddings=bool(getattr(t, "tie_word_embeddings", False)))
-
-
-def _text_state(path):
-    """the language model's tensors with the 'model.language_model.' / 'model.' prefixes normalised to 'model.'"""
-    from .hf_init import load_hf_tensors
-    sd = load_hf_tensors(path)
-    out = {}
-    for k, v in sd.items():
-        if k.startswith("model.visual") or k.startswith("mtp") or ".mtp" in k:
-            continue
-        k2 = k.replace("model.language_model.", "model.")
-        out[k2] = v
-    return out
 
 
 class QwenTern(nn.Module):
@@ -433,7 +420,8 @@ def pp_split(n_layers, n_stages, spec=""):
 
 def build_qwen(path, mode, make_linear=None, grad_checkpoint=True, device="cuda", dtype=torch.bfloat16, own=None):
     """the text decoder on `device`: mode 'fp32' (all linears float, the reference) or 'kernel' (make_linear for the large
-    linears); float parts in `dtype`. Weights are NOT loaded here (load_qwen). own=(lo, hi, first, last) (--pipe): only
+    linears); float parts in `dtype`. Weights are NOT loaded here (a ternary checkpoint, or the
+    ttf-conversion package's conversion). own=(lo, hi, first, last) (--pipe): only
     decoder layers [lo, hi) (+ the embedding if first, the final norm and head if last) are allocated, the rest stay on
     the meta device with the same module tree."""
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
@@ -474,140 +462,6 @@ def build_qwen(path, mode, make_linear=None, grad_checkpoint=True, device="cuda"
     return m, swapped
 
 
-@torch.no_grad()
-def load_qwen(m, path, swapped, method="als", rc=True, hess=None, log=print):
-    """copy the float tensors; convert each swapped linear's weight to trits + row / column scales (hf_init.ternarize /
-    ternarize_gptq); embedding and head are frozen"""
-    from .hf_init import ternarize, ternarize_gptq, _rel_err, _out_err, GPTQ_OPTS, mag_svd_fit
-    from .kernel import pack_rows, trit_beta
-    kept = []
-    sd = _text_state(path)
-    hf = m.hf
-    own = dict(hf.named_parameters())
-    sw = {k + ".weight" for k in swapped}
-    missing = []
-    for k, p in own.items():
-        if k in sd:
-            p.copy_(sd[k].to(p.dtype))
-        elif k == "lm_head.weight" and "model.embed_tokens.weight" in sd:
-            p.copy_(sd["model.embed_tokens.weight"].to(p.dtype))
-        elif not any(k.startswith(s.rsplit(".weight", 1)[0]) for s in sw):
-            missing.append(k)
-    if missing:
-        log(f"load_qwen: {len(missing)} float tensors not in the checkpoint (kept at init): {missing[:6]}")
-    hf.model.embed_tokens.weight.requires_grad_(False); hf.lm_head.weight.requires_grad_(False)
-    errs, oerrs = [], []
-    for name, lin in swapped.items():
-        W = sd[name + ".weight"].to(lin.wpacked.device).float()
-        T, a, c = ternarize(W, "als" if method in ("gptq", "gptqc") else method)
-        if hess is not None:
-            Hl = hess[name].to(W.device)
-            mu = hess["mu:" + name].to(W.device) if method == "gptqc" else None   # (centred: the layer's error)
-            e0 = _out_err(W, T, a, c, Hl, mu)
-            if method == "gptq":
-                T, a, c = ternarize_gptq(W, Hl, a, c)
-            elif method == "gptqc":     # centred (hf_init gptqc): GPTQ on the input covariance, the layer takes the
-                T, a, c = ternarize_gptq(W, Hl - torch.outer(mu, mu), a, c)   # input mean out before its activation
-                lin.enable_centering(mu, W @ mu)                            # quantisation, W mu as a bias
-            oerrs.append((e0, _out_err(W, T, a, c, Hl, mu))); del Hl
-        errs.append(_rel_err(W, T, a, c))
-        lin.wpacked.copy_(pack_rows(T))
-        beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
-        if rc and lin.row_scale is not None:
-            lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
-        else:
-            raise SystemExit("Qwen conversion needs --rc-scale")
-        if GPTQ_OPTS["mag_svd"] and hess is not None and method in ("gptq", "gptqc"):   # --adapter-init svd
-            Hc = hess[name].to(W.device)
-            if method == "gptqc":
-                mu = hess["mu:" + name].to(W.device); Hc = Hc - torch.outer(mu, mu)
-            kept.append(mag_svd_fit(lin, W, T, a, c, beta, Hc, GPTQ_OPTS["mag_svd"])); del Hc
-        del W
-    if errs:
-        log(f"--init-hf {path}: {method}, {len(errs)} ternary linears, relative weight error mean "
-            f"{sum(errs) / len(errs):.4f} (max {max(errs):.4f})")
-    if oerrs:
-        e0, e1 = zip(*oerrs)
-        log(f"  output-space error mean {sum(e1) / len(e1):.4f} (ALS rounding {sum(e0) / len(e0):.4f})")
-    if kept:
-        log(f"  --adapter-init svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
-            f"rounding error (min {min(kept):.3f}, max {max(kept):.3f}) over {len(kept)} linears")
-
-
-@torch.no_grad()
-def calib_hessians_qwen(path, data_path, n_seq=64, seq=2048, dev="cuda", dtype_u32=True, log=print):
-    """input second moments X^T X / tokens of every large linear in the full-precision model ({linear name: H})"""
-    import numpy as np
-    m, _ = build_qwen(path, "fp32", grad_checkpoint=False, device=dev)
-    sd = _text_state(path)
-    for k, p in m.hf.named_parameters():
-        src = sd.get(k, sd.get("model.embed_tokens.weight") if k == "lm_head.weight" else None)
-        if src is not None:
-            p.data.copy_(src.to(p.dtype))
-    del sd
-    m.eval()
-    H, S, cnt, hooks = {}, {}, {}, []
-    for name, mod in m.hf.model.layers.named_modules():
-        if isinstance(mod, nn.Linear) and name.rsplit(".", 1)[-1] not in _KEEP_FLOAT:
-            key = "model.layers." + name
-            H[key] = torch.zeros(mod.in_features, mod.in_features, device=dev); cnt[key] = 0
-            S[key] = torch.zeros(mod.in_features, device=dev)
-
-            def hook(mod_, inp, key=key):
-                x = inp[0].reshape(-1, inp[0].shape[-1]).float()
-                H[key].addmm_(x.T, x); S[key] += x.sum(0); cnt[key] += x.shape[0]
-            hooks.append(mod.register_forward_pre_hook(hook))
-    data = np.memmap(data_path, dtype=np.uint32 if dtype_u32 else np.uint16, mode="r")
-    rng = np.random.default_rng(4321)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        for s in rng.integers(0, len(data) - seq - 1, n_seq):
-            x = torch.tensor(data[s:s + seq].astype(np.int64), device=dev)[None]
-            m(x, x)
-    for h in hooks:
-        h.remove()
-    out = {k: (v / max(cnt[k], 1)).cpu() for k, v in H.items()}
-    out.update({"mu:" + k: (v / max(cnt[k], 1)).cpu() for k, v in S.items()})   # input means (gptqc)
-    del m, H, S; torch.cuda.empty_cache()
-    log(f"calibration: input second moments (and means) of {len(out) // 2} linears from {n_seq} x {seq} tokens")
-    return out
-
-
-class _StopFwd(Exception):
-    pass
-
-
-@torch.no_grad()
-def layer_inputs(m, windows, mb, dev):
-    """the first decoder layer's inputs for the windows (micro-batches of mb) and the keyword arguments transformers
-    passes to EACH layer (rotary embeddings; the full-attention and the recurrent masks differ by layer type), taken
-    from one full forward of the first micro-batch; the other micro-batches stop at layer 0"""
-    import numpy as np
-    layers = m.hf.model.layers
-    KW, H, hooks = [None] * len(layers), [], []
-
-    def mk(i):
-        def pre(mod, args, kwargs):
-            if KW[i] is None:
-                KW[i] = {k: v for k, v in kwargs.items() if k != "hidden_states"}
-            if i == 0:
-                H.append((args[0] if args else kwargs["hidden_states"]).detach())
-                if all(k is not None for k in KW):
-                    raise _StopFwd
-        return pre
-    for i, l in enumerate(layers):
-        hooks.append(l.register_forward_pre_hook(mk(i), with_kwargs=True))
-    for b in range(0, len(windows), mb):
-        x = torch.tensor(np.stack([w.astype(np.int64) for w in windows[b:b + mb]]), device=dev)
-        try:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                m.hf.model(input_ids=x, use_cache=False)
-        except _StopFwd:
-            pass
-    for h in hooks:
-        h.remove()
-    return H, KW
-
-
 def _safetensor_index(path):
     """{tensor name (normalised to 'model.'): file} for lazy per-layer loading"""
     import glob
@@ -631,114 +485,3 @@ def _get(files, name, dev):
     k, f = files[name]
     with safe_open(f, "pt", device="cpu") as h:
         return h.get_tensor(k).to(dev)
-
-
-@torch.no_grad()
-def convert_qwen_streaming(m, path, swapped, data_path, method="gptq", n_seq=64, seq=2048, mb=4, dev="cuda",
-                           dtype_u32=True, log=print):
-    """sequential, layer-by-layer conversion for models that do not fit as a whole in full precision (27B): the float
-    tensors are loaded first; then for each decoder layer in turn its full-precision linears are put in place (read
-    lazily from the safetensors), the calibration activations (inputs as produced by the already converted layers below)
-    are run through it to collect each linear's input second moment, the linears are rounded (GPTQ or ALS) into the
-    ternary layers, and the activations go on through the converted layer. Peak: the model's ternary form + one layer
-    in full precision + the calibration activations (n_seq x seq x d bf16)."""
-    import numpy as np
-    from .hf_init import ternarize, ternarize_gptq, _rel_err, _out_err, GPTQ_OPTS, mag_svd_fit
-    from .kernel import pack_rows, trit_beta
-    from . import ext as X_
-    kept = []
-    files = _safetensor_index(path)
-    hf = m.hf
-    wrapped = {n: q for n, q in swapped.items() if X_.base(q) is not q}   # --ext wrappers: their ternary layer is rounded and
-    swapped = {n: X_.base(q) for n, q in swapped.items()}                 # carries the stream; the wrapper goes back at the end
-    sw = {k + ".weight" for k in swapped}
-    for k, p in hf.named_parameters():                  # the float parts
-        src = k if k in files else ("model.embed_tokens.weight" if k == "lm_head.weight" else None)
-        if src in files and k not in sw:
-            p.copy_(_get(files, src, dev).to(p.dtype))
-    hf.model.embed_tokens.weight.requires_grad_(False); hf.lm_head.weight.requires_grad_(False)
-    for f_ in X_.having("begin"):
-        f_(m, files, dev, log)
-    _prop_w = any(getattr(e, "propagate_wrapped", False) for e in X_.active())
-    data = np.memmap(data_path, dtype=np.uint32 if dtype_u32 else np.uint16, mode="r")
-    rng = np.random.default_rng(4321)
-    starts = rng.integers(0, len(data) - seq - 1, n_seq)
-    layers = hf.model.layers
-    H_in, KW = layer_inputs(m, [data[s:s + seq] for s in starts], mb, dev)
-    log(f"streaming conversion: {len(layers)} layers, {n_seq} x {seq} calibration tokens in {len(H_in)} micro-batches")
-    errs, oerrs = [], []
-    for li, layer in enumerate(layers):
-        pre_ = f"model.layers.{li}."
-        mine = {n: l for n, l in swapped.items() if n.startswith(pre_)}
-        fp = {}                                         # this layer's full-precision linears, in place of the ternary ones
-        for n, lin in mine.items():
-            W = _get(files, n + ".weight", dev)
-            for f_ in X_.having("weight"):              # e.g. a residual-stream fold (rounded to bf16 with the rest)
-                W = f_(n, W.float(), li)
-            f = nn.Linear(W.shape[1], W.shape[0], bias=False, device=dev, dtype=torch.bfloat16); f.weight.copy_(W)
-            parent = layer.get_submodule(n[len(pre_):].rsplit(".", 1)[0]); setattr(parent, n.rsplit(".", 1)[1], f)
-            fp[n] = (f, parent)
-        Hs = {n: torch.zeros(f.in_features, f.in_features, device=dev) for n, (f, _) in fp.items()}
-        Ss = {n: torch.zeros(f.in_features, device=dev) for n, (f, _) in fp.items()}
-        cnt = {n: 0 for n in fp}
-        hooks = []
-        for n, (f, _) in fp.items():
-            def hook(mod_, inp, n=n):
-                xx = inp[0].reshape(-1, inp[0].shape[-1]).float(); Hs[n].addmm_(xx.T, xx); Ss[n] += xx.sum(0)
-                cnt[n] += xx.shape[0]
-            hooks.append(f.register_forward_pre_hook(hook))
-        kw = KW[li]
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            for h in H_in:
-                layer(h, **kw)
-        for hh in hooks:
-            hh.remove()
-        for n, (f, parent) in fp.items():               # round into the ternary layer, put it back
-            lin = mine[n]
-            W = f.weight.float(); Hl = Hs.pop(n) / max(cnt[n], 1); mu = Ss.pop(n) / max(cnt[n], 1)
-            T, a, c = ternarize(W, "als")
-            mu_e = mu if method == "gptqc" else None    # (centred: the layer's error, not the raw input's)
-            e0 = _out_err(W, T, a, c, Hl, mu_e)
-            if method == "gptq":
-                T, a, c = ternarize_gptq(W, Hl, a, c)
-            elif method == "gptqc":                     # centred (hf_init gptqc)
-                Hc_ = Hl - torch.outer(mu, mu)
-                T, a, c = ternarize_gptq(W, Hc_, a, c)
-                for f_ in X_.having("refine"):          # e.g. coordinate descent on the trits
-                    T, a, c = f_(n, W, Hc_, T, a, c)
-                lin.enable_centering(mu, W @ mu)
-            oerrs.append((e0, _out_err(W, T, a, c, Hl, mu_e))); errs.append(_rel_err(W, T, a, c))
-            lin.wpacked.copy_(pack_rows(T))
-            beta = float(trit_beta(lin.wpacked, lin.K)) if lin.use_beta else 1.0
-            lin.row_scale.copy_(a / beta); lin.col_scale.copy_(c)
-            if method == "gptqc":
-                for f_ in X_.having("fitted"):          # e.g. adapters fitted to what the trits left (the layer written)
-                    f_(n, wrapped.get(n, lin), W, Hc_, mu, T, a, c)
-                del Hc_
-            if GPTQ_OPTS["mag_svd"] and method in ("gptq", "gptqc"):          # --adapter-init svd
-                kept.append(mag_svd_fit(lin, W, T, a, c, beta, Hl - torch.outer(mu, mu) if method == "gptqc" else Hl,
-                                        GPTQ_OPTS["mag_svd"]))
-            # the calibration stream goes on through the bare ternary layer, unless a plug-in asks for the whole wrapper
-            # (ext attribute propagate_wrapped: the layers above are then rounded for the inputs they will see)
-            setattr(parent, n.rsplit(".", 1)[1], wrapped[n] if n in wrapped and _prop_w else lin)
-            del W, Hl, T
-        del fp, Hs, Ss
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):   # on through the converted layer
-            H_in = [(lambda o: o[0] if isinstance(o, tuple) else o)(layer(h, **kw)) for h in H_in]
-        torch.cuda.empty_cache()
-        if li % 8 == 0 or li == len(layers) - 1:
-            e0, e1 = zip(*oerrs[-len(mine):])
-            per = " ".join(f"{n.rsplit('.', 2)[-2]}.{n.rsplit('.', 1)[-1]} {e:.3f}" for n, e in zip(mine, e1))
-            log(f"  layer {li}: {len(mine)} linears, output-space error {sum(e1) / len(e1):.4f} "
-                f"(ALS {sum(e0) / len(e0):.4f}), peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB; {per}")
-    for n, q in wrapped.items():                         # the wrappers back in the tree
-        par, cn = n[len("model.layers."):].rsplit(".", 1)
-        setattr(hf.model.layers.get_submodule(par), cn, q)
-    for f_ in X_.having("end"):
-        f_(m, log)
-    e0, e1 = zip(*oerrs)
-    if kept:
-        log(f"--adapter-init svd {GPTQ_OPTS['mag_svd']}: the adapters take {sum(kept) / len(kept):.3f} of the output-space "
-            f"rounding error (min {min(kept):.3f}, max {max(kept):.3f}) over {len(kept)} linears")
-    log(f"--init-hf {path}: {method} (sequential, streaming), {len(errs)} ternary linears, weight error "
-        f"{sum(errs) / len(errs):.4f}, output-space error {sum(e1) / len(e1):.4f} (ALS {sum(e0) / len(e0):.4f})")

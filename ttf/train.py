@@ -116,12 +116,7 @@ def main():
     args = parse()
     from . import ext as _X
     _X.load(args.ext)   # --ext plug-ins (ttf/ext.py), before the model is built
-    if any(_X.having(h_) for h_ in ("begin", "weight", "refine", "fitted", "end")) and \
-            (args.convert != "gptqc" or not args.convert_stream):
-        raise SystemExit(f"--ext {args.ext}: these plug-ins hook the conversion, which runs them only in the centred "
-                         f"streaming conversion (--convert gptqc --convert-stream); got --convert {args.convert}"
-                         f"{'' if args.convert_stream else ' --no-convert-stream'}")
-    kmode = {"ttf": "kernel", "bitnet": "master", "fp32": "fp32"}[args.mode]   # the checkpoint's and hf_init's names
+    kmode = {"ttf": "kernel", "bitnet": "master", "fp32": "fp32"}[args.mode]   # the checkpoint's and hf_load's names
     ttf = args.mode == "ttf"
     te = args.tern_emb if args.tern_emb != "none" else ""            # the ternary embedding's kind ("": none)
     mag = f"add:{args.adapter_rank}" if args.adapter_rank else ""     # the adapter ("": none)
@@ -142,15 +137,15 @@ def main():
 
     mc: ModelConfig = PRESETS[args.preset]
     _QWEN = False
-    if args.init_hf:
+    if args.arch_hf:
         from .qwen import is_qwen35
-        _QWEN = is_qwen35(args.init_hf)
+        _QWEN = is_qwen35(args.arch_hf)
         if _QWEN:              # Qwen3.5 / 3.8 (Gated DeltaNet + gated attention): transformers' model, ternary linears
             from .qwen import model_config as _qmc
-            mc = _qmc(args.init_hf)
+            mc = _qmc(args.arch_hf)
         else:
-            from .hf_init import model_config_from_hf
-            mc = model_config_from_hf(args.init_hf)
+            from .hf_load import model_config_from_hf
+            mc = model_config_from_hf(args.arch_hf)
     tc = TrainConfig()
     if args.seed is not None: tc.seed = args.seed
     if args.data: tc.data_path = args.data
@@ -226,12 +221,12 @@ def main():
         _own = None
         if _PP:
             from .qwen import text_config, pp_split
-            _rng = pp_split(text_config(args.init_hf).num_hidden_layers, _PP[1], args.pipe_split)
+            _rng = pp_split(text_config(args.arch_hf).num_hidden_layers, _PP[1], args.pipe_split)
             _own = (*_rng[_PP[0]], _PP[0] == 0, _PP[0] == _PP[1] - 1)
             print(f"--pipe: stage {_PP[0]} of {_PP[1]}: decoder layers {_own[0]}..{_own[1] - 1} of {_rng[-1][1]}"
                   f"{' + embedding' if _own[2] else ''}{' + norm, head and loss' if _own[3] else ''}", flush=True)
         _mkl = lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, beta=use_beta)
-        model, _qsw = build_qwen(args.init_hf, "kernel", grad_checkpoint=tc.grad_checkpoint, device=device, own=_own,
+        model, _qsw = build_qwen(args.arch_hf, "kernel", grad_checkpoint=tc.grad_checkpoint, device=device, own=_own,
                                  make_linear=_mkl)
         from . import ext as _X
         for f_ in _X.having("build"):    # --ext plug-ins: wrappers / extra layers (fresh start and resume alike)
@@ -321,13 +316,14 @@ def main():
 
     if _init_ck:   # --init-ckpt: a converted checkpoint's weights, a fresh run (step 0, no optimizer / TTF state)
         _resume_path = args.init_ckpt
-    if args.init_hf and _from_ckpt:   # the checkpoint holds the converted model (trits, scales, float parts)
-        print(f"--init-hf: {'resuming from' if _resuming else '--init-ckpt'} {_resume_path}, conversion skipped", flush=True)
+    if args.arch_hf and _from_ckpt:   # the checkpoint holds the converted model (trits, scales, float parts)
+        print(f"--arch-hf: {'resuming from' if _resuming else '--init-ckpt'} {_resume_path}", flush=True)
         if _QWEN:   # as the conversion leaves them: embedding and head frozen (the optimizer is built below)
             model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
-        if args.convert == "gptqc":   # centred layers: their buffers and bias
-            _cb = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)
-            _ck, _cn = _cb["model"], set()                       # exist before the optimizer is built
+        _cb = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)
+        _ck, _cn = _cb["model"], set()
+        if args.mode == "ttf" and (_PP or any(k_.endswith(".in_mean") for k_ in _ck)):
+            # centred layers (a gptqc conversion's): their buffers and bias exist before the optimizer is built
             if _PP:   # a stage checkpoint holds its own layers: the others' centred layers, from their stages
                 _all = [None] * _dist.get_world_size()
                 _dist.all_gather_object(_all, [k_[:-len(".in_mean")] for k_ in _ck if k_.endswith(".in_mean")])
@@ -343,7 +339,7 @@ def main():
                     m_.enable_centering(torch.empty(m_.K, device="meta"), torch.empty(m_.N, device="meta"))
                     _nc += 1                             # every stage's optimizer groups match the saved ones)
             print(f"resume: {_nc} centred layers restored", flush=True)
-            del _cb, _ck
+        del _cb, _ck
         if _init_ck:   # the weights now, before the optimizer and the embedding / head options (--intk-emb
             _blob = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)   # quantizes these)
             _r = model.load_state_dict(_blob["model"], strict=False)
@@ -355,33 +351,16 @@ def main():
                   + (f"; not in it: {', '.join(_r.missing_keys[:4])}{' ...' if len(_r.missing_keys) > 4 else ''}"
                      if _r.missing_keys else ""), flush=True)
             del _blob, _r
-    if args.init_hf and not _from_ckpt:
-        if _PP:   # (each stage holds its own layers only: the conversion's calibration stream needs them all)
-            raise SystemExit("--pipe: no conversion here; convert on one GPU first (--stop-after 0, e.g. lab "
-                             "preconv27.sh), then start every stage from it with --init-ckpt")
-        from .hf_init import init_from_hf, GPTQ_OPTS as _GO
-        _GO["mag_svd"] = args.svd_rank
-        _hess = None
-        if _QWEN and args.convert_stream:   # --convert-stream: layer by layer, sequential (models too big for one fp copy)
-            from .qwen import convert_qwen_streaming
-            convert_qwen_streaming(model, args.init_hf, _qsw, tc.data_path, method=args.convert,
-                                   n_seq=args.calib, seq=tc.seq_len, dev=device, dtype_u32=args.u32,
-                                   log=lambda m_: print(m_, flush=True))
-        elif _QWEN:
-            from .qwen import load_qwen, calib_hessians_qwen
-            if args.convert in ("gptq", "gptqc"):
-                _hess = calib_hessians_qwen(args.init_hf, tc.data_path, n_seq=args.calib, seq=tc.seq_len,
-                                            dev=device, dtype_u32=args.u32, log=lambda m_: print(m_, flush=True))
-            load_qwen(model, args.init_hf, _qsw, method=args.convert, rc=args.rc_scale, hess=_hess,
-                      log=lambda m_: print(m_, flush=True))
-            _hess = None
-        elif args.convert in ("gptq", "gptqc"):     # input second moments of the full-precision model (not the run's windows)
-            from .hf_init import calib_hessians
-            _hess = calib_hessians(args.init_hf, tc.data_path, n_seq=args.calib, dev=device, dtype_u32=args.u32,
-                                   log=lambda m_: print(m_, flush=True))
-        if not _QWEN:
-            init_from_hf(model, args.init_hf, kmode, args.convert, rc=args.rc_scale, hess=_hess,
-                         log=lambda m_: print(m_, flush=True))
+    if args.arch_hf and not _from_ckpt:
+        if _QWEN:   # (build_qwen allocates the weights without values)
+            raise SystemExit(f"--arch-hf {args.arch_hf} (Qwen): start from a ternary checkpoint of it (--init-ckpt PATH, "
+                             f"or --resume); the conversion from the full-precision weights is the ttf-conversion "
+                             f"package's (python -m ttfconv.convert, since 28 Oct 2026)")
+        if args.mode == "ttf":   # Llama shape, TTF from scratch (a converted start: --init-ckpt, as above)
+            print(f"--arch-hf {args.arch_hf}: its shape, trained from scratch (weights not loaded)", flush=True)
+        else:                    # fp32 / bitnet: the full-precision weights (bitnet: as its master weights)
+            from .hf_load import load_hf_fp
+            load_hf_fp(model, args.arch_hf, log=lambda m_: print(m_, flush=True))
     _teacher = None
     if args.kd_cache:  # precomputed teacher targets (scripts/quant/teacher_topk.py)
         assert hasattr(model, "kd_topk"), "--kd-cache: Qwen models"
@@ -400,11 +379,11 @@ def main():
         model.kd_w = args.kd_weight
         print(f"--distill {args.teacher} (Qwen): teacher in bf16, loss (1 - {args.kd_weight}) CE + {args.kd_weight} KL", flush=True)
     elif args.teacher:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels
-        from .hf_init import model_config_from_hf as _mch, init_from_hf as _ifh
+        from .hf_load import model_config_from_hf as _mch, load_hf_fp as _ifh
         from .model import BitTransformer as _BT
         _teacher = _BT(_mch(args.teacher, max_seq_len=tc.seq_len), grad_checkpoint=False,
                        make_linear=lambda i_, o_: nn.Linear(i_, o_, bias=False)).to(device)
-        _ifh(_teacher, args.teacher, "fp32", log=lambda *_: None)
+        _ifh(_teacher, args.teacher, log=lambda *_: None)
         _teacher = _teacher.eval()
         for p_ in _teacher.parameters():   # parameters only: Module.to(bf16) would also cast the complex RoPE table
             p_.data = p_.data.to(torch.bfloat16); p_.requires_grad_(False)   # to real (teacher CE 5.20 instead of 2.34)

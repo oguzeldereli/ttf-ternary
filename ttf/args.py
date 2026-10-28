@@ -25,7 +25,7 @@ def build_parser():
     g.add_argument("--mode", default="ttf", choices=["ttf", "bitnet", "fp32"],
                    help="ttf: packed trits trained by TTF; bitnet: BitNet b1.58 (latent weights, STE, AdamW); "
                         "fp32: the full-precision model")
-    g.add_argument("--preset", default=DEFAULT_PRESET, choices=list(PRESETS), help="model shape (without --init-hf)")
+    g.add_argument("--preset", default=DEFAULT_PRESET, choices=list(PRESETS), help="model shape (without --arch-hf)")
     g.add_argument("--out-dir", default=None)
     g.add_argument("--resume", action="store_true", help="continue from <out-dir>/ckpt.pt if it exists")
     g.add_argument("--seed", type=int, default=None, help="init and data order (default TrainConfig.seed, 1337)")
@@ -59,9 +59,6 @@ def build_parser():
     g.add_argument("--rc-lr", type=float, default=0.0, help="constant lr of the scales (0: the schedule's)")
     g.add_argument("--qk-temp", action=ON, default=True, help="learnable per-head attention temperature")
     g.add_argument("--adapter-rank", type=int, default=16, help="rank of the float adapter A B^T beside the trits (0: none)")
-    g.add_argument("--adapter-init", default="zero", choices=["zero", "svd"],
-                   help="svd (with --init-hf, --convert gptq / gptqc): A B^T starts as the best rank-R part of each "
-                        "layer's rounding error in output space")
     g.add_argument("--adapter-schedule", default="", help="R0:R1[:START:END[:STEP]]: the adapter rank goes from R0 "
                    "(--adapter-rank) down to R1 between the fractions START and END of training (default 0.125:0.75), "
                    "STEP at a time (default 8), each time to the best lower-rank part of A B^T (its optimizer state "
@@ -82,7 +79,7 @@ def build_parser():
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
     g.add_argument("--ttf-orth", default="qr", choices=["qr", "cholqr2", "spanqr"],
                    help="the accumulator basis' orthonormalisation: Householder QR, Cholesky QR twice (QR where it would "
-                        "fail), or spanqr (the spanqr package on PYTHONPATH; above rank 512 its block Gram-Schmidt, needs rank % 256 "
+                        "fail), or spanqr (the spanqr package on PYTHONPATH; above rank 512 its block Gram-Schmidt, needs rank %% 256 "
                         "== 0; other shapes Householder)")
     g.add_argument("--ttf-theta", type=float, default=16.0, help="firing threshold (in units of the step)")
     g.add_argument("--ttf-theta-sched", default="", help="T0:T1[:START]: theta T0 until fraction START, then linear to T1")
@@ -142,15 +139,13 @@ def build_parser():
     g.add_argument("--pipe", action=ON, default=False, help="Qwen under torchrun: pipeline parallel over the ranks")
     g.add_argument("--pipe-split", default="", help="--pipe: decoder layers per stage, e.g. 17,16,16,15")
 
-    g = ap.add_argument_group("conversion and distillation")
-    g.add_argument("--init-hf", default="", help="start from a Hugging Face checkpoint (Llama or Qwen3.5 / 3.8)")
-    g.add_argument("--convert", default="gptqc",
-                   choices=["gptqc", "gptq", "als", "absmean", "scratch"],
-                   help="how the weights become trits and scales (gptqc: GPTQ on centred inputs)")
-    g.add_argument("--convert-stream", action=ON, default=True, help="Qwen: convert layer by layer from the files")
+    g = ap.add_argument_group("starting model and distillation")
+    g.add_argument("--arch-hf", "--init-hf", dest="arch_hf", default="",
+                   help="the architecture of a Hugging Face dir (Llama or Qwen3.5 / 3.8; --init-hf: the name before 28 Oct). "
+                        "--mode ttf trains a ternary checkpoint of it (--init-ckpt or --resume; the conversion from the "
+                        "full-precision weights is the ttf-conversion package's); --mode fp32 / bitnet (Llama) load its weights")
     g.add_argument("--ext", action="append", default=[], metavar="MODULE[:SPEC]",
-                   help="a structure / conversion plug-in (ttf/ext.py), e.g. ttfconv.adapters:rank=0.2,alt=1; repeatable, in order")
-    g.add_argument("--calib", type=int, default=64, help="calibration windows for gptq / gptqc")
+                   help="a structure plug-in (ttf/ext.py), e.g. ttfconv.adapters:rank=0.2,alt=1; repeatable, in order")
     g.add_argument("--teacher", default="", help="full-precision teacher (Hugging Face dir): loss (1 - W) CE + W KL")
     g.add_argument("--kd-weight", type=float, default=0.75, help="W, the KL term's weight")
     g.add_argument("--train-emb", default="none", choices=["none", "head", "both"],
@@ -223,7 +218,6 @@ def parse(argv=None):
 def resolve(a):
     """settings derived from several options (read by the trainer)"""
     a.factored_k = a.dw_sketch if (a.mode == "ttf" and a.dw == "factored") else 0
-    a.svd_rank = a.adapter_rank if a.adapter_init == "svd" else 0
     a.u32 = a.data_dtype == "u32"
     if a.adapter_schedule:
         f = a.adapter_schedule.split(":")
@@ -250,6 +244,18 @@ def _gone(what):
     return f
 
 
+def _moved(what, ok=None):
+    """a conversion option (28 Oct 2026: the conversion left the core for the ttf-conversion package); ok(v): a value
+    that did nothing (translates to nothing)"""
+    def f(v):
+        if ok is not None and ok(v):
+            return []
+        raise ValueError(f"{what}: in the ttf-conversion package since 28 Oct 2026 (python -m ttfconv.convert, then "
+                         f"--init-ckpt here)")
+    f.note = "moved to ttf-conversion 28 Oct 2026"
+    return f
+
+
 def _keep_if(ok, then, what):
     """the value translates by then(v) when ok(v), else the run used a removed setting"""
     def f(v):
@@ -267,13 +273,12 @@ _LEGACY = {
     "--master_dtype": _keep_if(lambda v: v == "fp32", lambda v: [], "--master_dtype"), "--lowrank": _SAME("--ttf-rank"), "--profile": _SAME("--profile"),
     "--qk_temp": _FLAG("--qk-temp", None), "--lowrank_mag": lambda v: ["--adapter-rank", v.split(":")[1]],
     "--mag_wd": _SAME("--adapter-wd"), "--mag_lr_mult": _SAME("--adapter-lr-mult"), "--ts": None,
-    "--ts_theta": _SAME("--ttf-theta"), "--mem_cap_gib": _SAME("--mem-cap-gib"), "--init_hf": _SAME("--init-hf"),
-    "--init_hf_method": _keep_if(lambda v: v in ("gptqc", "gptq", "als", "absmean", "scratch"), _SAME("--convert"),
-                                 "--init_hf_method"), "--distill": _SAME("--teacher"), "--distill_w": _SAME("--kd-weight"),
+    "--ts_theta": _SAME("--ttf-theta"), "--mem_cap_gib": _SAME("--mem-cap-gib"), "--init_hf": _SAME("--arch-hf"),
+    "--init_hf_method": _moved("--init_hf_method (the conversion)"), "--distill": _SAME("--teacher"), "--distill_w": _SAME("--kd-weight"),
     "--kd_cache": _SAME("--kd-cache"), "--kd_mode": _keep_if(lambda v: v != "windows", _SAME("--kd-cache-mode"), "--kd_mode"),
     "--kd_cache_start": _SAME("--kd-cache-start"), "--moe": _SAME("--moe"), "--moe_aux": _SAME("--moe-aux"),
-    "--init_stream": _FLAG("--convert-stream", None), "--data_u32": _FLAG("--data-dtype", "u32"),
-    "--hid_kd": _keep_if(lambda v: float(v) == 0, lambda v: [], "--hid_kd"), "--init_calib": _SAME("--calib"), "--ts_theta_sched": _SAME("--ttf-theta-sched"),
+    "--init_stream": _moved("--init_stream (the conversion)"), "--data_u32": _FLAG("--data-dtype", "u32"),
+    "--hid_kd": _keep_if(lambda v: float(v) == 0, lambda v: [], "--hid_kd"), "--init_calib": _moved("--init_calib (the conversion)"), "--ts_theta_sched": _SAME("--ttf-theta-sched"),
     "--ts_start": _SAME("--ttf-start"), "--ts_vdiag": None, "--ts_vdiag_every": None, "--ts_nomom": None,
     "--ts_spend": _SAME("--ttf-spend"), "--gemm": None,
     "--ts_store_a": _keep_if(lambda v: v in ("", "none", "fp32", "bf16", "fp12s"),
@@ -281,7 +286,7 @@ _LEGACY = {
     "--tern_emb": _SAME("--tern-emb"), "--lr_linear": _FLAG("--lr-schedule", "linear"),
     "--lr_wsd": lambda v: ["--lr-schedule", f"wsd:{v}"] if int(v) else [], "--lr_rewarm": _SAME("--lr-rewarm"),
     "--lean_batched": None, "--lean_tail": _FLAG("--tail", "lean"),
-    "--init_mag_svd": lambda v: ["--adapter-init", "svd"] if int(v) else [], "--ts_fire_fused": None,
+    "--init_mag_svd": _moved("--init_mag_svd (the conversion)", ok=lambda v: int(v) == 0), "--ts_fire_fused": None,
     "--ts_acc_scale": _SAME("--ttf-acc-scale"), "--fused_norm": None,
     "--fused_scales": None, "--ts_factored": lambda v: ["--dw", "factored", "--dw-sketch", v] if int(v) else ["--dw", "dense"],
     "--ts_micro": None, "--ckpt_block": _FLAG("--ckpt", "block"),
@@ -310,11 +315,11 @@ _LEGACY = {
 }
 # flags whose old meaning is off when absent but whose new option defaults to on (or to another value)
 _OLD_OFF = [("--qk_temp", ["--no-qk-temp"]), ("--rc_scale", ["--no-rc-scale"]), ("--lowrank_mag", ["--adapter-rank", "0"]),
-            ("--ts_factored", ["--dw", "dense"]), ("--init_stream", ["--no-convert-stream"])]
+            ("--ts_factored", ["--dw", "dense"])]
 # old defaults that differ from the new ones
 _OLD_DEFAULTS = [("--mode", ["--mode", "ttf"]), ("--ckpt_skip", ["--ckpt-skip", "0"]), ("--ts_tau", ["--ttf-tau", "300"]),
                  ("--ts_anneal", ["--ttf-step-p", "1.0"]), ("--lowrank", ["--ttf-rank", "0"]),
-                 ("--init_hf_method", ["--convert", "als"]), ("--distill_w", ["--kd-weight", "1.0"]),
+                 ("--distill_w", ["--kd-weight", "1.0"]),
                  ("--mag_wd", ["--adapter-wd", "0.0"]), ("--kd_mode", ["--kd-cache-mode", "renorm"]),
                  ("--int8_dx", ["--dx", "int8x2"])]
 _OLD_BOOL = {"--qk_temp", "--ts", "--init_stream", "--data_u32", "--ts_vdiag", "--ts_nomom", "--lr_linear",
