@@ -2,8 +2,8 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23394608.svg)](https://doi.org/10.5281/zenodo.23394608)
 
-Ternary ({-1, 0, 1}) language models trained **without full-precision master weights**, and pretrained models
-converted to ternary weights with the same update. The weights stay packed at 1.6 bits (5 trits per byte) during
+Ternary ({-1, 0, 1}) language models trained **without full-precision master weights**, from scratch or from a
+converted ternary checkpoint (the conversion itself is a separate package since 0.2.0). The weights stay packed at 1.6 bits (5 trits per byte) during
 training; the optimizer state is low-rank, so it grows with the layers' widths rather than with the number of weights.
 
 The method is **two-timescale threshold flips (TTF)**, `--mode ttf` (the default). The Adam-normalised gradient, with a factored second
