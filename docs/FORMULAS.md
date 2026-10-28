@@ -153,7 +153,7 @@ paper Appendix "Index of mechanisms and results" and docs/RUN_INDEX.md (tag pre-
 | `WORLD_SIZE` / `RANK` (data parallel) | the gradient of each layer is all-reduced before the TTF update; ranks stay bit-identical |
 | `--init_hf DIR --init_hf_method als / gptq` | convert a pretrained model: trits and scales by alternating least squares or by GPTQ onto the ternary grid (calibration `--init_calib`); `--init_stream` converts one decoder layer at a time from the safetensors (sequential GPTQ) |
 | `--distill W` | KL to the full-precision teacher (its parameters cast to bf16) |
-| `--eval_first_n N` | before training, the loss over the first N val windows in order (as `scripts/quant/qwen_check.py`) |
+| `--eval_first_n N` | before training, the loss over the first N val windows in order (as `scripts/quant/qwen_check.py`, now in the ttf-conversion package) |
 | `--lr_rewarm S:W:F` | re-warm a decayed run from step S over W steps to F times the peak |
 
 ## 2b. What master cannot do without (master from scratch with one ingredient changed, `--m_*`, `bitnet/master_opt.py` at tag `pre-consolidation-2026-10-17`)
@@ -292,6 +292,6 @@ For comparison, the current recipe is at perplexity 16.8 ($e^{2.8215}$) and mast
 | loss by pair frequency | held-out loss at positions whose (previous, target) pair occurs $n$ times in the training set, bucketed by $n$ | `loss_by_freq.py` |
 | loss by context position | held-out loss by position buckets 0-1 / 2-15 / 16-127 / 128-511 / 512+; copy gain = loss on a shuffled repeat minus on an exact repeat of random tokens | `loss_by_pos.py` |
 | rank capture | signal energy $\langle G_1,G_2\rangle$ of a bucket's held-out gradient from two disjoint halves; captured $\langle PG_1,PG_2\rangle$, $P$ = projection on $\operatorname{span}U\times\operatorname{span}V$; and $\cos(M,G)$ | `rank_capture.py` |
-| effective decay of dry friction | $b_{\text{eff}}=1-D\,\|g\|/\|M\|$, memory $1/(1-b_{\text{eff}})$ | `eff_beta.py` |
+| effective decay of dry friction | $b_{\text{eff}}=1-D\,\|g\|/\|M\|$, memory $1/(1-b_{\text{eff}})$ | `eff_beta.py` (tag `pre-consolidation-2026-10-17`) |
 | swing test (41 steps from one checkpoint) | true gradient $T_t$ from 32 batches; lag-$k$ autocorrelation $\cos(T_t,T_{t+k})$; uphill share $=\Pr[\text{move}\cdot T_t>0]$; never-turning = weights whose momentum does not follow a reversal of $T$ | `wave.py`, `master_wave.py` |
 | where the flips land | expected flips, uphill share and first-order $\Delta L=\sum p\cdot\text{move}\cdot T$ by row-steepness fifth | `flip_where.py` |
