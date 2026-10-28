@@ -56,7 +56,7 @@ def main():
         dup = len(ids) - len(set(ids))
         by = {}
         for r_ in cur.values():
-            by[r_["type"]] = by.get(r_["type"], 0) + 1
+            by[r_.get("type", "?")] = by.get(r_.get("type", "?"), 0) + 1
         print(f"{len(allrecs)} records ({', '.join(f'{v} {k}' for k, v in sorted(by.items()))} in force), "
               f"{len(bad)} malformed, {dup} duplicate ids")
         for x in bad[:20]:

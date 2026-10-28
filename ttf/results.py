@@ -162,8 +162,10 @@ def current(records):
     cur, first = {}, {}
     for r in records:
         s = r.get("supersedes")
-        k = first.get(s, s) if s else r["id"]
-        first[r["id"]] = k
+        k = first.get(s, s) if s else r.get("id")
+        if k is None:            # (no id: malformed, validate reports it)
+            continue
+        first[r.get("id", k)] = k
         cur[k] = r
     return cur
 

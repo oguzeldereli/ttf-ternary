@@ -81,3 +81,10 @@ def test_cli_does_not_double_an_end(tmp_path, monkeypatch):
         T.cli()
     assert [r["status"] for r in R.load(str(tmp_path / "records.jsonl")) if r["type"] == "event"] == ["stopped"]
     T.RUNLOG[0] = None
+
+
+def test_current_skips_records_without_id():
+    """a record without an id (hand-written notes, 23 Oct) is left out of current() for validate to report; it raised"""
+    from ttf import results as R
+    cur = R.current([{"type": "note", "text": "x"}, {"id": "a", "type": "note", "text": "y"}])
+    assert list(cur) == ["a"]
