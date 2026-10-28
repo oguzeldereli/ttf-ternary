@@ -835,6 +835,14 @@ def _ts_dense_acc(l, fgb, ia, state, st, key, t, M_, final_, lk, lr_ratio, theta
         return
     A = _dpm(A)            # data parallel: the micro-batches' terms are linear in g: one mean of the step's sum
     before = l.wpacked.clone() if l.track else None
+    if FIRE_FUSED[0] and A.is_cuda and A.dtype == torch.float32 and A.is_contiguous():   # (kernel.dense_fire: one pass)
+        from .kernel import dense_fire
+        nf = dense_fire(A, l.wpacked, l.K, theta, c["spend"] * theta)
+        _host_put(state, key, store_dense(sa, A), off)
+        st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
+        if before is not None:
+            l._record_flips(before, l.wpacked)
+        return
     w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
     d = A.sign()
     fire = (A.abs() >= theta) & ((w0.float() + d).abs() <= 1)

@@ -1269,11 +1269,14 @@ def fused_epilogue(y32, xs, beta, r_b, bias_b, acc, save_t):
 
 
 @triton.jit
-def _acc_gemm_kernel(g_ptr, x_ptr, ib_ptr, ia_ptr, c_ptr, o_ptr, T, N, K, sgt, sxt, cs, alpha, HAS_C: tl.constexpr,
+def _acc_gemm_kernel(g_ptr, x_ptr, ib_ptr, ia_ptr, c_ptr, o_ptr, T, N, K, sgt, sxt, cs, alpha, TC, HAS_C: tl.constexpr,
                      HAS_IB: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr):
     """o [N, K] = cs c + alpha ia (g^T bf16(x ib)): g [T, N], x [T, K] bf16 (ib per column of x, applied and rounded to
-    bf16 as the operand is loaded), fp32 sums over T"""
+    bf16 as the operand is loaded), fp32 sums over T. Split over T (grid axis 1, TC rows each): program s sums rows
+    [s TC, (s + 1) TC) into o + s N K (acc_gemm adds the parts)"""
     pid = tl.program_id(0)
+    s_ = tl.program_id(1)
+    o_ptr += s_ * N * K
     npm = tl.cdiv(N, BM); npn = tl.cdiv(K, BN)
     gid = pid // (GM * npn); fm = gid * GM; gs = tl.minimum(npm - fm, GM)
     pm = fm + (pid % (GM * npn)) % gs; pn = (pid % (GM * npn)) // gs
@@ -1281,10 +1284,11 @@ def _acc_gemm_kernel(g_ptr, x_ptr, ib_ptr, ia_ptr, c_ptr, o_ptr, T, N, K, sgt, s
     if HAS_IB:
         ib = tl.load(ib_ptr + rk, mask=rk < K, other=0.0)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for t0 in range(0, T, BK):
+    t1 = tl.minimum(s_ * TC + TC, T)
+    for t0 in range(s_ * TC, t1, BK):
         tt = t0 + rt
-        a = tl.load(g_ptr + tt[None, :] * sgt + rn[:, None], mask=(tt[None, :] < T) & (rn[:, None] < N), other=0.0)
-        b = tl.load(x_ptr + tt[:, None] * sxt + rk[None, :], mask=(tt[:, None] < T) & (rk[None, :] < K), other=0.0)
+        a = tl.load(g_ptr + tt[None, :] * sgt + rn[:, None], mask=(tt[None, :] < t1) & (rn[:, None] < N), other=0.0)
+        b = tl.load(x_ptr + tt[:, None] * sxt + rk[None, :], mask=(tt[:, None] < t1) & (rk[None, :] < K), other=0.0)
         if HAS_IB:
             b = (b.to(tl.float32) * ib[None, :]).to(tl.bfloat16)
         acc = tl.dot(a, b, acc)
@@ -1308,12 +1312,81 @@ def acc_gemm(g, x, ib, ia, C, cs, alpha):
     x = x if x.stride(1) == 1 else x.contiguous()
     o = torch.empty(N, K, dtype=torch.float32, device=g.device)
     C = C.contiguous() if C is not None else None
-    BM, BN, BK = 64, 128, 32                                  # (laptop 4080: near the best at every 27B shape)
-    _acc_gemm_kernel[(triton.cdiv(N, BM) * triton.cdiv(K, BN),)](
-        g, x, ib if ib is not None else ia, ia.contiguous().float(), C if C is not None else o, o, T, N, K, g.stride(0),
-        x.stride(0), float(cs), float(alpha), HAS_C=C is not None, HAS_IB=ib is not None, BM=BM, BN=BN, BK=BK, GM=8,
-        num_warps=4, num_stages=4)
+    BM, BN, BK, ST = 64, 128, 32, 4                           # (laptop 4080: near the best at every 27B shape)
+    tiles = triton.cdiv(N, BM) * triton.cdiv(K, BN)
+    S = _acc_split(tiles, T, g.device)
+    if S > 1:                                                  # (small layers, long T: 64 x 64 tiles, 4 per SM, 3 stages:
+        BN, ST = 64, 3                                         # 35-42 TF at the ViT / 110M shapes against cuBLAS's 40-48)
+        tiles = triton.cdiv(N, BM) * triton.cdiv(K, BN)
+        S = _acc_split(tiles, T, g.device, 4)
+    TC = triton.cdiv(triton.cdiv(T, S), BK) * BK; S = triton.cdiv(T, TC)
+    P = o if S == 1 else torch.empty(S, N, K, dtype=torch.float32, device=g.device)
+    _acc_gemm_kernel[(tiles, S)](
+        g, x, ib if ib is not None else ia, ia.contiguous().float(), C if C is not None and S == 1 else P, P, T, N, K,
+        g.stride(0), x.stride(0), float(cs), float(alpha), TC, HAS_C=C is not None and S == 1, HAS_IB=ib is not None,
+        BM=BM, BN=BN, BK=BK, GM=8, num_warps=4, num_stages=ST)
+    if S > 1:                                                  # (the parts' sum, then cs C: rounding level)
+        torch.sum(P, 0, out=o)
+        if C is not None:
+            o.add_(C, alpha=float(cs))
     return o
+
+
+def _acc_split(tiles, T, dev, per_sm=2):
+    """acc_gemm's split over T: 1 when the [N, K] tiles fill the GPU (the 27B shapes: unchanged), else enough parts for
+    per_sm tiles per SM, each at least 1024 rows of T (small layers with long T: a ViT's 384 x 384 at T 16640 had 18
+    tiles on 58 SMs)"""
+    sm = _SM.get(dev) or _SM.setdefault(dev, torch.cuda.get_device_properties(dev).multi_processor_count)
+    return max(1, min(triton.cdiv(per_sm * sm, tiles), T // (2048 if per_sm == 2 else 1024)))
+
+
+_SM = {}
+
+
+@triton.jit
+def _dense_fire_kernel(a_ptr, p_ptr, q_ptr, n_ptr, NK5, K, K5, theta, st, BLOCK: tl.constexpr):
+    """the dense accumulator's firing in one pass: per packed byte (5 trits of a row), A at those entries; a trit moves
+    by sign(A) where |A| >= theta and the move is legal, A -= st sign(A) there (st = spend theta); the new bytes to q
+    (the padding digits as read), the count of moves added to n"""
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = idx < NK5
+    row = idx // K5
+    b = idx % K5
+    p = tl.load(p_ptr + idx, mask=m, other=0).to(tl.int32)
+    out = tl.zeros((BLOCK,), dtype=tl.int32)
+    cnt = tl.zeros((BLOCK,), dtype=tl.int32)
+    pw = 1
+    for j in tl.static_range(5):
+        dig = p % 3
+        p = p // 3
+        col = b * 5 + j
+        mj = m & (col < K)
+        a = tl.load(a_ptr + row * K + col, mask=mj, other=0.0)
+        d = tl.where(a > 0, 1, tl.where(a < 0, -1, 0))
+        w = dig - 1 + d
+        fire = mj & (tl.abs(a) >= theta) & (w <= 1) & (w >= -1)
+        dd = tl.where(fire, d, 0)
+        tl.store(a_ptr + row * K + col, a - st * dd.to(tl.float32), mask=fire)
+        out += (dig + dd) * pw
+        cnt += fire.to(tl.int32)
+        pw = pw * 3
+    tl.store(q_ptr + idx, out.to(tl.uint8), mask=m)
+    tl.atomic_add(n_ptr, tl.sum(cnt, 0))
+
+
+def dense_fire(A, wpacked, K, theta, spend_theta):
+    """update._ts_dense_acc's firing on A [N, K] fp32 (in place) and the packed trits (wpacked updated by a copy_, so its
+    version moves and the layer's caches see the change): the moves where |A| >= theta and legal, A -= spend_theta D.
+    Returns the number of moves (int32 tensor). The same decisions and fp32 arithmetic as the torch ops"""
+    N, K5 = wpacked.shape
+    assert A.is_contiguous() and A.dtype == torch.float32 and A.shape == (N, K)
+    q = torch.empty_like(wpacked)
+    n = torch.zeros(1, dtype=torch.int32, device=A.device)
+    BLOCK = 1024
+    _dense_fire_kernel[(triton.cdiv(N * K5, BLOCK),)](A, wpacked, q, n, N * K5, K, K5, float(theta), float(spend_theta),
+                                                    BLOCK=BLOCK, num_warps=4)
+    wpacked.copy_(q)
+    return n[0]
 
 
 @triton.jit

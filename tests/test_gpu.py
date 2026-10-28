@@ -879,9 +879,11 @@ def test_fused_fwd_gemm(M, K, N, acc, bias):
         assert torch.equal(o0, o1) and (not save or torch.equal(t0, t1))
 
 
-@pytest.mark.parametrize("T,N,K,ib,c", [(256, 300, 200, True, True), (100, 64, 520, False, True), (512, 1000, 96, True, False)])
+@pytest.mark.parametrize("T,N,K,ib,c", [(256, 300, 200, True, True), (100, 64, 520, False, True), (512, 1000, 96, True, False),
+                                         (16640, 384, 384, True, True), (9001, 100, 1030, True, False)])
 def test_acc_gemm(T, N, K, ib, c):
-    """kernel.acc_gemm = cs C + alpha diag(ia) (g^T bf16(x diag(ib))) within fp32 summation order"""
+    """kernel.acc_gemm = cs C + alpha diag(ia) (g^T bf16(x diag(ib))) within fp32 summation order (the last two: split
+    over T, _acc_split > 1, T not a multiple of the chunk)"""
     import ttf.kernel as Kn
     gen = torch.Generator(device=dev).manual_seed(T + N)
     g = (torch.randn(T, N, device=dev, generator=gen) * 1e-2).to(torch.bfloat16)
@@ -894,6 +896,29 @@ def test_acc_gemm(T, N, K, ib, c):
     ref = -0.3 * a.double()[:, None] * term + (0.9 * C.double() if c else 0)
     o = Kn.acc_gemm(g, x, b, a, C, 0.9, -0.3)
     assert float((o.double() - ref).abs().max() / (0.3 * a.double()[:, None] * term).abs().max()) < 1e-5
+    if T > 4096:
+        assert Kn._acc_split(triton.cdiv(N, 64) * triton.cdiv(K, 128), T, g.device) > 1
+
+
+def test_dense_fire():
+    """kernel.dense_fire against _ts_dense_acc's torch firing: the same A (bit for bit), trits and count; entries
+    planted at theta (1 +- 1e-6), at trits +-1 pushed outward (illegal), K not a multiple of 5"""
+    import ttf.kernel as Kn
+    gen = torch.Generator(device=dev).manual_seed(4)
+    N, K, th, sp = 301, 1027, 3.0, 0.75
+    w = torch.randint(-1, 2, (N, K), device=dev, generator=gen, dtype=torch.int8)
+    A = torch.randn(N, K, device=dev, generator=gen) * 2.5
+    A[::7, ::3] = th * (1 + 1e-6); A[1::7, ::3] = -th * (1 - 1e-6); A[2::7, 5::11] = 0.0
+    A[w == 1] = A[w == 1].abs() + 0.1 * (A[w == 1] > 0)          # (some +1 trits pushed further up: illegal moves)
+    p0 = Kn.pack_rows(w)
+    d = A.sign(); fire = (A.abs() >= th) & ((w.float() + d).abs() <= 1)
+    D = torch.where(fire, d, torch.zeros_like(d))
+    A_ref = A.clone().sub_(D, alpha=sp * th); p_ref = Kn.pack_rows(w + D.to(torch.int8))
+    A1, p1 = A.clone(), p0.clone()
+    v0 = p1._version
+    n = Kn.dense_fire(A1, p1, K, th, sp * th)
+    assert torch.equal(A1, A_ref) and torch.equal(p1, p_ref) and int(n) == int(fire.sum()) > 0
+    assert p1._version > v0                                        # (the layers' trit caches key on the version)
 
 
 def test_intk_update_acc_gemm(monkeypatch):
