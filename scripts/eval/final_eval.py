@@ -166,8 +166,6 @@ def main():
             res.update(fw_loss=float(f.mean()), fw_windows=len(f), fw_bpb=float(f.mean() / math.log(2) / BYTES_PER_TOKEN_FW))
             arrays.update(fw=f, fw_pos=fp)
         if not a.no_check:
-            m = re.search(r"seed(\d+)", res["run"])
-            seed = a.seed if a.seed is not None else (int(m.group(1)) if m else 1337)
             cv = np.memmap(a.check_val, dtype=np.uint16, mode="r") if a.check_val else wiki
             log = os.path.join(run, "train.log")
             lt = open(log).read() if os.path.exists(log) else ""
@@ -177,6 +175,9 @@ def main():
                     r_ = json.loads(l_)
                     if r_.get("type") == "run" and r_.get("config"):
                         cfg_ = r_["config"]
+            m = re.search(r"seed(\d+)", res["run"])   # the run's seed: its config, else its name, else the default
+            seed = a.seed if a.seed is not None else cfg_.get("seed", int(m.group(1)) if m else 1337)   # (ttf110_s2,
+            # seed 2 in its config only, was checked with 1337: a false 'not rebuilt', 29 Oct)
             it_ = [cfg_["eval_iters"]] if cfg_.get("eval_iters") else re.findall(r"--eval[_-]iters (\d+)", lt)   # the run's own
             # number of val batches (the check compared
             res["check_iters"] = int(it_[-1]) if it_ else 30   # 30 with runs that logged 8: a false 'not rebuilt')
