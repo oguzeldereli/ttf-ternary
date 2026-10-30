@@ -13,8 +13,9 @@ out of an ablation of master-weight training, which showed what master weights p
 evidence with a memory of about 1000 steps, and immediate moves when it crosses a boundary; neither a full-rank first
 moment nor a per-weight second moment.
 
-The paper (preprint to follow) has every result below with its run, and an appendix indexing every mechanism that was
-tried with its result.
+The paper, *Training Ternary Language Models Without Master Weights* ([paper/ttf_paper1_training.pdf](paper/ttf_paper1_training.pdf),
+LaTeX source and figures in [paper/](paper/); submitted to arXiv 29 Oct 2026), has every result below with its run, and an
+appendix indexing every mechanism that was tried with its result.
 
 ## Results
 
