@@ -20,6 +20,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from ttf.kernel import tern_gemm_i8, trit_beta                    # noqa: E402
+from ttf.qwen import CenteredLinear                                  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ttf_kernels import act_quant_planes, tern_gemv_planes, tern_gemv2, repack_2bit, _UVA_TABLES, _gemv2_epi_kernel   # noqa: E402
 import triton                                                          # noqa: E402
@@ -177,6 +178,10 @@ def build(model_dir, weights, dev, emb_cpu):
         if isinstance(mod, PackedTLinear) and name + ".in_mean" in sd:
             mod.register_buffer("in_mean", torch.zeros(mod.K, dtype=torch.float32, device=dev))
             mod.register_buffer("out_bias", torch.zeros(mod.N, dtype=torch.float32, device=dev))
+            nc += 1
+        elif isinstance(mod, nn.Linear) and name + ".in_mean" in sd:   # --center-floats: in_proj_a / b
+            mod.__class__ = CenteredLinear
+            mod.center(torch.zeros(mod.in_features, device=dev), torch.zeros(mod.out_features, device=dev))
             nc += 1
     for k in [k for k in sd if k.endswith(".qmeta")]:  # pack_ttf.py: embedding / head in B-bit groups -> bf16
         from pack_ttf import dequant_groups

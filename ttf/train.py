@@ -339,6 +339,10 @@ def main():
                     m_.enable_centering(torch.empty(m_.K, device="meta"), torch.empty(m_.N, device="meta"))
                     _nc += 1                             # every stage's optimizer groups match the saved ones)
             print(f"resume: {_nc} centred layers restored", flush=True)
+        _cfl = []                     # --center-floats: the DeltaNet's float in_proj_a / b (the bias W mu after the weights)
+        if _QWEN and args.mode == "ttf" and args.center_floats:
+            from .qwen import center_float_readers
+            _cfl = center_float_readers(model, _ck, _init_ck, _cn, log=lambda m_: print(m_, flush=True))
         del _cb, _ck
         if _init_ck:   # the weights now, before the optimizer and the embedding / head options (--intk-emb
             _blob = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)   # quantizes these)
@@ -346,6 +350,12 @@ def main():
             # the parts the options below build (--intk-emb codes, --adapter-rank's factors) load once they exist
             _init_left.update({k_: _blob["model"][k_] for k_ in _r.unexpected_keys})
             _init_missing[:] = _r.missing_keys
+            if _cfl:   # --center-floats on a checkpoint without them: the bias W mu from the loaded weights
+                from .qwen import set_center_bias
+                set_center_bias(_cfl)
+                _new = tuple(f"{c_}.{t_}" for c_ in ("in_proj_a", "in_proj_b") for t_ in ("in_mean", "out_bias"))
+                _init_missing[:] = [k_ for k_ in _init_missing if not k_.endswith(_new)]
+                _r.missing_keys[:] = _init_missing
             print(f"--init-ckpt: weights of {_resume_path} (its step {_blob.get('step')}), a fresh run from step 0"
                   + (f"; {len(_r.unexpected_keys)} tensors wait for their modules" if _r.unexpected_keys else "")
                   + (f"; not in it: {', '.join(_r.missing_keys[:4])}{' ...' if len(_r.missing_keys) > 4 else ''}"

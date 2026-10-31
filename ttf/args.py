@@ -65,6 +65,11 @@ def build_parser():
                    "restarts)")
     g.add_argument("--adapter-wd", type=float, default=0.1)
     g.add_argument("--adapter-lr-mult", type=float, default=1.0)
+    g.add_argument("--center-floats", action=ON, default=True,
+                   help="Qwen: the Gated DeltaNet's float in_proj_a / in_proj_b on the centred input their in_proj_qkv "
+                   "reads (y = W (x - mu) + b, b = W mu at a fresh --init-ckpt start; restored on a resume of a run that "
+                   "had it, a resume of one without is left as it was). Without it, the residual stream's massive "
+                   "dimension drives their Adam steps and pins beta and the decay per head (Qwen3.8-27B, 31 Oct 2026)")
 
     g = ap.add_argument_group("TTF (--mode ttf)")
     g.add_argument("--ttf-rank", type=int, default=512, help="rank of each layer's accumulator A = U V^T")

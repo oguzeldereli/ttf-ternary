@@ -19,6 +19,69 @@ from torch.utils.checkpoint import checkpoint
 
 # linears kept in float (tiny, or gates whose rounding would be all error)
 _KEEP_FLOAT = ("in_proj_a", "in_proj_b")
+
+
+class CenteredLinear(nn.Linear):
+    """a float linear on a centred input, as the centred ternary layers (KernelTernaryLinear.enable_centering):
+    y = W (x - mu) + bias, mu a fixed buffer, bias a float parameter (W mu at the start: the same outputs). For the
+    DeltaNet's in_proj_a / in_proj_b, which read what the layer's in_proj_qkv reads: after ttfconv.fold that input
+    carries the residual stream's massive dimension (Qwen3.8-27B: 98% of the gain-free normalised input is one
+    token-independent direction at layer 1, 90% at 8), which the full-precision model's norm gain suppressed. The
+    ternary readers subtract its mean; these did not, so their gradient was that direction and Adam moved the per-head
+    offset W mu by ~lr sqrt(d) |u|_1 per step: q27f16r4k1_lab's in_proj_b offset rms 1.0 -> 20.5 by step 1000 in layer
+    1, beta = sigmoid(b) and the decay pinned per head, the delta rule's output gone and in_proj_qkv / z frozen in layers
+    1-22 (31 Oct 2026). State dict: weight as before, plus in_mean and out_bias (as the ternary layers')."""
+
+    def center(self, mu, bias):
+        self.register_buffer("in_mean", mu.detach().clone().float())
+        self.out_bias = nn.Parameter(bias.detach().clone().float(), requires_grad=self.weight.requires_grad)
+
+    def forward(self, x):
+        return F.linear(x - self.in_mean.to(x.dtype), self.weight) + self.out_bias.to(x.dtype)
+
+
+def center_float_readers(model, ck, fresh, cn=(), log=print):
+    """--center-floats: each Gated DeltaNet's float in_proj_a / in_proj_b as a CenteredLinear. ck: the checkpoint's
+    state dict (this stage's layers under --pipe); cn: the names of the centred layers of every stage (--pipe, for the
+    other stages' layers, which are on meta here). A checkpoint with their in_mean restores them; on a fresh start
+    (fresh: --init-ckpt) from one without, a layer whose in_proj_qkv is centred gets that layer's mu, and the bias is set
+    to W mu by set_center_bias once the weights are loaded. A resume of a run without them leaves it as it was. Layers on
+    meta get meta placeholders, so every stage's optimizer groups match. Returns the modules that wait for
+    set_center_bias."""
+    todo, n_ = [], 0
+    for name, la in model.named_modules():
+        if not name.endswith("linear_attn") or not hasattr(la, "in_proj_qkv"):
+            continue
+        for cname in _KEEP_FLOAT:
+            lin = getattr(la, cname, None)
+            if not isinstance(lin, nn.Linear) or isinstance(lin, CenteredLinear):
+                continue
+            key, qkv = f"{name}.{cname}", f"{name}.in_proj_qkv"
+            if lin.weight.is_meta:
+                if key not in cn and not (fresh and qkv in cn):
+                    continue
+                mu, b = torch.empty(lin.in_features, device="meta"), torch.empty(lin.out_features, device="meta")
+            elif f"{key}.in_mean" in ck:
+                mu, b = ck[f"{key}.in_mean"], ck[f"{key}.out_bias"]
+            elif fresh and f"{qkv}.in_mean" in ck:
+                mu, b = ck[f"{qkv}.in_mean"], torch.zeros(lin.out_features)
+                todo.append(lin)
+            else:
+                continue
+            lin.__class__ = CenteredLinear
+            lin.center(mu.to(lin.weight.device), b.to(lin.weight.device))
+            n_ += 1
+    if n_:
+        log(f"--center-floats: {n_} DeltaNet in_proj_a / in_proj_b on a centred input"
+            + (f" ({len(todo)} new: bias W mu once the weights load)" if todo else ""))
+    return todo
+
+
+@torch.no_grad()
+def set_center_bias(mods):
+    """the new CenteredLinears' bias W mu (their outputs unchanged), after the weights are loaded"""
+    for lin in mods:
+        lin.out_bias.copy_(lin.weight.float() @ lin.in_mean)
 FUSED_NORM = [False]     # (set by enable_fused_norm, which the trainer always calls) Qwen3_5RMSNorm through kernel.rms_norm_qwen (one kernel forward, one backward)
 
 
