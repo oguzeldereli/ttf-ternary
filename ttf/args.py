@@ -70,6 +70,11 @@ def build_parser():
                    "reads (y = W (x - mu) + b, b = W mu at a fresh --init-ckpt start; restored on a resume of a run that "
                    "had it, a resume of one without is left as it was). Without it, the residual stream's massive "
                    "dimension drives their Adam steps and pins beta and the decay per head (Qwen3.8-27B, 31 Oct 2026)")
+    g.add_argument("--decay-ssm", action=ON, default=False,
+                   help="Qwen: weight decay (--weight-decay) also on the Gated DeltaNet's A_log, dt_bias and the centred "
+                   "in_proj_a / b bias. Off: they go with the norm gains (no decay, fp16 under --tail lean), as Mamba / "
+                   "FLA train them; with decay A_log and dt_bias shrank x0.84 in the 27B run by step 4000 whatever the "
+                   "loss (1 Nov 2026). A resume keeps the checkpoint's setting (runs before 1 Nov: on)")
 
     g = ap.add_argument_group("TTF (--mode ttf)")
     g.add_argument("--ttf-rank", type=int, default=512, help="rank of each layer's accumulator A = U V^T")

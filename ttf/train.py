@@ -322,6 +322,11 @@ def main():
             model.hf.model.embed_tokens.weight.requires_grad_(False); model.hf.lm_head.weight.requires_grad_(False)
         _cb = torch.load(_resume_path, map_location="cpu", weights_only=False, mmap=True)
         _ck, _cn = _cb["model"], set()
+        if _resuming:   # --decay-ssm decides the optimizer groups: a resume keeps the checkpoint's (before 1 Nov: on)
+            _ds = (_cb.get("args") or {}).get("decay_ssm", True)
+            if _ds != args.decay_ssm:
+                print(f"--decay-ssm {_ds} as the checkpoint (not {args.decay_ssm}): its optimizer groups", flush=True)
+            args.decay_ssm = _ds
         if args.mode == "ttf" and (_PP or any(k_.endswith(".in_mean") for k_ in _ck)):
             # centred layers (a gptqc conversion's): their buffers and bias exist before the optimizer is built
             if _PP:   # a stage checkpoint holds its own layers: the others' centred layers, from their stages
@@ -421,6 +426,8 @@ def main():
         print(f"--train-emb {args.train_emb}: {sum(p_.numel() for p_ in _te) / 1e6:.0f}M embedding / head weights train"
               f" (tied: {model.hf.lm_head.weight is model.hf.model.embed_tokens.weight})", flush=True)
 
+    # the Gated DeltaNet's decay rate, step size and centred gate biases: no weight decay unless --decay-ssm
+    _NODECAY = () if args.decay_ssm else ("A_log", "dt_bias", "in_proj_a.out_bias", "in_proj_b.out_bias")
     if args.mode in ("bitnet", "fp32"):
         # the baseline keeps everything in fp32 with a standard AdamW: no bf16
         # rounding anywhere, so the ceiling is not limited by storage precision.
@@ -443,7 +450,7 @@ def main():
         from .opt_lean import LeanAdam
         tail = model.float_tail_parameters()
         names = {id(p): n for n, p in model.named_parameters()}
-        small = [p for p in tail if names[id(p)].endswith(("norm.weight", "qk_logscale", "row_scale", "col_scale"))]
+        small = [p for p in tail if names[id(p)].endswith(("norm.weight", "qk_logscale", "row_scale", "col_scale") + _NODECAY)]
         sid = {id(p) for p in small}
         emb = [p for p in tail if id(p) not in sid]
         for p in emb:
@@ -471,7 +478,7 @@ def main():
         rc = [p for n, p in model.named_parameters() if n.endswith(("row_scale", "col_scale"))]
         rcid = {id(p) for p in rc}
         norms = [p for n, p in model.named_parameters() if id(p) in tids and id(p) not in rcid
-                 and (n.endswith("norm.weight") or n.endswith("qk_logscale"))]
+                 and n.endswith(("norm.weight", "qk_logscale") + _NODECAY)]
         nids = {id(p) for p in norms} | rcid
         emb = [p for p in tail if id(p) not in nids]
         tail_groups = [{"params": emb, "weight_decay": tc.weight_decay},
