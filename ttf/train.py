@@ -70,6 +70,23 @@ def _split_emb_group(model, groups, wd, mult):
     return groups
 
 
+def _split_gate_groups(model, groups, mult):
+    """--gate-lr-mult: the Gated DeltaNet's float gates (in_proj_a / in_proj_b, their centred bias, A_log, dt_bias) out of
+    each float-tail group into a sibling with the same settings and lr x mult"""
+    ids = {id(p) for n, p in model.named_parameters() if ".linear_attn." in n and n.endswith(
+        ("in_proj_a.weight", "in_proj_b.weight", "in_proj_a.out_bias", "in_proj_b.out_bias", "A_log", "dt_bias"))}
+    out, n = [], 0
+    for g in groups:
+        out.append(g)
+        mv = [p for p in g["params"] if id(p) in ids] if not g.get("rc_lr") else []
+        if mv:
+            g["params"] = [p for p in g["params"] if id(p) not in ids]
+            out.append({**{k: v for k, v in g.items() if k != "params"}, "params": mv, "gate_mult": mult})
+            n += sum(p.numel() for p in mv)
+    print(f"DeltaNet gates: {n / 1e3:.1f}k floats, lr x{mult}", flush=True)
+    return out
+
+
 def _intk_lays(model):
     from .intk_emb import intk_layers
     return intk_layers(model)
@@ -316,6 +333,7 @@ def main():
 
     if _init_ck:   # --init-ckpt: a converted checkpoint's weights, a fresh run (step 0, no optimizer / TTF state)
         _resume_path = args.init_ckpt
+    args.gate_split = args.gate_lr_mult != 1.0          # (a resume below: the checkpoint's)
     if args.arch_hf and _from_ckpt:   # the checkpoint holds the converted model (trits, scales, float parts)
         print(f"--arch-hf: {'resuming from' if _resuming else '--init-ckpt'} {_resume_path}", flush=True)
         if _QWEN:   # as the conversion leaves them: embedding and head frozen (the optimizer is built below)
@@ -327,6 +345,10 @@ def main():
             if _ds != args.decay_ssm:
                 print(f"--decay-ssm {_ds} as the checkpoint (not {args.decay_ssm}): its optimizer groups", flush=True)
             args.decay_ssm = _ds
+            args.gate_split = bool((_cb.get("args") or {}).get("gate_split", False))   # --gate-lr-mult's groups
+            if not args.gate_split and args.gate_lr_mult != 1.0:
+                print(f"--gate-lr-mult {args.gate_lr_mult}: the checkpoint has no gate groups, lr x1", flush=True)
+                args.gate_lr_mult = 1.0
         if args.mode == "ttf" and (_PP or any(k_.endswith(".in_mean") for k_ in _ck)):
             # centred layers (a gptqc conversion's): their buffers and bias exist before the optimizer is built
             if _PP:   # a stage checkpoint holds its own layers: the others' centred layers, from their stages
@@ -464,6 +486,8 @@ def main():
         if rc:
             tail_groups.append({"params": rc, "weight_decay": 0.0, "rc_lr": args.rc_lr})
         tail_groups = _split_emb_group(model, tail_groups, args.emb_wd, args.emb_lr_mult)
+        if args.gate_split:
+            tail_groups = _split_gate_groups(model, tail_groups, args.gate_lr_mult)
         tail_opt = LeanAdam(tail_groups, lr=tc.lr, betas=(tc.beta1, tc.beta2))
         print(f"lean float tail: {sum(p.numel() for p in emb)/1e6:.1f}M bf16 + {sum(p.numel() for p in small)/1e3:.1f}k fp16, "
               f"LeanAdam (int8 m, factored v, stochastic rounding)", flush=True)
@@ -486,6 +510,8 @@ def main():
         if rc:
             tail_groups.append({"params": rc, "weight_decay": 0.0, "rc_lr": args.rc_lr})
         tail_groups = _split_emb_group(model, tail_groups, args.emb_wd, args.emb_lr_mult)
+        if args.gate_split:
+            tail_groups = _split_gate_groups(model, tail_groups, args.gate_lr_mult)
         tail_opt = torch.optim.AdamW(tail_groups, lr=tc.lr, betas=(tc.beta1, tc.beta2))
         print(f"fp32 float tail: {sum(p.numel() for p in emb)/1e6:.1f}M emb + "
               f"{sum(p.numel() for p in norms)/1e3:.1f}k norm gains, AdamW fp32 states", flush=True)
@@ -680,6 +706,10 @@ def main():
                 print(f"embedding / head group: lr x{g_['emb_mult']} -> x{args.emb_lr_mult}, weight decay "
                       f"{g_['weight_decay']} -> {args.emb_wd} (this command line, not the checkpoint's)", flush=True)
                 g_["emb_mult"], g_["weight_decay"] = args.emb_lr_mult, args.emb_wd
+        for g_ in tail_opt.param_groups:   # (likewise --gate-lr-mult)
+            if "gate_mult" in g_ and g_["gate_mult"] != args.gate_lr_mult:
+                print(f"DeltaNet gates: lr x{g_['gate_mult']} -> x{args.gate_lr_mult} (this command line)", flush=True)
+                g_["gate_mult"] = args.gate_lr_mult
         start_step = int(blob.get("step", 0)) + 1
         # fast-forward the data streams, so a resumed run sees the batches the uninterrupted
         # run would have (not the step-0 batches again)
@@ -969,7 +999,7 @@ def main():
                 print(f"--adapter-schedule: step {step}: adapters {r_c} -> {r_t} (dropped {e_:.4f} of their energy)",
                       flush=True)
         for g in tail_opt.param_groups:
-            g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0) * g.get("emb_mult", 1.0)
+            g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0) * g.get("emb_mult", 1.0) * g.get("gate_mult", 1.0)
         tail_opt.zero_grad(set_to_none=True)
         last_loss = 0.0
         sum_loss = 0.0         # all micro-batches' losses: the step's loss over its grad_accum windows ("loss_mean")

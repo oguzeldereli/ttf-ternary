@@ -75,6 +75,11 @@ def build_parser():
                    "in_proj_a / b bias. Off: they go with the norm gains (no decay, fp16 under --tail lean), as Mamba / "
                    "FLA train them; with decay A_log and dt_bias shrank x0.84 in the 27B run by step 4000 whatever the "
                    "loss (1 Nov 2026). A resume keeps the checkpoint's setting (runs before 1 Nov: on)")
+    g.add_argument("--gate-lr-mult", type=float, default=1.0,
+                   help="Qwen: lr x this for the Gated DeltaNet's float gates (in_proj_a / b and their centred bias, "
+                   "A_log, dt_bias), in their own optimizer groups when not 1. At 27B (one-GPU A/B, 1 Nov 2026) Adam at "
+                   "5e-4 on these drifted after ~150 steps, 1.5e-4 held. The groups follow the checkpoint on a resume "
+                   "(a run without them cannot gain them); the value is this command line's")
 
     g = ap.add_argument_group("TTF (--mode ttf)")
     g.add_argument("--ttf-rank", type=int, default=512, help="rank of each layer's accumulator A = U V^T")
