@@ -132,6 +132,16 @@ def build_parser():
                    help="factored: the update from the gradient's factors (gy, x), the dense weight gradient never "
                         "formed (equal loss to dense at 110M)")
     g.add_argument("--dw-sketch", type=int, default=256, help="--dw factored: sketch size for the sums of g^2")
+    g.add_argument("--dw-sketch-kind", default="gauss", choices=["gauss", "count"],
+                   help="--dw factored: the row sketch Sc [k, N] of the v sums and the basis turn: gauss (dense normal) or "
+                        "count (one +-1 per column in a random row; E[Sc^T Sc] = I as well)")
+    g.add_argument("--dw-sketch-warm", type=float, default=0.0,
+                   help="--dw factored, --accum > 1: this share of Sc's rows is the accumulator's own range (Q = orth(U G) "
+                        "after each step's turn, kept for the next step), the rest random on Q's complement, so E[Sc^T Sc] "
+                        "= I still and the turn's cross term (sum g)^T U is exact on Q (0: off)")
+    g.add_argument("--dw-sketch-per-n", type=float, default=0.0,
+                   help="--dw factored: per matrix k = max(--dw-sketch, this x N) (the turn's sketch noise ~ sqrt(N / k); "
+                        "0: off)")
     g.add_argument("--dw-thin", default="factored", choices=["factored", "dense"],
                    help="--dw factored: dense = layers with N K < (N + K)(sketch + 2 rank) (thin adapter factors) take "
                         "the dense weight gradient instead (fewer flops and launches; exact g^2 sums, not bit-identical)")

@@ -604,6 +604,24 @@ def _layer_gen(l, dev):
     return g
 
 
+def _row_sketch(l, dev, gen, k, c, Q=None):
+    """Sc [k, N] with E[Sc^T Sc] = I, fixed within a step (gen seeded by the step). gauss: dense normal / sqrt(k). count
+    (--dw-sketch-kind): one +-1 per column, in a random row. Q [N, kw] orthonormal (--dw-sketch-warm, the accumulator's
+    range from the step before): Sc = [Q^T; R (I - Q Q^T)] with R the k - kw random rows, so Sc^T Sc's expectation is
+    Q Q^T + (I - Q Q^T) = I and the sketched products are exact on Q"""
+    kr = k - (Q.shape[1] if Q is not None else 0)
+    if c.get("sketch_kind") == "count":
+        R = torch.zeros(kr, l.N, device=dev)
+        R[torch.randint(0, kr, (l.N,), device=dev, generator=gen), torch.arange(l.N, device=dev)] = \
+            torch.randint(0, 2, (l.N,), device=dev, generator=gen).float() * 2 - 1
+    else:
+        R = torch.randn(kr, l.N, device=dev, generator=gen) / kr ** 0.5
+    if Q is None:
+        return R
+    Q = Q.float()
+    return torch.cat([Q.T, R - (R @ Q) @ Q.T])
+
+
 def _ts_layer_factored(l, fg, state, c):
     """--dw factored K: the TTF update (one batch per step, or --accum M > 1) from the factors of the weight gradient,
     g = gy^T x, which is never formed. Everything the update reads from g is a product with a thin matrix: the
@@ -625,10 +643,12 @@ def _ts_layer_factored(l, fg, state, c):
     key = id(l); t = _micro_t(l, st, key, M_, c)
     lk = 1 - 1 / tau
     k_ = int(c["factored"])
+    if c.get("sketch_per_n"):   # --dw-sketch-per-n: k grows with the sketched side (multiples of 16)
+        k_ = max(k_, 16 * round(c["sketch_per_n"] * l.N / 16))
     ts_ = (t - 1) // M_
     gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
     Sr = torch.randn(l.K, k_, device=dev, generator=gen) / k_ ** 0.5
-    Sc = torch.randn(k_, l.N, device=dev, generator=gen) / k_ ** 0.5
+    Sc = _row_sketch(l, dev, gen, k_, c, st.get(("wq", key)) if M_ > 1 else None)
     if MICRO_FUSED[0] and M_ > 1 and dev.type == "cuda" and not c.get("vdiag"):
         # --accum M > 1 on the GPU: each sketch side's statistics (its squares, the cross terms with the step's
         # running sum, v's EMA, the scale and its bounded reciprocal) in two kernels (kernel.micro_sketch) instead of
@@ -724,6 +744,11 @@ def _ts_layer_factored(l, fg, state, c):
             U = _dpm(U)
             SPt, PS_, ia_, ib_ = turn_
             U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio))
+            if c.get("sketch_warm"):   # --dw-sketch-warm: the next step's sketch rows on the accumulator's range
+                kw = min(int(round(c["sketch_warm"] * k_)), k_ - 1, U.shape[1])
+            if c.get("sketch_warm") and kw > 0:
+                gw = torch.Generator(device=dev).manual_seed(7_000_003 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
+                st[("wq", key)] = _orth(U.float() @ torch.randn(U.shape[1], kw, device=dev, generator=gw)).to(torch.bfloat16)
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         A_prev = U @ V.T if c.get("band") else None
