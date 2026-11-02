@@ -362,7 +362,7 @@ def _orth_(X):
     if ORTH[0] == "qr" or X.dtype != torch.float32 or X.shape[0] < X.shape[1]:
         return torch.linalg.qr(X)[0]
     if ORTH[0] == "spanqr":
-        # spanqr (github.com/oguzeldereli/spanqr; 4080 laptop, 5120 x 256: 0.90 ms against cholqr2's 1.11 and
+        # spanqr (github.com/userreli/spanqr; 4080 laptop, 5120 x 256: 0.90 ms against cholqr2's 1.11 and
         # Householder's 3.47). Above r 512 (r a multiple of 256) its block Gram-Schmidt over 256-column blocks (spanqr
         # 4986987: 22/22 robustness cases at 5120 / 6144 / 17408 x 1024; 5120 x 1024 10.5 ms against Householder's
         # 11.9). The shapes it does not take (r not a multiple of 32, r > 512 not a multiple of 256, CPU): Householder
@@ -778,15 +778,17 @@ def _ts_layer_factored(l, fg, state, c):
         l._record_flips(before, l.wpacked)
 
 
-DENSE_ACC = [True]     # the dense accumulator where the rank covers the rows (dense_acc); False: low-rank (tests, A/B)
+DENSE_ACC = [True]     # the dense accumulator where U V^T would hold as many numbers (dense_acc); False: low-rank (tests, A/B)
 
 
 def dense_acc(l, ra):
-    """the layer's accumulator is held dense, A [N, K]: its rank is full, ra = min(N, K) (the adapters' factors at
-    rank 1024, the 1024-row projections). A U V^T of that rank holds more numbers than A ((N + K) ra against N K); with
-    ra = N < K its fixed basis V within a step drops the step's evidence outside span(V) (_acc_turn), with ra = K it is
-    exact but pays the basis' products, orth and turn. Dense, A + u is exact and needs none of them"""
-    return DENSE_ACC[0] and ra == min(l.N, l.K)
+    """the layer's accumulator is held dense, A [N, K], where a U V^T of rank ra holds at least as many numbers:
+    ra (N + K) >= N K, i.e. ra >= N K / (N + K) (rank ratio 0.5 of a square matrix, max(N, K) / (N + K) of a rectangular
+    one: 0.78 at 1024 x 3584, 0.77 at 5120 x 17408; full rank always). The factored form then saves no memory and is
+    worse: its basis drops each step's evidence outside span(V) (_acc_turn, with a sketched cross term) and pays the
+    basis' products, orth and turn. Dense, A + u is exact and needs none of them (user, 2 Nov 2026: "r0.5 is dense as is,
+    it takes exactly the same memory ... 0.5 and above should default to dense")"""
+    return DENSE_ACC[0] and ra * (l.N + l.K) >= l.N * l.K
 
 
 def _dense_mark(dev):

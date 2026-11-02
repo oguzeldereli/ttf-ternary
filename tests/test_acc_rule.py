@@ -142,3 +142,11 @@ def test_micro_index_keeps_the_count_aligned(dense):
     A, ts = _run_idx(dense, skip={(1, 1), (1, 3)})
     assert ts == [1, 2, 3, 4, 5, 7, 9, 10, 11, 12]
     assert torch.isfinite(A).all()
+
+
+@pytest.mark.parametrize("N,K,r,dense", [(64, 64, 32, True), (64, 64, 31, False), (40, 140, 32, True),
+                                         (40, 140, 31, False), (140, 40, 40, True), (48, 160, 12, False)])
+def test_dense_at_break_even(N, K, r, dense):
+    """dense_acc: the accumulator is held dense once a U V^T of its rank would hold as many numbers, r (N + K) >= N K
+    (rank ratio 0.5 of a square matrix; 40 x 140: 31.1)"""
+    assert UP.dense_acc(_Stub(N, K), r) == dense

@@ -89,7 +89,8 @@ def build_parser():
                         "reaches full rank, whose dense exact accumulator also integrates the per-step noise (27B at "
                         "--ttf-rank 1536: the 1024-row k / v and the adapter factors moved 28-40%% of their trits in 1000 "
                         "steps, oscillating). A resume below the checkpoint's rank keeps each accumulator's best rank-r "
-                        "part (truncated SVD)")
+                        "part (truncated SVD). A layer whose rank r has r (N + K) >= N K (ratio 0.5 of a square matrix, "
+                        "~0.77 of a 1:3.4 one) is held dense instead: U V^T would take as much memory")
     g.add_argument("--ttf-step-fp32", action=ON, default=False, help="--accum M > 1: keep U in fp32 between a step's "
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
     g.add_argument("--ttf-orth", default="qr", choices=["qr", "cholqr2", "spanqr"],
