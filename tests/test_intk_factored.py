@@ -484,3 +484,22 @@ def test_rel_err_chunked(monkeypatch):
     ref = float((m.dequant() - W.float()).norm() / W.float().norm())
     assert abs(m.rel_err(W) - ref) < 1e-5 * ref
     assert math.isnan(m.rel_err(torch.zeros_like(W)))    # (a resume builds the codes before its weights load)
+
+
+@pytest.mark.parametrize("bits", [2, 4])
+def test_build_chunked(monkeypatch, bits):
+    """IntKMatrix's codes / lo / s, built in row chunks (no [V, d] fp32 copy), equal the whole-matrix construction
+    (the pre-3 Nov one pass), for any chunk size; a meta W (another --pipe stage's matrix) still builds on meta"""
+    torch.manual_seed(4)
+    W = (torch.randn(301, 128) * 0.02).to(torch.bfloat16)
+    W[5, :64] = 0.0                                      # a constant group: s at its clamp
+    Wf = W.float().reshape(301, 2, 64); levels = 2 ** bits - 1
+    lo = Wf.amin(-1); s = ((Wf.amax(-1) - lo) / levels).clamp_min(1e-12)
+    q = ((Wf - lo[..., None]) / s[..., None]).round().clamp(0, levels).reshape(301, 128).to(torch.int8)
+    for rows in (1, 64, 300, 301, 8192):
+        monkeypatch.setattr(IE.IntKMatrix, "DEQ_ROWS", rows)
+        m = IE.IntKMatrix(W, bits)
+        assert torch.equal(m.codes, q) and torch.equal(m.lo.data, lo) and torch.equal(m.s.data, s), rows
+        assert m.codes.dtype == torch.int8 and m.lo.requires_grad and m.s.requires_grad
+    m = IE.IntKMatrix(torch.empty(300, 128, device="meta"), bits)
+    assert m.codes.is_meta and m.lo.is_meta

@@ -33,11 +33,19 @@ class IntKMatrix(nn.Module):
         N, K = W.shape
         assert K % g == 0, (K, g)
         self.N, self.K, self.g, self.bits, self.levels = N, K, g, bits, 2 ** bits - 1
+        # in row chunks on W's own device: the same values as one pass, without [V, d] fp32 copies (27B: 4.7 GiB each,
+        # more than a 16 GB pipeline stage 0 has free, 3 Nov). (Not on the CPU instead: CUDA divides by the scalar via
+        # its reciprocal, so s would differ in the last bit.)
+        codes = torch.empty(N, K, dtype=torch.int8, device=W.device)
+        lo, s = torch.empty(N, K // g, device=W.device), torch.empty(N, K // g, device=W.device)
         with torch.no_grad():
-            Wf = W.float().reshape(N, K // g, g)
-            lo = Wf.amin(-1); s = ((Wf.amax(-1) - lo) / self.levels).clamp_min(1e-12)
-            q = ((Wf - lo[..., None]) / s[..., None]).round().clamp(0, self.levels)
-        self.register_buffer("codes", q.reshape(N, K).to(torch.int8))
+            for i in range(0, N, self.DEQ_ROWS):
+                j = min(N, i + self.DEQ_ROWS)
+                Wf = W[i:j].float().reshape(j - i, K // g, g)
+                lo[i:j] = Wf.amin(-1); s[i:j] = ((Wf.amax(-1) - lo[i:j]) / self.levels).clamp_min(1e-12)
+                q = ((Wf - lo[i:j, :, None]) / s[i:j, :, None]).round().clamp(0, self.levels)
+                codes[i:j] = q.reshape(j - i, K).to(torch.int8)
+        self.register_buffer("codes", codes)
         self.lo, self.s = nn.Parameter(lo.contiguous()), nn.Parameter(s.contiguous())
         self.track, self._ts_host, self._W = False, False, None
         self._parts, self.n_parts = [], 1            # --intk-update factored: the micro-batch's gradient factors (tied: 2)
