@@ -214,7 +214,7 @@ def ttf_rows(l, g, state, c, rows=16384):
             U[i:i + rows] = u_of(i) @ V
     else:
         U, V = state[key]
-        U = U * (1 - lr / tau)
+        U = U * (1 - 1 / tau)
         X = V @ (U.T @ U)                              # update._acc_turn, a one-batch step: the turn from U_0
         for i in range(0, N, rows):
             X += u_of(i).T @ U[i:i + rows]
@@ -403,7 +403,7 @@ def _intk_update(l, parts, state, c):
     if old_:
         st[("t", key)] = st.get(("t", key), 0) * M_
     t = st.get(("t", key), 0) + 1; st[("t", key)] = t
-    lk = 1 - lr_ratio / tau
+    lk = 1 - 1 / tau
     k_ = int(c.get("factored") or 0) or 64
     ts_ = (t - 1) // M_
     gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)

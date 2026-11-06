@@ -99,9 +99,9 @@ def build_parser():
                         "== 0; other shapes Householder)")
     g.add_argument("--ttf-theta", type=float, default=16.0, help="firing threshold (in units of the step)")
     g.add_argument("--ttf-theta-sched", default="", help="T0:T1[:START]: theta T0 until fraction START, then linear to T1")
-    g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant (steps at the "
-                   "peak step scale; the leak per step shrinks with the step scale: the memory is a distance)")
-    g.add_argument("--ttf-step-p", type=float, default=0.75, help="the step scale (lr / peak lr)^P")
+    g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant: A <- (1 - 1 / TAU) A "
+                   "every step, a memory of TAU steps")
+    g.add_argument("--ttf-step-p", type=float, default=0.0, help="the step scale (lr / peak lr)^P (default 0: theta alone sets the step; the leak is 1 - 1 / tau whatever P)")
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")
     g.add_argument("--ttf-spend", type=float, default=1.0, help="a move spends this x theta of the accumulator")
     g.add_argument("--ttf-band", type=float, default=0.0, help="the exact tally on at most this share of the entries, those "

@@ -17,7 +17,7 @@ OLD_TTF = ("--preset small --mode kernel --data d --val v --seq_len 512 --batch_
 
 def test_defaults_are_the_recipe():
     a = A.parse([])
-    assert (a.mode, a.ttf_rank, a.ttf_theta, a.ttf_tau, a.ttf_step_p) == ("ttf", 512, 16.0, 1000.0, 0.75)
+    assert (a.mode, a.ttf_rank, a.ttf_theta, a.ttf_tau, a.ttf_step_p) == ("ttf", 512, 16.0, 1000.0, 0.0)
     assert a.adapter_rank == 16 and a.adapter_wd == 0.1 and a.qk_temp and a.rc_scale
     assert a.factored_k == 256 and a.tail == "fp32" and a.dx == "int8"
 

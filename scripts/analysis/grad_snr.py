@@ -35,6 +35,7 @@ ap.add_argument("--every", type=int, default=1, help="keep every k-th ternary la
 ap.add_argument("--n", type=int, default=96, help="micro-batch gradients (a multiple of 3)")
 ap.add_argument("--micro", type=int, default=4); ap.add_argument("--batch", type=int, default=16)
 ap.add_argument("--seq", type=int, default=2048); ap.add_argument("--no_svd", action="store_true")
+ap.add_argument("--annealed-leak", action="store_true", help="the checkpoint is from a trainer before 6 Nov 2026 (leak 1 - rho^p / tau)")
 a = ap.parse_args()
 dev = "cuda"
 if a.persist:
@@ -63,7 +64,7 @@ ts = ck.get("ts_state"); lr = ck.get("lowrank")
 print(f"{a.ckpt}: step {step}, {len(layers)} ternary layers, ts_state {'yes' if ts else 'no'}, "
       f"loaded in {time.time() - t0:.0f}s", flush=True)
 
-# fire bar theta / (tau_eff a), tau_eff = tau / rho (annealed leak), a = rho^p, from the run's own metrics
+# fire bar theta / (tau a), a = rho^p, from the run's own metrics (before 6 Nov: tau / a, the annealed leak)
 mp = os.path.join(os.path.dirname(a.ckpt), "metrics.jsonl")
 rho = None
 if os.path.exists(mp):
@@ -118,8 +119,8 @@ for b in range(3 * n3):
 n = 3 * n3
 k_noise = a.batch / a.micro            # micro-batch noise variance / training-batch noise variance
 cg = cfg if isinstance(cfg, dict) else vars(cfg)
-if "ttf_theta" in cg:   # the current trainer (--ttf-step-p, the leak always annealed with the step)
-    p_, theta, tau, tan = float(cg["ttf_step_p"]), float(cg["ttf_theta"]), float(cg["ttf_tau"]), True
+if "ttf_theta" in cg:   # the current trainer (--ttf-step-p; the leak 1 - 1 / tau since 6 Nov, annealed before)
+    p_, theta, tau, tan = float(cg["ttf_step_p"]), float(cg["ttf_theta"]), float(cg["ttf_tau"]), a.annealed_leak
 else:                  # a checkpoint of the trainer before 17 Oct 2026 (its option names)
     p_, theta, tau = float(cg.get("ts_anneal", 0.5)), float(cg.get("ts_theta", 16.0)), float(cg.get("ts_tau", 1000.0))
     tan = bool(cg.get("ts_tau_anneal", False))

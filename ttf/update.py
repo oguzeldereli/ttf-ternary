@@ -392,7 +392,7 @@ def ts_layer(l, g, state, c):
     --dw factored; c holds the settings and lr_ratio. Called from the layer's backward right after its input gradient
     is computed, so only one layer's fp32 gradient exists at a time.
     Per layer: v, the factored row x column EMA of g^2 (decay b2); u = -lr_ratio g / sqrt(v); A, the accumulator, rank
-    r: A <- (1 - lr_ratio^p / tau) A + u projected on its basis (V turns with the evidence); a trit moves by sign(A_ij)
+    r: A <- (1 - 1 / tau) A + u projected on its basis (V turns with the evidence); a trit moves by sign(A_ij)
     when |A_ij| >= theta (and stays in {-1, 0, 1}), and the move spends theta: A -= theta D (kept low-rank: U -= theta
     D V). With --accum M > 1 every micro-batch's u enters the accumulator, normalised by the v of the steps before;
     v, the basis turn (_acc_turn), the firing and the spend once per step, on the last micro-batch."""
@@ -501,7 +501,7 @@ def ts_layer(l, g, state, c):
         return
     del v
     ra = min(r, l.N, l.K)
-    lk = 1 - lr_ratio / tau   # the leak, annealed with the learning rate: the memory is a distance, not a step count
+    lk = 1 - 1 / tau   # the leak: a memory of tau steps, whatever the step scale (user, 6 Nov)
     if mic_nm and key in state:   # --accum M > 1: the basis stays fixed within the step (every micro-batch's u is projected
         # on it: U += u_i V), and turns once, on the last micro-batch (_acc_turn); turning it per micro-batch lets each
         # micro-batch's noisier u rotate the evidence away (Qwen 0.8B, 1 x 16: +0.09 train loss by step 500, acc_q08a)
@@ -628,7 +628,7 @@ def _ts_layer_factored(l, fg, state, c):
     off = c.get("offload", False) if getattr(l, "_ts_host", True) else False
     sa = _store_codec(c.get("store_a", ""))
     key = id(l); t = _micro_t(l, st, key, M_, c)
-    lk = 1 - lr_ratio / tau
+    lk = 1 - 1 / tau
     k_ = int(c["factored"])
     ts_ = (t - 1) // M_
     gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)

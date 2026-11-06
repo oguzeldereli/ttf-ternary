@@ -100,7 +100,7 @@ def test_one_batch_step_is_the_turn():
     R, C = b2 * R0 + (1 - b2) * G[2].square().mean(1), b2 * C0 + (1 - b2) * G[2].square().mean(0)
     v = R[:, None] * C[None, :] / R.mean() / (1 - b2 ** t)
     u = -G[2] / (v.sqrt() + 1e-8) * c["lr_ratio"]
-    Ul = U0 * (1 - c["lr_ratio"] / c["tau"])
+    Ul = U0 * (1 - 1 / c["tau"])
     Vn = torch.linalg.qr(V0 @ (Ul.T @ Ul) + u.T @ Ul).Q
     A_ref = (Ul @ V0.T + u) @ Vn @ Vn.T
     U1, V1 = UP._load_pair(st[id(l)])
