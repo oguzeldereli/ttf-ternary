@@ -40,7 +40,7 @@ from .layers import KernelTernaryLinear, build_kernel_transformer, enable_flip_t
 from .args import parse
 from .data import get_batch, _kd_cache_batch
 from .eval import evaluate
-from .schedule import lr_at, _ts_scale, resume_acc_scale, LR_LINEAR, LR_REWARM, LR_WSD
+from .schedule import lr_at, _ts_scale, resume_acc_scale, resume_leak_check, LR_LINEAR, LR_REWARM, LR_WSD
 from .update import (ts_layer, ts_step, _load_pair, is_dense_state, load_dense, store_dense, _orth, _store_codec, _store_pair,
                      _ts_on_host, _ts_state_bytes)
 
@@ -561,6 +561,7 @@ def main():
                     "opt": _opt_sd(), "pipe": (model.pp if _PP else None),
                     "touched": touched, "touched_origin": touched_origin,
                     "cfg": mc, "step": step, "mode": kmode, "beta": use_beta, "args": vars(args),
+                    "leak": "fixed",   # A <- (1 - 1 / tau) A (6 Nov 2026; before: 1 - rho^p / tau, the annealed leak)
                     "int8": True, "int8_dx": False,   # (read by the evaluation scripts of checkpoints before 25 Oct 2026)
                     "dw_mode": "dense",    # (read by the evaluation scripts of checkpoints before 17 Oct 2026)
                     # low-rank momentum (U, V) per ternary layer, in module order
@@ -656,6 +657,10 @@ def main():
         if _cx is not None and _X.structural(_cx) != _X.structural(args.ext):   # (None: written before --ext existed)
             raise SystemExit(f"checkpoint was trained with --ext {_X.structural(_cx)} but this run has "
                              f"{_X.structural(args.ext)}: the structure would differ, refusing to resume")
+        if ttf:   # the step scale and the leak must match the checkpoint's (a silent change mid-run changes the rule)
+            _lmsg = resume_leak_check(blob.get("leak"), blob.get("args") or {}, args.ttf_step_p, args.allow_leak_change)
+            if _lmsg:
+                print(_lmsg, flush=True)
         if mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):
             if args.adapter_schedule:   # the schedule continues from the checkpoint's rank (no growth back to R0)
                 mag = f"add:{next(v_.shape[1] for k_, v_ in blob['model'].items() if k_.endswith('mag_A'))}"

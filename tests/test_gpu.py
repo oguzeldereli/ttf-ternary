@@ -357,6 +357,21 @@ def test_resume_new_theta_needs_acc_scale(tmp_path):
     assert "accumulators x 0.5 (checkpoint theta 16.0, now 8.0)" in r.stdout, r.stdout[-1500:]
 
 
+def test_resume_step_p_change_refused(tmp_path):
+    """a resume with another --ttf-step-p than the checkpoint's (the default went 0.75 -> 0 on 6 Nov) is refused
+    without --allow-leak-change; the checkpoint carries leak = fixed"""
+    import torch
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    _train(str(tmp_path / "b"), ["--ttf-step-p", "0.75"], 4, data)
+    ck = torch.load(str(tmp_path / "b" / "ckpt.pt"), map_location="cpu", weights_only=False)
+    assert ck["leak"] == "fixed"
+    r = _run(str(tmp_path / "b"), ["--resume"], 6, data)
+    assert r.returncode != 0 and "--ttf-step-p 0.75 (checkpoint)" in r.stdout + r.stderr, r.stdout[-1500:] + r.stderr[-1500:]
+    r = _run(str(tmp_path / "b"), ["--resume", "--allow-leak-change"], 6, data)
+    assert r.returncode == 0 and "--allow-leak-change" in r.stdout, r.stdout[-2000:] + r.stderr[-2000:]
+
+
 def test_resume_new_emb_lr_mult(tmp_path):
     """--intk-emb resumed with another --emb-lr-mult: the embedding group takes this command line's multiplier (the
     optimizer load had restored the checkpoint's silently), and the codes' evidence, built against the old bar

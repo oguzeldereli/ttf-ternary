@@ -22,6 +22,25 @@ def _theta_at(sched, prog):
     return th0_ if prog <= st_ else th0_ + (th1_ - th0_) * (prog - st_) / max(1e-9, 1.0 - st_)
 
 
+def resume_leak_check(ck_leak, ck_args, new_p, allow=False):
+    """a resume must keep the checkpoint's TTF rule: its step scale (--ttf-step-p) and its leak. Checkpoints before
+    6 Nov 2026 (no "leak": "fixed") had the leak 1 - rho^p / tau (the annealed leak; pre-17-Oct ones only with
+    --ts_tau_anneal), this core 1 - 1 / tau: the same at p 0. A change raises SystemExit unless allow (then the message
+    of what changed is returned); None when nothing changes."""
+    op = ck_args.get("ttf_step_p", ck_args.get("ts_anneal"))
+    ol = "fixed" if ck_leak == "fixed" else ("annealed" if ("ttf_step_p" in ck_args or ck_args.get("ts_tau_anneal"))
+                                             else "fixed")
+    ch = []
+    if op is not None and float(op) != float(new_p):
+        ch.append(f"--ttf-step-p {op} (checkpoint) vs {new_p} (this run)")
+    if ol == "annealed" and float(op or 0) != 0:
+        ch.append(f"leak 1 - rho^{op} / tau (checkpoint, annealed) vs 1 - 1 / tau (this core)")
+    if ch and not allow:
+        raise SystemExit("resume: " + "; ".join(ch) + ": the TTF rule would change mid-run, refusing "
+                         "(--allow-leak-change to accept)")
+    return ("resume: --allow-leak-change: " + "; ".join(ch)) if ch else None
+
+
 def resume_acc_scale(old_theta, new_theta, acc_scale, old_sched=None, new_sched=None):
     """the accumulator scale of a resume (--ttf-acc-scale): resuming at a threshold different from the checkpoint's
     without rescaling fires, in its first update, every entry between the two thresholds at once (27B, theta 64 ->

@@ -17,7 +17,7 @@ Per ternary layer and step, with $\rho_t=(\text{lr}_t/\text{lr}_\text{peak})^{p}
   $C_j$ likewise, $v_{ij}=R_iC_j/\overline R$. With `--dw factored` (the default) $g=g_y^\top x$ is never formed: the
   sums of $g^2$ come from a `--dw-sketch` $k$-column random sketch (256) and every product with $g$ from the factors.
 - **Step**: $u=-\rho_t\,g/(\sqrt v+\epsilon)$ (no momentum).
-- **Accumulator** $A\approx UV^\top$ at rank $r$ (`--ttf-rank`, 512), leak $\lambda=1-1/\tau$ (`--ttf-tau` 1000), one
+- **Accumulator** $A\approx UV^\top$ at rank $r$ (`--ttf-rank`, 512), leak $\lambda=1-1/\tau$ (`--ttf-tau` 1000; since 6 Nov 2026, before $1-\rho_t^p/\tau$, so p > 0 results from before that date had the memory annealed too and are not reproduced by the same p), one
   subspace iteration per step on the whole tally $\tilde A=\lambda A+u$:
   $$V'=\operatorname{orth}\big(\tilde A^\top U\big)=\operatorname{orth}\big(V(U^\top U)+u^\top U\big),\qquad U'=\tilde AV'=U(V^\top V')+uV'$$
   ($U$ here already leaked; `--ttf-orth` the orthonormalisation).

@@ -101,7 +101,9 @@ def build_parser():
     g.add_argument("--ttf-theta-sched", default="", help="T0:T1[:START]: theta T0 until fraction START, then linear to T1")
     g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant: A <- (1 - 1 / TAU) A "
                    "every step, a memory of TAU steps")
-    g.add_argument("--ttf-step-p", type=float, default=0.0, help="the step scale (lr / peak lr)^P (default 0: theta alone sets the step; the leak is 1 - 1 / tau whatever P)")
+    g.add_argument("--ttf-step-p", type=float, default=0.0, help="the step scale (lr / peak lr)^P (default 0: theta alone sets the step). The leak is 1 - 1 / tau whatever "
+                   "P: P > 0 anneals the step only, so results measured before 6 Nov 2026 at P > 0 (leak 1 - rho^P / tau, "
+                   "the memory annealed too) are not reproduced by passing the same P")
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")
     g.add_argument("--ttf-spend", type=float, default=1.0, help="a move spends this x theta of the accumulator")
     g.add_argument("--ttf-band", type=float, default=0.0, help="the exact tally on at most this share of the entries, those "
@@ -113,6 +115,8 @@ def build_parser():
     g.add_argument("--ttf-start", type=int, default=0, help="trits frozen until this step (floats train)")
     g.add_argument("--ttf-acc-scale", type=float, default=None, help="--resume: multiply the accumulators by F "
                    "(continuing at theta F x the old one); required when --ttf-theta differs from the checkpoint's")
+    g.add_argument("--allow-leak-change", action="store_true", help="--resume: accept a checkpoint whose step scale "
+                   "(--ttf-step-p) or leak differs from this run's (before 6 Nov 2026 the leak was 1 - rho^p / tau)")
     g.add_argument("--ttf-store", default="fp32", choices=["fp32", "bf16", "fp12s"],
                    help="storage of U and V (fp12s: 1.5 bytes per value)")
     g.add_argument("--ttf-offload", default="none", choices=["none", "async"],

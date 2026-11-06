@@ -150,3 +150,21 @@ def test_dense_at_break_even(N, K, r, dense):
     """dense_acc: the accumulator is held dense once a U V^T of its rank would hold as many numbers, r (N + K) >= N K
     (rank ratio 0.5 of a square matrix; 40 x 140: 31.1)"""
     assert UP.dense_acc(_Stub(N, K), r) == dense
+
+
+@pytest.mark.parametrize("dense", [False, True])
+def test_leak_is_one_over_tau(dense):
+    """the leak is 1 - 1 / tau whatever the step scale (6 Nov): lr_ratio 0.5, tau 100, a step with no gradient keeps 0.99
+    of the accumulator (the annealed leak before kept 0.995)"""
+    N, K, T = 40, 24, 16
+    l, st = _Stub(N, K), {}
+    c = _cfg(micro=1, lr_ratio=0.5, tau=100.0)
+    g = torch.Generator().manual_seed(9)
+    gy, x = torch.randn(T, N, generator=g), torch.randn(T, K, generator=g) + 0.3
+    l._ts_final = True
+    UP.ts_layer(l, (gy.T @ x) if dense else (gy, x), st, c)
+    U, V = UP._load_pair(st[id(l)]); A0 = U @ V.T
+    z = torch.zeros(T, N)
+    UP.ts_layer(l, (z.T @ x) if dense else (z, x), st, c)
+    U, V = UP._load_pair(st[id(l)]); A1 = U @ V.T
+    assert float((A1 - 0.99 * A0).norm() / A0.norm()) < 1e-3
