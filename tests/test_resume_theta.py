@@ -30,16 +30,15 @@ def test_schedules_and_unknown_thetas_skip_the_check():
 
 
 def test_resume_leak_check():
-    """the step scale and the leak of a resume must be the checkpoint's (6 Nov: the fixed leak, p default 0)"""
+    """a resume keeps the checkpoint's TTF rule: this core has step scale 1 and the leak 1 - 1 / tau (6 Nov 2026)"""
     from ttf.schedule import resume_leak_check as R
-    assert R("fixed", {"ttf_step_p": 0.0}, 0.0) is None                     # this core, unchanged
-    assert R(None, {"ttf_step_p": 0.0}, 0.0) is None                        # an old p 0 run: the same rule
-    with pytest.raises(SystemExit, match="--ttf-step-p 0.75"):
-        R(None, {"ttf_step_p": 0.75}, 0.0)                                  # the old default resumed on the new default
+    assert R("fixed", {}) is None                                           # this core
+    assert R(None, {"ttf_step_p": 0.0}) is None                             # an old p 0 run: the same rule
     with pytest.raises(SystemExit, match="annealed"):
-        R(None, {"ttf_step_p": 0.75}, 0.75)                                 # the same p, but the leak changes
-    assert R("fixed", {"ttf_step_p": 0.75}, 0.75) is None
-    assert "annealed" in R(None, {"ttf_step_p": 0.75}, 0.0, allow=True)
-    assert R(None, {"ts_anneal": 0.5}, 0.5) is None                         # pre-17-Oct, fixed leak (no --ts_tau_anneal)
-    with pytest.raises(SystemExit, match="annealed"):
-        R(None, {"ts_anneal": 0.5, "ts_tau_anneal": True}, 0.5)
+        R(None, {"ttf_step_p": 0.75})                                       # the old default: step and leak annealed
+    assert "annealed" in R(None, {"ttf_step_p": 0.75}, allow=True)
+    assert R(None, {"ts_anneal": 0, "ts_theta": 16}) is None                # pre-17-Oct at p 0
+    with pytest.raises(SystemExit, match=r"\^1.0"):
+        R(None, {"ts_theta": 16})                                           # pre-17-Oct without --ts_anneal: p 1
+    m = R(None, {"ts_anneal": 0.5, "ts_theta": 16}, allow=True)             # pre-17-Oct, fixed leak: the step only
+    assert "^0.5" in m and "annealed" not in m

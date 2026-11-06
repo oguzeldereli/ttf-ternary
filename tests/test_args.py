@@ -10,14 +10,15 @@ from ttf import args as A
 OLD_TTF = ("--preset small --mode kernel --data d --val v --seq_len 512 --batch_size 4 --grad_accum 1 --warmup 5 "
            "--rate_schedule cosine --rate 0.0 --rate_peak 0.02 --rate_warmup 5 --g_ref 3.0 --int8 --dw_mode dense "
            "--tail_fp32 --lr 1.5e-3 --min_lr 1.5e-4 --eval_interval 1000 --eval_iters 2 --save_secs 99999 --snap_every 0 "
-           "--no_final_save --lookahead 0 --seed 7 --ts --ts_nomom --ts_theta 16 --ts_tau 1000 --ts_anneal 0.75 "
+           "--no_final_save --lookahead 0 --seed 7 --ts --ts_nomom --ts_theta 16 --ts_tau 1000 --ts_anneal 0 "
            "--ts_tau_anneal --ts_fused --gemm int8mm --lowrank 64 --ts_rank_s 64 --rc_scale --lowrank_mag add:16 "
            "--mag_wd 0.1 --qk_temp --steps 60")
 
 
 def test_defaults_are_the_recipe():
     a = A.parse([])
-    assert (a.mode, a.ttf_rank, a.ttf_theta, a.ttf_tau, a.ttf_step_p) == ("ttf", 512, 16.0, 1000.0, 0.0)
+    assert (a.mode, a.ttf_rank, a.ttf_theta, a.ttf_tau) == ("ttf", 512, 16.0, 1000.0)
+    assert not hasattr(a, "ttf_step_p")      # theta alone sets the step (6 Nov 2026)
     assert a.adapter_rank == 16 and a.adapter_wd == 0.1 and a.qk_temp and a.rc_scale
     assert a.factored_k == 256 and a.tail == "fp32" and a.dx == "int8"
 
@@ -68,7 +69,8 @@ def test_from_legacy_dx():
 
 @pytest.mark.parametrize("extra", ["", " --ts_nomom_x 1", " --lr_spend 1", " --dw_fp32", " --hid_kd 0.1",
                                    " --ts_store_a int8", " --init_hf_method row", " --ts_tau_anneal_pow 0.5",
-                                   " --extend_to 9000", " --master_dtype bf16", "-int8", "-ts_tau_anneal", "-tail_fp32", " --grad_accum 2"])
+                                   " --extend_to 9000", " --master_dtype bf16", "-int8", "-tail_fp32", " --grad_accum 2",
+                                   " --ts_anneal 0.75"])
 def test_from_legacy_rejects(extra):
     """the old trainer only: no flip rule, unknown flags, and the settings removed on 25 Oct 2026 (a leading "-": the
     flag left out, e.g. the bf16 forward; --grad_accum 2 without --ts_micro: one update from the summed gradients)"""
@@ -79,6 +81,15 @@ def test_from_legacy_rejects(extra):
         cmd = OLD_TTF.replace(" --ts ", " ") if not extra else OLD_TTF + extra
     with pytest.raises(ValueError):
         A.from_legacy(shlex.split(cmd))
+
+
+def test_from_legacy_step_annealing():
+    """the step annealed with the lr went on 6 Nov 2026: --ts_anneal 0 translates (to nothing), any other p, or its old
+    default p 1 (no --ts_anneal), is refused; the leak is 1 - 1 / tau with or without --ts_tau_anneal at p 0"""
+    assert A.parse(A.from_legacy(shlex.split(OLD_TTF))).ttf_tau == 1000.0
+    with pytest.raises(ValueError, match="p 1"):
+        A.from_legacy(shlex.split(OLD_TTF.replace(" --ts_anneal 0 ", " ")))
+    A.parse(A.from_legacy(shlex.split(OLD_TTF.replace(" --ts_tau_anneal ", " "))))
 
 
 def test_options_map_is_current():

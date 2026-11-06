@@ -657,8 +657,8 @@ def main():
         if _cx is not None and _X.structural(_cx) != _X.structural(args.ext):   # (None: written before --ext existed)
             raise SystemExit(f"checkpoint was trained with --ext {_X.structural(_cx)} but this run has "
                              f"{_X.structural(args.ext)}: the structure would differ, refusing to resume")
-        if ttf:   # the step scale and the leak must match the checkpoint's (a silent change mid-run changes the rule)
-            _lmsg = resume_leak_check(blob.get("leak"), blob.get("args") or {}, args.ttf_step_p, args.allow_leak_change)
+        if ttf:   # the checkpoint's step scale and leak must be this core's (a silent change mid-run changes the rule)
+            _lmsg = resume_leak_check(blob.get("leak"), blob.get("args") or {}, args.allow_leak_change)
             if _lmsg:
                 print(_lmsg, flush=True)
         if mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):

@@ -101,9 +101,6 @@ def build_parser():
     g.add_argument("--ttf-theta-sched", default="", help="T0:T1[:START]: theta T0 until fraction START, then linear to T1")
     g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant: A <- (1 - 1 / TAU) A "
                    "every step, a memory of TAU steps")
-    g.add_argument("--ttf-step-p", type=float, default=0.0, help="the step scale (lr / peak lr)^P (default 0: theta alone sets the step). The leak is 1 - 1 / tau whatever "
-                   "P: P > 0 anneals the step only, so results measured before 6 Nov 2026 at P > 0 (leak 1 - rho^P / tau, "
-                   "the memory annealed too) are not reproduced by passing the same P")
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")
     g.add_argument("--ttf-spend", type=float, default=1.0, help="a move spends this x theta of the accumulator")
     g.add_argument("--ttf-band", type=float, default=0.0, help="the exact tally on at most this share of the entries, those "
@@ -115,8 +112,9 @@ def build_parser():
     g.add_argument("--ttf-start", type=int, default=0, help="trits frozen until this step (floats train)")
     g.add_argument("--ttf-acc-scale", type=float, default=None, help="--resume: multiply the accumulators by F "
                    "(continuing at theta F x the old one); required when --ttf-theta differs from the checkpoint's")
-    g.add_argument("--allow-leak-change", action="store_true", help="--resume: accept a checkpoint whose step scale "
-                   "(--ttf-step-p) or leak differs from this run's (before 6 Nov 2026 the leak was 1 - rho^p / tau)")
+    g.add_argument("--allow-leak-change", action="store_true", help="--resume: accept a checkpoint from before 6 Nov "
+                   "2026 with a step scale (lr / peak lr)^p, p > 0, and its annealed leak 1 - rho^p / tau (this core: "
+                   "step scale 1, leak 1 - 1 / tau)")
     g.add_argument("--ttf-store", default="fp32", choices=["fp32", "bf16", "fp12s"],
                    help="storage of U and V (fp12s: 1.5 bytes per value)")
     g.add_argument("--ttf-offload", default="none", choices=["none", "async"],
@@ -286,6 +284,8 @@ def _keep_if(ok, then, what):
     return f
 
 
+_ANNEAL = _keep_if(lambda v: float(v) == 0, lambda v: [], "--ts_anneal (the step annealed with the lr)")
+_ANNEAL.note = "other values: removed 6 Nov 2026 (theta alone sets the step)"
 _LEGACY = {
     "--preset": _SAME("--preset"), "--data": _SAME("--data"), "--val": _SAME("--val"), "--steps": _SAME("--steps"),
     "--batch_size": _SAME("--batch-size"), "--grad_accum": _SAME("--accum"), "--seq_len": _SAME("--seq-len"),
@@ -314,7 +314,7 @@ _LEGACY = {
     "--eval_first_n": None, "--mem_report": _FLAG("--mem-report", None),
     "--ts_offload": _FLAG("--ttf-offload", "async"), "--ts_offload_async": _FLAG("--ttf-offload", "async"),
     "--dw_fp32": _gone("--dw_fp32 (the dense weight gradient's GEMM in fp32)"), "--w_cache": None, "--ts_offload_keep": _SAME("--ttf-offload-keep"),
-    "--ts_fused": None, "--ts_anneal": _SAME("--ttf-step-p"),
+    "--ts_fused": None, "--ts_anneal": _ANNEAL,
     "--ts_tau_anneal_pow": _keep_if(lambda v: float(v) == 1, lambda v: [], "--ts_tau_anneal_pow"), "--ts_tau_anneal": None,
     "--ts_tau": _SAME("--ttf-tau"), "--ts_b2": _SAME("--ttf-b2"), "--tf32": _FLAG("--tf32", None),
     "--int8": None, "--int8_dx": _FLAG("--dx", "int8"), "--stop_after": _SAME("--stop-after"),
@@ -338,8 +338,7 @@ _OLD_OFF = [("--qk_temp", ["--no-qk-temp"]), ("--rc_scale", ["--no-rc-scale"]), 
             ("--ts_factored", ["--dw", "dense"])]
 # old defaults that differ from the new ones
 _OLD_DEFAULTS = [("--mode", ["--mode", "ttf"]), ("--ckpt_skip", ["--ckpt-skip", "0"]), ("--ts_tau", ["--ttf-tau", "300"]),
-                 ("--ts_anneal", ["--ttf-step-p", "1.0"]), ("--lowrank", ["--ttf-rank", "0"]),
-                 ("--distill_w", ["--kd-weight", "1.0"]),
+                 ("--lowrank", ["--ttf-rank", "0"]), ("--distill_w", ["--kd-weight", "1.0"]),
                  ("--mag_wd", ["--adapter-wd", "0.0"]), ("--kd_mode", ["--kd-cache-mode", "renorm"]),
                  ("--int8_dx", ["--dx", "int8x2"])]
 _OLD_BOOL = {"--qk_temp", "--ts", "--init_stream", "--data_u32", "--ts_vdiag", "--ts_nomom", "--lr_linear",
@@ -383,9 +382,11 @@ def from_legacy(argv):
         raise ValueError("kernel mode without --ts (a flip rule): the old trainer only (tag pre-consolidation-2026-10-17)")
     if mode == "kernel" and "--ts_nomom" not in seen:
         raise ValueError("--ts without --ts_nomom (TTF with a short momentum): the old trainer only (tag pre-consolidation-2026-10-17)")
+    if mode == "kernel" and "--ts_anneal" not in seen:   # (its old default p 1)
+        raise ValueError(f"the step annealed with the lr, p 1 (no --ts_anneal): removed 6 Nov 2026 ({_TAG})")
     if mode == "kernel":    # off when absent in the old trainer, removed from the core since (25 Oct 2026)
         acc = int(([argv[j + 1] for j, x in enumerate(argv[:-1]) if x == "--grad_accum"] or ["1"])[-1])
-        for f, what in (("--int8", "the bf16 forward (no --int8)"), ("--ts_tau_anneal", "the fixed leak (no --ts_tau_anneal)")) + \
+        for f, what in (("--int8", "the bf16 forward (no --int8)"),) + \
                 ((("--ts_micro", "one update from the summed micro-batch gradients (no --ts_micro)"),) if acc > 1 else ()):
             if f not in seen:
                 raise ValueError(f"{what}: removed ({_TAG})")

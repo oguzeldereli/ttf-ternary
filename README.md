@@ -116,7 +116,7 @@ short momentum) run from a checkout of that tag (`python -m bitnet.train` there;
 | `--mode ttf / bitnet / fp32` | TTF; BitNet b1.58 (latent weights, STE, AdamW); the full-precision model |
 | `--recipe NAME` | defaults for a setting (`recipes/`: scratch-110m, continue-27b) |
 | `--ttf-rank R` | rank of each layer's accumulator (512) |
-| `--ttf-theta`, `--ttf-tau`, `--ttf-step-p P` | threshold, leak, step scale ρ^P (ρ = lr / peak lr; default P 0, θ sets the step); the leak is 1 − 1/τ |
+| `--ttf-theta`, `--ttf-tau` | threshold (θ alone sets the step; `--ttf-theta-sched` for a θ schedule), leak 1 − 1/τ |
 | `--dw factored / dense`, `--dw-sketch K` | the update from the gradient's factors, the dense weight gradient never formed |
 | `--ttf-store fp32 / bf16 / fp12s` | compressed accumulator |
 | `--ttf-offload async`, `--ttf-offload-keep F` | state in pinned host memory (all but the first share F of layers), copies overlapped with the backward |

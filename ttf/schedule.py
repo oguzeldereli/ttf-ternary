@@ -11,8 +11,10 @@ LR_REWARM = [0, 0]                # --lr-rewarm S:W: from step S, linear warmup 
 
 
 def _ts_scale(args, step, tc, lr):
-    """the TTF step scale (lr / peak lr)^p, p = --ttf-step-p"""
-    return max((lr / tc.lr) ** args.ttf_step_p, 0.0)
+    """the TTF step scale: 1. Theta alone sets the step (user, 6 Nov 2026: the step annealing (lr / peak lr)^p is a theta
+    schedule, so it went, with the annealed leak). Kept as the per-step call (ttf-lab profilers hook it); an --ext
+    plug-in may still set lr_ratio itself (a theta schedule in rescale form)."""
+    return 1.0
 
 
 def _theta_at(sched, prog):
@@ -22,23 +24,26 @@ def _theta_at(sched, prog):
     return th0_ if prog <= st_ else th0_ + (th1_ - th0_) * (prog - st_) / max(1e-9, 1.0 - st_)
 
 
-def resume_leak_check(ck_leak, ck_args, new_p, allow=False):
-    """a resume must keep the checkpoint's TTF rule: its step scale (--ttf-step-p) and its leak. Checkpoints before
-    6 Nov 2026 (no "leak": "fixed") had the leak 1 - rho^p / tau (the annealed leak; pre-17-Oct ones only with
-    --ts_tau_anneal), this core 1 - 1 / tau: the same at p 0. A change raises SystemExit unless allow (then the message
-    of what changed is returned); None when nothing changes."""
+def resume_leak_check(ck_leak, ck_args, allow=False):
+    """a resume must keep the checkpoint's TTF rule. This core: step scale 1, leak 1 - 1 / tau. Checkpoints before 6 Nov
+    2026 may have a step scale (lr / peak lr)^p (--ttf-step-p, the old --ts_anneal; the pre-17-Oct default was nonzero)
+    and the annealed leak 1 - rho^p / tau (pre-17-Oct only with --ts_tau_anneal): the same rule only at p 0. A change
+    raises SystemExit unless allow (then the message of what changed is returned); None when nothing changes."""
+    if ck_leak == "fixed":
+        return None
     op = ck_args.get("ttf_step_p", ck_args.get("ts_anneal"))
-    ol = "fixed" if ck_leak == "fixed" else ("annealed" if ("ttf_step_p" in ck_args or ck_args.get("ts_tau_anneal"))
-                                             else "fixed")
-    ch = []
-    if op is not None and float(op) != float(new_p):
-        ch.append(f"--ttf-step-p {op} (checkpoint) vs {new_p} (this run)")
-    if ol == "annealed" and float(op or 0) != 0:
-        ch.append(f"leak 1 - rho^{op} / tau (checkpoint, annealed) vs 1 - 1 / tau (this core)")
-    if ch and not allow:
+    if op is None and ck_args and "ttf_theta" not in ck_args:
+        op = "1.0"     # (the pre-17-Oct trainer without --ts_anneal: p 1)
+    if op is None or float(op) == 0:
+        return None
+    ann = "ttf_step_p" in ck_args or bool(ck_args.get("ts_tau_anneal"))
+    ch = [f"step scale (lr / peak lr)^{op} (checkpoint) vs 1 (this core: theta alone)"]
+    if ann:
+        ch.append(f"leak 1 - rho^{op} / tau (checkpoint, annealed) vs 1 - 1 / tau")
+    if not allow:
         raise SystemExit("resume: " + "; ".join(ch) + ": the TTF rule would change mid-run, refusing "
                          "(--allow-leak-change to accept)")
-    return ("resume: --allow-leak-change: " + "; ".join(ch)) if ch else None
+    return "resume: --allow-leak-change: " + "; ".join(ch)
 
 
 def resume_acc_scale(old_theta, new_theta, acc_scale, old_sched=None, new_sched=None):

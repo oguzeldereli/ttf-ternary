@@ -35,7 +35,6 @@ ap.add_argument("--every", type=int, default=1, help="keep every k-th ternary la
 ap.add_argument("--n", type=int, default=96, help="micro-batch gradients (a multiple of 3)")
 ap.add_argument("--micro", type=int, default=4); ap.add_argument("--batch", type=int, default=16)
 ap.add_argument("--seq", type=int, default=2048); ap.add_argument("--no_svd", action="store_true")
-ap.add_argument("--annealed-leak", action="store_true", help="the checkpoint is from a trainer before 6 Nov 2026 (leak 1 - rho^p / tau)")
 a = ap.parse_args()
 dev = "cuda"
 if a.persist:
@@ -119,8 +118,9 @@ for b in range(3 * n3):
 n = 3 * n3
 k_noise = a.batch / a.micro            # micro-batch noise variance / training-batch noise variance
 cg = cfg if isinstance(cfg, dict) else vars(cfg)
-if "ttf_theta" in cg:   # the current trainer (--ttf-step-p; the leak 1 - 1 / tau since 6 Nov, annealed before)
-    p_, theta, tau, tan = float(cg["ttf_step_p"]), float(cg["ttf_theta"]), float(cg["ttf_tau"]), a.annealed_leak
+if "ttf_theta" in cg:   # the trainer since 17 Oct (since 6 Nov step scale 1, leak 1 - 1 / tau; before, p = ttf_step_p, annealed)
+    p_, theta, tau = float(cg.get("ttf_step_p", 0.0)), float(cg["ttf_theta"]), float(cg["ttf_tau"])
+    tan = "ttf_step_p" in cg and p_ != 0
 else:                  # a checkpoint of the trainer before 17 Oct 2026 (its option names)
     p_, theta, tau = float(cg.get("ts_anneal", 0.5)), float(cg.get("ts_theta", 16.0)), float(cg.get("ts_tau", 1000.0))
     tan = bool(cg.get("ts_tau_anneal", False))

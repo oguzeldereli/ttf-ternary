@@ -7,7 +7,7 @@ from ttf import args as A  # noqa: E402
 
 SAMPLE = {"--lowrank_mag": "add:16", "--ts_factored": "128", "--lr_wsd": "4000", "--init_mag_svd": "16",
           "--mode": "kernel", "--master_dtype": "fp32", "--init_hf_method": "gptqc", "--kd_mode": "renorm",
-          "--hid_kd": "0", "--ts_store_a": "fp12s", "--ts_tau_anneal_pow": "1", "--extend_to": "0"}
+          "--hid_kd": "0", "--ts_store_a": "fp12s", "--ts_tau_anneal_pow": "1", "--extend_to": "0", "--ts_anneal": "0"}
 NOTE = {"--ts": "implied by `--mode ttf`", "--ts_nomom": "implied by `--mode ttf` (TTF has no short momentum)",
         "--ts_vdiag": None, "--ts_vdiag_every": None}
 rows = []
@@ -40,8 +40,10 @@ out = ["# Options map: the trainer's flags before 17 Oct 2026 and the current op
        "the trainer at tag `pre-consolidation-2026-10-17` (`python -m bitnet.train` there).", "",
        "| old | new |", "|---|---|"] + [f"| `{a}` | {b if b.startswith(('removed', 'implied', '(', 'moved')) else '`' + b.split('; ')[0] + '`' + ('; ' + b.split('; ', 1)[1] if '; ' in b else '')} |" for a, b in rows]
 out += ["", "Removed on 25 Oct 2026 (the measured best is now the only path): an old command line that left out `--int8` "
-        "(the bf16 forward) or `--ts_tau_anneal` (the fixed leak), or, in kernel mode, both `--tail_fp32` and `--lean_tail` (the bf16 float tail with 8-bit Adam, removed 26 Oct), or ran `--grad_accum` > 1 without `--ts_micro` (one "
-        "update from the summed micro-batch gradients), is refused by `from_legacy`, as are the values marked above."]
+        "(the bf16 forward), or, in kernel mode, both `--tail_fp32` and `--lean_tail` (the bf16 float tail with 8-bit Adam, removed 26 Oct), or ran `--grad_accum` > 1 without `--ts_micro` (one "
+        "update from the summed micro-batch gradients), is refused by `from_legacy`, as are the values marked above. "
+        "Removed on 6 Nov 2026: the step annealed with the lr (`--ts_anneal` other than 0, or its old default p 1 when "
+        "absent) and with it the annealed leak; the leak is 1 - 1 / tau, so `--ts_tau_anneal` at p 0 changes nothing."]
 out += ["", "## Old flags that were off by default, now on (an old command line without them)", "",
         "| absent | new equivalent |", "|---|---|"] + [f"| `{a}` | `{b}` |" for a, b in off]
 out += ["", "## Old defaults that differ from the new ones (an old command line without the flag)", "",
