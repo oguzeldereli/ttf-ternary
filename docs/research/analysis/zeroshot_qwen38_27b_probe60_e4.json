@@ -1,5 +1,5 @@
 {
- "model": "/tmp/oguzelde/tern/qw27/qw27_probe60_e4.pt",
+ "model": "qw27/qw27_probe60_e4.pt",
  "limit": 2000,
  "lambada": {
   "acc": 0.5375,

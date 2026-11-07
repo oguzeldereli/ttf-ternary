@@ -209,7 +209,7 @@ def test_ttf_moves_and_spend():
 
 def test_factored_matches_dense():
     """the update from the gradient's factors (gy, x) approaches the dense one as the sketch grows (no firing): its
-    error is the sketch's ~ 1 / sqrt(K_s) (koi, 17 Oct: 0.226 at 64, 0.062 at 1024)"""
+    error is the sketch's ~ 1 / sqrt(K_s) (17 Oct: 0.226 at 64, 0.062 at 1024)"""
     from ttf import update as U
     N, K, T, r = 512, 256, 1024, 32
 
