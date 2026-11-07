@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from ttf.layers import KernelTernaryLinear, DX_MODE, FUSED_LAYER, FACTORED
 from ttf.master import MasterTernaryLinear
 from ttf.model import RMSNorm
+from ttf.schedule import theta_at
 from ttf.update import ts_layer, ts_step
 
 
@@ -104,12 +105,14 @@ def main():
     ap.add_argument("--bs", type=int, default=256)
     ap.add_argument("--wd", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--theta", type=float, default=16.0)
+    ap.add_argument("--theta", type=float, default=16.0, help="the base threshold (ttf.train --ttf-theta)")
+    ap.add_argument("--theta-start", type=float, default=64.0, help="theta at step 0, down to --theta over the warmup")
+    ap.add_argument("--theta-end", type=float, default=80.0, help="theta at the last step (start = end = theta: constant)")
     ap.add_argument("--rank", type=int, default=512)        # >= min(N, K) here: every layer full rank (dense state)
     ap.add_argument("--adapter-rank", type=int, default=16)
     ap.add_argument("--resid", choices=["fp32", "bf16"], default="fp32",
                     help="residual stream dtype (bf16: as ttf.model; fp32: the 28 Oct wave 1 runs)")
-    ap.add_argument("--tau", type=float, default=1000.0, help="TTF leak time constant (steps at lr ratio 1)")
+    ap.add_argument("--tau", type=float, default=1000.0, help="TTF leak time constant: A <- (1 - 1 / TAU) A")
     ap.add_argument("--lowrank", action="store_true", help="TTF: the low-rank accumulator at full rank (update.DENSE_ACC off)")
     ap.add_argument("--diag", type=int, default=0, help="examples/vit/ttf_diag.py checks every N steps (0: off)")
     ap.add_argument("--stop-epoch", type=int, default=0, help="stop after this epoch (the schedule stays --epochs long)")
@@ -184,7 +187,8 @@ def main():
             for g in opt.param_groups:
                 g["lr"] = lr
             if cfg is not None:
-                cfg["lr_ratio"] = max((lr / a.lr) ** 0.75, 0.0)   # TTF's step scale (lr / peak)^p, p 0.75
+                # the core theta schedule in rescale form, as ttf.train (before 7 Nov: the step (lr / peak)^0.75)
+                cfg["lr_ratio"] = a.theta / theta_at(step / total, a.theta, a.theta_start, a.theta_end, warm / total)
                 cfg["progress"] = step / total
                 cfg["step"], cfg["start"], cfg["micro"], cfg["vdiag"] = step, 0, 1, False   # as ttf.train sets them
                 FACTORED[0] = True     # --dw factored (ttf.train's default): (gy, x) to the update, dense accumulator at full rank
