@@ -10,18 +10,31 @@ LR_WSD = [0]                      # --lr-schedule wsd D: warmup, constant peak l
 LR_REWARM = [0, 0]                # --lr-rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
 
 
+THETA_RISE = 0.6   # the end rise starts at this fraction of training (DRAFT: from the 0.8B A/B of 7 Nov)
+
+
+def theta_at(prog, base, start, end, warm, rise=None):
+    """the theta schedule (user, 7 Nov 2026: one default, three knobs; no p, no lr coupling): theta START at progress 0,
+    a cosine down to BASE over the lr warmup (progress WARM), BASE until progress RISE, then a cosine up to END at
+    progress 1. start = end = base: constant theta."""
+    rise = THETA_RISE if rise is None else rise
+    prog = min(max(float(prog), 0.0), 1.0)
+    if warm > 0 and prog < warm:
+        return base + (start - base) * 0.5 * (1 + math.cos(math.pi * prog / warm))
+    rise = max(rise, warm)
+    if prog < rise or rise >= 1:
+        return base
+    return base + (end - base) * 0.5 * (1 - math.cos(math.pi * (prog - rise) / (1 - rise)))
+
+
 def _ts_scale(args, step, tc, lr):
-    """the TTF step scale: 1. Theta alone sets the step (user, 6 Nov 2026: the step annealing (lr / peak lr)^p is a theta
-    schedule, so it went, with the annealed leak). Kept as the per-step call (ttf-lab profilers hook it); an --ext
-    plug-in may still set lr_ratio itself (a theta schedule in rescale form)."""
-    return 1.0
-
-
-def _theta_at(sched, prog):
-    """--ttf-theta-sched T0:T1[:START]: T0 until fraction START of training (default 0), then linear to T1 at the end"""
-    th0_, th1_, st_ = (tuple(sched) + (0.0,))[:3]
-    prog = min(max(prog, 0.0), 1.0)
-    return th0_ if prog <= st_ else th0_ + (th1_ - th0_) * (prog - st_) / max(1e-9, 1.0 - st_)
+    """the TTF step scale of the theta schedule, in rescale form: the bar stays at --ttf-theta (BASE) and the step is
+    BASE / theta(t), so each accumulator entry keeps its position A / theta when theta moves (no burst of moves when
+    theta falls, as a moving bar gives; the leak 1 - 1 / tau is not touched). Theta alone sets the step (user, 6 Nov
+    2026); the ttf-lab profilers hook this per-step call."""
+    th = theta_at(step / max(1, tc.max_steps), args.ttf_theta, args.ttf_theta_start, args.ttf_theta_end,
+                  tc.warmup_steps / max(1, tc.max_steps))
+    return args.ttf_theta / th
 
 
 def resume_leak_check(ck_leak, ck_args, allow=False):
@@ -44,6 +57,21 @@ def resume_leak_check(ck_leak, ck_args, allow=False):
         raise SystemExit("resume: " + "; ".join(ch) + ": the TTF rule would change mid-run, refusing "
                          "(--allow-leak-change to accept)")
     return "resume: --allow-leak-change: " + "; ".join(ch)
+
+
+def resume_theta_check(ck_args, base, start, end, allow=False):
+    """a resume must keep the checkpoint's TTF rule: a checkpoint from before the theta schedule (7 Nov 2026: no
+    ttf_theta_start in its args) ran at constant theta, so resuming it under a start / end schedule would change the step
+    mid-run. Refused (SystemExit) unless the schedule is off (start = end = base) or allow; returns the message of an
+    accepted change, else None."""
+    if not ck_args or "ttf_theta_start" in ck_args or start == end == base:
+        return None
+    ch = (f"theta schedule {start:g} -> {base:g} -> {end:g} (this run) vs constant theta (checkpoint from before 7 Nov "
+          f"2026)")
+    if not allow:
+        raise SystemExit(f"resume: {ch}: the step would change mid-run, refusing (--ttf-theta-start {base:g} "
+                         f"--ttf-theta-end {base:g} keeps it constant; --allow-leak-change accepts the schedule)")
+    return "resume: --allow-leak-change: " + ch
 
 
 def resume_acc_scale(old_theta, new_theta, acc_scale, old_sched=None, new_sched=None):

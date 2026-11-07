@@ -97,8 +97,12 @@ def build_parser():
                    help="the accumulator basis' orthonormalisation: Householder QR, Cholesky QR twice (QR where it would "
                         "fail), or spanqr (the spanqr package on PYTHONPATH; above rank 512 its block Gram-Schmidt, needs rank %% 256 "
                         "== 0; other shapes Householder)")
-    g.add_argument("--ttf-theta", type=float, default=16.0, help="firing threshold (in units of the step)")
-    g.add_argument("--ttf-theta-sched", default="", help="T0:T1[:START]: theta T0 until fraction START, then linear to T1")
+    g.add_argument("--ttf-theta", type=float, default=16.0, help="the base firing threshold (in units of the step); the "
+                   "theta schedule: --ttf-theta-start at step 0, a cosine down to this over the lr warmup, this until "
+                   "fraction schedule.THETA_RISE of training, then a cosine up to --ttf-theta-end (in rescale form: the bar "
+                   "stays here, the step is base / theta(t))")
+    g.add_argument("--ttf-theta-start", type=float, default=64.0, help="theta at step 0 (= --ttf-theta: no start phase)")
+    g.add_argument("--ttf-theta-end", type=float, default=80.0, help="theta at the last step (= --ttf-theta: no end rise)")
     g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant: A <- (1 - 1 / TAU) A "
                    "every step, a memory of TAU steps")
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")
@@ -114,7 +118,8 @@ def build_parser():
                    "(continuing at theta F x the old one); required when --ttf-theta differs from the checkpoint's")
     g.add_argument("--allow-leak-change", action="store_true", help="--resume: accept a checkpoint from before 6 Nov "
                    "2026 with a step scale (lr / peak lr)^p, p > 0, and its annealed leak 1 - rho^p / tau (this core: "
-                   "step scale 1, leak 1 - 1 / tau)")
+                   "step scale 1, leak 1 - 1 / tau), or one from before 7 Nov 2026 (constant theta) under the theta "
+                   "schedule")
     g.add_argument("--ttf-store", default="fp32", choices=["fp32", "bf16", "fp12s"],
                    help="storage of U and V (fp12s: 1.5 bytes per value)")
     g.add_argument("--ttf-offload", default="none", choices=["none", "async"],
@@ -298,7 +303,7 @@ _LEGACY = {
     "--kd_cache": _SAME("--kd-cache"), "--kd_mode": _keep_if(lambda v: v != "windows", _SAME("--kd-cache-mode"), "--kd_mode"),
     "--kd_cache_start": _SAME("--kd-cache-start"), "--moe": _SAME("--moe"), "--moe_aux": _SAME("--moe-aux"),
     "--init_stream": _moved("--init_stream (the conversion)"), "--data_u32": _FLAG("--data-dtype", "u32"),
-    "--hid_kd": _keep_if(lambda v: float(v) == 0, lambda v: [], "--hid_kd"), "--init_calib": _moved("--init_calib (the conversion)"), "--ts_theta_sched": _SAME("--ttf-theta-sched"),
+    "--hid_kd": _keep_if(lambda v: float(v) == 0, lambda v: [], "--hid_kd"), "--init_calib": _moved("--init_calib (the conversion)"), "--ts_theta_sched": _gone("--ts_theta_sched (the linear moving bar; 7 Nov 2026: --ttf-theta-start / --ttf-theta-end)"),
     "--ts_start": _SAME("--ttf-start"), "--ts_vdiag": None, "--ts_vdiag_every": None, "--ts_nomom": None,
     "--ts_spend": _SAME("--ttf-spend"), "--gemm": None,
     "--ts_store_a": _keep_if(lambda v: v in ("", "none", "fp32", "bf16", "fp12s"),

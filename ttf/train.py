@@ -40,7 +40,7 @@ from .layers import KernelTernaryLinear, build_kernel_transformer, enable_flip_t
 from .args import parse
 from .data import get_batch, _kd_cache_batch
 from .eval import evaluate
-from .schedule import lr_at, _ts_scale, resume_acc_scale, resume_leak_check, LR_LINEAR, LR_REWARM, LR_WSD
+from .schedule import THETA_RISE, lr_at, _ts_scale, resume_acc_scale, resume_leak_check, resume_theta_check, LR_LINEAR, LR_REWARM, LR_WSD
 from .update import (ts_layer, ts_step, _load_pair, is_dense_state, load_dense, store_dense, _orth, _store_codec, _store_pair,
                      _ts_on_host, _ts_state_bytes)
 
@@ -436,7 +436,6 @@ def main():
         # frozen codes; noise-level pulls fired, as the leak passes |E u| > theta / tau)
         cm_ = _code_mult(args)               # (--intk-code-mult: the codes' rate apart from the group parameters')
         tm_ = 1.0 / cm_ if cm_ > 0 else math.inf
-        assert tm_ == 1.0 or not args.ttf_theta_sched, "--intk-emb with --emb-lr-mult and a theta schedule"
         for m_ in _en(model, args.intk_emb, log=lambda m_: print(m_, flush=True)):
             m_.dp_reduce = _WS > 1 and not _PP          # (data parallel only: --pipe stages are not replicas)
             m_.theta_mult = tm_
@@ -661,6 +660,11 @@ def main():
             _lmsg = resume_leak_check(blob.get("leak"), blob.get("args") or {}, args.allow_leak_change)
             if _lmsg:
                 print(_lmsg, flush=True)
+            if args.mode == "ttf":
+                _tmsg = resume_theta_check(blob.get("args") or {}, args.ttf_theta, args.ttf_theta_start,
+                                           args.ttf_theta_end, args.allow_leak_change)
+                if _tmsg:
+                    print(_tmsg, flush=True)
         if mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):
             if args.adapter_schedule:   # the schedule continues from the checkpoint's rank (no growth back to R0)
                 mag = f"add:{next(v_.shape[1] for k_, v_ in blob['model'].items() if k_.endswith('mag_A'))}"
@@ -783,8 +787,7 @@ def main():
                           f"part (truncated SVD; {100 * _ek / max(_et, 1e-30):.1f}% of their squared norm kept)", flush=True)
             _ba = blob.get("args") or {}   # (checkpoints before 17 Oct: the old option names)
             _acc, _amsg = resume_acc_scale(_ba.get("ttf_theta", _ba.get("ts_theta")), args.ttf_theta, args.ttf_acc_scale,
-                                           _ba.get("ttf_theta_sched", _ba.get("ts_theta_sched")),
-                                           args.ttf_theta_sched) if ttf else (1.0, None)
+                                           _ba.get("ttf_theta_sched", _ba.get("ts_theta_sched"))) if ttf else (1.0, None)
             if ttf and _acc != 1.0:   # --ttf-acc-scale F (a new theta = F x the run's): every accumulator x F,
                 _sa = _store_codec(store)   # so each entry keeps its distance to the bar (no burst of moves)
                 for m in lays:
@@ -901,9 +904,11 @@ def main():
             "--ttf-band: one batch per step (--accum 1), --dw factored, one process (phase 1)"
         ts_cfg = dict(r=args.ttf_rank, lr_ratio=1.0, theta=args.ttf_theta, tau=args.ttf_tau, b2=args.ttf_b2, spend=args.ttf_spend,
                       store_a=store, offload=args.ttf_offload == "async",
-                      theta_sched=(tuple(float(x) for x in args.ttf_theta_sched.split(":")) if args.ttf_theta_sched else None),
                       progress=0.0, factored=args.factored_k, band=args.ttf_band, band_lo=args.ttf_band_lo,
                       hspend=args.ttf_hspend)
+        print(f"TTF theta schedule: {args.ttf_theta_start:g} -> {args.ttf_theta:g} over the lr warmup, from "
+              f"{THETA_RISE:g} of training up to {args.ttf_theta_end:g} (rescale form: bar {args.ttf_theta:g}, step "
+              f"{args.ttf_theta:g} / theta(t))", flush=True)
     if ttf and args.intk_emb and args.intk_update == "factored":   # the int-k matrices update inside their backward
         for m_ in _intk_lays(model):
             m_._ts_state, m_._ts_cfg = lr_state, ts_cfg

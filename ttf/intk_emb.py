@@ -382,13 +382,10 @@ def _intk_update(l, parts, state, c):
     diag(1/b), with --accum M > 1 each micro-batch's u V into U on the step's fixed basis, the turn, firing and spend on
     the last), with every [N, .] product in row chunks; a code moves one level within 0 .. levels"""
     from .update import _orth, _dpm, _store_codec, _host_get, _host_put, _layer_gen, _step_scale
-    from .schedule import _theta_at
     P = _Parts(parts)
     N, K = l.N, l.K
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
     r = getattr(l, "ts_rank", None) or r
-    if c.get("theta_sched"):
-        theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
     theta = theta * l.theta_mult
     M_ = int(c.get("micro") or 1)
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True

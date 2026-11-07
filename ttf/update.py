@@ -6,7 +6,6 @@ import math
 import torch
 
 from .layers import _rf
-from .schedule import _theta_at
 
 
 def _store_codec(name):
@@ -406,8 +405,6 @@ def ts_layer(l, g, state, c):
         return _ts_layer_factored(l, g, state, c)
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
     r = getattr(l, "ts_rank", None) or r   # a layer's own accumulator rank (set by a plug-in, e.g. thin adapter factors)
-    if c.get("theta_sched"):   # --ttf-theta-sched T0:T1[:START]: the threshold moves linearly from T0 to T1
-        theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
     M_ = int(c.get("micro") or 1)   # --accum M: the accumulator takes every micro-batch's u
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True   # firing and the spend only on the last one
     b2o = b2
@@ -619,8 +616,6 @@ def _ts_layer_factored(l, fg, state, c):
     gy, x = fg                                # [T, N], [T, K] (bf16; products accumulate in fp32: _mmb)
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
     r = getattr(l, "ts_rank", None) or r
-    if c.get("theta_sched"):
-        theta = _theta_at(c["theta_sched"], c.get("progress", 0.0))
     M_ = int(c.get("micro") or 1)
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True
     st = state.setdefault("_ts", {})
