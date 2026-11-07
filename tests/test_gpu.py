@@ -372,6 +372,29 @@ def test_train_resume_round_trip_sketch_warm(tmp_path):
             assert all(torch.equal(x, y) for x, y in zip(pa, pb) if torch.is_tensor(x))
 
 
+def test_move_capture_plugin(tmp_path):
+    """scripts/analysis/move_capture.py: resumed from a snapshot it captures the gradients through the grad hook, moves
+    nothing, and writes its file"""
+    import torch
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    _train(str(tmp_path / "b"), [], 4, data)
+    w0 = torch.load(str(tmp_path / "b" / "ckpt.pt"), map_location="cpu", weights_only=False)["model"]
+    out = str(tmp_path / "cap.pt")
+    cmd = [sys.executable, "-m", "ttf.train", "--preset", "small", "--data", data, "--val", data, "--seq-len", "128",
+           "--batch-size", "2", "--accum", "2", "--steps", "8", "--warmup", "2", "--eval-interval", "1000",
+           "--eval-iters", "1", "--save-secs", "99999", "--ttf-rank", "16", "--out-dir", str(tmp_path / "b"), "--resume",
+           "--no-final-save", "--ext", f"move_capture:out={out},blocks=0:1,nb=6"]
+    env = dict(os.environ, PYTHONPATH=ROOT + os.pathsep + os.path.join(ROOT, "scripts", "analysis"))
+    r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=900)
+    assert r.returncode == 0 and os.path.exists(out), r.stdout[-2000:] + r.stderr[-2000:]
+    cap = torch.load(out, weights_only=False)
+    assert cap["nb"] == 6 and len(cap["mu"]) > 0
+    assert all(torch.isfinite(v).all() and v.abs().sum() > 0 for v in cap["mu"].values())
+    w1 = torch.load(str(tmp_path / "b" / "ckpt.pt"), map_location="cpu", weights_only=False)["model"]
+    assert all(torch.equal(w0[k], w1[k]) for k in w0 if k.endswith("wpacked"))   # (no save, and nothing moved)
+
+
 def test_resume_new_theta_needs_acc_scale(tmp_path):
     """a resume at a theta different from the checkpoint's is refused without --ttf-acc-scale (the burst of 17 / 23 Oct),
     and runs with it, saying what it did"""
