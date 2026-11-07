@@ -44,7 +44,7 @@ from .data import get_batch, _kd_cache_batch
 from .eval import evaluate
 from .schedule import lr_at, _ts_scale, resume_acc_scale, resume_leak_check, resume_theta_check, LR_LINEAR, LR_REWARM, LR_WSD
 from .update import (ts_layer, ts_step, _load_pair, is_dense_state, load_dense, store_dense, _orth, _store_codec, _store_pair,
-                     _ts_on_host, _ts_state_bytes)
+                     _ts_on_host, _ts_state_bytes, dense_acc)
 
 
 def _tern_lays(model):
@@ -768,8 +768,8 @@ def main():
                         continue
                     t_ = lr_state[id(m)]; dn_ = is_dense_state(t_)
                     ra_ = min(getattr(m, "ts_rank", None) or args.ttf_rank, m.N, m.K)
-                    if dn_ and ra_ == min(m.N, m.K):
-                        continue                                        # (still full rank: stays dense)
+                    if dn_ and dense_acc(m, ra_):
+                        continue                                        # (still at or above the dense break-even: stays dense)
                     if not dn_:
                         U_, V_ = _load_pair(t_)
                         if V_.shape[1] <= ra_:

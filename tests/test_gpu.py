@@ -481,6 +481,28 @@ def test_rank_ratio_resume_cuts_dense(tmp_path):
     assert r.returncode == 0 and "cut to their best" not in r.stdout, r.stdout[-1500:]   # (saved low-rank: no second cut)
 
 
+def test_resume_keeps_dense_below_full_rank(tmp_path):
+    """a layer held dense by the break-even (update.dense_acc: ratio 0.5 of a square matrix, below its full rank) stays
+    dense on a resume at the same rank: the resume's rank cut tested full rank only, so every resume cut such an A to its
+    rank-r SVD (7 Nov). Resumed = straight, and no cut"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    w = ["--ttf-rank", "4096", "--ttf-rank-ratio", "0.5"]
+    a = _train(str(tmp_path / "a"), w, 6, data)
+    assert len(_train(str(tmp_path / "b"), w, 3, data)) == 3
+    r = _run(str(tmp_path / "b"), w + ["--resume"], 6, data)
+    assert r.returncode == 0 and "cut to their best" not in r.stdout, r.stdout[-1500:]
+    b = [json.loads(l)["loss"] for l in open(tmp_path / "b" / "metrics.jsonl") if '"loss"' in l]
+    assert len(a) == 6 and a == b, (a, b)
+    from ttf.update import is_dense_state
+    ck = torch.load(str(tmp_path / "b" / "ckpt.pt"), map_location="cpu", weights_only=False)
+    assert any(t is not None and is_dense_state(t) for t in ck["lowrank"])      # (the case exists in this model)
+    ca = torch.load(str(tmp_path / "a" / "ckpt.pt"), map_location="cpu", weights_only=False)
+    for pa, pb in zip(ca["lowrank"], ck["lowrank"]):                       # the accumulators themselves
+        if pa is not None:
+            assert all(torch.equal(x, y) for x, y in zip(pa, pb) if torch.is_tensor(x))
+
+
 def test_train_resume_fp32(tmp_path):
     """--mode fp32 saved and resumed (also from step 0): the same per-step losses (the default adapter rank once added
     an empty optimizer group that the resume could not match, 18 Oct)"""
