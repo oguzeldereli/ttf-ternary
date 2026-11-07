@@ -663,8 +663,6 @@ def _ts_layer_factored(l, fg, state, c):
     key = id(l); t = _micro_t(l, st, key, M_, c)
     lk = 1 - 1 / tau
     k_ = int(c["factored"])
-    if c.get("sketch_per_n"):   # --dw-sketch-per-n: k grows with the sketched side (multiples of 16)
-        k_ = max(k_, 16 * round(c["sketch_per_n"] * l.N / 16))
     ts_ = (t - 1) // M_
     gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
     Sr = torch.randn(l.K, k_, device=dev, generator=gen) / k_ ** 0.5

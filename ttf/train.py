@@ -910,8 +910,7 @@ def main():
         ts_cfg = dict(r=args.ttf_rank, lr_ratio=1.0, theta=args.ttf_theta, tau=args.ttf_tau, b2=args.ttf_b2, spend=args.ttf_spend,
                       store_a=store, offload=args.ttf_offload == "async",
                       progress=0.0, factored=args.factored_k, band=args.ttf_band, band_lo=args.ttf_band_lo,
-                      hspend=args.ttf_hspend, sketch_warm=args.dw_sketch_warm,
-                      sketch_per_n=args.dw_sketch_per_n)
+                      hspend=args.ttf_hspend, sketch_warm=args.dw_sketch_warm)
         print(f"TTF theta schedule: {args.ttf_theta_start:g} -> {args.ttf_theta:g} over the lr warmup, then "
               f"up to {args.ttf_theta_end:g} at the end (rescale form: bar {args.ttf_theta:g}, step "
               f"{args.ttf_theta:g} / theta(t))", flush=True)
