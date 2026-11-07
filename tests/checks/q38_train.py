@@ -66,9 +66,9 @@ for L in student.layers:                        # (the ternary modules' floats s
     for n, tm in QT.tern_modules(L):
         tm.float()
 student.embed_tokens.to(dev); student.lm_head.to(dev); student.hyper_connection_mixer.to(dev); student.rotary.to(dev)
-args = types.SimpleNamespace(steps=40, theta=2.0, tau=200.0, sketch=16, rank_ratio=0.5, lr=3e-3, lr_min=3e-4, warmup=2,
+args = types.SimpleNamespace(steps=40, theta=8.0, tau=200.0, sketch=16, rank_ratio=0.5, lr=3e-3, lr_min=3e-4, warmup=2,
                              kd_weight=1.0, head_chunk=16, expert_chunk=4, pin=False, save_every=10 ** 9,
-                             eval_every=10 ** 9)
+                             eval_every=10 ** 9, ttf_store="fp32")
 
 # 1) the layer-major float gradients equal autograd on the whole model (no ternary update: theta huge, lr 0)
 chk = copy.deepcopy(student)
@@ -107,7 +107,8 @@ for i, L in enumerate(ref.layers):
 print(f"layer-major vs autograd: {len(grads)} float grads, worst relative diff {worst:.2e}")
 assert len(grads) > 20 and worst < (3e-2 if dt == torch.bfloat16 else 1e-4), worst
 
-# 2) training: loss falls, moves of every kind
+# 2) training: loss falls, moves of every kind. (theta 8: with the fixed leak 1 - 1/tau theta 2 moved ~16% of the expert
+# trits per step here and the val loss stalled or rose, 3.294 -> 3.295 / 3.136 by thread count; theta 8: 3.294 -> 2.621)
 tr = QT.Trainer(student, args, dev)
 val = batch(999)
 v0 = tr.eval_loss(val)

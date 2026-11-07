@@ -14,6 +14,8 @@ t.update(hidden_size=64, hc_count=4, hc_lowrank=8, num_hidden_layers=4, num_atte
          vocab_size=1000, ngram_vocab_size_base=101, heads_per_ngram=2, ple_embed_dim=64, eos_token_id=999,
          bos_token_id=999, indexer_n_heads=2, indexer_kv_heads=1, indexer_head_dim=16, indexer_budget=64,
          layer_types=["linear_attention"] * 3 + ["full_attention"], ple_layer_ids=[2], max_position_embeddings=4096)
+for k, v in dict(ngram_size=3, ple_conv_kernel_size=3, hidden_act="silu", rms_norm_eps=1e-6).items():
+    t.setdefault(k, v)          # (the real config.json, when given, keeps its own values)
 cfg = M.text_config({"text_config": t})
 torch.manual_seed(0)
 m = M.build(cfg, device="cpu").to(dev)
