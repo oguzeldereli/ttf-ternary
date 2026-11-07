@@ -1,4 +1,4 @@
-"""moe_gg.py: grouped GEMMs over expert segments in Triton (S, 5 Nov 2026). torch._grouped_mm on sm_120 (torch 2.13)
+"""moe_gg.py: grouped GEMMs over expert segments in Triton. torch._grouped_mm on sm_120 (torch 2.13)
 is a host loop over the groups (one .item() and one mm per expert: 8k syncs per layer and window on Flash-Next), so
 the expert products are launch-bound. Here one launch per product, no host sync:
 

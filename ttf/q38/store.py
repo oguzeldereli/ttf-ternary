@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next checkpoint I/O on one GPU with the model in host memory (S, 5 Nov 2026).
+"""Qwen3.8-Flash-Next checkpoint I/O on one GPU with the model in host memory.
 
 Store(path): the FP8 release read once into host memory: per decoder layer the routed experts as stacked FP8 bytes
 (gu [E, 2I, d] = gate rows then up, dn [E, d, I]) with their 128 x 128 block scales, and the layer's other tensors (bf16);

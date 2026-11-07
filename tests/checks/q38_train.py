@@ -1,4 +1,4 @@
-"""q38_train.py end to end on a tiny random Qwen3.8-Flash-Next config (P, 5 Nov 2026): the float model is the teacher
+"""ttf.q38.train end to end on a tiny random Qwen3.8-Flash-Next config: the float model is the teacher
 (its top-k + sampled tail as the KD cache would hold them), the ternary student (rounding conversion) trains layer-major
 for some steps. Checks: the loss falls, all three kinds of moves happen, the layer-major gradient equals plain autograd
 on the whole model (one step's float gradients), and a save / load resumes to the same next step.
@@ -59,7 +59,7 @@ def batch(seed):
 student = copy.deepcopy(teacher).float().cpu()
 for L in student.layers:
     QT.swap_ternary(L, adapter_rank=4, quick=True)
-    for n, tm in QT.tern_modules(L):            # a nonzero adapter start (S's conversion fits one)
+    for n, tm in QT.tern_modules(L):            # a nonzero adapter start (the conversion fits one)
         tm.ta_packed.copy_(QT.pack3(torch.randint(-1, 2, (tm.E, tm.N, tm.ra), dtype=torch.int8)))
 student = student.to(dt)
 for L in student.layers:                        # (the ternary modules' floats stay fp32)
@@ -137,7 +137,7 @@ print("resume", ra["loss"], rb["loss"], ra["moves"], rb["moves"])
 assert ra["step"] == rb["step"] and ra["loss"] == rb["loss"] and ra["moves"] == rb["moves"], (ra, rb)
 print("q38_train tiny end-to-end OK")
 
-# 4) SIGINT mid-run (S's budget watchdog): the step finishes, a slim save to OUT/stop, run() returns
+# 4) SIGINT mid-run (a budget watchdog): the step finishes, a slim save to OUT/stop, run() returns
 import json as _json, signal as _signal
 out = tempfile.mkdtemp()
 a4 = types.SimpleNamespace(**{**vars(args), "out": out, "steps": 10, "eval_every": 10 ** 9, "save_every": 10 ** 9,

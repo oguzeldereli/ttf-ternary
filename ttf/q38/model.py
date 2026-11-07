@@ -1,9 +1,6 @@
 """Qwen3.8-Flash-Next text decoder (HF model_type qwen4_exp) for conversion and TTF training, 5 Nov 2026.
 
-User, 5 Nov ~01:20 (via P, confirmed): "convert and train Qwen 3.8 Flash Next ... r16 adapters, row col scales, an
-optimal theta and float lr, and train for 1k steps, rank 0.2-0.3 whatever fits. Use mix5c for now".
-
-transformers 5.19 (the lab / box env) has Qwen3.5-MoE but not qwen4_exp, so this file builds the text decoder from
+transformers 5.19 has Qwen3.5-MoE but not qwen4_exp, so this file builds the text decoder from
 5.19's Qwen3.5-MoE parts (gated DeltaNet, gated attention, router, shared expert) plus the qwen4_exp-only pieces,
 written here after the reference (transformers main, models/qwen4_exp/modular_qwen4_exp.py):
   gated residual: hc_count = 4 residual streams of hidden_size; each sub-block reads a sigmoid-gated mean of the grouped-
@@ -15,12 +12,12 @@ written here after the reference (transformers main, models/qwen4_exp/modular_qw
   the DeltaNet output gate is sigmoid (output_gate_type), the 5.19 class's is silu
 Dropped: vision tower, MTP layer.
 
-Per-layer API (P's layer-major trainer, ttf-lab/wip/moe_ttf.py):
+Per-layer API (the layer-major trainer, ttf.q38.train):
   m.embed(ids) -> h0 [B, T, hc x d];  m.rope(T, dev) -> (cos, sin);  m.layers[i](h, pe, ids) -> h;
   m.head_in(h) -> [B, T, d] (the stream mixer; there is no other final norm);  m.lm_head (float, untied)
 The routed experts are two modules mlp.gu [E, 2I, d] (gate rows, then up) and mlp.dn [E, d, I], each forward(x_sorted
-[T, K], offsets [E + 1]) -> [T, N]; DenseMat below is the float reference (and the conversion's source), P's
-TernaryExperts the trained one. Router sort / unsort and the weighted sum live in MoE.forward.
+[T, K], offsets [E + 1]) -> [T, N]; DenseMat below is the float reference (and the conversion's source),
+moe.TernaryExperts the trained one. Router sort / unsort and the weighted sum live in MoE.forward.
 """
 import json, math, os
 import torch
@@ -223,7 +220,7 @@ class NGramEmbedding(nn.Module):
         flat = idx.reshape(-1)
         if torch.is_tensor(self.table):
             rows = self.table[flat.to(self.table.device)]
-        else:                                                   # q38_io.MmapTable (host, on demand)
+        else:                                                   # store.MmapTable (host, on demand)
             rows = self.table[flat]
         rows = rows.to(ids.device).float()
         if self.scale is not None:
@@ -265,7 +262,7 @@ class PLE(nn.Module):
 
 class DenseMat(nn.Module):
     """E float matrices [E, N, K] in the routed layout (the reference and the conversion source); forward(x sorted by
-    expert [T, K], offsets [E + 1]) -> [T, N], as TernaryExperts (moe_ttf.py), which replaces it for training"""
+    expert [T, K], offsets [E + 1]) -> [T, N], as moe.TernaryExperts, which replaces it for training"""
 
     def __init__(self, E, N, K, dtype=torch.bfloat16):
         super().__init__()
@@ -434,7 +431,7 @@ class Q38(nn.Module):
         return self.lm_head(self.head_in(h))
 
     def param_groups(self, i):
-        """(trainable float params, frozen float params) of layer i besides the ternary weights (P's trainer)"""
+        """(trainable float params, frozen float params) of layer i besides the ternary weights (the layer-major trainer)"""
         frozen_keys = ("mlp.gate.", "shared_expert_gate", "hyper_connection", "ple.", "in_proj_a", "in_proj_b",
                        "conv1d", "A_log", "dt_bias", "indexer")
         tr, fr = [], []
@@ -549,7 +546,7 @@ def build(path_or_cfg, layers=None, device="meta"):
 
 def ngram_table_memmap(path, i):
     """(table, scale) of layer i's PLE n-gram table for NGramEmbedding: rows read on demand from the checkpoint shards
-    (q38_io.MmapTable, page cache), the stored scale (or None)"""
+    (store.MmapTable, page cache), the stored scale (or None)"""
     from ttf.q38 import store as q38_io
     cfg = text_config(path)
     rd = Reader(path)

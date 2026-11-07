@@ -1,8 +1,5 @@
-"""moe_ttf.py: ternary mixture-of-experts layers and their TTF update, batched over the experts (P, 5 Nov 2026, for S's
+"""moe.py: ternary mixture-of-experts layers and their TTF update, batched over the experts (for the
 Qwen3.8-Flash-Next conversion: 48 layers x 512 experts, gate/up fused [1280, 2560] and down [2560, 640] per expert).
-
-User (5 Nov ~01:30): "you can use ternary adapters of equal size to get rid of that 40GB + optimize state, put
-accumulator at rank 0.3 into host rama and stream it".
 
 TernaryExperts(E, K, N): E experts' trits packed [E, N, Kp] (5 per byte along K, as KernelTernaryLinear), a fixed
 beta [E], learned row [E, N] / column [E, K] scales, an optional fixed input mean mu [E, K] (centring) with a learned
@@ -20,7 +17,7 @@ step are there at once). Experts with no tokens are left as they are (as a core 
 (U [E, N, r], V [E, K, r], R [E, N], C [E, K], t [E]) lives wherever the caller keeps it (host, pinned); the update
 takes it on the device and gives it back.
 
-Equivalence: test_moe_ttf.py checks the forward / input gradient / factors against per-expert KernelTernaryLinear
+Equivalence: tests/test_q38_moe.py checks the forward / input gradient / factors against per-expert KernelTernaryLinear
 layers and the update against the core _ts_layer_factored run per expert (seeds="core": the core's own sketch and init
 seeds per expert), on CPU.
 """
@@ -217,14 +214,14 @@ def _rchol_b(X, eps=2e-7, alphas=(1e-6, 1e-6, 1e-7), ns=3):
         R, info = torch.linalg.cholesky_ex(G, upper=True)
         bad = info > 0 if bad is None else bad | (info > 0)
         # Y R^-1 as a GEMM with the small [r, r] inverse (the batched right trsm over [K, r] is ~4x slower at the
-        # expert shapes; the same orthogonality and span, 5 Nov: scratchpad rchol_var.py)
+        # expert shapes; the same orthogonality and span)
         Y = Y @ torch.linalg.solve_triangular(R, I, upper=True)
     for _ in range(ns):
         Y = torch.baddbmm(Y, Y, Y.transpose(1, 2) @ Y, beta=1.5, alpha=-0.5)    # 1.5 Y - 0.5 Y (Y^T Y), one pass
     # a Cholesky that broke down: Householder QR for those matrices only (as the core's cholqr2 check; one host sync
     # per call). It happens: the fp32 Gram of a near-rank-1 Y (an expert with 1-2 tokens, K 2560, r 384) carries
-    # rounding of ~3e-6 ||G|| in norm, above the first shift 1e-6 ||G||, so G + shift is indefinite (6 Nov: such an
-    # expert's U / V went NaN for good, 1-13 experts per layer in run2's ckpt@50; scratchpad nanrep4.py)
+    # rounding of ~3e-6 ||G|| in norm, above the first shift 1e-6 ||G||, so G + shift is indefinite (such an
+    # expert's U / V went NaN for good: 1-13 experts per layer after 50 steps of a Flash-Next run)
     bad = bad | ~torch.isfinite(Y).flatten(1).all(1)
     if _DEFER[0]:          # (update_b: no sync here; the caller collects the mask and repairs once per module)
         _RB_LAST[0] = bad

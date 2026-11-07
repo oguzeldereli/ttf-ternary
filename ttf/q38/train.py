@@ -1,10 +1,4 @@
-"""q38_train.py: layer-major TTF training of the ternary Qwen3.8-Flash-Next (P, 5 Nov 2026, for S's conversion run).
-
-User, 5 Nov ~01:20: "convert and train Qwen 3.8 Flash Next, convert with folded rotations and some such, r16 adapters,
-row col scales, an optimal theta and float lr, and train for 1k steps, rank 0.2-0.3 whatever fits. Use mix5c";
-~01:30: "you can use ternary adapters of equal size to get rid of that 40GB + optimize state, put accumulator at rank
-0.3 into host rama and stream it". KD (via S, 01:35): "we need 100% KD cache, but not only top32, I want top64 +
-sampled 64 tail". Agreed with S 02:05: accumulator rank 0.2 in fp32 (bf16 U would swallow the small increments).
+"""ttf.q38.train: layer-major TTF training of the ternary Qwen3.8-Flash-Next (from the ttfconv conversion).
 
 One step, layer by layer (only one layer's weights and TTF state on the GPU at a time):
   1. forward, no grad: every micro-batch through layer i; layer i's inputs h_i kept on the host (bf16)
@@ -18,11 +12,11 @@ The update of layer i comes after its input gradient (as the core's on_grad hook
 sees the trits its forward used.
 
 Trainable: row / column scales, centring biases, the adapter's scales (cb, sa), norms, attention / DeltaNet floats
-that S's param_groups leaves trainable. Frozen: embed, lm_head, router, shared_expert_gate, hyper-connections, PLE,
+that the conversion's param_groups leaves trainable. Frozen: embed, lm_head, router, shared_expert_gate, hyper-connections, PLE,
 DeltaNet a / b / conv / A_log / dt_bias.
 
-  python q38_train.py --model DIR --conv DIR --kd-cache DIR --data TOKENS.bin --out DIR [--steps 1000 ...]
-  python q38_train.py --tiny          (the end-to-end test on a random tiny config: see test_q38_train.py)
+  python -m ttf.q38.train --model DIR --conv DIR --kd-cache DIR --data TOKENS.bin --out DIR [--steps 1000 ...]
+  python tests/checks/q38_train.py   (the end-to-end test on a random tiny config)
 """
 from __future__ import annotations
 import argparse, json, math, os, sys, time
@@ -35,7 +29,7 @@ from ttf.q38.moe import TernaryExperts, TernLinear, ExpertTTF, AdapterTTF, pack3
 from ttf.q38 import moe as MT
 from ttf.qwen import _kd_topk_chunk
 import inspect as _insp, ttf.update as _TU
-assert "lk = 1 - 1 / tau" in _insp.getsource(_TU), "q38_train needs the fixed-leak core (ac6b295): tau is no longer rescaled"
+assert "lk = 1 - 1 / tau" in _insp.getsource(_TU), "ttf.q38.train needs the fixed-leak core: tau is no longer rescaled"
 
 DENSE = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
          "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj",
@@ -64,7 +58,7 @@ def tern_modules(L):
 
 
 def swap_ternary(L, adapter_rank=16, centring=True, quick=False):
-    """layer L's routed experts and dense projections replaced by TernaryExperts / TernLinear (empty: S's conversion
+    """layer L's routed experts and dense projections replaced by TernaryExperts / TernLinear (empty: the conversion
     loads them). quick: a rounding conversion from the float weights (tests only)"""
     for path in ("mlp.gu", "mlp.dn") + DENSE:
         f = _get(L, path)
@@ -485,7 +479,7 @@ class Trainer:
         moves = {"exp": 0, "dense": 0, "adapter": 0}
         self._dg, self._dgl = {}, {}
         # the updates of layer i run on a side stream from a worker thread while the backward of layer i - 1 runs
-        # (--overlap-update, opt-in, unvalidated: no gain on the box (6 Nov: 37.0-38.2 s vs 36.6 serial; both threads
+        # (--overlap-update, opt-in, unvalidated: no gain on an RTX PRO 6000 (37.0-38.2 s vs 36.6 serial; both threads
         # are CPU launch-bound under the GIL) and the moves differed from the serial run at step 3; at most one update in
         # flight; timing / diag run them inline)
         ov = pf and not ph.on and not MT.DIAG[0] and getattr(a, "overlap_update", False)
@@ -617,7 +611,7 @@ def main():
     ap.add_argument("--seq", type=int, default=2048)
     ap.add_argument("--theta", type=float, default=16.0); ap.add_argument("--tau", type=float, default=1000.0)
     ap.add_argument("--theta-end", type=float, default=None,
-                    help="late theta rise (P's 15M study, 5 Nov): theta(t) from --theta to this by the last step, cosine, "
+                    help="late theta rise: theta(t) from --theta to this by the last step, cosine, "
                     "starting at --theta-rise-from x steps; in rescale form (the bar stays --theta, lr_ratio scaled by "
                     "theta / theta(t), the leak 1 - 1 / tau: no burst, no state change)")
     ap.add_argument("--theta-rise-from", type=float, default=0.0)
@@ -632,7 +626,7 @@ def main():
                     "(rescale form, as --dense-theta-mult; adapters keep --theta)")
     ap.add_argument("--dense-theta-mult", type=float, default=1.0, help="the dense (E = 1) projections' theta x this "
                     "(rescale form)")
-    ap.add_argument("--fire", choices=["kernel", "torch"], default="kernel", help="update_b's firing (moe_ttf.FIRE_B)")
+    ap.add_argument("--fire", choices=["kernel", "torch"], default="kernel", help="update_b's firing (moe.FIRE_B)")
     ap.add_argument("--dense-orth", choices=["qr", "rchol"], default=None, help="the dense (E = 1) projections' "
                     "orth (default: --expert-orth)")
     ap.add_argument("--diag", action="store_true", help="per-module update diagnostics in metrics (gradient spike, "
@@ -641,9 +635,9 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4); ap.add_argument("--lr-min", type=float, default=1e-5)
     ap.add_argument("--warmup", type=int, default=20); ap.add_argument("--kd-weight", type=float, default=1.0)
     ap.add_argument("--ple-pq", default=None, help="the PLE n-gram table from ple_pq.py's compressed store (DIR) "
-                    "instead of the FP8 table (run4, user 6 Nov: the release's compressed table in the loop)")
+                    "instead of the FP8 table")
     ap.add_argument("--ttf-start", type=int, default=0, help="trits frozen (no TTF update: experts, dense, adapters) for "
-                    "the first N steps; the floats train (run4, user 6 Nov: no trits for 20 steps)")
+                    "the first N steps; the floats train")
     ap.add_argument("--head-chunk", type=int, default=512); ap.add_argument("--expert-chunk", type=int, default=32)
     ap.add_argument("--save-every", type=int, default=250); ap.add_argument("--eval-every", type=int, default=100)
     ap.add_argument("--val-offset", type=int, default=16128); ap.add_argument("--val-micro", type=int, default=8)
@@ -660,7 +654,7 @@ def main():
     ap.add_argument("--no-grouped", action="store_true", help="padded bmm instead of moe_gg's grouped GEMMs for the experts")
     ap.add_argument("--resident", action="store_true", help="keep all layers on the device (no per-layer moves)")
     ap.add_argument("--compile-hc", action="store_true", help="torch.compile the hyper-connection / SwiGLU glue "
-                    "(q38_model.compile_hc: fused, fp32 inside; rounding level)")
+                    "(model.compile_hc: fused, fp32 inside; rounding level)")
     ap.add_argument("--wbatch", type=int, default=1, help="windows per layer call (forward and backward)")
     ap.add_argument("--timing", action="store_true", help="synced wall time per phase in the step's record")
     ap.add_argument("--stop-save", choices=("slim", "full", "none"), default="slim",
@@ -691,7 +685,7 @@ def main():
             S_tab = getattr(QM, "ngram_table_memmap", None)
             assert S_tab is not None, "S: the PLE table reader (memmap) goes here"
             L.ple.ple_embedding.table, L.ple.ple_embedding.scale = S_tab(args.model, i)
-            if getattr(args, "ple_pq", None):     # (the compressed table in the loop: P's prune1+pq4.256, ple_pq.py)
+            if getattr(args, "ple_pq", None):     # (the compressed table in the loop: prune1 + pq4.256, ple_pq)
                 from ttf.q38.ple_pq import PQTable
                 L.ple.ple_embedding.table, L.ple.ple_embedding.scale = PQTable(args.ple_pq, dev), None
                 print(f"PLE table: {args.ple_pq} (codes, decoded on {dev})", flush=True)
@@ -710,7 +704,7 @@ def run(tr, args, batches, val_batches):
     log = open(os.path.join(args.out, "metrics.jsonl"), "a")
     stop = []
 
-    def _sig(num, frame):          # (S's budget watchdog): end after the current step, save, exit 0
+    def _sig(num, frame):          # (a budget watchdog): end after the current step, save, exit 0
         if not stop:
             print(f"signal {num}: stopping after step {tr.step + 1}", flush=True)
         stop.append(num)

@@ -1,4 +1,4 @@
-"""q38_model.py on a tiny random config: forward / backward run, PLE hashing equals a direct per-position recompute,
+"""ttf.q38.model on a tiny random config: forward / backward run, PLE hashing equals a direct per-position recompute,
 MoE equals a per-token dense loop, attention at T <= budget is causal (a prefix's outputs do not depend on later
 tokens), on GPU when there is one."""
 import copy, json, os, sys
@@ -30,7 +30,7 @@ with torch.no_grad():
     for L in m.layers:
         if L.ple is not None:
             ng = L.ple.ple_embedding
-            ng.table = torch.randn(ng.rows, ng.dim)               # CPU table, as on the box
+            ng.table = torch.randn(ng.rows, ng.dim)               # CPU table, as in training
 m = m.to(torch.bfloat16 if dev == "cuda" else torch.float32)
 ids = torch.randint(0, 999, (2, 48), device=dev)
 ids[0, 10] = 999; ids[1, 30] = 999
