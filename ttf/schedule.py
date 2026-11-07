@@ -10,21 +10,19 @@ LR_WSD = [0]                      # --lr-schedule wsd D: warmup, constant peak l
 LR_REWARM = [0, 0]                # --lr-rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
 
 
-THETA_RISE = 0.6   # the end rise starts at this fraction of training (DRAFT: from the 0.8B A/B of 7 Nov)
-
-
-def theta_at(prog, base, start, end, warm, rise=None):
+def theta_at(prog, base, start, end, warm):
     """the theta schedule (user, 7 Nov 2026: one default, three knobs; no p, no lr coupling): theta START at progress 0,
-    a cosine down to BASE over the lr warmup (progress WARM), BASE until progress RISE, then a cosine up to END at
-    progress 1. start = end = base: constant theta."""
-    rise = THETA_RISE if rise is None else rise
+    a cosine down to BASE over the lr warmup (progress WARM), then a cosine up to END at progress 1. start = end = base:
+    constant theta. The rise starts at the warmup's end: at 0.8B (st08, 1000 steps, one seed; wiki / chat / mix) 64 -> 16
+    -> 80 that way ends at 3.1069 / 1.8125 / 1.5031, level with the old lr-tied step (p 0.75: 3.1115 / 1.8123 / 1.5084),
+    while a hold at 16 until 60% of training and a rise to 48 or 80 after it end at 3.1335 / 3.1321 and constant 16 at
+    3.1751. The end level (x3 or x5 from 60%) changed nothing; the step shape just after the warmup did."""
     prog = min(max(float(prog), 0.0), 1.0)
     if warm > 0 and prog < warm:
         return base + (start - base) * 0.5 * (1 + math.cos(math.pi * prog / warm))
-    rise = max(rise, warm)
-    if prog < rise or rise >= 1:
+    if warm >= 1:
         return base
-    return base + (end - base) * 0.5 * (1 - math.cos(math.pi * (prog - rise) / (1 - rise)))
+    return base + (end - base) * 0.5 * (1 - math.cos(math.pi * (prog - warm) / (1 - warm)))
 
 
 def _ts_scale(args, step, tc, lr):

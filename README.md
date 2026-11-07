@@ -117,7 +117,7 @@ short momentum) run from a checkout of that tag (`python -m bitnet.train` there;
 | `--recipe NAME` | defaults for a setting (`recipes/`: scratch-110m, continue-27b) |
 | `--ttf-rank R` | rank of each layer's accumulator (512) |
 | `--ttf-theta`, `--ttf-tau` | base threshold (θ alone sets the step), fixed leak 1 − 1/τ |
-| `--ttf-theta-start`, `--ttf-theta-end` | θ schedule: start, cosine down to base over the lr warmup, hold, cosine up to end from 60% of training (start = end = base: constant) |
+| `--ttf-theta-start`, `--ttf-theta-end` | θ schedule: start, cosine down to base over the lr warmup, then a cosine up to end (defaults 64 → 16 → 80; start = end = base: constant) |
 | `--dw factored / dense`, `--dw-sketch K` | the update from the gradient's factors, the dense weight gradient never formed |
 | `--ttf-store fp32 / bf16 / fp12s` | compressed accumulator |
 | `--ttf-offload async`, `--ttf-offload-keep F` | state in pinned host memory (all but the first share F of layers), copies overlapped with the backward |

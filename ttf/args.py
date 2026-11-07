@@ -98,9 +98,8 @@ def build_parser():
                         "fail), or spanqr (the spanqr package on PYTHONPATH; above rank 512 its block Gram-Schmidt, needs rank %% 256 "
                         "== 0; other shapes Householder)")
     g.add_argument("--ttf-theta", type=float, default=16.0, help="the base firing threshold (in units of the step); the "
-                   "theta schedule: --ttf-theta-start at step 0, a cosine down to this over the lr warmup, this until "
-                   "fraction schedule.THETA_RISE of training, then a cosine up to --ttf-theta-end (in rescale form: the bar "
-                   "stays here, the step is base / theta(t))")
+                   "theta schedule: --ttf-theta-start at step 0, a cosine down to this over the lr warmup, then a cosine "
+                   "up to --ttf-theta-end at the last step (in rescale form: the bar stays here, the step is base / theta(t))")
     g.add_argument("--ttf-theta-start", type=float, default=64.0, help="theta at step 0 (= --ttf-theta: no start phase)")
     g.add_argument("--ttf-theta-end", type=float, default=80.0, help="theta at the last step (= --ttf-theta: no end rise)")
     g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant: A <- (1 - 1 / TAU) A "
