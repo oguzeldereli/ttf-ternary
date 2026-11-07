@@ -1,4 +1,4 @@
-"""The theta schedule (ttf.schedule.theta_at / _ts_scale, user 7 Nov 2026): start -> base over the lr warmup, then a
+"""The theta schedule (ttf.schedule.theta_at / _ts_scale, 7 Nov 2026): start -> base over the lr warmup, then a
 cosine rise to end from the warmup's end; in rescale form (bar at base, step base / theta(t)); resumes of constant-theta checkpoints."""
 import math
 from types import SimpleNamespace

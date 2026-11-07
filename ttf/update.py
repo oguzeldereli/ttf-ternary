@@ -524,7 +524,7 @@ def ts_layer(l, g, state, c):
         return
     del v
     ra = min(r, l.N, l.K)
-    lk = 1 - 1 / tau   # the leak: a memory of tau steps, whatever the step scale (user, 6 Nov)
+    lk = 1 - 1 / tau   # the leak: a memory of tau steps, whatever the step scale (since 6 Nov 2026)
     if mic_nm and key in state:   # --accum M > 1: the basis stays fixed within the step (every micro-batch's u is projected
         # on it: U += u_i V), and turns once, on the last micro-batch (_acc_turn); turning it per micro-batch lets each
         # micro-batch's noisier u rotate the evidence away (Qwen 0.8B, 1 x 16: +0.09 train loss by step 500, acc_q08a)
@@ -824,8 +824,8 @@ def dense_acc(l, ra):
     ra (N + K) >= N K, i.e. ra >= N K / (N + K) (rank ratio 0.5 of a square matrix, max(N, K) / (N + K) of a rectangular
     one: 0.78 at 1024 x 3584, 0.77 at 5120 x 17408; full rank always). The factored form then saves no memory and is
     worse: its basis drops each step's evidence outside span(V) (_acc_turn, with a sketched cross term) and pays the
-    basis' products, orth and turn. Dense, A + u is exact and needs none of them (user, 2 Nov 2026: "r0.5 is dense as is,
-    it takes exactly the same memory ... 0.5 and above should default to dense")"""
+    basis' products, orth and turn. Dense, A + u is exact and needs none of them, at the same memory from ratio 0.5 of
+    a square matrix up"""
     return DENSE_ACC[0] and ra * (l.N + l.K) >= l.N * l.K
 
 

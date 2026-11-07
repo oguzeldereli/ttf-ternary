@@ -28,8 +28,6 @@ from ttf.q38 import model as QM
 from ttf.q38.moe import TernaryExperts, TernLinear, ExpertTTF, AdapterTTF, pack3
 from ttf.q38 import moe as MT
 from ttf.qwen import _kd_topk_chunk
-import inspect as _insp, ttf.update as _TU
-assert "lk = 1 - 1 / tau" in _insp.getsource(_TU), "ttf.q38.train needs the fixed-leak core: tau is no longer rescaled"
 
 DENSE = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
          "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj",
@@ -457,7 +455,7 @@ class Trainer:
         th0 = getattr(a, "theta_base", None) or a.theta     # (sched.json theta_base: a new flat level; the bar stays a.theta)
         th = theta_at(self.step, a.steps, th0, getattr(a, "theta_end", None), getattr(a, "theta_rise_from", 0.0),
                       getattr(a, "theta_warm", None), getattr(a, "theta_warm_steps", 0))
-        self.c["lr_ratio"] = a.theta / th     # (rescale form: the bar stays a.theta; the leak 1 - 1 / tau, core ac6b295)
+        self.c["lr_ratio"] = a.theta / th     # (rescale form: the bar stays a.theta; the fixed leak 1 - 1 / tau)
         a.norm = sum(int((b["tgt"] != -1).sum()) for b in mbs)
         pf = getattr(a, "prefetch", False) and dev != "cpu"
         if pf:
@@ -666,7 +664,7 @@ def main():
     cfg = QM.text_config(args.model)
     m = QM.build(cfg, device="meta")
     rd = QM.Reader(args.model)
-    QM.load_globals(m, rd, "cpu")      # (S: set_param replaces the meta parameters; no to_empty, which would wipe the
+    QM.load_globals(m, rd, "cpu")      # (set_param replaces the meta parameters; no to_empty, which would wipe the
                                         # n-gram hashing buffers; the cache: 64 shards x 256 windows, training 0..15999,
                                         # validation from 16128 = shard 63, never trained)
     if args.adapter_rank < 0:      # (from the conversion: the adapter rank of conv/L0.pt, so it cannot mismatch)
@@ -682,9 +680,7 @@ def main():
         for n, sd in conv.items():
             _get(L, n).load_state_dict(sd)
         if L.ple is not None:
-            S_tab = getattr(QM, "ngram_table_memmap", None)
-            assert S_tab is not None, "S: the PLE table reader (memmap) goes here"
-            L.ple.ple_embedding.table, L.ple.ple_embedding.scale = S_tab(args.model, i)
+            L.ple.ple_embedding.table, L.ple.ple_embedding.scale = QM.ngram_table_memmap(args.model, i)
             if getattr(args, "ple_pq", None):     # (the compressed table in the loop: prune1 + pq4.256, ple_pq)
                 from ttf.q38.ple_pq import PQTable
                 L.ple.ple_embedding.table, L.ple.ple_embedding.scale = PQTable(args.ple_pq, dev), None

@@ -11,7 +11,7 @@ LR_REWARM = [0, 0]                # --lr-rewarm S:W: from step S, linear warmup 
 
 
 def theta_at(prog, base, start, end, warm):
-    """the theta schedule (user, 7 Nov 2026: one default, three knobs; no p, no lr coupling): theta START at progress 0,
+    """the theta schedule (one default, three knobs; no p, no lr coupling): theta START at progress 0,
     a cosine down to BASE over the lr warmup (progress WARM), then a cosine up to END at progress 1. start = end = base:
     constant theta. The rise starts at the warmup's end: at 0.8B (st08, 1000 steps, one seed; wiki / chat / mix) 64 -> 16
     -> 80 that way ends at 3.1069 / 1.8125 / 1.5031, level with the old lr-tied step (p 0.75: 3.1115 / 1.8123 / 1.5084),
@@ -28,8 +28,8 @@ def theta_at(prog, base, start, end, warm):
 def _ts_scale(args, step, tc, lr):
     """the TTF step scale of the theta schedule, in rescale form: the bar stays at --ttf-theta (BASE) and the step is
     BASE / theta(t), so each accumulator entry keeps its position A / theta when theta moves (no burst of moves when
-    theta falls, as a moving bar gives; the leak 1 - 1 / tau is not touched). Theta alone sets the step (user, 6 Nov
-    2026); the ttf-lab profilers hook this per-step call."""
+    theta falls, as a moving bar gives; the leak 1 - 1 / tau is not touched). Theta alone sets the step (since 6 Nov
+    2026); the profilers in scripts/prof hook this per-step call."""
     th = theta_at(step / max(1, tc.max_steps), args.ttf_theta, args.ttf_theta_start, args.ttf_theta_end,
                   tc.warmup_steps / max(1, tc.max_steps))
     return args.ttf_theta / th

@@ -577,7 +577,7 @@ class ExpertTTF:
         dev = mod.wpacked.device
         N, K, ra = mod.N, mod.K, st["ra"]
         lr, tau, b2, sp, k_ = c["lr_ratio"], c["tau"], c["b2"], c["spend"], int(c["factored"])
-        lk = 1 - 1 / tau   # (the fixed leak, core ac6b295)
+        lk = 1 - 1 / tau   # (the fixed leak)
         th_all = c["theta"]
         es = sorted(fac)
         nf = 0
@@ -686,7 +686,7 @@ class ExpertTTF:
         dev = mod.wpacked.device
         N, K, ra = mod.N, mod.K, st["ra"]
         lr, tau, b2, sp, k_ = c["lr_ratio"], c["tau"], c["b2"], c["spend"], int(c["factored"])
-        lk = 1 - 1 / tau   # (the fixed leak, core ac6b295)
+        lk = 1 - 1 / tau   # (the fixed leak)
         th_all = c["theta"]
         C_ = chunk or self.chunk
         g = torch.Generator(device=dev).manual_seed(13_000_000 + 2 * idx0 + 1_000_003 * step_seed)
