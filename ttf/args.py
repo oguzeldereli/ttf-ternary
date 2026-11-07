@@ -131,10 +131,11 @@ def build_parser():
                    help="factored: the update from the gradient's factors (gy, x), the dense weight gradient never "
                         "formed (equal loss to dense at 110M)")
     g.add_argument("--dw-sketch", type=int, default=256, help="--dw factored: sketch size for the sums of g^2")
-    g.add_argument("--dw-sketch-warm", type=float, default=0.0,
+    g.add_argument("--dw-sketch-warm", type=float, default=0.75,
                    help="--dw factored, --accum > 1: this share of Sc's rows is the accumulator's own range (Q = orth(U G) "
                         "after each step's turn, kept for the next step), the rest random on Q's complement, so E[Sc^T Sc] "
-                        "= I still and the turn's cross term (sum g)^T U is exact on Q (0: off)")
+                        "= I still and the turn's cross term (sum g)^T U is exact on Q (0: off, the cold sketch; 0.75 from "
+                        "the 0.8B conversion recovery A/B, k 128: wiki 3.1390 vs 3.1777 cold, same k and cost)")
     g.add_argument("--dw-sketch-per-n", type=float, default=0.0,
                    help="--dw factored: per matrix k = max(--dw-sketch, this x N) (the turn's sketch noise ~ sqrt(N / k); "
                         "0: off)")

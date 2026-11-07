@@ -119,6 +119,7 @@ short momentum) run from a checkout of that tag (`python -m bitnet.train` there;
 | `--ttf-theta`, `--ttf-tau` | base threshold (θ alone sets the step), fixed leak 1 − 1/τ |
 | `--ttf-theta-start`, `--ttf-theta-end` | θ schedule: start, cosine down to base over the lr warmup, then a cosine up to end (defaults 64 → 16 → 80; start = end = base: constant) |
 | `--dw factored / dense`, `--dw-sketch K` | the update from the gradient's factors, the dense weight gradient never formed |
+| `--dw-sketch-warm F` | with `--accum` > 1: a share F (0.75) of the turn's sketch rows on the accumulator's own range from the step before (0: a random sketch) |
 | `--ttf-store fp32 / bf16 / fp12s` | compressed accumulator |
 | `--ttf-offload async`, `--ttf-offload-keep F` | state in pinned host memory (all but the first share F of layers), copies overlapped with the backward |
 | `--adapter-rank R` | rank-R float adapter beside the trits (16) |

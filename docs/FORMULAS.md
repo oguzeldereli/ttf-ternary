@@ -39,6 +39,12 @@ training, then a rise to 48 or 80: 3.1335 / 3.1321; constant 16: 3.1751.
   turns once: $V'=\operatorname{orth}\big(V(U^\top U)+(I-VV^\top)(\sum u)^\top U\big)$, the product with $\sum u$ read
   from the $k$-row sketch of $\sum g$ that $v$ keeps anyway (no dense sum), and $U'=U(V^\top V')$ (the step's mass
   outside $V$ is not kept). Firing and the spend once per step.
+- **Warm sketch** (`--dw-sketch-warm` 0.75, micro-batches only): the turn's $k$-row sketch $S$ (of $\sum g$ and the cross
+  term $(\sum g)^\top U$) is $[Q^\top;\,R(I-QQ^\top)]$, with $Q=\operatorname{orth}(UG)$ ($0.75k$ columns, $G$ random) taken
+  after the step before's turn and $R$ the remaining random rows, so $\mathbb E[S^\top S]=I$ still and the cross term is
+  exact on the accumulator's range. At Qwen 0.8B (conversion recovery, $k=128$, 1000 steps, 7 Nov) wiki / chat / mix
+  3.1390 / 1.8439 / 1.5565 against the random sketch's 3.1777 / 1.8709 / 1.5722, at the same $k$ and cost (one $N\times
+  0.75k$ bf16 basis per layer kept on the GPU).
 - **History of the turn**: from ttf-core 2858771 until 26 Oct the one-batch turn kept only the part of the step inside
   the old basis ($A\leftarrow A_{\text{in }V}V'V'^\top$): at 110M from scratch 39% of the trits had never moved by step
   2000 against 30% with the exact turn above, and the validation loss was 0.0085 worse (3.2483 vs 3.2398 at 2000
