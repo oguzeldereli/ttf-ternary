@@ -216,7 +216,7 @@ def build_parser():
     g.add_argument("--mem-snapshot", default="", help="PATH:STEP: CUDA allocation history to PATH at STEP")
     g.add_argument("--max-temp", type=int, default=86, help="pause while the GPU is at or above this (C)")
     g.add_argument("--resume-temp", type=int, default=85, help="after a pause, resume at or below this (C)")
-    g.add_argument("--temp-check", type=int, default=4, help="check the GPU temperature every N steps")
+    g.add_argument("--temp-check", type=int, default=4, help="check the GPU temperature every N steps (0: off)")
     return ap
 
 

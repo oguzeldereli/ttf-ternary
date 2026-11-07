@@ -270,6 +270,8 @@ class KernelTernaryLinear(nn.Module):
             self._beta_key = None
 
     def _invalidate(self):
+        """drop the cached beta and int8 weight copy; call after writing wpacked from outside the update (ttfconv's
+        model / finish / swap / blocklocal, ttf-home's ref_ppl)"""
         self._beta_key = None
         self.__dict__.pop("_w8c", None)
 

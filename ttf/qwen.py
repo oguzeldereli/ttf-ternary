@@ -543,8 +543,3 @@ def _safetensor_index(path):
     return files
 
 
-def _get(files, name, dev):
-    from safetensors import safe_open
-    k, f = files[name]
-    with safe_open(f, "pt", device="cpu") as h:
-        return h.get_tensor(k).to(dev)

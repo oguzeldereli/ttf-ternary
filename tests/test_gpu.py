@@ -344,6 +344,17 @@ def test_train_resume_round_trip(tmp_path):
     assert [r["type"] for r in recs].count("run") == 2 and recs[-1].get("status") == "finished"
 
 
+def test_temp_check_off_and_snapshot_off_log_step(tmp_path):
+    """--temp-check 0 turns the thermal check off (it divided by zero), and --mem-snapshot PATH:3 dumps at step 3 although
+    3 is not a log step (the dump sat inside the every-10-steps log block)"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    snap = str(tmp_path / "snap.pickle")
+    r = _run(str(tmp_path / "a"), ["--temp-check", "0", "--mem-snapshot", f"{snap}:3"], 4, data)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    assert os.path.getsize(snap) > 0 and "allocation history to step 3" in r.stdout
+
+
 def test_resume_new_theta_needs_acc_scale(tmp_path):
     """a resume at a theta different from the checkpoint's is refused without --ttf-acc-scale (the burst of 17 / 23 Oct),
     and runs with it, saying what it did"""

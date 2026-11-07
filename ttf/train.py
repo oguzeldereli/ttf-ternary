@@ -24,11 +24,13 @@ def _code_mult(args):
 
 
 def gpu_temp():
-    """Current GPU temperature in Celsius via nvidia-smi, or None if unavailable."""
+    """This process's GPU temperature in Celsius via nvidia-smi (selected by UUID, so CUDA_VISIBLE_DEVICES and the DP
+    rank's device are respected; before, it always read the first GPU), or None if unavailable."""
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5)
+        cmd = ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"]
+        if torch.cuda.is_available():
+            cmd += ["-i", f"GPU-{torch.cuda.get_device_properties(torch.cuda.current_device()).uuid}"]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         return int(out.stdout.strip().splitlines()[0])
     except Exception:
         return None
@@ -220,7 +222,7 @@ def main():
         _WS, _RK = 1, 0       # --pipe: no data-parallel reduction, every stage reads the same windows
     if args.mem_cap_gib and device == "cuda":   # --mem-cap-gib G: PyTorch may use at most G GiB of this GPU (a 96 GB card
         # standing in for a 24 GB one in memory-matched comparisons; allocations beyond it raise out-of-memory)
-        tot_ = torch.cuda.get_device_properties(0).total_memory / 2**30
+        tot_ = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 2**30
         torch.cuda.set_per_process_memory_fraction(min(1.0, args.mem_cap_gib / tot_))
         print(f"--mem-cap-gib: PyTorch capped at {args.mem_cap_gib:.1f} of {tot_:.1f} GiB", flush=True)
     if args.mem_snapshot and device == "cuda":   # --mem-snapshot PATH:STEP: every allocation with its Python stack
@@ -981,7 +983,7 @@ def main():
             raise SystemExit(0)
         # thermal guard: PAUSE (not stop) while GPU is at/above max_temp; resume
         # in place once it cools. No exit, no save — just wait it out.
-        if step % args.temp_check == 0:
+        if args.temp_check > 0 and step % args.temp_check == 0:   # --temp-check 0: off
             temp = gpu_temp()
             if temp is not None and temp >= args.max_temp:
                 print(f"GPU {temp}C >= {args.max_temp}C -> pausing to cool "
@@ -1158,6 +1160,10 @@ def main():
                        flip_frac_layers=fs["flip_frac"], never_frac_layers=fs["never_frac"])
         log_metrics(rec)
 
+        if args.mem_snapshot and device == "cuda" and step == int(args.mem_snapshot.rsplit(":", 1)[1]):
+            torch.cuda.memory._dump_snapshot(args.mem_snapshot.rsplit(":", 1)[0])    # scripts/analysis/mem_snapshot.py (any step, not only log steps)
+            torch.cuda.memory._record_memory_history(enabled=None)
+            print(f"--mem-snapshot: allocation history to step {step} in {args.mem_snapshot.rsplit(':', 1)[0]}", flush=True)
         if step % tc.log_interval == 0:
             dt = time.time() - t0
             mem = max(_peak_all, torch.cuda.max_memory_allocated()) / 1024**3 if device == "cuda" else 0
@@ -1169,10 +1175,6 @@ def main():
                   f"| {dt:6.1f}s | peakVRAM {mem:.2f}GiB", flush=True)
             if ttf and step in (10, 1000):
                 print(f"  TTF state: {_ts_state_bytes(lr_state) / 2**20:.1f} MiB stored", flush=True)
-            if args.mem_snapshot and device == "cuda" and step == int(args.mem_snapshot.rsplit(":", 1)[1]):
-                torch.cuda.memory._dump_snapshot(args.mem_snapshot.rsplit(":", 1)[0])    # scripts/analysis/mem_snapshot.py
-                torch.cuda.memory._record_memory_history(enabled=None)
-                print(f"--mem-snapshot: allocation history to step {step} in {args.mem_snapshot.rsplit(':', 1)[0]}", flush=True)
             if args.mem_report and step in (10, 50, 100, 1000):
                 mr = mem_report(model, tail_opt, lr_state)
                 log_metrics({"step": step, **mr})
