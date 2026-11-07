@@ -143,14 +143,18 @@ ttf/          the package
   master.py      BitNet b1.58 (--mode bitnet); tern_emb.py: ternary embeddings; opt_lean.py: LeanAdam
   model.py, config.py   Llama-style transformer, presets (small = 110M, d1024_l24 = 340M, d2048_l24 = 1.3B, b27)
   results.py     the results database (results/runs.jsonl): runs, events, results, notes
+  q38/           Qwen3.8-Flash-Next (MoE) in TTF: model, batched expert TTF, grouped GEMMs, layer-major trainer
+                 (docs/Q38.md)
 recipes/       TOML defaults for the measured settings (scratch-110m, continue-27b)
 scripts/
   results.py     the database's command line (status, table, show, find, note, ingest, validate)
   infer/         ttf_run.py (our models), ttf_qwen.py + ttf_kernels.py (converted Qwen, 2-bit dp4a decode)
-  eval/          final_eval.py, compare.py, zeroshot*.py
-  quant/, analysis/, data/   teacher caches, diagnostics (gradient and rank spectra, memory), data preparation
+  eval/          final_eval.py, compare.py, zeroshot*.py, gen_bench.py, genwrap.py; q38_*: Qwen3.8 generation / zero-shot
+  prof/          step-time and memory profilers (README.md)
+  quant/, analysis/, data/   teacher caches, diagnostics (gradient and rank spectra, memory, move capture), data preparation
   tests/         kernel checks and benchmarks, det_run.py (deterministic runs)
 tests/         pytest (-m "not gpu" anywhere; the gpu tests on a CUDA machine); checks/: script checks
+examples/vit/  a CIFAR-100 ViT: TTF vs master weights (STE) vs full precision
 docs/          see below
 ```
 
@@ -160,6 +164,7 @@ docs/          see below
   `show`, `find`); notes are kept outside the repository (`ttf/results.py`, `TTF_NOTES`).
 - [docs/FORMULAS.md](docs/FORMULAS.md): the current update with its options, then every rule tried (old flags).
 - [docs/OPTIONS_MAP.md](docs/OPTIONS_MAP.md): the old flags and the current options.
+- [docs/Q38.md](docs/Q38.md): Qwen3.8-Flash-Next: modules, the conversion-to-training pipeline, the recipe, tests.
 - [docs/research/](docs/research/): early results summary, related work, analysis outputs (rank spectra, gaps,
   zero-shot).
 
