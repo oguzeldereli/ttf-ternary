@@ -9,7 +9,7 @@ from ttf.kernel import pack_rows, unpack_rows
 
 def _cfg(**kw):
     c = dict(r=4, lr_ratio=1.0, theta=1e9, tau=1000.0, b2=0.95, spend=1.0, store_a="", offload=False,
-             theta_sched=None, progress=0.0, factored=16, start=0, step=10, micro=1, band=0.0, band_lo=0.5)
+             progress=0.0, factored=16, start=0, step=10, micro=1, band=0.0, band_lo=0.5)
     c.update(kw)
     return c
 

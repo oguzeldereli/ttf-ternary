@@ -14,7 +14,7 @@ from ttf import update as U
 
 def _cfg(**kw):
     c = dict(r=16, lr_ratio=1.0, theta=1e9, tau=1000.0, b2=0.95, spend=1.0, store_a="", offload=False,
-             theta_sched=None, progress=0.0, factored=16, start=0, step=10, micro=1)
+             progress=0.0, factored=16, start=0, step=10, micro=1)
     c.update(kw)
     return c
 

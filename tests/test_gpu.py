@@ -172,7 +172,7 @@ def test_lean_adam_batched():
 
 def _cfg(**kw):
     c = dict(r=512, lr_ratio=1.0, theta=2.0, tau=1000.0, b2=0.95, spend=1.0, store_a="", offload=False,
-             theta_sched=None, progress=0.0, factored=0, start=0, step=10, micro=1)
+             progress=0.0, factored=0, start=0, step=10, micro=1)
     c.update(kw)
     return c
 
@@ -979,7 +979,7 @@ def test_intk_update_acc_gemm(monkeypatch):
                     x = torch.randn(T, K, device=dev, generator=g).to(torch.bfloat16)
                     m._ts_final = i == M - 1
                     c = dict(r=16, lr_ratio=1.0, theta=1e9, tau=1000.0, b2=0.95, spend=1.0, store_a="", offload=False,
-                             theta_sched=None, progress=0.0, factored=16, start=0, step=10 + s, micro=M)
+                             progress=0.0, factored=16, start=0, step=10 + s, micro=M)
                     IE._intk_update(m, [("d", gy, x)], st, c)
             S = IE._Store(m, st, id(m), None, False, dev)
             res[name] = torch.cat([S.u(cc) for cc in range(S.nch)]) @ S.v().T
