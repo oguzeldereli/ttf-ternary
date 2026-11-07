@@ -386,6 +386,25 @@ def _orth_(X):
 DEFER = [None]   # --pipe, a stage after the first: the last micro-batch's per-layer updates collected here (qwen.pp_train)
 
 
+SKIP = object()     # a grad hook's return value: this call updates nothing (the layer's state and trits stay)
+GRAD_HOOKS = []     # fn(l, g, state, c) -> None (observe), a gradient (replaces g, same form: dense or (gy, x)) or SKIP;
+                    # called in order for every layer update (main layers, int-k matrices, the ternary embedding;
+                    # not for ts_frozen layers; under --pipe once, when the deferred update runs). For analysis and experiment plug-ins (--ext), in place of patching ts_layer: the
+                    # trainer holds its own reference to ts_layer (and runs as __main__ under python -m ttf.train), so
+                    # a patched module attribute is not what it calls; this list is read by the one ts_layer there is.
+
+
+def add_grad_hook(fn):
+    """register fn in GRAD_HOOKS (returns fn, so it works as a decorator); remove_grad_hook(fn) takes it out"""
+    GRAD_HOOKS.append(fn)
+    return fn
+
+
+def remove_grad_hook(fn):
+    if fn in GRAD_HOOKS:
+        GRAD_HOOKS.remove(fn)
+
+
 def ts_layer(l, g, state, c):
     """one layer of TTF (the no-momentum update): g is this layer's gradient (fp32), or its factors (gy, x) with
     --dw factored; c holds the settings and lr_ratio. Called from the layer's backward right after its input gradient
@@ -401,6 +420,12 @@ def ts_layer(l, g, state, c):
     if DEFER[0] is not None and getattr(l, "_ts_final", True) and int(c.get("micro") or 1) > 1:
         DEFER[0].append((l, g, state, c))   # (run after the stage's input gradient is sent: same inputs, later)
         return
+    for h_ in GRAD_HOOKS:                # (after the defer: a deferred update calls ts_layer again, hooks run once)
+        r_ = h_(l, g, state, c)
+        if r_ is SKIP:
+            return
+        if r_ is not None:
+            g = r_
     if not torch.is_tensor(g):           # --dw factored: the backward passed (gy, x) instead of the dense gradient
         return _ts_layer_factored(l, g, state, c)
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
