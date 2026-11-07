@@ -11,13 +11,21 @@ $g=\partial L/\partial T$ ($N\times K$, one batch of $16\times2048$ tokens); the
 
 ## 0. The current trainer (`--mode ttf`)
 
-Per ternary layer and step ($\rho_t=1$: $\theta$ alone sets the step since 6 Nov 2026; before, $\rho_t=(\text{lr}_t/\text{lr}_\text{peak})^{p}$, `--ttf-step-p` $p$ 0.75, with the leak $1-\rho_t/\tau$):
+Per ternary layer and step. $\theta$ alone sets the step (6 Nov 2026), through the $\theta$ schedule (7 Nov 2026) in
+rescale form: the bar stays at the base $\theta_0$ (`--ttf-theta`) and the step is $\rho_t=\theta_0/\theta(t)$, so an
+accumulator entry keeps its position $A/\theta$ when $\theta$ moves. With progress $s=t/T_{\max}$, warmup share $w$ and
+rise start $s_r$ (`schedule.THETA_RISE`):
+$$\theta(s)=\begin{cases}\theta_0+(\theta_s-\theta_0)\tfrac12\big(1+\cos\tfrac{\pi s}{w}\big)&s<w\\\theta_0&w\le s<s_r\\\theta_0+(\theta_e-\theta_0)\tfrac12\big(1-\cos\tfrac{\pi(s-s_r)}{1-s_r}\big)&s\ge s_r\end{cases}$$
+with $\theta_s$ = `--ttf-theta-start`, $\theta_e$ = `--ttf-theta-end` ($\theta_s=\theta_e=\theta_0$: constant). Before 6 Nov the
+step was $\rho_t=(\text{lr}_t/\text{lr}_\text{peak})^{p}$ (`--ttf-step-p` $p$ 0.75) with the leak $1-\rho_t/\tau$; at 0.8B that
+shape is worth 0.06 wiki over constant $\theta$ 16, and the leak form none of it (fixed leak 3.1115 vs annealed 3.111).
 
 - **Second moment**, factored (`--ttf-b2` 0.95, bias-corrected): $R_i\leftarrow\beta_2R_i+(1-\beta_2)\overline{g_{i\cdot}^2}$,
   $C_j$ likewise, $v_{ij}=R_iC_j/\overline R$. With `--dw factored` (the default) $g=g_y^\top x$ is never formed: the
   sums of $g^2$ come from a `--dw-sketch` $k$-column random sketch (256) and every product with $g$ from the factors.
 - **Step**: $u=-\rho_t\,g/(\sqrt v+\epsilon)$ (no momentum).
-- **Accumulator** $A\approx UV^\top$ at rank $r$ (`--ttf-rank`, 512), leak $\lambda=1-1/\tau$ (`--ttf-tau` 1000), one
+- **Accumulator** $A\approx UV^\top$ at rank $r$ (`--ttf-rank`, 512), leak $\lambda=1-1/\tau$ (`--ttf-tau` 1000; fixed, whatever
+  $\rho_t$), one
   subspace iteration per step on the whole tally $\tilde A=\lambda A+u$:
   $$V'=\operatorname{orth}\big(\tilde A^\top U\big)=\operatorname{orth}\big(V(U^\top U)+u^\top U\big),\qquad U'=\tilde AV'=U(V^\top V')+uV'$$
   ($U$ here already leaked; `--ttf-orth` the orthonormalisation).
