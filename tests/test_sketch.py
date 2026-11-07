@@ -1,4 +1,4 @@
-"""--dw-sketch-kind / --dw-sketch-warm: the row sketch keeps E[Sc^T Sc] = I, is exact on the warm basis, and the default
+"""--dw-sketch-warm: the row sketch keeps E[Sc^T Sc] = I, is exact on the warm basis, and the default
 draws the same numbers as before the options."""
 import types
 
@@ -24,10 +24,10 @@ def test_gauss_default_draw_unchanged():
     assert torch.equal(_row_sketch(l, torch.device("cpu"), g1, 16, {}), torch.randn(16, 48, generator=g2) / 16 ** 0.5)
 
 
-def test_unbiased_all_kinds():
+def test_unbiased_cold_and_warm():
     N, k = 32, 8
     Q = _orth(torch.randn(N, 3, generator=torch.Generator().manual_seed(9)))
-    for c, q in (({}, None), ({"sketch_kind": "count"}, None), ({}, Q), ({"sketch_kind": "count"}, Q)):
+    for c, q in (({}, None), ({}, Q)):
         E = _mean_sts(N, k, c, q)
         assert (E - torch.eye(N)).abs().max() < 0.25, (c, q is not None)
         assert (torch.diagonal(E) - 1).abs().mean() < 0.05

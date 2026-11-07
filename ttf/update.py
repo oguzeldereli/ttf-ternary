@@ -605,17 +605,11 @@ def _layer_gen(l, dev):
 
 
 def _row_sketch(l, dev, gen, k, c, Q=None):
-    """Sc [k, N] with E[Sc^T Sc] = I, fixed within a step (gen seeded by the step). gauss: dense normal / sqrt(k). count
-    (--dw-sketch-kind): one +-1 per column, in a random row. Q [N, kw] orthonormal (--dw-sketch-warm, the accumulator's
-    range from the step before): Sc = [Q^T; R (I - Q Q^T)] with R the k - kw random rows, so Sc^T Sc's expectation is
+    """Sc [k, N] with E[Sc^T Sc] = I, fixed within a step (gen seeded by the step): dense normal / sqrt(k). Q [N, kw]
+    orthonormal (--dw-sketch-warm, the accumulator's range from the step before): Sc = [Q^T; R (I - Q Q^T)] with R the k - kw random rows, so Sc^T Sc's expectation is
     Q Q^T + (I - Q Q^T) = I and the sketched products are exact on Q"""
     kr = k - (Q.shape[1] if Q is not None else 0)
-    if c.get("sketch_kind") == "count":
-        R = torch.zeros(kr, l.N, device=dev)
-        R[torch.randint(0, kr, (l.N,), device=dev, generator=gen), torch.arange(l.N, device=dev)] = \
-            torch.randint(0, 2, (l.N,), device=dev, generator=gen).float() * 2 - 1
-    else:
-        R = torch.randn(kr, l.N, device=dev, generator=gen) / kr ** 0.5
+    R = torch.randn(kr, l.N, device=dev, generator=gen) / kr ** 0.5
     if Q is None:
         return R
     Q = Q.float()
