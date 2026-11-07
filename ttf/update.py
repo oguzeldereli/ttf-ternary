@@ -389,9 +389,10 @@ DEFER = [None]   # --pipe, a stage after the first: the last micro-batch's per-l
 SKIP = object()     # a grad hook's return value: this call updates nothing (the layer's state and trits stay)
 GRAD_HOOKS = []     # fn(l, g, state, c) -> None (observe), a gradient (replaces g, same form: dense or (gy, x)) or SKIP;
                     # called in order for every layer update (main layers, int-k matrices, the ternary embedding;
-                    # not for ts_frozen layers; under --pipe once, when the deferred update runs). For analysis and experiment plug-ins (--ext), in place of patching ts_layer: the
-                    # trainer holds its own reference to ts_layer (and runs as __main__ under python -m ttf.train), so
-                    # a patched module attribute is not what it calls; this list is read by the one ts_layer there is.
+                    # not for ts_frozen layers; under --pipe once, when the deferred update runs). For analysis and
+                    # experiment plug-ins (--ext), in place of patching ts_layer: the trainer holds its own reference to
+                    # ts_layer (and runs as __main__ under python -m ttf.train), so a patched module attribute is not
+                    # what it calls; this list is read by the one ts_layer there is.
 
 
 def add_grad_hook(fn):
@@ -631,8 +632,8 @@ def _layer_gen(l, dev):
 
 def _row_sketch(l, dev, gen, k, c, Q=None):
     """Sc [k, N] with E[Sc^T Sc] = I, fixed within a step (gen seeded by the step): dense normal / sqrt(k). Q [N, kw]
-    orthonormal (--dw-sketch-warm, the accumulator's range from the step before): Sc = [Q^T; R (I - Q Q^T)] with R the k - kw random rows, so Sc^T Sc's expectation is
-    Q Q^T + (I - Q Q^T) = I and the sketched products are exact on Q"""
+    orthonormal (--dw-sketch-warm, the accumulator's range from the step before): Sc = [Q^T; R (I - Q Q^T)] with R the
+    k - kw random rows, so Sc^T Sc's expectation is Q Q^T + (I - Q Q^T) = I and the sketched products are exact on Q"""
     kr = k - (Q.shape[1] if Q is not None else 0)
     R = torch.randn(kr, l.N, device=dev, generator=gen) / kr ** 0.5
     if Q is None:

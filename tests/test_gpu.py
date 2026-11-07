@@ -355,6 +355,23 @@ def test_temp_check_off_and_snapshot_off_log_step(tmp_path):
     assert os.path.getsize(snap) > 0 and "allocation history to step 3" in r.stdout
 
 
+def test_train_resume_round_trip_sketch_warm(tmp_path):
+    """the same with --dw-sketch-warm 0.75: the warm sketch basis is in the checkpoint (it was not: a resumed run took one
+    cold-sketch step and left the straight run's path)"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    w = ["--dw-sketch-warm", "0.75", "--dw-sketch", "32"]
+    a = _train(str(tmp_path / "a"), w, 8, data)
+    assert len(_train(str(tmp_path / "b"), w, 4, data)) == 4
+    b = _train(str(tmp_path / "b"), w + ["--resume"], 8, data)
+    assert len(a) == 8 and a == b, (a, b)
+    ca, cb = (torch.load(str(tmp_path / d / "ckpt.pt"), map_location="cpu", weights_only=False) for d in "ab")
+    assert any(d_.get("wq") is not None for d_ in ca["ts_state"])           # (the warm basis exists and is saved)
+    for pa, pb in zip(ca["lowrank"], cb["lowrank"]):                       # the accumulators (losses alone cannot see
+        if pa is not None:                                                 # the sketch while no trit has moved)
+            assert all(torch.equal(x, y) for x, y in zip(pa, pb) if torch.is_tensor(x))
+
+
 def test_resume_new_theta_needs_acc_scale(tmp_path):
     """a resume at a theta different from the checkpoint's is refused without --ttf-acc-scale (the burst of 17 / 23 Oct),
     and runs with it, saying what it did"""

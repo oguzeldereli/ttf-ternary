@@ -568,8 +568,10 @@ def main():
                     # low-rank momentum (U, V) per ternary layer, in module order
                     "lowrank": [lr_state.get(id(m)) for m in model.modules()
                                 if isinstance(m, KernelTernaryLinear)] if lr_state else None,
-                    # TTF: the rest of the per-layer state (update count, factored v, short momentum), module order
-                    "ts_state": [{k[0]: st_[k] for k in (("t", id(m)), ("v", id(m)), ("m", id(m)), ("bd", id(m))) if k in st_}
+                    # TTF: the rest of the per-layer state (update count, factored v, short momentum, the warm sketch
+                    # basis of --dw-sketch-warm), module order
+                    "ts_state": [{k[0]: st_[k] for k in (("t", id(m)), ("v", id(m)), ("m", id(m)), ("bd", id(m)),
+                                                         ("wq", id(m))) if k in st_}
                                  for m in model.modules() if isinstance(m, KernelTernaryLinear)]
                                 if (st_ := lr_state.get("_ts")) else None,
                     # --tern-emb: the ternary embedding matrices' TTF state (U V, update count, factored v)
@@ -833,7 +835,8 @@ def main():
             st_ = lr_state.setdefault("_ts", {})
             for m, d_ in zip(lays, blob["ts_state"]):
                 for k_, v_ in (d_.items() if not m.wpacked.is_meta else ()):
-                    st_[(k_, id(m))] = tuple(x.to(_sdev[id(m)]) for x in v_) if isinstance(v_, tuple) else v_
+                    st_[(k_, id(m))] = (tuple(x.to(_sdev[id(m)]) for x in v_) if isinstance(v_, tuple) else
+                                        v_.to(_sdev[id(m)]) if torch.is_tensor(v_) else v_)
             print(f"resumed TTF state (v, step counts) for {len(lays)} layers", flush=True)
         tmask = blob.get("touched") or {}
         nres = 0
