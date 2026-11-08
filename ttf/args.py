@@ -102,6 +102,9 @@ def build_parser():
                    "up to --ttf-theta-end at the last step (in rescale form: the bar stays here, the step is base / theta(t))")
     g.add_argument("--ttf-theta-start", type=float, default=64.0, help="theta at step 0 (= --ttf-theta: no start phase)")
     g.add_argument("--ttf-theta-end", type=float, default=80.0, help="theta at the last step (= --ttf-theta: no end rise)")
+    g.add_argument("--ttf-theta-interp", default="theta", choices=["theta", "step", "log"],
+                   help="the theta schedule's cosines interpolate theta itself (theta), the step base / theta (step) or "
+                        "log theta (log); experiment, 8 Nov 2026")
     g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant: A <- (1 - 1 / TAU) A "
                    "every step, a memory of TAU steps")
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")

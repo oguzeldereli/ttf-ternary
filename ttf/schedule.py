@@ -10,7 +10,7 @@ LR_WSD = [0]                      # --lr-schedule wsd D: warmup, constant peak l
 LR_REWARM = [0, 0]                # --lr-rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
 
 
-def theta_at(prog, base, start, end, warm):
+def theta_at(prog, base, start, end, warm, interp="theta"):
     """the theta schedule (one default, three knobs; no p, no lr coupling): theta START at progress 0,
     a cosine down to BASE over the lr warmup (progress WARM), then a cosine up to END at progress 1. start = end = base:
     constant theta. The rise starts at the warmup's end: at 0.8B (st08, 1000 steps, one seed; wiki / chat / mix) 64 -> 16
@@ -19,10 +19,20 @@ def theta_at(prog, base, start, end, warm):
     3.1751. The end level (x3 or x5 from 60%) changed nothing; the step shape just after the warmup did."""
     prog = min(max(float(prog), 0.0), 1.0)
     if warm > 0 and prog < warm:
-        return base + (start - base) * 0.5 * (1 + math.cos(math.pi * prog / warm))
+        return _interp(start, base, 0.5 * (1 - math.cos(math.pi * prog / warm)), interp)
     if warm >= 1:
         return base
-    return base + (end - base) * 0.5 * (1 - math.cos(math.pi * (prog - warm) / (1 - warm)))
+    return _interp(base, end, 0.5 * (1 - math.cos(math.pi * (prog - warm) / (1 - warm))), interp)
+
+
+def _interp(a, b, w, interp):
+    """theta from a (w 0) to b (w 1): linear in theta (theta), in the step 1 / theta (step: the step scale base / theta
+    follows the cosine), or in log theta (log)"""
+    if interp == "step":
+        return 1.0 / ((1 - w) / a + w / b)
+    if interp == "log":
+        return math.exp((1 - w) * math.log(a) + w * math.log(b))
+    return a + (b - a) * w
 
 
 def _ts_scale(args, step, tc, lr):
@@ -31,7 +41,7 @@ def _ts_scale(args, step, tc, lr):
     theta falls, as a moving bar gives; the leak 1 - 1 / tau is not touched). Theta alone sets the step (since 6 Nov
     2026); the profilers in scripts/prof hook this per-step call."""
     th = theta_at(step / max(1, tc.max_steps), args.ttf_theta, args.ttf_theta_start, args.ttf_theta_end,
-                  tc.warmup_steps / max(1, tc.max_steps))
+                  tc.warmup_steps / max(1, tc.max_steps), getattr(args, "ttf_theta_interp", "theta"))
     return args.ttf_theta / th
 
 
