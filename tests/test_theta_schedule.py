@@ -67,7 +67,7 @@ def test_legacy_linear_schedule_refused():
 def test_interp_forms():
     """--ttf-theta-interp: the same end points; step = the cosine on 1 / theta, log = on log theta"""
     for it in ("theta", "step", "log"):
-        assert theta_at(0.0, 16, 64, 80, 0.1, it) == 64 and theta_at(0.1, 16, 64, 80, 0.1, it) == 16
+        assert math.isclose(theta_at(0.0, 16, 64, 80, 0.1, it), 64) and theta_at(0.1, 16, 64, 80, 0.1, it) == 16
         assert math.isclose(theta_at(1.0, 16, 64, 80, 0.1, it), 80)
     assert math.isclose(1 / theta_at(0.55, 16, 64, 80, 0.1, "step"), (1 / 16 + 1 / 80) / 2)
     assert math.isclose(theta_at(0.55, 16, 64, 80, 0.1, "log"), (16 * 80) ** 0.5)

@@ -28,6 +28,8 @@ def theta_at(prog, base, start, end, warm, interp="theta"):
 def _interp(a, b, w, interp):
     """theta from a (w 0) to b (w 1): linear in theta (theta), in the step 1 / theta (step: the step scale base / theta
     follows the cosine), or in log theta (log)"""
+    if w <= 0 or w >= 1 or a == b:
+        return a if w <= 0 else b
     if interp == "step":
         return 1.0 / ((1 - w) / a + w / b)
     if interp == "log":
