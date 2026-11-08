@@ -18,12 +18,13 @@ $$\frac{1}{\theta(s)}=\begin{cases}\frac1{\theta_0}+\Big(\frac1{\theta_s}-\frac1
 with $\theta_s$ = `--ttf-theta-start`, $\theta_e$ = `--ttf-theta-end` ($\theta_s=\theta_e=\theta_0$: constant). Before 6 Nov the
 step was $\rho_t=(\text{lr}_t/\text{lr}_\text{peak})^{p}$ (`--ttf-step-p` $p$ 0.75) with the leak $1-\rho_t/\tau$; at 0.8B that
 shape is worth 0.06 wiki over constant $\theta$ 16, and the leak form none of it (fixed leak 3.1115 vs annealed 3.111).
-so the step $\rho_t$ itself follows the cosines (8 Nov 2026; on 7 Nov they were in $\theta$). The defaults 64 → 16 → 80 take
+The cosines are in $1/\theta$, so the step $\rho_t$ itself follows them (8 Nov 2026; on 7 Nov they were in $\theta$). The defaults 64 → 16 → 80 take
 the step from 0.25 to 1 over the warmup and down to 0.2 at the end, near the lr-tied step $(\text{lr}_t/\text{lr}_\text{peak})^{0.75}$
-(0.18 at the end) without reading the lr. 110M from scratch (recipes/scratch-110m, one seed, 974 Wikipedia windows): 2.6741
-against paper 1's 2.6728 with $p$ 0.75 and the annealed leak; the cosines in $\theta$ 2.7320, in $\log\theta$ 2.6980. 0.8B
-conversion recovery (st08, 1000 steps): the $\theta$-space form 3.1069 / 1.8125 / 1.5031 (wiki / chat / mix), $p$ 0.75 3.1115 /
-1.8123 / 1.5084, a hold at 16 until 60% then a rise 3.1335 / 3.1321, constant 16 3.1751.
+(0.18 at the end) without reading the lr. 110M from scratch (recipes/scratch-110m, 974 Wikipedia windows): 2.6741 / 2.6695 (seeds 1337 / 2)
+against paper 1's 2.6728 with $p$ 0.75 and the annealed leak; the cosines in $\theta$ 2.7320, in $\log\theta$ 2.6980. Without the start phase (start 16) 2.7037,
+end 90 2.6795. 0.8B conversion recovery (st08, 1000 steps): the $\theta$-space form 3.1069 / 1.8125 / 1.5031 (wiki / chat / mix), $p$ 0.75 3.1115 /
+1.8123 / 1.5084, a hold at 16 until 60% then a rise 3.1335 / 3.1321, constant 16 3.1751; on the fixed-leak core the three
+shapes end level (wiki / chat on 3200 windows: step 3.1042 / 1.8375, $\theta$ 3.1054 / 1.8393, $\log\theta$ 3.1045 / 1.8371).
 
 - **Second moment**, factored (`--ttf-b2` 0.95, bias-corrected): $R_i\leftarrow\beta_2R_i+(1-\beta_2)\overline{g_{i\cdot}^2}$,
   $C_j$ likewise, $v_{ij}=R_iC_j/\overline R$. With `--dw factored` (the default) $g=g_y^\top x$ is never formed: the

@@ -2,7 +2,7 @@
 # The paper's TTF recipe (rank 512, theta 16): sw512_t75, fixed-window Wikipedia loss 2.6728 (3 seeds of rank 512:
 # 2.6888), measured with the step scale p 0.75 and the annealed leak, which are gone (7 Nov 2026: the fixed leak
 # 1 - 1/tau, p 0, the theta schedule). On the current trainer with the theta defaults (64 -> 16 -> 80, cosines in the
-# step base / theta) it ends at 2.6741 (8 Nov, one seed); with the cosines in theta (7 Nov) it ended at 2.7320. The options
+# step base / theta) it ends at 2.6741 / 2.6695 (8 Nov, seeds 1337 / 2); with the cosines in theta (7 Nov) at 2.7320. The options
 # not set here are the trainer's defaults.
 #   python -m ttf.train --recipe scratch-110m --out-dir runs/scratch-110m
 mode = "ttf"
