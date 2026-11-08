@@ -22,7 +22,7 @@ The cosines are in $1/\theta$, so the step $\rho_t$ itself follows them (8 Nov 2
 the step from 0.25 to 1 over the warmup and down to 0.2 at the end, near the lr-tied step $(\text{lr}_t/\text{lr}_\text{peak})^{0.75}$
 (0.18 at the end) without reading the lr. 110M from scratch (recipes/scratch-110m, 974 Wikipedia windows): 2.6741 / 2.6695 (seeds 1337 / 2)
 against paper 1's 2.6728 with $p$ 0.75 and the annealed leak; the cosines in $\theta$ 2.7320, in $\log\theta$ 2.6980. Constant 16 2.8631, without the start phase (start 16) 2.7037,
-end 90 2.6795. 0.8B conversion recovery (st08, 1000 steps): the $\theta$-space form 3.1069 / 1.8125 / 1.5031 (wiki / chat / mix), $p$ 0.75 3.1115 /
+end 48 / 64 / 90 / 120 2.6759 / 2.6690 / 2.6795 / 2.6889 (seed 1337; 80: 2.6741). 0.8B conversion recovery (st08, 1000 steps): the $\theta$-space form 3.1069 / 1.8125 / 1.5031 (wiki / chat / mix), $p$ 0.75 3.1115 /
 1.8123 / 1.5084, a hold at 16 until 60% then a rise 3.1335 / 3.1321, constant 16 3.1751; on the fixed-leak core the three
 shapes end level (wiki / chat on 3200 windows: step 3.1042 / 1.8375, $\theta$ 3.1054 / 1.8393, $\log\theta$ 3.1045 / 1.8371).
 
