@@ -18,7 +18,7 @@ $$\frac{1}{\theta(s)}=\begin{cases}\frac1{\theta_0}+\Big(\frac1{\theta_s}-\frac1
 with $\theta_s$ = `--ttf-theta-start`, $\theta_e$ = `--ttf-theta-end` ($\theta_s=\theta_e=\theta_0$: constant). Before 6 Nov the
 step was $\rho_t=(\text{lr}_t/\text{lr}_\text{peak})^{p}$ (`--ttf-step-p` $p$ 0.75) with the leak $1-\rho_t/\tau$; at 0.8B that
 shape is worth 0.06 wiki over constant $\theta$ 16, and the leak form none of it (fixed leak 3.1115 vs annealed 3.111).
-The cosines are in $1/\theta$, so the step $\rho_t$ itself follows them (8 Nov 2026; on 7 Nov they were in $\theta$). The defaults 64 → 16 → 80 take
+The cosines are in $1/\theta$, so the step $\rho_t$ itself follows them (8 Nov 2026; on 7 Nov they were in $\theta$). The defaults $4\theta_0\to\theta_0\to5\theta_0$ (64 → 16 → 80 at $\theta_0=16$) take
 the step from 0.25 to 1 over the warmup and down to 0.2 at the end, near the lr-tied step $(\text{lr}_t/\text{lr}_\text{peak})^{0.75}$
 (0.18 at the end) without reading the lr. 110M from scratch (recipes/scratch-110m, 974 Wikipedia windows): 2.6741 / 2.6695 (seeds 1337 / 2)
 against paper 1's 2.6728 with $p$ 0.75 and the annealed leak; the cosines in $\theta$ 2.7320, in $\log\theta$ 2.6980. Constant 16 2.8631, without the start phase (start 16) 2.7037,

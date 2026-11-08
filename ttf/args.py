@@ -12,6 +12,7 @@ import os
 import tomllib
 
 from .config import PRESETS, DEFAULT_PRESET
+from .schedule import THETA_START_X, THETA_END_X
 
 RECIPES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "recipes")
 ON = argparse.BooleanOptionalAction
@@ -101,8 +102,10 @@ def build_parser():
                    "theta schedule: --ttf-theta-start at step 0, this at the end of the lr warmup, --ttf-theta-end at the "
                    "last step, cosines between them in the step (rescale form: the bar stays here, the step base / "
                    "theta(t) follows the cosines)")
-    g.add_argument("--ttf-theta-start", type=float, default=64.0, help="theta at step 0 (= --ttf-theta: no start phase)")
-    g.add_argument("--ttf-theta-end", type=float, default=80.0, help="theta at the last step (= --ttf-theta: no end rise)")
+    g.add_argument("--ttf-theta-start", type=float, default=None, help="theta at step 0 (default %g x --ttf-theta; = "
+                   "--ttf-theta: no start phase)" % THETA_START_X)
+    g.add_argument("--ttf-theta-end", type=float, default=None, help="theta at the last step (default %g x --ttf-theta; "
+                   "= --ttf-theta: no end rise)" % THETA_END_X)
     g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant: A <- (1 - 1 / TAU) A "
                    "every step, a memory of TAU steps")
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")
@@ -246,6 +249,10 @@ def parse(argv=None):
 def resolve(a):
     """settings derived from several options (read by the trainer)"""
     a.factored_k = a.dw_sketch if (a.mode == "ttf" and a.dw == "factored") else 0
+    if a.ttf_theta_start is None:      # (the theta schedule's defaults follow the base: the step base / theta then runs
+        a.ttf_theta_start = THETA_START_X * a.ttf_theta    # 0.25 -> 1 -> 0.2 whatever the base)
+    if a.ttf_theta_end is None:
+        a.ttf_theta_end = THETA_END_X * a.ttf_theta
     a.u32 = a.data_dtype == "u32"
     if a.adapter_schedule:
         f = a.adapter_schedule.split(":")

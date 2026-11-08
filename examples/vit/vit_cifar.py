@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from ttf.layers import KernelTernaryLinear, DX_MODE, FUSED_LAYER, FACTORED
 from ttf.master import MasterTernaryLinear
 from ttf.model import RMSNorm
-from ttf.schedule import theta_at
+from ttf.schedule import theta_at, THETA_START_X, THETA_END_X
 from ttf.update import ts_layer, ts_step
 
 
@@ -106,8 +106,10 @@ def main():
     ap.add_argument("--wd", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--theta", type=float, default=16.0, help="the base threshold (ttf.train --ttf-theta)")
-    ap.add_argument("--theta-start", type=float, default=64.0, help="theta at step 0, down to --theta over the warmup")
-    ap.add_argument("--theta-end", type=float, default=80.0, help="theta at the last step (start = end = theta: constant)")
+    ap.add_argument("--theta-start", type=float, default=None, help="theta at step 0, down to --theta over the warmup "
+                    "(default 4 x --theta)")
+    ap.add_argument("--theta-end", type=float, default=None, help="theta at the last step (default 5 x --theta; start = "
+                    "end = theta: constant)")
     ap.add_argument("--rank", type=int, default=512)        # >= min(N, K) here: every layer full rank (dense state)
     ap.add_argument("--adapter-rank", type=int, default=16)
     ap.add_argument("--resid", choices=["fp32", "bf16"], default="fp32",
@@ -121,6 +123,8 @@ def main():
     ap.add_argument("--data", default="data/cifar")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
+    a.theta_start = THETA_START_X * a.theta if a.theta_start is None else a.theta_start
+    a.theta_end = THETA_END_X * a.theta if a.theta_end is None else a.theta_end
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(a.seed)
     dev = "cuda"

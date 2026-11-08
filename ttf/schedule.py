@@ -10,6 +10,9 @@ LR_WSD = [0]                      # --lr-schedule wsd D: warmup, constant peak l
 LR_REWARM = [0, 0]                # --lr-rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
 
 
+THETA_START_X, THETA_END_X = 4.0, 5.0   # the schedule's default start / end as multiples of the base (16: 64 -> 16 -> 80)
+
+
 def theta_at(prog, base, start, end, warm):
     """the theta schedule (one default, three knobs; no p, no lr coupling): theta START at progress 0, BASE at the end of
     the lr warmup (progress WARM), END at progress 1, with cosines between them in the step BASE / theta (the step scale
