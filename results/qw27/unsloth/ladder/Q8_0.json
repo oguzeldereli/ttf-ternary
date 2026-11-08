@@ -1,5 +1,5 @@
 {
- "model": "/tmp/oguzelde/gguf/Qwen3.8-27B-Q8_0.gguf",
+ "model": "Qwen3.8-27B-Q8_0.gguf",
  "wikiq8_val.bin": {
   "mean": 1.9427281258544922,
   "losses": [

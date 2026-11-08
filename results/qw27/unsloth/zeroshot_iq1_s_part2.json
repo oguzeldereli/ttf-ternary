@@ -1,5 +1,5 @@
 {
- "model": "/home/oguzeldereli/models/unsloth-q38-27b/Qwen3.8-27B-UD-IQ1_S.gguf",
+ "model": "Qwen3.8-27B-UD-IQ1_S.gguf",
  "arc_easy": {
   "acc": 0.7565,
   "acc_se": 0.009599476546926269,

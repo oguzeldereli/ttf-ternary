@@ -1,5 +1,5 @@
 {
- "model": "/tmp/oguzelde/gguf/Qwen3.8-27B-UD-IQ1_S.gguf",
+ "model": "Qwen3.8-27B-UD-IQ1_S.gguf",
  "lambada": {
   "acc": 0.5855,
   "acc_se": 0.011018419931591573,

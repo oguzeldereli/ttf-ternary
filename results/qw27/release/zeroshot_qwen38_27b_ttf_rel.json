@@ -1,5 +1,5 @@
 {
- "model": "/scratch0/oguzelde/tern/end/qw27_rel/qw27_rel_e4.pt",
+ "model": "qw27_rel_e4.pt",
  "limit": 2000,
  "lambada": {
   "acc": 0.6395,
