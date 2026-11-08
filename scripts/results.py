@@ -76,7 +76,7 @@ def main():
     elif a.cmd == "status":
         last = {}
         for r_ in cur.values():
-            if r_["type"] == "event":
+            if r_.get("type") == "event":   # (notes written by hand may have no type)
                 if r_["run"] not in last or r_["time"] >= last[r_["run"]]["time"]:
                     last[r_["run"]] = r_
         for rid, ev in sorted(last.items(), key=lambda kv: kv[1]["time"]):
