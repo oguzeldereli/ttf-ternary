@@ -14,13 +14,16 @@ $g=\partial L/\partial T$ ($N\times K$, one batch of $16\times2048$ tokens); the
 Per ternary layer and step. $\theta$ alone sets the step (6 Nov 2026), through the $\theta$ schedule (7 Nov 2026) in
 rescale form: the bar stays at the base $\theta_0$ (`--ttf-theta`) and the step is $\rho_t=\theta_0/\theta(t)$, so an
 accumulator entry keeps its position $A/\theta$ when $\theta$ moves. With progress $s=t/T_{\max}$ and warmup share $w$:
-$$\theta(s)=\begin{cases}\theta_0+(\theta_s-\theta_0)\tfrac12\big(1+\cos\tfrac{\pi s}{w}\big)&s<w\\\theta_0+(\theta_e-\theta_0)\tfrac12\big(1-\cos\tfrac{\pi(s-w)}{1-w}\big)&s\ge w\end{cases}$$
+$$\frac{1}{\theta(s)}=\begin{cases}\frac1{\theta_0}+\Big(\frac1{\theta_s}-\frac1{\theta_0}\Big)\tfrac12\big(1+\cos\tfrac{\pi s}{w}\big)&s<w\\\frac1{\theta_0}+\Big(\frac1{\theta_e}-\frac1{\theta_0}\Big)\tfrac12\big(1-\cos\tfrac{\pi(s-w)}{1-w}\big)&s\ge w\end{cases}$$
 with $\theta_s$ = `--ttf-theta-start`, $\theta_e$ = `--ttf-theta-end` ($\theta_s=\theta_e=\theta_0$: constant). Before 6 Nov the
 step was $\rho_t=(\text{lr}_t/\text{lr}_\text{peak})^{p}$ (`--ttf-step-p` $p$ 0.75) with the leak $1-\rho_t/\tau$; at 0.8B that
 shape is worth 0.06 wiki over constant $\theta$ 16, and the leak form none of it (fixed leak 3.1115 vs annealed 3.111).
-The defaults (64 → 16 → 80, the rise from the warmup's end) are the 0.8B A/B of 7 Nov (st08, one seed, wiki / chat /
-mix): 3.1069 / 1.8125 / 1.5031, level with that lr-tied step (3.1115 / 1.8123 / 1.5084); a hold at 16 until 60% of
-training, then a rise to 48 or 80: 3.1335 / 3.1321; constant 16: 3.1751.
+so the step $\rho_t$ itself follows the cosines (8 Nov 2026; on 7 Nov they were in $\theta$). The defaults 64 → 16 → 80 take
+the step from 0.25 to 1 over the warmup and down to 0.2 at the end, near the lr-tied step $(\text{lr}_t/\text{lr}_\text{peak})^{0.75}$
+(0.18 at the end) without reading the lr. 110M from scratch (recipes/scratch-110m, one seed, 974 Wikipedia windows): 2.6741
+against paper 1's 2.6728 with $p$ 0.75 and the annealed leak; the cosines in $\theta$ 2.7320, in $\log\theta$ 2.6980. 0.8B
+conversion recovery (st08, 1000 steps): the $\theta$-space form 3.1069 / 1.8125 / 1.5031 (wiki / chat / mix), $p$ 0.75 3.1115 /
+1.8123 / 1.5084, a hold at 16 until 60% then a rise 3.1335 / 3.1321, constant 16 3.1751.
 
 - **Second moment**, factored (`--ttf-b2` 0.95, bias-corrected): $R_i\leftarrow\beta_2R_i+(1-\beta_2)\overline{g_{i\cdot}^2}$,
   $C_j$ likewise, $v_{ij}=R_iC_j/\overline R$. With `--dw factored` (the default) $g=g_y^\top x$ is never formed: the

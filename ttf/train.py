@@ -563,6 +563,7 @@ def main():
                     "touched": touched, "touched_origin": touched_origin,
                     "cfg": mc, "step": step, "mode": kmode, "beta": use_beta, "args": vars(args),
                     "leak": "fixed",   # A <- (1 - 1 / tau) A (6 Nov 2026; before: 1 - rho^p / tau, the annealed leak)
+                    "theta_shape": "step",   # the theta schedule's cosines in the step base / theta (8 Nov 2026)
                     "int8": True, "int8_dx": False,   # (read by the evaluation scripts of checkpoints before 25 Oct 2026)
                     "dw_mode": "dense",    # (read by the evaluation scripts of checkpoints before 17 Oct 2026)
                     # low-rank momentum (U, V) per ternary layer, in module order
@@ -666,7 +667,7 @@ def main():
                 print(_lmsg, flush=True)
             if args.mode == "ttf":
                 _tmsg = resume_theta_check(blob.get("args") or {}, args.ttf_theta, args.ttf_theta_start,
-                                           args.ttf_theta_end, args.allow_leak_change)
+                                           args.ttf_theta_end, args.allow_leak_change, blob.get("theta_shape"))
                 if _tmsg:
                     print(_tmsg, flush=True)
         if mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):

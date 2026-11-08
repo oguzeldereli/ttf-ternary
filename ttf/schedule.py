@@ -10,31 +10,29 @@ LR_WSD = [0]                      # --lr-schedule wsd D: warmup, constant peak l
 LR_REWARM = [0, 0]                # --lr-rewarm S:W: from step S, linear warmup over W steps from min_lr to the peak, then cosine
 
 
-def theta_at(prog, base, start, end, warm, interp="theta"):
-    """the theta schedule (one default, three knobs; no p, no lr coupling): theta START at progress 0,
-    a cosine down to BASE over the lr warmup (progress WARM), then a cosine up to END at progress 1. start = end = base:
-    constant theta. The rise starts at the warmup's end: at 0.8B (st08, 1000 steps, one seed; wiki / chat / mix) 64 -> 16
-    -> 80 that way ends at 3.1069 / 1.8125 / 1.5031, level with the old lr-tied step (p 0.75: 3.1115 / 1.8123 / 1.5084),
-    while a hold at 16 until 60% of training and a rise to 48 or 80 after it end at 3.1335 / 3.1321 and constant 16 at
-    3.1751. The end level (x3 or x5 from 60%) changed nothing; the step shape just after the warmup did."""
+def theta_at(prog, base, start, end, warm):
+    """the theta schedule (one default, three knobs; no p, no lr coupling): theta START at progress 0, BASE at the end of
+    the lr warmup (progress WARM), END at progress 1, with cosines between them in the step BASE / theta (the step scale
+    of _ts_scale), not in theta. start = end = base: constant theta.
+    Why the step (8 Nov 2026): a cosine in theta puts the step on a hyperbola that drops early (110M from scratch, 64 ->
+    16 -> 80: step 0.35 at mid-run, 2.7320 on the 974 Wikipedia windows); the cosine in the step gives 0.62 there, close
+    to paper 1's lr-tied step (lr / peak)^0.75 (0.66), and reproduces its 2.6728 (2.6741, one seed; log theta 2.6980,
+    end 40 in theta 2.6976). At 0.8B (st08 recovery, 1000 steps) the theta-space form had ended at 3.1069 / 1.8125 /
+    1.5031 (wiki / chat / mix), level with p 0.75 (3.1115 / 1.8123 / 1.5084); a hold at 16 until 60% then a rise ended at
+    3.1335 / 3.1321, constant 16 at 3.1751."""
     prog = min(max(float(prog), 0.0), 1.0)
     if warm > 0 and prog < warm:
-        return _interp(start, base, 0.5 * (1 - math.cos(math.pi * prog / warm)), interp)
+        return _step_interp(start, base, 0.5 * (1 - math.cos(math.pi * prog / warm)))
     if warm >= 1:
         return base
-    return _interp(base, end, 0.5 * (1 - math.cos(math.pi * (prog - warm) / (1 - warm))), interp)
+    return _step_interp(base, end, 0.5 * (1 - math.cos(math.pi * (prog - warm) / (1 - warm))))
 
 
-def _interp(a, b, w, interp):
-    """theta from a (w 0) to b (w 1): linear in theta (theta), in the step 1 / theta (step: the step scale base / theta
-    follows the cosine), or in log theta (log)"""
+def _step_interp(a, b, w):
+    """theta from a (w 0) to b (w 1), linear in 1 / theta (so the step base / theta is linear in w); exact end points"""
     if w <= 0 or w >= 1 or a == b:
         return a if w <= 0 else b
-    if interp == "step":
-        return 1.0 / ((1 - w) / a + w / b)
-    if interp == "log":
-        return math.exp((1 - w) * math.log(a) + w * math.log(b))
-    return a + (b - a) * w
+    return 1.0 / ((1 - w) / a + w / b)
 
 
 def _ts_scale(args, step, tc, lr):
@@ -43,7 +41,7 @@ def _ts_scale(args, step, tc, lr):
     theta falls, as a moving bar gives; the leak 1 - 1 / tau is not touched). Theta alone sets the step (since 6 Nov
     2026); the profilers in scripts/prof hook this per-step call."""
     th = theta_at(step / max(1, tc.max_steps), args.ttf_theta, args.ttf_theta_start, args.ttf_theta_end,
-                  tc.warmup_steps / max(1, tc.max_steps), getattr(args, "ttf_theta_interp", "theta"))
+                  tc.warmup_steps / max(1, tc.max_steps))
     return args.ttf_theta / th
 
 
@@ -69,18 +67,28 @@ def resume_leak_check(ck_leak, ck_args, allow=False):
     return "resume: --allow-leak-change: " + "; ".join(ch)
 
 
-def resume_theta_check(ck_args, base, start, end, allow=False):
-    """a resume must keep the checkpoint's TTF rule: a checkpoint from before the theta schedule (7 Nov 2026: no
-    ttf_theta_start in its args) ran at constant theta, so resuming it under a start / end schedule would change the step
-    mid-run. Refused (SystemExit) unless the schedule is off (start = end = base) or allow; returns the message of an
+def resume_theta_check(ck_args, base, start, end, allow=False, ck_shape=None):
+    """a resume must keep the checkpoint's TTF rule. A checkpoint from before the theta schedule (7 Nov 2026: no
+    ttf_theta_start in its args) ran at constant theta; one with a schedule but no theta_shape "step" (7-8 Nov 2026) ran
+    the cosines in theta, not in the step. Resuming either under this core's schedule would change the step mid-run:
+    refused (SystemExit) unless the schedule is off on both sides (start = end = base) or allow; returns the message of an
     accepted change, else None."""
-    if not ck_args or "ttf_theta_start" in ck_args or start == end == base:
+    if not ck_args:
         return None
-    ch = (f"theta schedule {start:g} -> {base:g} -> {end:g} (this run) vs constant theta (checkpoint from before 7 Nov "
-          f"2026)")
+    if "ttf_theta_start" not in ck_args:
+        if start == end == base:
+            return None
+        ch = (f"theta schedule {start:g} -> {base:g} -> {end:g} (this run) vs constant theta (checkpoint from before 7 "
+              f"Nov 2026)")
+    else:
+        cb = float(ck_args.get("ttf_theta", base))
+        cs, ce = float(ck_args["ttf_theta_start"]), float(ck_args.get("ttf_theta_end", cb))
+        if ck_shape == "step" or cs == ce == cb:
+            return None
+        ch = (f"the checkpoint's theta schedule {cs:g} -> {cb:g} -> {ce:g} ran its cosines in theta (7-8 Nov 2026), this "
+              f"core in the step base / theta")
     if not allow:
-        raise SystemExit(f"resume: {ch}: the step would change mid-run, refusing (--ttf-theta-start {base:g} "
-                         f"--ttf-theta-end {base:g} keeps it constant; --allow-leak-change accepts the schedule)")
+        raise SystemExit(f"resume: {ch}: the step would change mid-run, refusing (--allow-leak-change accepts it)")
     return "resume: --allow-leak-change: " + ch
 
 
