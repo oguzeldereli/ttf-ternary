@@ -38,6 +38,93 @@ def ce_kd_dz(z, tgt, tlp, a):
     return loss, dz
 
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:          # (CPU-only installs: the torch path below)
+    triton = None
+
+FUSED_CEKD = [os.environ.get("TTF_HEAD_TORCH") != "1"]   # the Triton kernel for ce_kd_dz on CUDA bf16 logits (9 Nov)
+
+if triton is not None:
+    @triton.jit
+    def _cekd_kernel(z_ptr, t_ptr, tgt_ptr, dz_ptr, nll_ptr, kl_ptr, V, sz, st, sd, ca, ak,
+                     HAS_T: tl.constexpr, BLOCK: tl.constexpr):
+        """one row: lse of z (two passes: max, then sum), the teacher's sums, then dz in a third pass; z / tl read
+        as bf16 and computed in fp32 (as the torch path's .float()), dz written as bf16 (its only use)"""
+        row = tl.program_id(0).to(tl.int64)
+        zr = z_ptr + row * sz
+        tr = t_ptr + row * st
+        dr = dz_ptr + row * sd
+        tgt = tl.load(tgt_ptr + row)
+        ok = tgt != -1
+        tg = tl.where(ok, tgt, 0)
+        offs = tl.arange(0, BLOCK)
+        mx = tl.full([BLOCK], float("-inf"), tl.float32)
+        for v0 in range(0, V, BLOCK):
+            o = v0 + offs
+            mx = tl.maximum(mx, tl.load(zr + o, mask=o < V, other=float("-inf")).to(tl.float32))
+        m = tl.max(mx, 0)
+        se = tl.zeros([BLOCK], tl.float32)
+        spt = tl.zeros([BLOCK], tl.float32)
+        sptd = tl.zeros([BLOCK], tl.float32)
+        for v0 in range(0, V, BLOCK):
+            o = v0 + offs
+            msk = o < V
+            zb = tl.load(zr + o, mask=msk, other=float("-inf")).to(tl.float32)
+            se += tl.exp(zb - m)
+            if HAS_T:
+                tb = tl.load(tr + o, mask=msk, other=float("-inf")).to(tl.float32)
+                pt = tl.exp(tb)
+                spt += pt
+                sptd += tl.where(msk, pt * (tb - zb), 0.0)     # sum pt (tl - z): KL = this + lse sum pt
+        lse = m + tl.log(tl.sum(se, 0))
+        zt = tl.load(zr + tg).to(tl.float32)
+        tl.store(nll_ptr + row, tl.where(ok, lse - zt, 0.0))
+        S = 0.0
+        if HAS_T:
+            S = tl.sum(spt, 0)
+            tl.store(kl_ptr + row, tl.sum(sptd, 0) + lse * S)
+        okf = tl.where(ok, 1.0, 0.0)
+        coef = ca * okf + ak * S
+        for v0 in range(0, V, BLOCK):
+            o = v0 + offs
+            msk = o < V
+            zb = tl.load(zr + o, mask=msk, other=float("-inf")).to(tl.float32)
+            d = tl.exp(zb - lse) * coef
+            if HAS_T:
+                tb = tl.load(tr + o, mask=msk, other=float("-inf")).to(tl.float32)
+                d -= ak * tl.exp(tb)
+            d -= tl.where(o == tg, ca * okf, 0.0)
+            tl.store(dr + o, d.to(tl.bfloat16), mask=msk)
+
+
+def ce_kd_dz_fused(zb, tgt, tlp, a):
+    """ce_kd_dz from bf16 logits zb [n, V] on CUDA (the Triton kernel): (loss, dz bf16). Same maths; the sums in
+    another order (fp32), dz rounded to bf16 once (the torch path rounds its fp32 dz to bf16 for dh)"""
+    n, V = zb.shape
+    zb = zb.contiguous()
+    t_ = tlp.contiguous() if tlp is not None else zb
+    dz = torch.empty_like(zb, dtype=torch.bfloat16)
+    nll = torch.empty(n, device=zb.device, dtype=torch.float32)
+    kl = torch.empty(n, device=zb.device, dtype=torch.float32)
+    if tlp is not None:
+        ca, ak = (0.0 if a >= 1.0 else 1 - a), min(a, 1.0)
+    else:
+        ca, ak = 1.0, 0.0
+    _cekd_kernel[(n,)](zb, t_, tgt.contiguous(), dz, nll, kl, V, zb.stride(0), t_.stride(0), dz.stride(0),
+                       float(ca), float(ak), HAS_T=tlp is not None, BLOCK=4096, num_warps=8)
+    nl = nll.sum()
+    if tlp is None:
+        return nl, dz
+    k = kl.sum()
+    return (k if a >= 1.0 else (1 - a) * nl + a * k), dz
+
+
+def _fused_ok(h, w):
+    return FUSED_CEKD[0] and triton is not None and h.is_cuda and h.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
+
+
 def topk_dz(z, tgt, ids, tlp, a, mode):
     """as ce_kd_dz for qwen._kd_topk_chunk ((1 - a) CE + a KD to the teacher's top k, mode 'rest' / 'renorm')"""
     lse = torch.logsumexp(z, -1, keepdim=True)
@@ -69,7 +156,10 @@ class _HeadLossFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h, w, tgt, tlp, a):
         with torch.no_grad():
-            loss, dz = ce_kd_dz(F.linear(h, w).float(), tgt, tlp, a)
+            if _fused_ok(h, w):     # bf16 logits straight into the kernel: no fp32 [n, V] tensors
+                loss, dz = ce_kd_dz_fused(F.linear(h, w), tgt, tlp, a)
+            else:
+                loss, dz = ce_kd_dz(F.linear(h, w).float(), tgt, tlp, a)
             dh = torch.mm(dz.to(h.dtype), w, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dz.to(h.dtype) @ w
         ctx.save_for_backward(dh); ctx.h_dtype = h.dtype
         return loss
@@ -117,8 +207,11 @@ class _HeadLossTrainFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, h, w, tgt, tlp, a, acc):
         with torch.no_grad():
-            loss, dz = ce_kd_dz(F.linear(h, w).float(), tgt, tlp, a)
-            dzb = dz.to(h.dtype)
+            if _fused_ok(h, w):
+                loss, dzb = ce_kd_dz_fused(F.linear(h, w), tgt, tlp, a)
+            else:
+                loss, dz = ce_kd_dz(F.linear(h, w).float(), tgt, tlp, a)
+                dzb = dz.to(h.dtype); del dz
             dh = torch.mm(dzb, w, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dzb @ w
             dW = torch.mm(dzb.T, h, out_dtype=torch.float32) if h.dtype == torch.bfloat16 else dzb.T.float() @ h.float()
             if acc.get("dW") is None:
