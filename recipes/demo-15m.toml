@@ -1,0 +1,21 @@
+# A few-minute demo: a 15M Llama-style model (preset s15) from scratch on 20M tokens of Wikipedia (Llama 32k
+# tokenizer), TTF against BitNet b1.58 (master weights + straight-through) and full precision, same data and schedule.
+#   python3 scripts/data/prep_wiki.py 2e7 --tokenizer llama --val_tokens 1000000 --out_prefix data/demo
+#   python -m ttf.train --recipe demo-15m --out-dir runs/demo-ttf
+#   python -m ttf.train --recipe demo-15m --mode bitnet --out-dir runs/demo-bitnet
+mode = "ttf"
+preset = "s15"
+data = "data/demo_train.bin"
+val = "data/demo_val.bin"
+seq-len = 1024
+batch-size = 16
+accum = 1
+steps = 1200
+warmup = 60
+lr = 2e-3
+min-lr = 2e-4
+eval-interval = 200
+eval-iters = 20
+save-secs = 600
+ttf-rank = 128
+ttf-theta = 16
