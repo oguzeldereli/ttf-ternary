@@ -49,9 +49,8 @@ git clone https://github.com/oguzeldereli/ttf-ternary && cd ttf-ternary && pip i
 ```
 
 Extras: `[qwen]` for Qwen3.5 / 3.8 (transformers 5.19, flash-linear-attention), `[data]` for the data scripts,
-`[test]` for pytest. Optional, faster at ranks of 256 and up: clone
-[spanqr](https://github.com/oguzeldereli/spanqr) and put it on `PYTHONPATH`; `--ttf-orth auto` (the default) uses it
-when it imports.
+`[test]` for pytest. Optional, faster at ranks of 256 and up:
+`pip install git+https://github.com/oguzeldereli/spanqr`; `--ttf-orth auto` (the default) uses it when it imports.
 
 Check the install: `pytest -q -m "not gpu"` (CPU, a few seconds) and `pytest -q` on the GPU machine.
 
@@ -64,10 +63,20 @@ estimator) on the same data and schedule ([recipes/demo-15m.toml](recipes/demo-1
 python3 scripts/data/prep_wiki.py 2e7 --tokenizer llama --val_tokens 1000000 --out_prefix data/demo   # ~5 min download
 python -m ttf.train --recipe demo-15m --out-dir runs/demo-ttf
 python -m ttf.train --recipe demo-15m --mode bitnet --out-dir runs/demo-bitnet
-python -m ttf.train --recipe demo-15m --mode fp32 --out-dir runs/demo-fp32          # the full-precision reference
+python -m ttf.train --recipe demo-15m --mode fp32 --lr 1.5e-3 --min-lr 1.5e-4 --out-dir runs/demo-fp32   # reference
 ```
 
-DEMO_TABLE
+Measured on an RTX 4070 Ti Super, three seeds each (final validation loss; lower is better):
+
+| method | val loss (mean of 3) | seeds | time per run | peak VRAM |
+|---|---|---|---|---|
+| TTF | 4.470 | 4.401 / 4.407 / 4.603 | 4 min | 4.1 GiB |
+| BitNet b1.58 | 4.522 | 4.409 / 4.596 / 4.562 | 3 min | 4.4 GiB |
+| full precision | 4.463 | 4.494 / 4.449 / 4.446 | 2 min | 2.6 GiB |
+
+At this size and budget (1.3 tokens per parameter) the seed-to-seed spread (~0.2) is larger than the differences
+between the methods; the demo checks the install and the pipeline. The measured comparisons are the 110M run below and
+the paper.
 
 Every run writes `train.log`, `metrics.jsonl` and `ckpt.pt` to its `--out-dir`; `--resume` continues it.
 
@@ -167,10 +176,14 @@ weight at every size: about one byte per weight at the 12 bits the accumulator t
   32 (rank 340 at 12 bits 2.7086 vs rank 128 at 32 bits 2.8410).
 - **Checkpointing is chosen from measured memory** (`--ckpt-skip auto`, the default): blocks keep their activations
   while the GPU has room, then the int8 trit cache.
-- **Use the largest micro-batch that fits:** for the same tokens per step, 2 x 8 is 25% faster than 1 x 16 on a
-  0.8B conversion (11.4 vs 15.1 s per step on a 4070 Ti Super).
+- **Use the largest micro-batch that fits.** For the same 32k tokens per step on a 0.8B conversion (4070 Ti Super),
+  with the head kernel below:
+  - 2 x 8 micro-batches take 8.9 s per step, against 12.7 s for 1 x 16 (15.1 s for 1 x 16 before the kernel);
+  - 4 x 4 does not fit in 16 GB: the teacher's logits alone need 3.8 GiB.
 - **The loss head** of large vocabularies (Qwen's 248k) runs in one Triton kernel: 3.3x faster and 2.4 GiB less
   transient memory per 512-token chunk than the PyTorch ops.
+- **Orthonormal bases** come from [spanqr](https://github.com/oguzeldereli/spanqr) at accumulator ranks of 256 and up
+  when it is installed (`--ttf-orth auto`). Below 256, Householder QR is as fast.
 
 ## Main options
 
