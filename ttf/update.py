@@ -363,12 +363,13 @@ def _orth_(X):
         return torch.linalg.qr(X)[0]
     if ORTH[0] == "spanqr":
         # spanqr (github.com/oguzeldereli/spanqr: robust Cholesky QR with its own kernels, no host sync; above r 512 block
-        # Gram-Schmidt over 256-column blocks). It takes r a multiple of 32 (<= 512) or of 256 (above): other widths
-        # are padded with zero columns and the first r columns of Q kept (Cholesky QR is triangular, X = Q[:, :r]
-        # R[:r, :r], so they span X; the padding's columns come out as arbitrary completing directions and are
-        # dropped). CPU, or K below the padded width: Householder
+        # Gram-Schmidt over 256-column blocks). Widths: a multiple of 64 (<= 512) or of 256 (above); others are padded
+        # with zero columns and the first r columns of Q kept (Cholesky QR is triangular, X = Q[:, :r] R[:r, :r], so
+        # they span X; the padding's columns come out as arbitrary completing directions and are dropped). spanqr
+        # 4986987 returns NaN at odd multiples of 32 (32, 96, 160 on a 4070 Ti Super, 9 Nov), hence 64. CPU, or K
+        # below the padded width: Householder
         K, r = X.shape
-        rp = -(-r // 32) * 32 if r <= 512 else -(-r // 256) * 256
+        rp = -(-r // 64) * 64 if r <= 512 else -(-r // 256) * 256
         if not X.is_cuda or K < rp:
             return torch.linalg.qr(X)[0]
         if _SPANQR[0] is None:
