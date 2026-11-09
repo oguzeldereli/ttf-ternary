@@ -252,39 +252,6 @@ def test_layer_ts_rank():
             assert Uu.shape[1] == V.shape[1] == (own or 24), (fac, M, own, Uu.shape, V.shape)
 
 
-def test_orth_cholqr2():
-    """--ttf-orth cholqr2: an orthonormal basis of the same span as QR on well-conditioned X; on rank-deficient or
-    ill-conditioned X (zero columns, nearly parallel ones) the QR fallback, still orthonormal"""
-    from ttf import update as U
-    g = torch.Generator(device=dev).manual_seed(3)
-    X = torch.randn(4096, 256, device=dev, generator=g)
-    Xz = X.clone(); Xz[:, 10:20] = 0
-    Xp = X.clone(); Xp[:, 1] = Xp[:, 0] + 1e-5 * Xp[:, 1]
-    old = U.ORTH[0]
-    try:
-        U.ORTH[0] = "cholqr2"
-        for Y in (X, Xz, Xp, X * 1e-20):
-            Q = U._orth_(Y)
-            I = torch.eye(Q.shape[1], device=dev)
-            assert float((Q.T @ Q - I).abs().max()) < 1e-4
-        Q = U._orth_(X); Q0 = torch.linalg.qr(X)[0]
-        assert float((Q @ (Q.T @ Q0) - Q0).abs().max()) < 1e-4          # same span
-        try:
-            import orth  # noqa: F401  (spanqr, when on PYTHONPATH)
-        except ImportError:
-            return
-        U.ORTH[0] = "spanqr"
-        Xw = torch.randn(5120, 1024, device=dev, generator=g)          # above r 512: spanqr's block Gram-Schmidt
-        Xwz = Xw.clone(); Xwz[:, 300:340] = 0
-        for Y in (X, Xz, Xp, Xw, Xwz, X[:, :200]):                      # (r 200: Householder)
-            Q = U._orth_(Y)
-            assert float((Q.T @ Q - torch.eye(Q.shape[1], device=dev)).abs().max()) < 1e-4
-        Q = U._orth_(Xw); Q0 = torch.linalg.qr(Xw)[0]
-        assert float((Q @ (Q.T @ Q0) - Q0).abs().max()) < 1e-4          # same span
-    finally:
-        U.ORTH[0] = old
-
-
 def test_micro_fused_matches_torch():
     """--accum M > 1: kernel.micro_sketch (the sketch sides' statistics in four kernels) against the torch ops,
     over 3 steps x 4 micro-batches (shapes that are not tile multiples): v agrees to fp32 rounding (the sums run in

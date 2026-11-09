@@ -348,46 +348,32 @@ def _orth(X):
 
 
 STEP_FP32 = [False]   # --ttf-step-fp32: the accumulator's U in fp32 between a step's micro-batches (see _ts_layer_factored)
-ORTH = ["qr"]   # --ttf-orth: qr (Householder), cholqr2 (two Cholesky QR passes, QR where they would fail), or spanqr
-                # (the trainer's default since 9 Nov when the spanqr package is importable: --ttf-orth auto)
+ORTH = ["qr"]   # --ttf-orth: qr (Householder) or spanqr (the spanqr package; --ttf-orth auto picks it where it runs)
 _SPANQR = [None]  # (the spanqr package's orth: robust shifted Cholesky QR, no host sync; above r 512 block Gram-Schmidt)
 
 
 def _orth_(X):
-    """orthonormal basis of the columns of X (tall, K x r), Householder QR. Only the span matters to TTF
-    (A = U V^T does not depend on the basis chosen). cholqr2: Q = X R^-1 with R^T R the Cholesky factorisation of
-    X^T X, twice (the second pass restores orthogonality to fp32 rounding when the first is within 0.1 of it, i.e.
-    cond(X) below ~1e3); otherwise (rank deficient, ill conditioned: Cholesky QR would lose directions) Householder QR.
-    One host sync per call for that check."""
+    """orthonormal basis of the columns of X (tall, K x r): Householder QR, or spanqr's (--ttf-orth spanqr). Only the
+    span matters to TTF (A = U V^T does not depend on the basis chosen)."""
     if ORTH[0] == "qr" or X.dtype != torch.float32 or X.shape[0] < X.shape[1]:
         return torch.linalg.qr(X)[0]
-    if ORTH[0] == "spanqr":
-        # spanqr (github.com/oguzeldereli/spanqr: robust Cholesky QR with its own kernels, no host sync; above r 512 block
-        # Gram-Schmidt over 256-column blocks). Widths: a multiple of 64 (<= 512) or of 256 (above); others are padded
-        # with zero columns and the first r columns of Q kept (Cholesky QR is triangular, X = Q[:, :r] R[:r, :r], so
-        # they span X; the padding's columns come out as arbitrary completing directions and are dropped). spanqr
-        # 4986987 returns NaN at odd multiples of 32 (32, 96, 160 on a 4070 Ti Super, 9 Nov), hence 64. CPU, or K
-        # below the padded width: Householder
-        K, r = X.shape
-        rp = -(-r // 64) * 64 if r <= 512 else -(-r // 256) * 256
-        if not X.is_cuda or K < rp:
-            return torch.linalg.qr(X)[0]
-        if _SPANQR[0] is None:
-            from orth import orth as _o
-            _SPANQR[0] = _o
-        if rp == r:
-            return _SPANQR[0](X.contiguous())
-        Xp = X.new_zeros(K, rp); Xp[:, :r] = X
-        return _SPANQR[0](Xp)[:, :r].contiguous()
-    L1, i1 = torch.linalg.cholesky_ex(X.T @ X)
-    Q = torch.linalg.solve_triangular(L1.T, X, upper=True, left=False)
-    G2 = Q.T @ Q
-    L2, i2 = torch.linalg.cholesky_ex(G2)
-    G2.diagonal().sub_(1.0)
-    ok = (i1 == 0) & (i2 == 0) & (G2.abs().amax() < 0.1)
-    if not bool(ok):
+    # spanqr (github.com/oguzeldereli/spanqr: robust Cholesky QR with its own kernels, no host sync; above r 512 block
+    # Gram-Schmidt over 256-column blocks). Widths: a multiple of 64 (<= 512) or of 256 (above); others are padded
+    # with zero columns and the first r columns of Q kept (Cholesky QR is triangular, X = Q[:, :r] R[:r, :r], so
+    # they span X; the padding's columns come out as arbitrary completing directions and are dropped). spanqr
+    # 4986987 returns NaN at odd multiples of 32 (32, 96, 160 on a 4070 Ti Super, 9 Nov), hence 64. CPU, or K
+    # below the padded width: Householder
+    K, r = X.shape
+    rp = -(-r // 64) * 64 if r <= 512 else -(-r // 256) * 256
+    if not X.is_cuda or K < rp:
         return torch.linalg.qr(X)[0]
-    return torch.linalg.solve_triangular(L2.T, Q, upper=True, left=False)
+    if _SPANQR[0] is None:
+        from orth import orth as _o
+        _SPANQR[0] = _o
+    if rp == r:
+        return _SPANQR[0](X.contiguous())
+    Xp = X.new_zeros(K, rp); Xp[:, :r] = X
+    return _SPANQR[0](Xp)[:, :r].contiguous()
 
 
 DEFER = [None]   # --pipe, a stage after the first: the last micro-batch's per-layer updates collected here (qwen.pp_train)
