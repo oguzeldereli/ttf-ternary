@@ -937,10 +937,16 @@ def main():
             from .update import STEP_FP32 as _SF
             _SF[0] = True
             print("--ttf-step-fp32: U in fp32 between micro-batches, encoded once per step", flush=True)
+        if args.ttf_orth == "auto":   # spanqr where it can run (the package on the path, CUDA), else Householder
+            try:
+                import orth as _sq   # noqa: F401  (the spanqr package)
+                args.ttf_orth = "spanqr" if device == "cuda" else "qr"
+            except ImportError:
+                args.ttf_orth = "qr"
         if args.ttf_orth != "qr":
             from .update import ORTH as _OR
             _OR[0] = args.ttf_orth
-            print(f"--ttf-orth {args.ttf_orth}", flush=True)
+        print(f"--ttf-orth {args.ttf_orth}", flush=True)
         if args.factored_k:
             print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
             if args.dw_thin == "dense":   # thin layers (adapter factors): the dense gradient is cheaper than the factors

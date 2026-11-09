@@ -349,6 +349,7 @@ def _orth(X):
 
 STEP_FP32 = [False]   # --ttf-step-fp32: the accumulator's U in fp32 between a step's micro-batches (see _ts_layer_factored)
 ORTH = ["qr"]   # --ttf-orth: qr (Householder), cholqr2 (two Cholesky QR passes, QR where they would fail), or spanqr
+                # (the trainer's default since 9 Nov when the spanqr package is importable: --ttf-orth auto)
 _SPANQR = [None]  # (the spanqr package's orth: robust shifted Cholesky QR, no host sync; above r 512 block Gram-Schmidt)
 
 
@@ -361,17 +362,22 @@ def _orth_(X):
     if ORTH[0] == "qr" or X.dtype != torch.float32 or X.shape[0] < X.shape[1]:
         return torch.linalg.qr(X)[0]
     if ORTH[0] == "spanqr":
-        # spanqr (github.com/userreli/spanqr; 4080 laptop, 5120 x 256: 0.90 ms against cholqr2's 1.11 and
-        # Householder's 3.47). Above r 512 (r a multiple of 256) its block Gram-Schmidt over 256-column blocks (spanqr
-        # 4986987: 22/22 robustness cases at 5120 / 6144 / 17408 x 1024; 5120 x 1024 10.5 ms against Householder's
-        # 11.9). The shapes it does not take (r not a multiple of 32, r > 512 not a multiple of 256, CPU): Householder
-        r = X.shape[1]
-        if not (X.is_cuda and r % 32 == 0 and (r <= 512 or r % 256 == 0)):
+        # spanqr (github.com/oguzeldereli/spanqr: robust Cholesky QR with its own kernels, no host sync; above r 512 block
+        # Gram-Schmidt over 256-column blocks). It takes r a multiple of 32 (<= 512) or of 256 (above): other widths
+        # are padded with zero columns and the first r columns of Q kept (Cholesky QR is triangular, X = Q[:, :r]
+        # R[:r, :r], so they span X; the padding's columns come out as arbitrary completing directions and are
+        # dropped). CPU, or K below the padded width: Householder
+        K, r = X.shape
+        rp = -(-r // 32) * 32 if r <= 512 else -(-r // 256) * 256
+        if not X.is_cuda or K < rp:
             return torch.linalg.qr(X)[0]
         if _SPANQR[0] is None:
             from orth import orth as _o
             _SPANQR[0] = _o
-        return _SPANQR[0](X.contiguous())
+        if rp == r:
+            return _SPANQR[0](X.contiguous())
+        Xp = X.new_zeros(K, rp); Xp[:, :r] = X
+        return _SPANQR[0](Xp)[:, :r].contiguous()
     L1, i1 = torch.linalg.cholesky_ex(X.T @ X)
     Q = torch.linalg.solve_triangular(L1.T, X, upper=True, left=False)
     G2 = Q.T @ Q

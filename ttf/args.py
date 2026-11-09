@@ -94,10 +94,11 @@ def build_parser():
                         "~0.77 of a 1:3.4 one) is held dense instead: U V^T would take as much memory")
     g.add_argument("--ttf-step-fp32", action=ON, default=False, help="--accum M > 1: keep U in fp32 between a step's "
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
-    g.add_argument("--ttf-orth", default="qr", choices=["qr", "cholqr2", "spanqr"],
-                   help="the accumulator basis' orthonormalisation: Householder QR, Cholesky QR twice (QR where it would "
-                        "fail), or spanqr (the spanqr package on PYTHONPATH; above rank 512 its block Gram-Schmidt, needs rank %% 256 "
-                        "== 0; other shapes Householder)")
+    g.add_argument("--ttf-orth", default="auto", choices=["auto", "qr", "cholqr2", "spanqr"],
+                   help="the accumulator basis' orthonormalisation: auto (default: spanqr when the package imports and "
+                        "the run is on CUDA, else qr), Householder QR, Cholesky QR twice (QR where it would fail; unstable "
+                        "in training), or spanqr (the spanqr package on PYTHONPATH, github.com/oguzeldereli/spanqr; any "
+                        "rank, padded to its widths; 110M 1.41 -> 1.37 s/step)")
     g.add_argument("--ttf-theta", type=float, default=16.0, help="the base firing threshold (in units of the step); the "
                    "theta schedule: --ttf-theta-start at step 0, this at the end of the lr warmup, --ttf-theta-end at the "
                    "last step, cosines between them in the step (rescale form: the bar stays here, the step base / "
