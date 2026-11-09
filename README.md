@@ -1,35 +1,132 @@
 # ttf-ternary
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23394608.svg)](https://doi.org/10.5281/zenodo.23394608)
+[![tests](https://github.com/oguzeldereli/ttf-ternary/actions/workflows/tests.yml/badge.svg)](https://github.com/oguzeldereli/ttf-ternary/actions/workflows/tests.yml)
 
-Ternary ({-1, 0, 1}) language models trained **without full-precision master weights**, from scratch or from a
-converted ternary checkpoint (the conversion itself is a separate package since 0.2.0). The weights stay packed at 1.6 bits (5 trits per byte) during
-training; the optimizer state is low-rank, so it grows with the layers' widths rather than with the number of weights.
+Train ternary ({-1, 0, +1}) language models **without full-precision master weights**. The weights stay packed at 1.6
+bits (5 trits per byte) for the whole of training. The optimizer state is low-rank, about one byte per weight in place
+of the 12-16 bytes of master weights plus Adam. A 23B-parameter model trains on one 16 GB GPU, and a converted
+Qwen3.8-27B trains on one 24 GB card.
 
-The method is **two-timescale threshold flips (TTF)**, `--mode ttf` (the default). The Adam-normalised gradient, with a factored second
-moment, feeds a leaky accumulator kept at low rank. A weight moves one level when its accumulated evidence crosses a
-threshold, and the threshold is then spent from the accumulator. The trits are the only per-weight state. TTF came
-out of an ablation of master-weight training, which showed what master weights provide: an integrator of normalised
-evidence with a memory of about 1000 steps, and immediate moves when it crosses a boundary; neither a full-rank first
-moment nor a per-weight second moment.
+The method is **two-timescale threshold flips (TTF)**. The Adam-normalised gradient (with a factored second moment)
+feeds a leaky accumulator kept at low rank. A weight moves one level when its accumulated evidence crosses a threshold,
+and the threshold is then spent from the accumulator. The trits are the only per-weight state.
 
-The paper, *Training Ternary Language Models Without Master Weights* ([paper/ttf_paper1_training.pdf](paper/ttf_paper1_training.pdf),
-LaTeX source and figures in [paper/](paper/); submitted to arXiv 29 Oct 2026), has every result below with its run, and an
-appendix indexing every mechanism that was tried with its result.
+Paper: [*Training Ternary Language Models Without Master Weights*](paper/ttf_paper1_training.pdf) (in this repository;
+LaTeX source in [paper/](paper/)). It has every result below with its run, and an appendix of every mechanism tried.
+
+**The TTF family**
+
+| repository | what it does |
+|---|---|
+| **ttf-ternary** (this one) | the trainer: TTF from scratch or from a ternary checkpoint, Llama-style models and Qwen3.5 / 3.8 (dense and Flash-Next MoE), BitNet b1.58 and full-precision baselines, evaluation |
+| [ttf-conversion](https://github.com/oguzeldereli/ttf-conversion) | converts a pretrained Hugging Face model to a ternary checkpoint this trainer continues from |
+| [ttf-home](https://github.com/oguzeldereli/ttf-home) | one command line for a home computer: prepare data, train, convert, fine-tune, export to GGUF, chat / serve with llama.cpp |
+| [spanqr](https://github.com/oguzeldereli/spanqr) (optional) | a faster robust orthonormal basis for the accumulator, used automatically when installed |
+
+**Released models** (Hugging Face; GGUF files for ttf-home's llama.cpp):
+
+| model | file | GSM8K (first 200) | HumanEval | runs on |
+|---|---|---|---|---|
+| [ttf-Qwen3.8-27B-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-27B-GGUF) | 10.2 GB | 0.895 (full precision 0.895) | 0.841 (0.933) | one 12 GB GPU |
+| [ttf-Qwen3.8-Flash-Next-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-Flash-Next-GGUF) | 40.4 GB | 0.905 (FP8 0.905) | 0.848 (0.927) | a 24 GB GPU + 64 GB RAM (experts on the CPU) |
+
+## Requirements
+
+- Linux with an NVIDIA GPU (CUDA). The kernels are Triton and use the int8 tensor cores; measured on RTX 3090 Ti,
+  4070 Ti Super, 4080 Laptop and RTX PRO 6000. A 16 GB card trains up to ~1B parameters directly and much larger
+  models with the state offloaded to host memory.
+- Python 3.11+, PyTorch 2.13+ (with its Triton).
+- macOS and Windows are not supported for training. The CPU runs the test suite only. To *run* the trained models on
+  any machine, use [ttf-home](https://github.com/oguzeldereli/ttf-home) (llama.cpp: CUDA, Metal, Vulkan or CPU).
+
+## Install
+
+```bash
+pip install "ttf-ternary[data] @ git+https://github.com/oguzeldereli/ttf-ternary"
+# or, to edit the code and use the recipes and scripts:
+git clone https://github.com/oguzeldereli/ttf-ternary && cd ttf-ternary && pip install -e ".[data,test]"
+```
+
+Extras: `[qwen]` for Qwen3.5 / 3.8 (transformers 5.19, flash-linear-attention), `[data]` for the data scripts,
+`[test]` for pytest. Optional, faster at ranks of 256 and up: clone
+[spanqr](https://github.com/oguzeldereli/spanqr) and put it on `PYTHONPATH`; `--ttf-orth auto` (the default) uses it
+when it imports.
+
+Check the install: `pytest -q -m "not gpu"` (CPU, a few seconds) and `pytest -q` on the GPU machine.
+
+## Quickstart: a few minutes on one GPU
+
+A 15M model from scratch on 20M tokens of Wikipedia, TTF against BitNet b1.58 (master weights + straight-through
+estimator) on the same data and schedule ([recipes/demo-15m.toml](recipes/demo-15m.toml)):
+
+```bash
+python3 scripts/data/prep_wiki.py 2e7 --tokenizer llama --val_tokens 1000000 --out_prefix data/demo   # ~5 min download
+python -m ttf.train --recipe demo-15m --out-dir runs/demo-ttf
+python -m ttf.train --recipe demo-15m --mode bitnet --out-dir runs/demo-bitnet
+python -m ttf.train --recipe demo-15m --mode fp32 --out-dir runs/demo-fp32          # the full-precision reference
+```
+
+DEMO_TABLE
+
+Every run writes `train.log`, `metrics.jsonl` and `ckpt.pt` to its `--out-dir`; `--resume` continues it.
+
+## The paper's 110M run
+
+```bash
+python3 scripts/data/prep_wiki.py 4e8 --tokenizer llama --out_prefix data/wiki32k    # 400M tokens of Wikipedia
+python -m ttf.train --recipe scratch-110m --out-dir runs/ttf                          # ~3.5 h on a 4070 Ti Super
+python -m ttf.train --recipe scratch-110m --mode bitnet --out-dir runs/bitnet
+python scripts/eval/final_eval.py runs/ttf runs/bitnet                                # all 974 validation windows
+python scripts/eval/compare.py runs/ttf runs/bitnet --set fw                          # paired, on FineWeb-Edu
+```
+
+## Train a converted model
+
+Convert a pretrained model with [ttf-conversion](https://github.com/oguzeldereli/ttf-conversion), then train the
+ternary checkpoint here with distillation from the original. Qwen3.5-0.8B on one 16 GB GPU:
+
+```bash
+pip install -e ".[qwen]" "ttf-conversion @ git+https://github.com/oguzeldereli/ttf-conversion"
+hf download Qwen/Qwen3.5-0.8B-Base --local-dir models/Qwen3.5-0.8B-Base
+M=models/Qwen3.5-0.8B-Base
+# the Wikipedia tokens of the 110M run, re-tokenized for Qwen (uint32)
+python scripts/quant/retok.py data/wiki32k_train.bin data/wikiqw_train.bin --target $M --max_tokens 6e7
+python scripts/quant/retok.py data/wiki32k_val.bin data/wikiqw_val.bin --target $M
+# convert: norm gains folded + a Hadamard rotation of the residual stream, ternary GPTQ, ternary low-rank adapters
+python -m ttfconv.convert --model $M --data data/wikiqw_train.bin --out runs/conv08 \
+    --ext ttfconv.fold --ext "ttfconv.adapters:rank=0.2,alt=1"
+# 1000 steps of TTF recovery (32k tokens per step; ttf-conversion's recipe)
+python -m ttf.train --recipe PATH/TO/ttf-conversion/recipes/qwen-0.8b.toml --arch-hf $M --init-ckpt runs/conv08/ckpt.pt \
+    --teacher $M --data data/wikiqw_train.bin --val data/wikiqw_val.bin --batch-size 2 --accum 8 \
+    --ext ttfconv.fold --ext "ttfconv.adapters:rank=0.2,alt=1" --out-dir runs/q08
+```
+
+Qwen3.8-27B: ttf-conversion's [docs/CONVERT_27B.md](https://github.com/oguzeldereli/ttf-conversion/blob/main/docs/CONVERT_27B.md)
+and `--recipe continue-27b` here (2 x 8 micro-batches of 2048 tokens on one 24 GB GPU, a cached teacher with
+`--kd-cache`). Qwen3.8-Flash-Next (512 experts per layer) has its own layer-major trainer: [docs/Q38.md](docs/Q38.md).
+
+## Run a trained model
+
+- **GGUF / llama.cpp:** `ttf export` in [ttf-home](https://github.com/oguzeldereli/ttf-home) writes an ordinary GGUF
+  file. The export is exact (llama.cpp's next-token loss matches the trainer's).
+- **In Python:** `python scripts/infer/ttf_run.py run runs/demo-ttf/ckpt.pt -p "The history of"` (models trained
+  here; `ppl` scores a token file, `export` writes a small safetensors file) and `scripts/infer/ttf_qwen.py` (converted
+  Qwen, trits never expanded: 22.7 tokens/s for the 27B on a 12 GB laptop GPU).
 
 ## Results
 
 All numbers are validation loss (nats per token) on fixed windows: all 974 non-overlapping 2048-token windows of the
-Wikipedia validation set and 2000 windows of FineWeb-Edu, which was never used for any choice
-(`scripts/eval/final_eval.py`). "Master + extras" is the BitNet b1.58 straight-through recipe with exactly the same
-auxiliary float parameters as TTF (row / column scales, rank-16 float adapter, attention temperature): the fair
-reference.
+Wikipedia validation set, and 2000 windows of FineWeb-Edu, which was never used for any choice
+(`scripts/eval/final_eval.py`). "Master + extras" is BitNet b1.58 with exactly the auxiliary float parameters TTF has
+(row / column scales, rank-16 float adapter, attention temperature): the fair reference.
 
 **110M, 300M tokens of Wikipedia (Llama-2 32k tokenizer)**
 
 | method | Wikipedia | FineWeb-Edu |
 |---|---|---|
-| **TTF, rank 512 (final recipe)** | **2.6728** (seed 2: 2.6671) | **3.6226** (3.6168) |
+| **TTF, rank 512 (the paper's recipe)** | **2.6728** | **3.6226** |
+| TTF, the default θ schedule (seeds 1337 / 2) | 2.6741 / 2.6695 | |
 | TTF, full rank | 2.6480 | 3.5976 |
 | TTF, rank 512, no float extras | 2.6907 | 3.6435 |
 | master + extras | 2.7166 | 3.6830 |
@@ -38,7 +135,7 @@ reference.
 
 At 600M tokens of FineWeb-Edu TTF leads master + extras by 0.056 (3.0423 vs 3.0982).
 
-**Scale (fixed windows; TTF minus master + extras at its best learning rate)**
+**Scale (TTF minus master + extras at its best learning rate)**
 
 | size | TTF state (numbers per weight) | Wikipedia | FineWeb-Edu |
 |---|---|---|---|
@@ -48,131 +145,94 @@ At 600M tokens of FineWeb-Edu TTF leads master + extras by 0.056 (3.0423 vs 3.09
 | 1.3B | full rank 2048 (1.57) | −0.051 | −0.069 |
 | 2.9B (trained on FineWeb-Edu) | rank 1536 (0.79) | +0.002 | −0.004 |
 
-TTF's gap to master is a smooth function of the size of its state and closes at 0.57–0.70 numbers of state per weight
-at every size (about one byte per weight at the 12 bits the accumulator tolerates, against 12 bytes for master).
+TTF's gap to master is a smooth function of the size of its state, and closes at 0.57-0.70 numbers of state per
+weight at every size: about one byte per weight at the 12 bits the accumulator tolerates, against 12 bytes for master.
 
-**Converted pretrained models:** trits chosen by GPTQ onto the ternary grid, frozen while the float parts calibrate,
-then moved by TTF at a threshold four times the from-scratch one (a smaller threshold triggers an avalanche of harmful
-moves after a conversion). Since 28 Oct 2026 the conversion itself is the separate ttf-conversion package; its ternary
-checkpoints train here (`--arch-hf DIR --init-ckpt CKPT`).
+**Converted pretrained models** (the conversion is ttf-conversion's; the recovery training is TTF here)
 
 | model, recovery tokens | full precision | converted, before training | after |
 |---|---|---|---|
-| TinyLlama-1.1B, 50M | 1.875 | 8.01 | **2.2320**; with distillation 2.1878 (latent-weight conversion: 2.5973) |
-| Qwen3.5-0.8B-Base, 50M | 2.556 | 4.96 | 2.8503 (distillation does not help at this size) |
-| Qwen3.8-27B, 2M (probe) | 1.9034 | 3.8507 | 2.3644 (8 windows) |
+| TinyLlama-1.1B, 50M | 1.875 | 8.01 | **2.2320**; with distillation 2.1878 |
+| Qwen3.5-0.8B-Base, 50M | 2.556 | 4.96 | 2.8503 |
+| Qwen3.8-27B, 72M (the released model) | — | — | GSM8K 0.895 (full precision 0.895), HumanEval 0.841 (0.933), IFEval 0.735 (0.787) |
 
-Qwen3.8-27B is converted layer by layer (about 20 minutes) and trained on one 24 GB GPU (peak 21.2 GiB);
-the converted model runs on a 12 GB laptop GPU at 22.7 tokens per second (`scripts/infer/ttf_qwen.py`). The 27B row
-is an early 60-step probe; a release model (about 40M tokens of recovery with distillation) is in training.
+## Memory and speed
 
-## Memory
-
-- A 23.0B-parameter model (22.85B ternary) trains on one 16 GB GPU (11.1–11.6 GiB at ranks 256–1024, state in host memory with
-  asynchronous copies, `--ttf-offload async`; measured with `scripts/lab/b27_lean.sh` at tag `pre-consolidation-2026-10-17`).
-  At its leanest it peaks at 9.73 GiB.
-- **Qwen3.8-27B on one 24 GB GPU** (RTX 3090 Ti): a ternary checkpoint trained at 32k tokens per step (2 × 8 × 2048) in
-  68.9 s per step, peak 19.7 GB (`recipes/continue-27b.toml`).
-- **Micro-batches without a dense gradient** (with `--accum M`): each micro-batch's gradient enters the state and is
-  discarded (the basis held within the step, turned once after the last); 4 × 4 micro-batches match one pass of batch 16
-  over the full schedule (2.6733 vs 2.6728) at 3.1 instead of 7.4 GiB.
-- **State formats:** a 12-bit accumulator (`--ttf-store fp12s`: per-column scale, sign, 5 exponent and 6 mantissa
-  bits, two values in 3 bytes) matches 32 bits; at fixed memory a higher rank in 12 bits beats a lower rank in 32
-  (rank 340 at 12 bits 2.7086 vs rank 128 at 32 bits 2.8410).
-
-## Quickstart
-
-```bash
-pip install -e ".[data]"          # ".[qwen]" for Qwen3.5 / 3.8, ".[test]" for pytest; the ttf-train command = python -m ttf.train
-python3 scripts/data/prep_wiki.py 4e8 --tokenizer llama --out_prefix data/wiki32k     # Wikipedia, 32k vocab
-python3 -m scripts.data.prep_fineweb 2e9 --out_prefix data/fwedu32k                    # FineWeb-Edu (optional)
-
-# TTF, 110M, 300M tokens (the final recipe: recipes/scratch-110m.toml)
-python -m ttf.train --recipe scratch-110m --out-dir runs/ttf
-
-# BitNet b1.58 (master weights + STE) with the same float extras, and the full-precision model
-python -m ttf.train --recipe scratch-110m --mode bitnet --out-dir runs/bitnet
-python -m ttf.train --recipe scratch-110m --mode fp32 --out-dir runs/fp32
-
-# fixed-window evaluation, paired comparison, zero-shot
-python scripts/eval/final_eval.py runs/ttf runs/bitnet
-python scripts/eval/compare.py runs/ttf runs/bitnet --set fw
-python3 scripts/eval/zeroshot_tok.py && python scripts/eval/zeroshot.py runs/ttf
-
-# train a converted model (a ternary checkpoint from the ttf-conversion package; Llama architecture or Qwen3.5 / 3.8)
-python -m ttf.train --recipe continue-27b --arch-hf PATH/TO/Qwen3.8-27B --init-ckpt CKPT --kd-cache KD_DIR --out-dir runs/qw27
-```
-
-Add `--resume` to continue any run; any option on the command line overrides the recipe's. `python -m ttf.train
---help` lists every option with its default (the measured best). Commands from before 17 Oct 2026 (the flags of tag
-`pre-consolidation-2026-10-17`) translate with `ttf.args.from_legacy`; [docs/OPTIONS_MAP.md](docs/OPTIONS_MAP.md)
-lists the correspondence. The earlier methods (the stateless flip rule, low-rank momentum, look-ahead, TTF with a
-short momentum) run from a checkout of that tag (`python -m bitnet.train` there; ttf/legacy, its copy, was removed from the core on 25 Oct).
+- **23.0B parameters on one 16 GB GPU** (22.85B ternary; 11.1-11.6 GiB at ranks 256-1024) with the TTF state in host
+  memory and copies overlapped with the backward (`--ttf-offload async`).
+- **Qwen3.8-27B on one 24 GB GPU:** 32k tokens per step (2 x 8 x 2048), peak 19.7 GB (`--recipe continue-27b`).
+- **Micro-batches without a dense gradient** (`--accum M`): each micro-batch's gradient enters the state and is
+  dropped; 4 x 4 micro-batches match one pass of batch 16 (2.6733 vs 2.6728) at 3.1 instead of 7.4 GiB.
+- **12-bit state** (`--ttf-store fp12s`) matches 32-bit; at equal memory a higher rank in 12 bits beats a lower rank in
+  32 (rank 340 at 12 bits 2.7086 vs rank 128 at 32 bits 2.8410).
+- **Checkpointing is chosen from measured memory** (`--ckpt-skip auto`, the default): blocks keep their activations
+  while the GPU has room, then the int8 trit cache.
+- **Use the largest micro-batch that fits:** for the same tokens per step, 2 x 8 is 25% faster than 1 x 16 on a
+  0.8B conversion (11.4 vs 15.1 s per step on a 4070 Ti Super).
+- **The loss head** of large vocabularies (Qwen's 248k) runs in one Triton kernel: 3.3x faster and 2.4 GiB less
+  transient memory per 512-token chunk than the PyTorch ops.
 
 ## Main options
+
+`python -m ttf.train --help` lists every option with its default, which is the measured best. A recipe
+(`--recipe NAME`, [recipes/](recipes/)) sets defaults for a setting; any option on the command line overrides it.
 
 | option | what |
 |---|---|
 | `--mode ttf / bitnet / fp32` | TTF; BitNet b1.58 (latent weights, STE, AdamW); the full-precision model |
-| `--recipe NAME` | defaults for a setting (`recipes/`: scratch-110m, continue-27b) |
+| `--recipe NAME` | demo-15m, scratch-110m, continue-27b |
+| `--preset NAME` | model shape without `--arch-hf` (s15, small = 110M, d1024_l24 = 340M, d2048_l24 = 1.3B, b3, b27, ...) |
 | `--ttf-rank R` | rank of each layer's accumulator (512) |
-| `--ttf-theta`, `--ttf-tau` | base threshold (θ alone sets the step), fixed leak 1 − 1/τ |
-| `--ttf-theta-start`, `--ttf-theta-end` | θ schedule: start at step 0, base at the warmup's end, end at the last step, cosines between them in the step base/θ (defaults 4θ → θ → 5θ, 64 → 16 → 80 at the base 16; start = end = base: constant) |
-| `--dw factored / dense`, `--dw-sketch K` | the update from the gradient's factors, the dense weight gradient never formed |
-| `--dw-sketch-warm F` | with `--accum` > 1: a share F (0.75) of the turn's sketch rows on the accumulator's own range from the step before (0: a random sketch) |
-| `--ttf-store fp32 / bf16 / fp12s` | compressed accumulator |
-| `--ttf-offload async`, `--ttf-offload-keep F` | state in pinned host memory (all but the first share F of layers), copies overlapped with the backward |
+| `--ttf-theta`, `--ttf-tau` | base threshold (θ alone sets the step), leak 1 − 1/τ |
+| `--ttf-theta-start`, `--ttf-theta-end` | θ schedule: start at step 0, base at the warmup's end, end at the last step, cosines between them in the step base/θ (default 4θ → θ → 5θ; start = end = base for a constant θ) |
+| `--accum M`, `--batch-size B` | M micro-batches of B sequences per step |
+| `--dw-sketch K`, `--dw-sketch-warm F` | the update from the gradient's factors (no dense weight gradient), sketch size K |
+| `--ttf-store fp32 / bf16 / fp12s` | accumulator format |
+| `--ttf-offload async` | TTF state in pinned host memory, copies overlapped with the backward |
+| `--ttf-orth auto / qr / spanqr` | the accumulator basis' orthonormalisation |
 | `--adapter-rank R` | rank-R float adapter beside the trits (16) |
-| `--arch-hf DIR`, `--init-ckpt CKPT` | a Hugging Face architecture (Llama, Qwen3.5 / 3.8) and a ternary checkpoint of it to start from |
+| `--arch-hf DIR`, `--init-ckpt CKPT` | a Hugging Face architecture (Llama, Qwen3.5 / 3.8) and a ternary checkpoint of it |
 | `--teacher DIR`, `--kd-weight W`, `--kd-cache DIR` | distillation from the full-precision model, or from cached top-k targets |
-| `--ttf-start S` | trits frozen until step S (conversion) |
-| `--tern-emb tied / untied / tied_wide:M` | ternary token embedding (and head), trained by TTF |
-| `--moe E:K[:H]` | mixture of ternary experts, each with its own state |
+| `--ext MODULE[:SPEC]` | a structure plug-in (ttf-conversion's fold, ternary adapters, ...) |
+| `--tern-emb`, `--moe E:K[:H]` | ternary token embedding; a mixture of ternary experts |
 
 ## Layout
 
 ```
-ttf/          the package
-  train.py       training loop (python -m ttf.train); args.py: the options, recipes, from_legacy
-  update.py      TTF: ts_layer (the per-layer update), the factored update, state codecs, host offload
-  layers.py      the ternary layer (packed trits, scales, adapter, gradient capture / fused hooks)
-  kernel.py      Triton kernels (int8 / bf16 GEMMs, input gradient, packing, firing, codecs, fused norms)
-  schedule.py, data.py, eval.py   lr and TTF schedules, batches and KD-cache windows, validation loss
-  hf_load.py     Hugging Face Llama shapes and full-precision weights (--mode fp32 / bitnet, the --teacher)
-  qwen.py        Qwen3.5 / 3.8 (Gated DeltaNet + attention) with ternary linears, pipeline stages, chunked loss / KD
-  master.py      BitNet b1.58 (--mode bitnet); tern_emb.py: ternary embeddings; opt_lean.py: LeanAdam
-  model.py, config.py   Llama-style transformer, presets (small = 110M, d1024_l24 = 340M, d2048_l24 = 1.3B, b27)
-  results.py     the results database (results/runs.jsonl): runs, events, results, notes
-  q38/           Qwen3.8-Flash-Next (MoE) in TTF: model, batched expert TTF, grouped GEMMs, layer-major trainer
-                 (docs/Q38.md)
-recipes/       TOML defaults for the measured settings (scratch-110m, continue-27b)
-scripts/
-  results.py     the database's command line (status, table, show, find, note, ingest, validate)
-  infer/         ttf_run.py (our models), ttf_qwen.py + ttf_kernels.py (converted Qwen, 2-bit dp4a decode)
-  eval/          final_eval.py, compare.py, zeroshot*.py, gen_bench.py, genwrap.py; q38_*: Qwen3.8 generation / zero-shot
-  prof/          step-time and memory profilers (README.md)
-  quant/, analysis/, data/   teacher caches, diagnostics (gradient and rank spectra, memory, move capture), data preparation
-  tests/         kernel checks and benchmarks, det_run.py (deterministic runs)
-tests/         pytest (-m "not gpu" anywhere; the gpu tests on a CUDA machine); checks/: script checks
-examples/vit/  a CIFAR-100 ViT: TTF vs master weights (STE) vs full precision
-docs/          see below
+ttf/            the package
+  train.py        training loop (python -m ttf.train / ttf-train); args.py: options, recipes
+  update.py       TTF: the per-layer update, the factored update, state codecs, host offload
+  layers.py       the ternary layer (packed trits, scales, adapter, fused forward / backward)
+  kernel.py       Triton kernels (int8 GEMMs, input gradient, packing, firing, codecs, fused norms)
+  headloss.py     the fused loss head (CE + distillation and its gradient in one pass)
+  memplan.py      --ckpt-skip auto
+  qwen.py         Qwen3.5 / 3.8 (Gated DeltaNet + attention) with ternary linears, pipeline stages
+  q38/            Qwen3.8-Flash-Next (MoE) in TTF: batched expert TTF, grouped GEMMs, layer-major trainer
+  model.py, config.py, master.py, data.py, eval.py, schedule.py, ...
+recipes/        demo-15m, scratch-110m, continue-27b
+scripts/        data/ (Wikipedia, FineWeb-Edu), eval/, infer/, prof/ (step time and memory profilers), analysis/
+tests/          pytest (-m "not gpu" on any machine; the rest on a CUDA GPU)
+examples/vit/   a CIFAR-100 ViT: TTF vs master weights vs full precision
+docs/           FORMULAS.md (the update in full), Q38.md (Flash-Next), OPTIONS_MAP.md (old flag names)
+paper/          the paper (PDF, LaTeX, figures)
+results/        runs.jsonl: every run behind the paper, with its configuration (python scripts/results.py table)
 ```
 
-## Docs
+## Citation
 
-- `results/runs.jsonl`, `python scripts/results.py`: every run with its configuration, events and results (`table`,
-  `show`, `find`); notes are kept outside the repository (`ttf/results.py`, `TTF_NOTES`).
-- [docs/FORMULAS.md](docs/FORMULAS.md): the current update with its options, then every rule tried (old flags).
-- [docs/OPTIONS_MAP.md](docs/OPTIONS_MAP.md): the old flags and the current options.
-- [docs/Q38.md](docs/Q38.md): Qwen3.8-Flash-Next: modules, the conversion-to-training pipeline, the recipe, tests.
-- [docs/research/](docs/research/): early results summary, related work, analysis outputs (rank spectra, gaps,
-  zero-shot).
+```bibtex
+@software{guzeldereli_ttf_ternary,
+  author = {G{\"u}zeldereli, {\"O}zg{\"u}r},
+  title  = {ttf-ternary: training ternary language models without master weights},
+  year   = {2026},
+  doi    = {10.5281/zenodo.23394608},
+  url    = {https://github.com/oguzeldereli/ttf-ternary}
+}
+```
 
-## License and patents
+## License
 
-The code is licensed under the PolyForm Noncommercial License 1.0.0 ([LICENSE](LICENSE)): free for any noncommercial
-purpose, including personal research, study and use by educational, charitable, public research and government
-organisations; that licence also covers the patent claims you would infringe by using this software for those
-purposes. The TTF training and inference methods are the subject of UK patent applications GB2623290.0 and
-GB2624374.1 (patent pending). Commercial use of the software or the methods needs a separate licence: contact the
-author. Contributions are accepted under the Contributor Licence Agreement in [CONTRIBUTING.md](CONTRIBUTING.md).
+PolyForm Noncommercial 1.0.0 ([LICENSE](LICENSE)): free for any noncommercial purpose, including personal use,
+research and study, and use by educational, charitable, public research and government organisations. Commercial use
+needs a separate licence: contact the author. The released model weights keep their base models' licence (Apache-2.0
+for Qwen). Contributions are welcome under [CONTRIBUTING.md](CONTRIBUTING.md).
