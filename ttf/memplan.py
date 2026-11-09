@@ -33,8 +33,29 @@ class CkptAuto:
         self.budget = int(BUDGET * avail)
         self.w8_bytes = sum(2 * m.N * m.K for m in model.modules() if isinstance(m, L.KernelTernaryLinear))
         self.hist, self.d, self.done = [], None, False
+        # the bytes a block without recompute keeps from its forward to its backward (activations + output), measured
+        # directly around each such block's training forward: the peak difference of step 1 under-reads them when the
+        # step's peak falls where the last block's activations are already freed (0.8B 2 x 8, 9 Nov: 0.14 GiB read,
+        # 0.41 x 2 actual; 17 blocks chosen, OOM)
+        self.kept, self._m0 = 0, {}
+        lay = list(model.layers)[lo:hi]
+        for j, l_ in enumerate(lay):
+            l_.register_forward_pre_hook(self._pre(j)); l_.register_forward_hook(self._post(j))
         self._set(0)
         torch.cuda.reset_peak_memory_stats()
+
+    def _pre(self, j):
+        def f(mod, inp):
+            if mod.training and torch.is_grad_enabled() and j >= self.n - self.skip:
+                self._m0[j] = torch.cuda.memory_allocated()
+        return f
+
+    def _post(self, j):
+        def f(mod, inp, out):
+            m0 = self._m0.pop(j, None)
+            if m0 is not None:
+                self.kept = max(self.kept, torch.cuda.memory_allocated() - m0)
+        return f
 
     def _set(self, k):
         self.skip = k
@@ -51,6 +72,8 @@ class CkptAuto:
             (k0, w0, p0), (k1, w1, p1) = self.hist[-2], self.hist[-1]
             if k1 != k0 and w1 == w0:
                 self.d = max(self.d or 0, (p1 - p0) / (k1 - k0), 1)
+        if self.d is not None and self.kept > self.d:
+            self.d = self.kept
         if peak > self.budget:                 # over: give back the trit cache first, then blocks
             if w8:
                 self.L.W8_CACHE[0] = False; self._drop_w8()
