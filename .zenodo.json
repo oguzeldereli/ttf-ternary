@@ -1,7 +1,7 @@
 {
   "title": "ttf-ternary: training ternary language models without master weights",
   "upload_type": "software",
-  "description": "<p>Code for two-timescale threshold flips (TTF): training ternary ({-1, 0, 1}) language models without full-precision master weights, from scratch or from a converted ternary checkpoint. The weights stay packed at 1.6 bits during training; the optimizer state is low-rank (about one byte per weight). Includes the trainer, packed-ternary Triton kernels, pipeline and data parallel training, evaluation and inference code. Since version 0.2.0 the conversion of pretrained models (GPTQ-type ternary rounding, streaming conversion) is a separate package.</p><p>The TTF training and inference methods are the subject of UK patent applications GB2623290.0 and GB2624374.1 (patent pending). The code is licensed under the PolyForm Noncommercial License 1.0.0; commercial use needs a separate licence from the author.</p>",
+  "description": "<p>Code for two-timescale threshold flips (TTF): training ternary ({-1, 0, 1}) language models without full-precision master weights, from scratch or from a converted ternary checkpoint. The weights stay packed at 1.6 bits during training; the optimizer state is low-rank (about one byte per weight). Includes the trainer, packed-ternary Triton kernels, pipeline and data parallel training, evaluation and inference code. The conversion of pretrained models is the separate ttf-conversion package; ttf-home exports trained models to GGUF for llama.cpp.</p><p>The code is licensed under the PolyForm Noncommercial License 1.0.0; commercial use needs a separate licence from the author.</p>",
   "creators": [
     {
       "name": "Güzeldereli, Özgür",
@@ -18,5 +18,5 @@
     "optimizer state",
     "model compression"
   ],
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
