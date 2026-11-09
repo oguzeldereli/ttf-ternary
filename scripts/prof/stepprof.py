@@ -21,6 +21,8 @@ ttf.G itself (not in a helper) are split by op name: randn / normal -> sketch.rn
   SP_OUT=out/A SP_FROM=3 python scripts/prof/stepprof.py ttf.train ARGS...
   SP_MEMONLY=1: only the memory step (at step SP_FROM); SP_MEM_ENTRIES: the history's ring size (default 20M: an
   adapter step makes more than 2M allocator events, and a truncated history loses the step's start)
+  SP_TRACE=0: stop after the attribution step (no chrome trace, no memory history: those two need the 125 GB of host
+  memory on an adapter step; the attribution step alone fits a 32 GB PC; qmem.py gives the memory breakdown)
   SP_TRAIN_EMB=1: --convert random leaves the embedding / head trainable (from-scratch arm)
 """
 import collections, gc, gzip, json, os, pickle, runpy, shutil, sys, time
@@ -488,7 +490,9 @@ def wrap(cls):
             ST["prof"] = torch.profiler.profile(activities=A_); ST["prof"].start(); ST["t0"] = time.time()
         elif kk == FROM:
             torch.cuda.synchronize(); ST["prof"].stop(); report_light()
-            ST["prof"] = torch.profiler.profile(activities=A_, record_shapes=True, with_stack=True, profile_memory=True)
+            if os.environ.get("SP_TRACE") == "0":   # attribution only: no trace / memory step (fits a 32 GB PC)
+                open(OUT + ".done", "w").write("SP_DONE\n"); sys.stdout.flush(); os._exit(0)
+            ST["prof"] =torch.profiler.profile(activities=A_, record_shapes=True, with_stack=True, profile_memory=True)
             torch.cuda.synchronize(); ST["prof"].start()
         elif kk == FROM + 1:
             torch.cuda.synchronize(); ST["prof"].stop(); export_full(); start_mem()
