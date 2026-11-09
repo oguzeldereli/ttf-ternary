@@ -349,6 +349,7 @@ def _orth(X):
 
 STEP_FP32 = [False]   # --ttf-step-fp32: the accumulator's U in fp32 between a step's micro-batches (see _ts_layer_factored)
 ORTH = ["qr"]   # --ttf-orth: qr (Householder) or spanqr (the spanqr package; --ttf-orth auto picks it where it runs)
+SPANQR_MIN = [256]   # spanqr for ranks from this up (--ttf-orth spanqr / auto)
 _SPANQR = [None]  # (the spanqr package's orth: robust shifted Cholesky QR, no host sync; above r 512 block Gram-Schmidt)
 
 
@@ -365,8 +366,8 @@ def _orth_(X):
     # below the padded width: Householder
     K, r = X.shape
     rp = -(-r // 64) * 64 if r <= 512 else -(-r // 256) * 256
-    if not X.is_cuda or K < rp:
-        return torch.linalg.qr(X)[0]
+    if not X.is_cuda or K < rp or r < SPANQR_MIN[0]:   # (below rank 256 Householder is as fast: 0.8B at ranks
+        return torch.linalg.qr(X)[0]                    # 31-307, all through spanqr: 16.1 vs 15.1 s/step)
     if _SPANQR[0] is None:
         from orth import orth as _o
         _SPANQR[0] = _o
