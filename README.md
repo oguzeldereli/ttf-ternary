@@ -48,6 +48,9 @@ pip install "ttf-ternary[data] @ git+https://github.com/oguzeldereli/ttf-ternary
 git clone https://github.com/oguzeldereli/ttf-ternary && cd ttf-ternary && pip install -e ".[data,test]"
 ```
 
+If pip says the build backend "is missing the 'build_editable' hook", it built without isolation (`--no-build-isolation`,
+`PIP_NO_BUILD_ISOLATION` or a pip config) on a setuptools older than 64: `pip install -U "setuptools>=68"` and rerun.
+
 Extras: `[qwen]` for Qwen3.5 / 3.8 (transformers 5.19, flash-linear-attention), `[data]` for the data scripts,
 `[test]` for pytest. Optional, faster at ranks of 256 and up:
 `pip install git+https://github.com/oguzeldereli/spanqr`; `--ttf-orth auto` (the default) uses it when it imports.
