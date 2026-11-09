@@ -3,6 +3,11 @@
 #   python3 scripts/data/prep_wiki.py 2e7 --tokenizer llama --val_tokens 1000000 --out_prefix data/demo
 #   python -m ttf.train --recipe demo-15m --out-dir runs/demo-ttf
 #   python -m ttf.train --recipe demo-15m --mode bitnet --out-dir runs/demo-bitnet
+#   python -m ttf.train --recipe demo-15m --mode fp32 --lr 1.5e-3 --min-lr 1.5e-4 --out-dir runs/demo-fp32
+# Settings from a sweep on a 4070 Ti Super (9 Nov 2026, final val loss after 1200 steps): lr 3e-3 is the best of
+# 1e-3 / 1.5e-3 / 2e-3 / 3e-3 / 5e-3 for TTF (4.518) and BitNet (4.404); full precision is best at 1.5e-3 (4.484, 3e-3:
+# 4.575). In a run this short theta stays at its base after the warmup: the default rise to 5 x theta cost TTF 0.22
+# (4.874 vs 4.654 at lr 1.5e-3), and theta 8 was worse (4.957 at 3e-3). Rank 256 is full rank at width 256.
 mode = "ttf"
 preset = "s15"
 data = "data/demo_train.bin"
@@ -12,10 +17,11 @@ batch-size = 16
 accum = 1
 steps = 1200
 warmup = 60
-lr = 2e-3
-min-lr = 2e-4
+lr = 3e-3
+min-lr = 3e-4
 eval-interval = 200
 eval-iters = 20
 save-secs = 600
-ttf-rank = 128
+ttf-rank = 256
 ttf-theta = 16
+ttf-theta-end = 16
