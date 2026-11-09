@@ -28,7 +28,7 @@ LaTeX source in [paper/](paper/)). It has every result below with its run, and a
 
 | model | file | GSM8K (first 200) | HumanEval | runs on |
 |---|---|---|---|---|
-| [ttf-Qwen3.8-27B-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-27B-GGUF) | 10.2 GB | 0.895 (full precision 0.895) | 0.841 (0.933) | one 12 GB GPU |
+| [ttf-Qwen3.8-27B-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-27B-GGUF) | 8.2 GB | 0.895 (full precision 0.895) | 0.841 (0.933) | one 12 GB GPU |
 | [ttf-Qwen3.8-Flash-Next-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-Flash-Next-GGUF) | 40.4 GB | 0.905 (FP8 0.905) | 0.848 (0.927) | a 24 GB GPU + 64 GB RAM (experts on the CPU) |
 
 ## Requirements
