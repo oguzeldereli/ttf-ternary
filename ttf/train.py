@@ -836,8 +836,9 @@ def main():
             st_ = lr_state.setdefault("_ts", {})
             for m, d_ in zip(lays, blob["ts_state"]):
                 for k_, v_ in (d_.items() if not m.wpacked.is_meta else ()):
+                    # (the warm sketch basis "wq" lives on the GPU in a run, offloaded or not: _row_sketch uses it there)
                     st_[(k_, id(m))] = (tuple(x.to(_sdev[id(m)]) for x in v_) if isinstance(v_, tuple) else
-                                        v_.to(_sdev[id(m)]) if torch.is_tensor(v_) else v_)
+                                        v_.to(device if k_ == "wq" else _sdev[id(m)]) if torch.is_tensor(v_) else v_)
             print(f"resumed TTF state (v, step counts) for {len(lays)} layers", flush=True)
         tmask = blob.get("touched") or {}
         nres = 0
