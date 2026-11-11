@@ -86,10 +86,14 @@ def resume_theta_check(ck_args, base, start, end, allow=False, ck_shape=None):
     else:
         cb = float(ck_args.get("ttf_theta", base))
         cs, ce = float(ck_args["ttf_theta_start"]), float(ck_args.get("ttf_theta_end", cb))
-        if ck_shape == "step" or cs == ce == cb:
+        if cb != base or cs != start or ("ttf_theta_end" in ck_args and ce != end):
+            ch = (f"theta schedule {cs:g} -> {cb:g} -> {ce:g} (checkpoint) vs "
+                  f"{start:g} -> {base:g} -> {end:g} (this run)")
+        elif ck_shape == "step" or cs == ce == cb:
             return None
-        ch = (f"the checkpoint's theta schedule {cs:g} -> {cb:g} -> {ce:g} ran its cosines in theta (7-8 Nov 2026), this "
-              f"core in the step base / theta")
+        else:
+            ch = (f"the checkpoint's theta schedule {cs:g} -> {cb:g} -> {ce:g} ran its cosines in theta (7-8 Nov 2026), "
+                  f"this core in the step base / theta")
     if not allow:
         raise SystemExit(f"resume: {ch}: the step would change mid-run, refusing (--allow-leak-change accepts it)")
     return "resume: --allow-leak-change: " + ch

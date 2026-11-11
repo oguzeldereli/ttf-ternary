@@ -77,6 +77,41 @@ def test_resume_of_theta_space_checkpoint():
     assert resume_theta_check(const, 16.0, 16.0, 16.0) is None     # (constant theta: no shape)
 
 
+@pytest.mark.parametrize(
+    "base,start,end",
+    [
+        (32.0, 64.0, 80.0),
+        (16.0, 32.0, 80.0),
+        (16.0, 64.0, 40.0),
+    ],
+)
+def test_resume_rejects_changed_step_schedule(base, start, end):
+    ck = {
+        "ttf_theta": 16.0,
+        "ttf_theta_start": 64.0,
+        "ttf_theta_end": 80.0,
+    }
+    with pytest.raises(SystemExit, match="theta schedule"):
+        resume_theta_check(ck, base, start, end, ck_shape="step")
+
+    msg = resume_theta_check(
+        ck, base, start, end, allow=True, ck_shape="step"
+    )
+    assert "checkpoint" in msg
+    assert "this run" in msg
+
+
+def test_resume_accepts_unchanged_step_schedule():
+    ck = {
+        "ttf_theta": 16.0,
+        "ttf_theta_start": 64.0,
+        "ttf_theta_end": 80.0,
+    }
+    assert resume_theta_check(
+        ck, 16.0, 64.0, 80.0, ck_shape="step"
+    ) is None
+
+
 def test_legacy_linear_schedule_refused():
     with pytest.raises(ValueError):
         from_legacy(["--ts_theta_sched", "8:16"])
