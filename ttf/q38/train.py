@@ -678,6 +678,9 @@ def main():
         QM.load_layer(L, i, rd, "cpu", experts=False,
                       skip=[s for s in DENSE if not rd.has(f"{QM.PFX}layers.{i}.{s}.weight")])
         swap_ternary(L, adapter_rank=args.adapter_rank)
+        left = [n for n, p in L.named_parameters() if p.is_meta]
+        assert not left, f"layer {i}: parameters still on meta after load_layer + swap_ternary (not in --model, " \
+                         f"not a TTF layer): {left[:4]}"
         L.to("cpu")
         conv = torch.load(os.path.join(args.conv, f"L{i}.pt"), weights_only=False)
         for n, sd in conv.items():

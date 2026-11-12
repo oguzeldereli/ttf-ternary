@@ -53,7 +53,7 @@ def text_config(path_or_dict):
     cfg = Qwen3_5MoeTextConfig(**known)
     for k in EXTRA:
         setattr(cfg, k, t.get(k, DEFAULTS.get(k)))
-    cfg.plain = plain
+    cfg.plain = plain and "hc_count" not in t      # (a hyper-connection config is never plain, whatever its model_type)
     if plain:
         cfg.hc_count = 1
     if cfg.ple_embed_dim is None:
@@ -421,7 +421,10 @@ class Layer(nn.Module):
             self.attn_hyper_connection = GatedResidual(cfg)
             self.mlp_hyper_connection = GatedResidual(cfg)
         self.plain = cfg.plain
-        self.inject = PlainResidual.inject if cfg.plain else GatedResidual.inject
+
+    def _inject(self, h, y, w):
+        # (looked up at call time: compile_hc rebinds GatedResidual.inject on the class after build)
+        return (PlainResidual if self.plain else GatedResidual).inject(h, y, w)
 
     def mixer_in(self, h, pe, ids):
         """h after the PLE and the attention / DeltaNet sub-block (the MoE sub-block's input stream)"""
@@ -433,12 +436,12 @@ class Layer(nn.Module):
         else:
             assert x.shape[1] <= self.budget, "QSA indexer not implemented for T > indexer_budget"
             y, _ = self.self_attn(x, pe, None)
-        return self.inject(h, y, w)
+        return self._inject(h, y, w)
 
     def forward(self, h, pe, ids):
         h = self.mixer_in(h, pe, ids)
         x, w = (self.post_attention_layernorm if self.plain else self.mlp_hyper_connection)(h)
-        return self.inject(h, self.mlp(x), w)
+        return self._inject(h, self.mlp(x), w)
 
 
 class Q38(nn.Module):

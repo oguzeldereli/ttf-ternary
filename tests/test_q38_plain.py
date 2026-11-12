@@ -7,7 +7,6 @@ import torch
 Q = pytest.importorskip("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig  # noqa: E402
 
-pytestmark = pytest.mark.gpu
 
 TEXT = dict(  # Ornith-1.5-35B-A3B's text_config, shrunk
     model_type="qwen3_5_moe_text", attention_bias=False, attention_dropout=0.0, attn_output_gate=True,
@@ -23,6 +22,24 @@ TEXT = dict(  # Ornith-1.5-35B-A3B's text_config, shrunk
     pad_token_id=0, bos_token_id=1, eos_token_id=1)
 
 
+def test_plain_residual_cpu():
+    """PlainResidual = transformers' zero-centred Qwen3.5-MoE RMS norm; inject adds; plain only without hc fields"""
+    from ttf.q38 import model as M
+    torch.manual_seed(0)
+    cfg = M.text_config({"model_type": "qwen3_5_moe", "text_config": dict(TEXT)})
+    assert cfg.plain and cfg.hc_count == 1
+    assert not M.text_config({"model_type": "qwen3_5_moe", "text_config": dict(TEXT, hc_count=4)}).plain
+    pr = M.PlainResidual(cfg)
+    pr.weight.data.normal_(0, 0.1)
+    ref = Q.Qwen3_5MoeRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+    ref.weight.data.copy_(pr.weight.data)
+    h = torch.randn(2, 5, cfg.hidden_size)
+    y, w = pr(h)
+    assert w is None and torch.allclose(y, ref(h), atol=1e-6, rtol=1e-5)
+    assert torch.equal(M.PlainResidual.inject(h, y, None), h + y)
+
+
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_plain_matches_transformers():
     from ttf.q38 import model as M
