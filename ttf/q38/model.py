@@ -491,11 +491,14 @@ def set_param(root, name, t):
 
 
 @torch.no_grad()
-def load_layer(L, i, rd, dev, dtype=torch.bfloat16, experts=True):
-    """layer i's float weights from the checkpoint into L (on dev); experts=False leaves the routed experts alone"""
+def load_layer(L, i, rd, dev, dtype=torch.bfloat16, experts=True, skip=()):
+    """layer i's float weights from the checkpoint into L (on dev); experts=False leaves the routed experts alone;
+    skip: module paths not read (their weights come from elsewhere: the conversion's TTF layers)"""
     p = f"{PFX}layers.{i}."
     for n, t in list(L.named_parameters()):
         if n.startswith("mlp.gu.") or n.startswith("mlp.dn.") or n.startswith("ple.ple_embedding"):
+            continue
+        if any(n.startswith(s + ".") for s in skip):
             continue
         key = p + n
         v = rd.weight(key[:-len(".weight")]) if n.endswith(".weight") else rd.get(key)

@@ -673,18 +673,22 @@ def main():
         del c0
         print(f"adapter rank {args.adapter_rank} (conv/L0.pt)", flush=True)
     for i, L in enumerate(m.layers):
-        QM.load_layer(L, i, rd, "cpu", experts=False)
+        # (a model dir without the dense TTF layers' float weights, e.g. ttf-home's import of a released GGUF: conv/
+        # holds them, and load_state_dict below is strict)
+        QM.load_layer(L, i, rd, "cpu", experts=False,
+                      skip=[s for s in DENSE if not rd.has(f"{QM.PFX}layers.{i}.{s}.weight")])
         swap_ternary(L, adapter_rank=args.adapter_rank)
         L.to("cpu")
         conv = torch.load(os.path.join(args.conv, f"L{i}.pt"), weights_only=False)
         for n, sd in conv.items():
             _get(L, n).load_state_dict(sd)
         if L.ple is not None:
-            L.ple.ple_embedding.table, L.ple.ple_embedding.scale = QM.ngram_table_memmap(args.model, i)
             if getattr(args, "ple_pq", None):     # (the compressed table in the loop: prune1 + pq4.256, ple_pq)
                 from ttf.q38.ple_pq import PQTable
                 L.ple.ple_embedding.table, L.ple.ple_embedding.scale = PQTable(args.ple_pq, dev), None
                 print(f"PLE table: {args.ple_pq} (codes, decoded on {dev})", flush=True)
+            else:                                 # (the full table, read from the model's shards)
+                L.ple.ple_embedding.table, L.ple.ple_embedding.scale = QM.ngram_table_memmap(args.model, i)
     for mod in (m.embed_tokens, m.lm_head, m.hyper_connection_mixer):
         mod.to(dev)
     m.rotary.to(dev)
