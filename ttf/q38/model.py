@@ -12,6 +12,11 @@ written here after the reference (transformers main, models/qwen4_exp/modular_qw
   the DeltaNet output gate is sigmoid (output_gate_type), the 5.19 class's is silu
 Dropped: vision tower, MTP layer.
 
+Plain mode (qwen3_5_moe checkpoints, e.g. Ornith-1.5-35B-A3B, which Tiel-Coder re-quantizes): hc_count 1 and no gated
+residual. Each sub-block reads a zero-centred RMS norm of the residual (input_layernorm / post_attention_layernorm) and
+adds its output; the head reads model.norm. No PLE. The experts are stored fused (mlp.experts.gate_up_proj [E, 2I, d],
+gate rows first, and mlp.experts.down_proj [E, d, I]), which is DenseMat's layout.
+
 Per-layer API (the layer-major trainer, ttf.q38.train):
   m.embed(ids) -> h0 [B, T, hc x d];  m.rope(T, dev) -> (cos, sin);  m.layers[i](h, pe, ids) -> h;
   m.head_in(h) -> [B, T, d] (the stream mixer; there is no other final norm);  m.lm_head (float, untied)
@@ -42,10 +47,15 @@ def text_config(path_or_dict):
         c = json.load(open(os.path.join(path_or_dict, "config.json")))
     t = dict(c.get("text_config", c))
     t["layer_types"] = ["full_attention" if x in ("full_attention", "indexed_attention") else x for x in t["layer_types"]]
-    known = {k: v for k, v in t.items() if k not in EXTRA and k not in ("mtp", "model_type", "dtype")}
+    plain = c.get("model_type", t.get("model_type")) in ("qwen3_5_moe", "qwen3_5_moe_text")
+    known = {k: v for k, v in t.items() if k not in EXTRA and k not in ("mtp", "model_type", "dtype")
+             and not k.startswith("mtp_")}
     cfg = Qwen3_5MoeTextConfig(**known)
     for k in EXTRA:
         setattr(cfg, k, t.get(k, DEFAULTS.get(k)))
+    cfg.plain = plain
+    if plain:
+        cfg.hc_count = 1
     if cfg.ple_embed_dim is None:
         cfg.ple_embed_dim = cfg.hidden_size
     cfg._attn_implementation = "sdpa"
@@ -68,6 +78,24 @@ class GroupRMSNorm(nn.Module):
         if self.group is not None:
             y = y.flatten(-2)
         return (y * (1.0 + self.weight.float())).type_as(x)
+
+
+class PlainResidual(nn.Module):
+    """the plain residual in GatedResidual's interface: forward(h) -> (norm(h), None) (combine) or norm(h); inject adds"""
+
+    def __init__(self, cfg, combine=True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(cfg.hidden_size))     # zero-centred: x / rms * (1 + w), as the checkpoint
+        self.eps, self.combine = cfg.rms_norm_eps, combine
+
+    def forward(self, h):
+        y = h.float()
+        y = (y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps) * (1.0 + self.weight.float())).type_as(h)
+        return (y, None) if self.combine else y
+
+    @staticmethod
+    def inject(h, y, w):
+        return h + y
 
 
 class GatedResidual(nn.Module):
@@ -100,6 +128,7 @@ def compile_hc():
     row reductions only, no atomics (deterministic)"""
     GatedResidual.forward = torch.compile(GatedResidual.forward, dynamic=False)
     GatedResidual.inject = staticmethod(torch.compile(GatedResidual.inject, dynamic=False))
+    PlainResidual.forward = torch.compile(PlainResidual.forward, dynamic=False)
     global _swiglu
     _swiglu = torch.compile(_swiglu, dynamic=False)
     # the reference's eager norms in the mixers: DeltaNet's gated RMS norm (on [T heads, 128]) and attention's q / k
@@ -370,6 +399,9 @@ class Layer(nn.Module):
         if self.kind == "linear_attention":
             self.linear_attn = Q.Qwen3_5MoeGatedDeltaNet(cfg, i)
             self.linear_attn.norm.activation = cfg.output_gate_type or cfg.hidden_act
+        elif cfg.plain:
+            self.self_attn = Q.Qwen3_5MoeAttention(cfg, i)
+            self.budget = 1 << 30
         else:
             self.self_attn = Q.Qwen3_5MoeAttention(cfg, i)
             ix = nn.Module()                                                # the QSA indexer: kept, unused for T <= budget
@@ -382,25 +414,31 @@ class Layer(nn.Module):
         self.mlp = MoE(cfg)
         pl = cfg.ple_layer_ids or []
         self.ple = PLE(cfg, pl.index(i + 1)) if (i + 1) in pl else None
-        self.attn_hyper_connection = GatedResidual(cfg)
-        self.mlp_hyper_connection = GatedResidual(cfg)
+        if cfg.plain:
+            self.input_layernorm = PlainResidual(cfg)
+            self.post_attention_layernorm = PlainResidual(cfg)
+        else:
+            self.attn_hyper_connection = GatedResidual(cfg)
+            self.mlp_hyper_connection = GatedResidual(cfg)
+        self.plain = cfg.plain
+        self.inject = PlainResidual.inject if cfg.plain else GatedResidual.inject
 
     def mixer_in(self, h, pe, ids):
         """h after the PLE and the attention / DeltaNet sub-block (the MoE sub-block's input stream)"""
         if self.ple is not None:
             h = h + self.ple(h, ids)
-        x, w = self.attn_hyper_connection(h)
+        x, w = (self.input_layernorm if self.plain else self.attn_hyper_connection)(h)
         if self.kind == "linear_attention":
             y = self.linear_attn(x)
         else:
             assert x.shape[1] <= self.budget, "QSA indexer not implemented for T > indexer_budget"
             y, _ = self.self_attn(x, pe, None)
-        return GatedResidual.inject(h, y, w)
+        return self.inject(h, y, w)
 
     def forward(self, h, pe, ids):
         h = self.mixer_in(h, pe, ids)
-        x, w = self.mlp_hyper_connection(h)
-        return GatedResidual.inject(h, self.mlp(x), w)
+        x, w = (self.post_attention_layernorm if self.plain else self.mlp_hyper_connection)(h)
+        return self.inject(h, self.mlp(x), w)
 
 
 class Q38(nn.Module):
@@ -410,7 +448,7 @@ class Q38(nn.Module):
         n = cfg.num_hidden_layers if layers is None else layers
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList([Layer(cfg, i) for i in range(n)])
-        self.hyper_connection_mixer = GatedResidual(cfg, combine=False)
+        self.hyper_connection_mixer = PlainResidual(cfg, combine=False) if cfg.plain else GatedResidual(cfg, combine=False)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.rotary = Q.Qwen3_5MoeTextRotaryEmbedding(cfg)
 
@@ -509,7 +547,12 @@ def load_layer(L, i, rd, dev, dtype=torch.bfloat16, experts=True, skip=()):
                              (ng.offs, "ngram_heads_offsets")):
             if rd.has(q + theirs):
                 assert torch.equal(mine.cpu(), rd.get(q + theirs).cpu().long()), f"PLE {theirs} differs"
-    if experts:
+    if experts and rd.has(p + "mlp.experts.gate_up_proj"):       # fused storage (qwen3_5_moe): DenseMat's layout
+        gu = rd.get(p + "mlp.experts.gate_up_proj").to(dev, dtype)
+        dn = rd.get(p + "mlp.experts.down_proj").to(dev, dtype)
+        assert gu.shape == L.mlp.gu.weight.shape and dn.shape == L.mlp.dn.weight.shape, (gu.shape, dn.shape)
+        set_param(L, "mlp.gu.weight", gu); set_param(L, "mlp.dn.weight", dn)
+    elif experts:
         E, I = L.mlp.E, L.mlp.I
         gu = torch.empty(L.mlp.gu.weight.shape, dtype=dtype, device=dev)
         dn = torch.empty(L.mlp.dn.weight.shape, dtype=dtype, device=dev)
@@ -534,7 +577,8 @@ def load_globals(m, rd, dev, dtype=torch.bfloat16):
     set_param(m, "embed_tokens.weight", rd.get(PFX + "embed_tokens.weight").to(dev, dtype))
     set_param(m, "lm_head.weight", rd.get("lm_head.weight").to(dev, dtype))
     for n, t in list(m.hyper_connection_mixer.named_parameters()):
-        set_param(m.hyper_connection_mixer, n, rd.get(PFX + "hyper_connection_mixer." + n).to(dev, dtype))
+        key = PFX + "norm." + n if m.cfg.plain else PFX + "hyper_connection_mixer." + n
+        set_param(m.hyper_connection_mixer, n, rd.get(key).to(dev, dtype))
 
 
 def build(path_or_cfg, layers=None, device="meta"):

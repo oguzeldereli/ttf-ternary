@@ -81,7 +81,7 @@ class Store:
                 log(f"store: layer {i} in host memory ({time.time() - t0:.0f}s)")
         self.glob = {k: self.rd.get(k).clone() for k in ("lm_head.weight", PFX + "embed_tokens.weight")}
         for k in self.rd.idx:
-            if k.startswith(PFX + "hyper_connection_mixer."):
+            if k.startswith(PFX + "hyper_connection_mixer.") or k == PFX + "norm.weight":
                 self.glob[k] = self.rd.get(k).clone()
         self.tables = {}
 
@@ -94,6 +94,11 @@ class Store:
         if not experts:
             return {"rest": rest}
         E, I, d = self.E, self.I, self.d
+        if self.rd.has(p + "mlp.experts.gate_up_proj"):          # fused bf16 storage (qwen3_5_moe)
+            gu = self.rd.get(p + "mlp.experts.gate_up_proj").clone()
+            dn = self.rd.get(p + "mlp.experts.down_proj").clone()
+            assert gu.shape == (E, 2 * I, d) and dn.shape == (E, d, I), (gu.shape, dn.shape)
+            return {"rest": rest, "gu": gu, "dn": dn}
         q0 = f"{p}mlp.experts.0."
         fp8 = self.rd.has(q0 + "gate_proj.weight_scale_inv")
         dt = torch.float8_e4m3fn if fp8 else torch.bfloat16
@@ -175,5 +180,6 @@ class Store:
         M.set_param(m, "embed_tokens.weight", self.glob[PFX + "embed_tokens.weight"].to(dtype))      # host (lookup)
         M.set_param(m, "lm_head.weight", self.glob["lm_head.weight"].to(dev, dtype))
         for n, t in list(m.hyper_connection_mixer.named_parameters()):
-            M.set_param(m.hyper_connection_mixer, n, self.glob[PFX + "hyper_connection_mixer." + n].to(dev, dtype))
+            key = PFX + "norm." + n if m.cfg.plain else PFX + "hyper_connection_mixer." + n
+            M.set_param(m.hyper_connection_mixer, n, self.glob[key].to(dev, dtype))
         m.rotary.to(dev)
