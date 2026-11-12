@@ -53,7 +53,8 @@ def text_config(path_or_dict):
     cfg = Qwen3_5MoeTextConfig(**known)
     for k in EXTRA:
         setattr(cfg, k, t.get(k, DEFAULTS.get(k)))
-    cfg.plain = plain and "hc_count" not in t      # (a hyper-connection config is never plain, whatever its model_type)
+    plain = plain and "hc_count" not in t          # (a hyper-connection config is never plain, whatever its model_type)
+    cfg.plain = plain
     if plain:
         cfg.hc_count = 1
     if cfg.ple_embed_dim is None:

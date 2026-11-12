@@ -28,7 +28,8 @@ def test_plain_residual_cpu():
     torch.manual_seed(0)
     cfg = M.text_config({"model_type": "qwen3_5_moe", "text_config": dict(TEXT)})
     assert cfg.plain and cfg.hc_count == 1
-    assert not M.text_config({"model_type": "qwen3_5_moe", "text_config": dict(TEXT, hc_count=4)}).plain
+    hc = M.text_config({"model_type": "qwen3_5_moe", "text_config": dict(TEXT, hc_count=4)})
+    assert not hc.plain and hc.hc_count == 4
     pr = M.PlainResidual(cfg)
     pr.weight.data.normal_(0, 0.1)
     ref = Q.Qwen3_5MoeRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
