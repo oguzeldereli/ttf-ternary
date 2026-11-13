@@ -33,6 +33,7 @@ class CkptAuto:
         self.budget = int(BUDGET * avail)
         self.w8_bytes = sum(2 * m.N * m.K for m in model.modules() if isinstance(m, L.KernelTernaryLinear))
         self.hist, self.d, self.done = [], None, False
+        self.settled = False   # the last step changed nothing (--cuda-graph waits for it, then freezes the plan)
         # the bytes a block without recompute keeps from its forward to its backward (activations + output), measured
         # directly around each such block's training forward: the peak difference of step 1 under-reads them when the
         # step's peak falls where the last block's activations are already freed (0.8B 2 x 8, 9 Nov: 0.14 GiB read,
@@ -90,6 +91,7 @@ class CkptAuto:
         elif k == self.n and not w8 and peak + MARGIN * self.w8_bytes < self.budget and \
                 not any(w for _, w, p in self.hist if w and p > self.budget):
             self.L.W8_CACHE[0] = True
+        self.settled = len(self.hist) >= 2 and (self.skip, self.L.W8_CACHE[0]) == (k, w8)
         if (self.skip, self.L.W8_CACHE[0]) != (k, w8):
             self.log(f"--ckpt-skip auto: peak {peak / 2**30:.2f} of {self.budget / 2**30:.2f} GiB -> {self.skip} of "
                      f"{self.n} blocks without recompute{', int8 trit cache' if self.L.W8_CACHE[0] else ''}"

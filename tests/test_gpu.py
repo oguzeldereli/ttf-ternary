@@ -340,15 +340,19 @@ def test_train_resume_round_trip_sketch_warm(tmp_path):
 
 
 def test_cuda_graph_matches_eager(tmp_path):
-    """--cuda-graph (the first, a middle and the last micro-batch captured per step, the middle one replayed): in
-    deterministic mode the same per-step losses, accumulators and trits as the eager loop, bit for bit, over steps that
-    move trits (3 eager warm-up steps, then graph steps; --accum 4, so the middle graph is replayed twice a step)"""
+    """--cuda-graph (the first, a middle and the last micro-batch captured once, then replayed every step; the middle one
+    twice a step at --accum 4): in deterministic mode the same per-step losses, accumulators and trits as the eager loop,
+    bit for bit, over steps that move trits (3 eager warm-up steps, a capture step, replayed steps); and a run saved after
+    replayed steps resumes onto the same path"""
     data = str(tmp_path / "tok.bin")
     np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
     w = ["--accum", "4", "--dw-sketch-warm", "0.75", "--dw-sketch", "32", "--lr", "3e-3", "--ttf-theta", "4"]
     a = _train(str(tmp_path / "a"), w, 8, data)
     b = _train(str(tmp_path / "b"), w + ["--cuda-graph"], 8, data)
     assert len(a) == 8 and a == b, (a, b)
+    assert len(_train(str(tmp_path / "c"), w + ["--cuda-graph"], 6, data)) == 6   # (replayed steps 4, 5, then saved:
+    c = _train(str(tmp_path / "c"), w + ["--cuda-graph", "--resume"], 8, data)      # the counters graph_step_done sets)
+    assert a == c, (a, c)
     ma = [json.loads(l) for l in open(tmp_path / "a" / "metrics.jsonl") if '"loss"' in l]
     assert sum(m_.get("ts_frac", 0) for m_ in ma[3:]) > 0, "no trit moved in the graph steps: the test sees no firing"
     ca, cb = (torch.load(str(tmp_path / d / "ckpt.pt"), map_location="cpu", weights_only=False) for d in "ab")

@@ -286,16 +286,29 @@ def _acc_turn(U, V, S_):
     return U @ (V.T @ Vn), Vn
 
 
-def _sketch_cross(U, SPt, Sc, ia, ib, lr_ratio):
+def _sketch_cross(U, SPt, Sc, ia, ib, lr_ratio, neg_lr=None):
     """(sum u)^T U [K, r] without sum u: through the step's own k-row sketch of its gradient, SPt = (Sc sum g)^T [K, k],
     which the update keeps for v anyway (E[Sc^T Sc] = I; Sc regenerated from its seed), with the step's v (ia, ib):
     -lr diag(ib) SPt (Sc diag(ia) U)"""
-    return (-lr_ratio) * ib[:, None] * (SPt.float() @ (Sc @ (ia[:, None] * U)))
+    return (neg_lr if neg_lr is not None else -lr_ratio) * ib[:, None] * (SPt.float() @ (Sc @ (ia[:, None] * U)))
 
 
-def _step_scale(R, C, b2, n):
-    """1 / a_i, 1 / b_j of the step's v (R, C after n steps), as the update's u uses them"""
-    a = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** n)).sqrt(); b = C.sqrt()
+def _dv(c, k, v):
+    """--cuda-graph: the step's value k as a device scalar (c["_dev"], rewritten before each replay) when the trainer set
+    them, else the Python value v"""
+    d = c.get("_dev")
+    return d[k] if d is not None else v
+
+
+def _step_scale(R, C, b2, n, inv=None):
+    """1 / a_i, 1 / b_j of the step's v (R, C after n steps), as the update's u uses them. inv: --cuda-graph's device
+    scalar fp32(1 / (1 - b2^n)), the reciprocal in double (PyTorch divides a CUDA tensor by a Python number so: the same
+    bits)"""
+    if inv is not None:
+        a = (R / R.mean().clamp_min(1e-30) * inv).sqrt()
+    else:
+        a = (R / R.mean().clamp_min(1e-30) / (1 - b2 ** n)).sqrt()
+    b = C.sqrt()
     return 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30), 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)
 
 
@@ -679,11 +692,13 @@ def _row_sketch(l, dev, gen, k, c, Q=None, R=None):
 _SK = {}   # --cuda-graph: id(layer) -> (step index, Sr, the row sketch's random rows R, the warm basis' random matrix)
 
 
-def draw_step_sketches(layers, state, c):
+def draw_step_sketches(layers, state, c, ts=None):
     """--cuda-graph, before a step's capture: each factored layer's random numbers for the step (a CUDA generator cannot
     be re-seeded inside a capture), drawn as _ts_layer_factored draws them: the layer's generator seeded by the step,
     Sr then R; the --dw-sketch-warm matrix from its own seed. Layers with no step before (no index yet) are skipped
-    (the capture then stops with an error: the warm-up steps make every layer's state)"""
+    (the capture then stops with an error: the warm-up steps make every layer's state). ts: the step's index (a replayed
+    step's updates do not run, so the layers' own counters are set by graph_step_done); the numbers are written into
+    the tensors of the step before (fixed addresses for the replays)"""
     st = state.get("_ts", {})
     k_ = int(c.get("factored") or 0)
     M_ = int(c.get("micro") or 1)
@@ -694,7 +709,7 @@ def draw_step_sketches(layers, state, c):
         last = st.get(("tsl", key))
         if last is None:
             continue
-        ts_ = last + 1
+        ts_ = last + 1 if ts is None else ts
         dev = l.wpacked.device
         Q = st.get(("wq", key)) if M_ > 1 else None
         kr = k_ - (Q.shape[1] if Q is not None else 0)
@@ -708,7 +723,26 @@ def draw_step_sketches(layers, state, c):
             if kw > 0:
                 gw = torch.Generator(device=dev).manual_seed(7_000_003 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
                 Wr = torch.randn(ra, kw, device=dev, generator=gw)
-        _SK[key] = (ts_, Sr, R, Wr)
+        old = _SK.get(key)
+        if old is not None and _same(old[1:], (Sr, R, Wr)):
+            _copy_into(old[1:], (Sr, R, Wr))
+            _SK[key] = (ts_,) + tuple(old[1:])
+        else:
+            _SK[key] = (ts_, Sr, R, Wr)
+
+
+def graph_step_done(layers, state, c, step, ts):
+    """--cuda-graph: after a replayed step, the counters its updates keep in Python (their code did not run), set as the
+    step's last micro-batch sets them (update count, step, step index), so a capture, an eager step or a checkpoint
+    after it sees the right ones"""
+    st = state.get("_ts", {})
+    M_ = int(c.get("micro") or 1)
+    for l in layers:
+        key = id(l)
+        if ("t", key) in st:
+            st[("t", key)] = ts * M_ + M_
+            st[("ls", key)] = step
+            st[("tsl", key)] = ts
 
 
 def _ts_layer_factored(l, fg, state, c):
@@ -758,7 +792,9 @@ def _ts_layer_factored(l, fg, state, c):
         R0 = C0 = None
         if ("v", key) in st and ts_ > 0:
             R0, C0 = _host_get(st, ("v", key), dev, off)
-        bc_ = 1 - b2 ** ts_ if ts_ > 0 else 1.0
+        bc_ = _dv(c, "bc", 1 - b2 ** ts_ if ts_ > 0 else 1.0)
+        if c.get("_dev") is not None:
+            assert c["_dev_ts"] == ts_, (c["_dev_ts"], ts_)   # (the device scalars are the step's: same index)
         PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (None,) * 6
         ia, rs, ds, PS = micro_sketch(gS, PS, rs, ds, R0, M_, l.K, b2, bc_, True)
         ib, cs, es, SP = micro_sketch(SgT, SP, cs, es, C0, M_, l.N, b2, bc_, False)
@@ -770,7 +806,7 @@ def _ts_layer_factored(l, fg, state, c):
             else:
                 R, C = (1 - b2) * rs, (1 - b2) * cs
             _host_put(st, ("v", key), (R, C), off)
-            turn_ = (SP, PS) + _step_scale(R, C, b2, ts_ + 1)       # (Sc sum g)^T [K, k], (sum g) Sr: the turn's sketches
+            turn_ = (SP, PS) + _step_scale(R, C, b2, ts_ + 1, _dv(c, "inv_bcn", None))   # (Sc sum g)^T [K, k], (sum g) Sr
         else:
             _keep(st, ("mx", key), (PS, SP, rs, cs, ds, es))
         del PS, SP
@@ -835,21 +871,21 @@ def _ts_layer_factored(l, fg, state, c):
         U = -lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
     elif M_ > 1:   # basis fixed within the step (every micro-batch's u enters on it), turned on the last (_acc_turn)
         U, V = _load_pair(_host_get(state, key, dev, off))
-        U = _fg_add_r(U, fgb, ia, V, -lr_ratio, lk if (t - 1) % M_ == 0 else 1.0)   # (data parallel: this rank's term,
+        U = _fg_add_r(U, fgb, ia, V, _dv(c, "neg_lr", -lr_ratio), lk if (t - 1) % M_ == 0 else 1.0)   # (data parallel: this rank's term,
         # averaged on the last one)
         if final_:
             # data parallel: the micro-batches' terms are linear in g and V is fixed within the step, so each rank
             # summed its own and one mean here replaces a mean per micro-batch (N x r per layer: 16 x less traffic)
             U = _dpm(U)
             SPt, PS_, ia_, ib_ = turn_
-            U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio))
+            U, V = _acc_turn(U, V, _sketch_cross(U, SPt, Sc, ia_, ib_, lr_ratio, _dv(c, "neg_lr", None)))
             if c.get("sketch_warm"):   # --dw-sketch-warm: the next step's sketch rows on the accumulator's range
                 kw = min(int(round(c["sketch_warm"] * k_)), k_ - 1, U.shape[1])
             if c.get("sketch_warm") and kw > 0:
                 if Wr_ is None:
                     gw = torch.Generator(device=dev).manual_seed(7_000_003 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
                     Wr_ = torch.randn(U.shape[1], kw, device=dev, generator=gw)
-                st[("wq", key)] = _orth(U.float() @ Wr_).to(torch.bfloat16)
+                _keep(st, ("wq", key), _orth(U.float() @ Wr_).to(torch.bfloat16))
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         A_prev = U @ V.T if c.get("band") else None
@@ -879,10 +915,11 @@ def _ts_layer_factored(l, fg, state, c):
         U, nf = _band_fire(l, st, key, c, U, V, A_prev, u_, lk, theta)
     elif FIRE_FUSED[0] and dev.type == "cuda":   # A, the moves, the repack and D V in one kernel
         from .kernel import ttf_fire
-        DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, theta, Vs=Vs)
+        th_ = _dv(c, "theta", theta)
+        DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, th_, Vs=Vs)
         DV = _dpm(DV)          # data parallel: the spend's sparse sums (index_add_) are not bit-reproducible: one mean
         l._after_fire(dnnz)    # the kernel writes the trits in place (no version bump): beta follows the moves
-        U = U - c["spend"] * (theta * DV); del DV
+        U = U - c["spend"] * (th_ * DV); del DV
     else:
         A = U @ V.T
         w0 = unpack_rows(l.wpacked, l.K).to(torch.int8)
@@ -946,7 +983,7 @@ def _ts_dense_acc(l, fgb, ia, state, st, key, t, M_, final_, lk, lr_ratio, theta
     cs = lk if (t - 1) % M_ == 0 else 1.0
     if gy.is_cuda and gy.dtype == x.dtype == torch.bfloat16:   # (kernel.acc_gemm: x diag(ib) rounded to bf16 on load)
         from .kernel import acc_gemm
-        A = acc_gemm(gy, x, ib, ia, A, cs, -lr_ratio)
+        A = acc_gemm(gy, x, ib, ia, A, cs, _dv(c, "neg_lr", -lr_ratio))
     else:
         xb = torch.empty(x.shape, dtype=x.dtype, device=x.device)      # (bf16 factors: x diag(ib) rounded to bf16)
         torch.mul(x, ib[None, :], out=xb)
@@ -960,7 +997,9 @@ def _ts_dense_acc(l, fgb, ia, state, st, key, t, M_, final_, lk, lr_ratio, theta
     before = l.wpacked.clone() if l.track else None
     if FIRE_FUSED[0] and A.is_cuda and A.dtype == torch.float32 and A.is_contiguous():   # (kernel.dense_fire: one pass)
         from .kernel import dense_fire
-        nf = dense_fire(A, l.wpacked, l.K, theta, c["spend"] * theta)
+        nf = dense_fire(A, l.wpacked, l.K, _dv(c, "theta", theta), _dv(c, "spend_theta", c["spend"] * theta))
+        if GRAPH_STATE[0]:     # (the trits changed by a copy_: the layer's caches rewritten in place)
+            l._graph_refresh()
         _host_put(state, key, store_dense(sa, A), off)
         st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
         if before is not None:

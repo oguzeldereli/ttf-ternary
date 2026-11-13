@@ -202,11 +202,13 @@ def _dev_scalar(v, device):
     return torch.full((), float(v), dtype=torch.float32, device=device)
 
 
-def tern_gemm_i8(xq: torch.Tensor, xs: torch.Tensor, wpacked: torch.Tensor, K: int, beta=1.0) -> torch.Tensor:
+def tern_gemm_i8(xq: torch.Tensor, xs: torch.Tensor, wpacked: torch.Tensor, K: int, beta=1.0, w8=None) -> torch.Tensor:
     """int8 x [M,K] (codes) @ decode(wpacked)^T * xs[:,None] * beta -> bf16 [M,N]: int8 activation codes x int8 trits
     on the int8 tensor cores (cuBLASLt via torch._int_mm), int32 accumulation: exact; the trits unpacked per call to
-    int8 (1 byte per weight). beta: float or a 0-dim device tensor (no host sync)."""
-    w8 = unpack_fast(wpacked, K)
+    int8 (1 byte per weight). beta: float or a 0-dim device tensor (no host sync). w8: the trits already unpacked
+    (KernelTernaryLinear.w8(): the same int8 values)"""
+    if w8 is None:
+        w8 = unpack_fast(wpacked, K)
     M_, N_ = xq.shape[0], w8.shape[0]
     if M_ > 16 and K % 16 == 0 and N_ % 8 == 0:   # (K % 16: cuBLASLt int8 on Blackwell sm_120 refuses K 8 / 24
         y32 = torch._int_mm(xq.contiguous(), w8.t())  # with N 48, the rank-8 adapters of in_proj_a / b; Ada took them)
@@ -275,7 +277,7 @@ def unpack_t_i8(wpacked: torch.Tensor, K: int) -> torch.Tensor:
     return out
 
 
-def tern_gemm_dx_i8x2(gy: torch.Tensor, wpacked: torch.Tensor, K: int, two: bool = True) -> torch.Tensor:
+def tern_gemm_dx_i8x2(gy: torch.Tensor, wpacked: torch.Tensor, K: int, two: bool = True, w8t=None) -> torch.Tensor:
     """grad_x = gy @ decode(wpacked), gy [M, N] -> bf16 [M, K], on the int8 tensor cores with gy in two int8 slices
     (--dx int8x2; two False: the first slice only, --dx int8); shapes the int8 GEMM cannot take fall back to the bf16
     path"""
@@ -286,7 +288,8 @@ def tern_gemm_dx_i8x2(gy: torch.Tensor, wpacked: torch.Tensor, K: int, two: bool
     q1 = torch.empty(M, N, dtype=torch.int8, device=g.device); q2 = torch.empty_like(q1)
     sc = torch.empty(M, dtype=torch.float32, device=g.device)
     _slice2_kernel[(M,)](g, q1, q2, sc, N, g.stride(0), q1.stride(0), BLOCK=1024)
-    wt = unpack_t_i8(wpacked, K).t()                     # [N, K], column-major: the layout torch._int_mm wants
+    wt = (unpack_t_i8(wpacked, K) if w8t is None else w8t).t()   # [N, K], column-major: the layout torch._int_mm
+    # wants (w8t: KernelTernaryLinear.w8(t=True), the same int8 [K, N])
     y1 = torch._int_mm(q1, wt); y2 = torch._int_mm(q2, wt) if two else y1
     out = torch.empty(M, K, dtype=torch.bfloat16, device=g.device)
     _dx2_epi_kernel[(triton.cdiv(M, 32), triton.cdiv(K, 128))](y1, y2, sc, out, M, K, TWO=two, BM=32, BK=128)
@@ -436,10 +439,13 @@ def _msk_rows_kernel(g_ptr, p_ptr, sq_ptr, cr_ptr, n, k, sg, sp, HAS_P: tl.const
 
 @triton.jit
 def _msk_vec_kernel(sq_ptr, cr_ptr, rs_ptr, ds_ptr, v_ptr, o_ptr, n, c_sq, c_d, c_cr, b2, bc,
-                    HAS_P: tl.constexpr, HAS_V: tl.constexpr, NORM: tl.constexpr, B: tl.constexpr):
+                    HAS_P: tl.constexpr, HAS_V: tl.constexpr, NORM: tl.constexpr, B: tl.constexpr,
+                    BC_PTR: tl.constexpr = False):
     """one program over a side's vector (n entries): r0 = sq c_sq (then the v EMA: b2 v / bc + (1 - b2) r0), the
     scale a = sqrt(r0 / mean(r0)) (NORM) or sqrt(r0), o = 1 / max(a, max(a) 1e-12 + 1e-30); rs += sq / c_d + c_cr cr
     and ds += sq / c_d (HAS_P; else both = sq / c_d), in place"""
+    if BC_PTR:                                                  # (bc from a device scalar: --cuda-graph)
+        bc = tl.load(bc)
     offs = tl.arange(0, B)
     tot = tl.zeros([B], dtype=tl.float32)
     for i0 in range(0, n, B):                                   # pass 1: r0 (kept in o), its sum
@@ -472,6 +478,15 @@ def _msk_vec_kernel(sq_ptr, cr_ptr, rs_ptr, ds_ptr, v_ptr, o_ptr, n, c_sq, c_d, 
         tl.store(o_ptr + i, 1.0 / tl.maximum(a, lo), mask=m)
 
 
+def _sc(x):
+    """a kernel's float argument: a 0-dim fp32 device tensor stays (the kernel loads it: a --cuda-graph replay reads the
+    step's value), else float(x) (the kernel gets x rounded to fp32 either way: the same bits)"""
+    if torch.is_tensor(x):
+        assert x.dtype == torch.float32 and x.numel() == 1 and x.is_cuda
+        return x
+    return float(x)
+
+
 def micro_sketch(G, P, rs, ds, v, M, n_other, b2, bc, norm):
     """--accum M > 1: one side of the factored update's statistics in two kernels (instead of ~25 torch ops):
     G [n, k] fp32, this micro-batch's sketch (g Sr, or (Sc g)^T); P [n, k] bf16, the running sum of the step's
@@ -490,19 +505,23 @@ def micro_sketch(G, P, rs, ds, v, M, n_other, b2, bc, norm):
                                             BK=min(256, triton.next_power_of_2(k)))
     o = torch.empty_like(sq)
     _msk_vec_kernel[(1,)](sq, cr, rs, ds, v if v is not None else sq, o, n, float(M * M / n_other), float(n_other),
-                          2.0 / n_other, float(b2), float(bc), HAS_P=has_p, HAS_V=v is not None, NORM=bool(norm), B=1024)
+                          2.0 / n_other, float(b2), _sc(bc), HAS_P=has_p, HAS_V=v is not None, NORM=bool(norm), B=1024,
+                          BC_PTR=torch.is_tensor(bc))
     return o, rs, ds, P
 
 
 @triton.jit
 def _fire_kernel(ub_ptr, vb_ptr, u_ptr, v_ptr, un_ptr, vn_ptr, p_ptr, d_ptr, s_ptr, N, K, K5, R, sun, svk, spn, sdn,
-                 theta, eb, NPK, SLOTS: tl.constexpr, RC: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr):
+                 theta, eb, NPK, SLOTS: tl.constexpr, RC: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr,
+                 TH_PTR: tl.constexpr = False):
     """one tile of packed bytes, for each of the 5 trit digits: A = U V^T on those columns from bf16 copies (fp32
     accumulation), with the entry's bound on the bf16 error, eb |u_n| |v_k| (Cauchy-Schwarz; eb covers the two bf16
     roundings and the fp32 sums). Sure entries are decided here (|A| - bound >= theta: the move, the sign is certain;
     |A| + bound < theta: none) and written to D; the rest (real data: 1e-6 .. 6e-4 of the entries) are listed in the
     tile's SLOTS slots (s, the entry's n K + k; -1 empty) for _fire_fix_kernel's exact fp32 dot. A digit whose list
     would overflow the slots is decided here with tf32x3 instead. The trits are not written (_fire_apply_kernel)."""
+    if TH_PTR:                                                  # (theta from a device scalar: --cuda-graph)
+        theta = tl.load(theta)
     pn = tl.program_id(0); pk = tl.program_id(1)
     rows = pn * BN + tl.arange(0, BN)
     k5 = pk * BK5 + tl.arange(0, BK5)
@@ -551,8 +570,10 @@ def _fire_kernel(ub_ptr, vb_ptr, u_ptr, v_ptr, un_ptr, vn_ptr, p_ptr, d_ptr, s_p
 
 @triton.jit
 def _fire_fix_kernel(u_ptr, v_ptr, p_ptr, d_ptr, s_ptr, n_slots, K, R, sun, svk, spn, sdn, theta,
-                     BE: tl.constexpr, RC: tl.constexpr):
+                     BE: tl.constexpr, RC: tl.constexpr, TH_PTR: tl.constexpr = False):
     """the listed entries: A_nk = u_n . v_k in fp32 (FMAs), the move decided as in _fire_kernel, written to D"""
+    if TH_PTR:
+        theta = tl.load(theta)
     pe = tl.program_id(0) * BE + tl.arange(0, BE)
     ent = tl.load(s_ptr + pe, mask=pe < n_slots, other=-1)
     live = ent >= 0
@@ -674,11 +695,12 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     g = (triton.cdiv(N, BN), triton.cdiv(K5, BK5))
     S = torch.full((g[0] * g[1] * FIRE_SLOTS,), -1, dtype=torch.int64, device=U.device)
     _fire_kernel[g](Ub, Vb, U, V, un, vn, packed, D, S, N, K, K5, R, U.stride(0), V.stride(0), packed.stride(0),
-                    D.stride(0), float(theta), FIRE_EB, g[1], SLOTS=FIRE_SLOTS, RC=RC, BN=BN, BK5=BK5,
-                    num_warps=4, num_stages=3)
+                    D.stride(0), _sc(theta), FIRE_EB, g[1], SLOTS=FIRE_SLOTS, RC=RC, BN=BN, BK5=BK5,
+                    num_warps=4, num_stages=3, TH_PTR=torch.is_tensor(theta))
     BE = 64
     _fire_fix_kernel[(triton.cdiv(S.numel(), BE),)](U, V, packed, D, S, S.numel(), K, R, U.stride(0), V.stride(0),
-                                                     packed.stride(0), D.stride(0), float(theta), BE=BE, RC=64)
+                                                     packed.stride(0), D.stride(0), _sc(theta), BE=BE, RC=64,
+                                                     TH_PTR=torch.is_tensor(theta))
     cnt = torch.zeros(2, dtype=torch.int32, device=U.device)          # (the number of moves, the change of nonzeros)
     AN, AK5, SL = 16, 32, 16                                           # (the apply tile: the spend's band and list)
     ga = (triton.cdiv(N, AN), triton.cdiv(K5, AK5))
@@ -1270,7 +1292,8 @@ def fused_epilogue(y32, xs, beta, r_b, bias_b, acc, save_t):
 
 @triton.jit
 def _acc_gemm_kernel(g_ptr, x_ptr, ib_ptr, ia_ptr, c_ptr, o_ptr, T, N, K, sgt, sxt, cs, alpha, TC, HAS_C: tl.constexpr,
-                     HAS_IB: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr):
+                     HAS_IB: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr,
+                     AL_PTR: tl.constexpr = False):
     """o [N, K] = cs c + alpha ia (g^T bf16(x ib)): g [T, N], x [T, K] bf16 (ib per column of x, applied and rounded to
     bf16 as the operand is loaded), fp32 sums over T. Split over T (grid axis 1, TC rows each): program s sums rows
     [s TC, (s + 1) TC) into o + s N K (acc_gemm adds the parts)"""
@@ -1295,6 +1318,8 @@ def _acc_gemm_kernel(g_ptr, x_ptr, ib_ptr, ia_ptr, c_ptr, o_ptr, T, N, K, sgt, s
     m = (rn[:, None] < N) & (rk[None, :] < K)
     off = rn[:, None] * K + rk[None, :]
     ia = tl.load(ia_ptr + rn, mask=rn < N, other=0.0)
+    if AL_PTR:                                                  # (alpha from a device scalar: --cuda-graph)
+        alpha = tl.load(alpha)
     v = alpha * (ia[:, None] * acc)
     if HAS_C:
         v = cs * tl.load(c_ptr + off, mask=m, other=0.0) + v
@@ -1323,8 +1348,8 @@ def acc_gemm(g, x, ib, ia, C, cs, alpha):
     P = o if S == 1 else torch.empty(S, N, K, dtype=torch.float32, device=g.device)
     _acc_gemm_kernel[(tiles, S)](
         g, x, ib if ib is not None else ia, ia.contiguous().float(), C if C is not None and S == 1 else P, P, T, N, K,
-        g.stride(0), x.stride(0), float(cs), float(alpha), TC, HAS_C=C is not None and S == 1, HAS_IB=ib is not None,
-        BM=BM, BN=BN, BK=BK, GM=8, num_warps=4, num_stages=ST)
+        g.stride(0), x.stride(0), float(cs), _sc(alpha), TC, HAS_C=C is not None and S == 1, HAS_IB=ib is not None,
+        BM=BM, BN=BN, BK=BK, GM=8, num_warps=4, num_stages=ST, AL_PTR=torch.is_tensor(alpha))
     if S > 1:                                                  # (the parts' sum, then cs C: rounding level)
         torch.sum(P, 0, out=o)
         if C is not None:
@@ -1344,10 +1369,14 @@ _SM = {}
 
 
 @triton.jit
-def _dense_fire_kernel(a_ptr, p_ptr, q_ptr, n_ptr, NK5, K, K5, theta, st, BLOCK: tl.constexpr):
+def _dense_fire_kernel(a_ptr, p_ptr, q_ptr, n_ptr, NK5, K, K5, theta, st, BLOCK: tl.constexpr,
+                       TH_PTR: tl.constexpr = False):
     """the dense accumulator's firing in one pass: per packed byte (5 trits of a row), A at those entries; a trit moves
     by sign(A) where |A| >= theta and the move is legal, A -= st sign(A) there (st = spend theta); the new bytes to q
     (the padding digits as read), the count of moves added to n"""
+    if TH_PTR:                                                  # (theta and st from device scalars: --cuda-graph)
+        theta = tl.load(theta)
+        st = tl.load(st)
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = idx < NK5
     row = idx // K5
@@ -1383,8 +1412,10 @@ def dense_fire(A, wpacked, K, theta, spend_theta):
     q = torch.empty_like(wpacked)
     n = torch.zeros(1, dtype=torch.int32, device=A.device)
     BLOCK = 1024
-    _dense_fire_kernel[(triton.cdiv(N * K5, BLOCK),)](A, wpacked, q, n, N * K5, K, K5, float(theta), float(spend_theta),
-                                                    BLOCK=BLOCK, num_warps=4)
+    tp = torch.is_tensor(theta)
+    assert tp == torch.is_tensor(spend_theta)
+    _dense_fire_kernel[(triton.cdiv(N * K5, BLOCK),)](A, wpacked, q, n, N * K5, K, K5, _sc(theta), _sc(spend_theta),
+                                                    BLOCK=BLOCK, num_warps=4, TH_PTR=tp)
     wpacked.copy_(q)
     return n[0]
 

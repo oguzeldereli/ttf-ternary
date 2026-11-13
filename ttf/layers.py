@@ -80,7 +80,8 @@ class _KernelTernFn(torch.autograd.Function):
         # activation is 1 byte per element
         xq, xs = (act_quant_i8_fast if x.is_cuda else act_quant_i8)(x.reshape(-1, layer.K), layer.act_bits)
         with _rf("tern.fwd"):
-            y = tern_gemm_i8(xq, xs, wpacked, layer.K, beta if beta is not None else 1.0)
+            y = tern_gemm_i8(xq, xs, wpacked, layer.K, beta if beta is not None else 1.0,
+                             layer.w8() if (W8_CACHE[0] and wpacked.data_ptr() == layer.wpacked.data_ptr()) else None)
         y = y.view(*x.shape[:-1], layer.N)
         ctx.save_for_backward(xq, xs, wpacked)
         ctx.layer = layer
@@ -103,7 +104,8 @@ class _KernelTernFn(torch.autograd.Function):
         if getattr(layer, "cap_accum", False):   # --accum > 1: the update sees every micro-batch (no gradient kept
             layer._ts_final = getattr(layer, "cap_final", True)   # across them); the firing on the last one
             layer._ts_micro = getattr(layer, "cap_micro", None)   # (the index: update._micro_t)
-        xf = xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype)
+        xf = (_K.dequant_i8(xq, xs) if xq.is_cuda and gyf.dtype == torch.bfloat16 and xq.dim() == 2
+              else xq.to(gyf.dtype) * xs[:, None].to(gyf.dtype))   # (one kernel, the same bf16 roundings)
         if FACTORED[0] and getattr(layer, "on_grad", None) is not None and not getattr(layer, "_dw_dense", False):
             layer.on_grad(layer, (gyf, xf))      # --dw factored: no dense weight gradient, the factors (gy, x), g = gy^T x
             return gx.to(gy.dtype), None, None
@@ -127,12 +129,14 @@ class _KernelTernFn(torch.autograd.Function):
 
 def _grad_x(layer, gyf, wpacked):
     if DX_MODE[0] in ("int8x2", "int8"):
-        return tern_gemm_dx_i8x2(gyf, wpacked, layer.K, two=DX_MODE[0] == "int8x2")
+        return tern_gemm_dx_i8x2(gyf, wpacked, layer.K, two=DX_MODE[0] == "int8x2",
+                                 w8t=layer.w8(t=True) if (W8_CACHE[0] and wpacked.data_ptr() == layer.wpacked.data_ptr()) else None)
     return tern_gemm_dx(gyf, wpacked, layer.K)
 
 
 W8_CACHE = [False]       # KernelTernaryLinear.w8: the int8 trits kept between their changes (turned on by --ckpt-skip
                          # auto when the memory allows: 2 bytes per trit; False: unpacked per use)
+GRAPH_INPLACE = [False]  # --cuda-graph: after a firing the cached beta and int8 trits are rewritten in place (_graph_refresh)
 FUSED_LAYER = [False]    # --fused-layer: centring, column scale, act-quant, GEMM epilogue, row scale, bias and the adapter
                          # sum in a few kernels each way (_FusedTernFn); bit-identical output and input grad
 
@@ -264,10 +268,32 @@ class KernelTernaryLinear(nn.Module):
         """after the fused firing (trits written in place, no version bump): the nonzero count moves by dnnz, so a
         valid cached beta is updated exactly instead of recomputed from all the trits"""
         self._nfire = getattr(self, "_nfire", 0) + 1
+        if GRAPH_INPLACE[0]:
+            return self._graph_refresh()
         if getattr(self, "_beta_key", None) is not None and self._beta_key == self._wkey(self.wpacked):
             self._nnz = self._nnz + dnnz; self._beta_val = beta_from_nnz(self._nnz, self.N)
         else:
             self._beta_key = None
+
+    @torch.no_grad()
+    def _graph_refresh(self):
+        """--cuda-graph, after a firing inside a captured step: the cached beta (from all the trits: the same integer
+        count as the running one) and the cached int8 trits rewritten in their own tensors, so the step's forward,
+        replayed later, reads the moved trits; the cache keys follow the trits' version (dense_fire's copy_ moves it)"""
+        if getattr(self, "_beta_key", None) is not None:
+            nnz = trit_nnz(self.wpacked, self.K)
+            if torch.is_tensor(self._nnz):
+                self._nnz.copy_(nnz)
+            else:
+                self._nnz = nnz
+            self._beta_val.copy_(beta_from_nnz(nnz, self.N))
+            self._beta_key = self._wkey(self.wpacked)
+        c = self.__dict__.get("_w8c")
+        if c:
+            k = (self._wkey(self.wpacked), getattr(self, "_nfire", 0))
+            for t_, (_, buf) in list(c.items()):
+                buf.copy_(_K.unpack_t_i8(self.wpacked, self.K) if t_ else unpack_fast(self.wpacked, self.K))
+                c[t_] = (k, buf)
 
     def _invalidate(self):
         """drop the cached beta and int8 weight copy; call after writing wpacked from outside the update (ttfconv's

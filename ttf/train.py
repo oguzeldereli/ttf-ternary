@@ -108,43 +108,73 @@ def _mark_micro(model, i, M, te, intk):
 
 
 CG_WARM = 3     # --cuda-graph: eager steps first (Triton autotuning, the memory plan, the TTF state's own tensors)
+CG_WARM_MAX = 20   # ... and at most this many while the memory plan (--ckpt-skip auto) keeps changing
 _CG = {"pool": None, "graphs": None}   # --cuda-graph: one memory pool for every step's graphs; the last step's graphs
 
 
-def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk):
+def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lays, lr_state, ts_cfg, step):
     """--cuda-graph: one step's micro-batches. The first, a middle and the last micro-batch (forward under bf16 autocast,
-    backward with the TTF updates inside it) are each captured once on a side stream and replayed on the current one;
-    the middle graph is replayed for micro-batches 1 .. M - 2, with each batch copied into its static input first.
-    Captured fresh every step, so every per-step number the Python side passes (lr ratio, theta, the sketch seed, the
-    memory plan) is the step's own; between the middle graph's replays the TTF state stays at fixed addresses
-    (update._keep) and the float gradients accumulate in place. Returns (last loss, sum of losses) as GPU tensors."""
+    backward with the TTF updates inside it) are each captured on a side stream and replayed on the current one; the
+    middle graph is replayed for micro-batches 1 .. M - 2, each batch copied into the static input first.
+    With --accum M >= 2 the graphs are captured once and replayed every step until the run's shape changes (the memory
+    plan, the int8 trit cache): the per-step numbers the update reads (lr ratio, theta, v's bias corrections) are device
+    scalars rewritten before the replays (ts_cfg["_dev"]), the step's random sketches are drawn into fixed tensors, the
+    TTF state is written in place (update._keep), the float gradients are zeroed in place, and the counters the updates
+    keep in Python are set after the step (update.graph_step_done). With M = 1 (the one-batch update reads Python numbers)
+    the graph is captured fresh each step. Returns (last loss, sum of losses) as GPU tensors."""
+    from . import update as U_
+    from .layers import W8_CACHE
     M = tc.grad_accum
+    reuse = ttf and M >= 2
     _ov = getattr(torch.autograd.graph, "set_override_stale_capture_stream", None)
     if _ov is not None:   # the leaf parameters' AccumulateGrad nodes remember the eager steps' stream: use the capture's
         _ov(True)
     cur = torch.cuda.current_stream()
     side = _CG.get("side") or _CG.setdefault("side", torch.cuda.Stream())   # (one capture stream for the run: the
     # allocator keeps freed blocks per stream, so a new stream each step would never reuse the pool's memory)
-    # the last step's graphs go first (the step ended on the loss's host read, so none is running), so their memory
-    # returns to the shared pool and this step's captures reuse it
-    _CG["graphs"] = None
-    if _CG["pool"] is None:   # a small graph that lives as long as the run holds the pool (a pool with no graph
-        _CG["pool"] = torch.cuda.graph_pool_handle()   # left is released, and the next capture into it fails)
-        _a = torch.cuda.CUDAGraph(); _t = torch.zeros(1, device="cuda")
-        side.wait_stream(cur)
+    if _CG["pool"] is None:   # (the eager steps' cached blocks back to the GPU: the graphs' pool is separate memory)
+        torch.cuda.empty_cache()
+        _CG["pool"] = torch.cuda.graph_pool_handle()   # a small graph that lives as long as the run holds the pool (a
+        _a = torch.cuda.CUDAGraph(); _t = torch.zeros(1, device="cuda")   # pool with no graph left is released, and
+        side.wait_stream(cur)                                              # the next capture into it fails)
         with torch.cuda.stream(side):
             _a.capture_begin(pool=_CG["pool"]); _t.add_(1); _a.capture_end()
         cur.wait_stream(side)
         _CG["anchor"] = (_a, _t)
-    graphs = _CG["graphs"] = {}
+    sig = (M, tc.batch_size, tc.seq_len, getattr(model, "ckpt_skip", None), W8_CACHE[0])
+    valid = reuse and _CG["graphs"] is not None and _CG.get("sig") == sig
+    if not valid:
+        _CG["graphs"] = None      # (the old graphs' memory back to the pool: the last step ended on a host read)
+    if reuse:
+        st = lr_state.get("_ts", {})
+        if valid:
+            ts = _CG["ts0"] + (step - _CG["step0"])
+        else:
+            tl_ = {st.get(("tsl", id(l_))) for l_ in lays}
+            assert len(tl_) == 1 and None not in tl_, f"--cuda-graph: layers at different step indices {tl_}"
+            ts = tl_.pop() + 1
+        b2, sp = ts_cfg["b2"], ts_cfg["spend"]
+        vals = np.array([-ts_cfg["lr_ratio"], ts_cfg["theta"], sp * ts_cfg["theta"], 1 - b2 ** ts if ts > 0 else 1.0,
+                         1.0 / (1 - b2 ** (ts + 1))], dtype=np.float32)   # (a tensor / a Python number is a
+        # multiply by fp32(1 / number), the reciprocal taken in double: update._step_scale's inv)
+        if "devbuf" not in _CG:
+            _CG["devbuf"] = torch.zeros(5, dtype=torch.float32, device="cuda")
+        _CG["devbuf"].copy_(torch.from_numpy(vals))
+        db = _CG["devbuf"]
+        ts_cfg["_dev"] = {"neg_lr": db[0], "theta": db[1], "spend_theta": db[2], "bc": db[3], "inv_bcn": db[4]}
+        ts_cfg["_dev_ts"] = ts
+        U_.draw_step_sketches(lays, lr_state, ts_cfg, ts)
+    elif ttf:
+        U_.draw_step_sketches(lays, lr_state, ts_cfg)
+    graphs = _CG["graphs"] if valid else {}
     pool = _CG["pool"]
     last_loss, sum_loss = None, 0.0
     for micro in range(M):
-        if ttf and M > 1:
-            _mark_micro(model, micro, M, te, intk)
         x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
         kind = (micro == 0, micro == M - 1)
         if kind not in graphs:
+            if ttf and M > 1:
+                _mark_micro(model, micro, M, te, intk)
             sx, sy = x.clone(), y.clone()
             _tc0 = time.time()
             g_ = torch.cuda.CUDAGraph()
@@ -163,18 +193,27 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk):
                       flush=True)
             cur.wait_stream(side)
             graphs[kind] = (g_, sx, sy, loss_)
+            if kind[1] and reuse:   # (the step's move count: a tensor the last graph rewrites; ts_step reads it)
+                _CG["nf"] = (lr_state.get("_ts", {}).get("_nf"), lr_state.get("_ts", {}).get("_nt"))
         else:
             g_, sx, sy, loss_ = graphs[kind]
             sx.copy_(x, non_blocking=True); sy.copy_(y, non_blocking=True)
         g_.replay()
-        if os.environ.get("CG_DEBUG"):
-            torch.cuda.synchronize()
-            print(f"  cg micro {micro} kind {kind}: allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB, "
-                  f"reserved {torch.cuda.memory_reserved() / 2**30:.2f}", flush=True)
         lv = loss_.detach()
         sum_loss = sum_loss + lv.float()
         if micro == M - 1:
             last_loss = lv.clone()
+    if reuse:
+        if valid:
+            st = lr_state.setdefault("_ts", {})
+            nf_, nt_ = _CG["nf"]
+            if nf_ is not None:
+                st["_nf"], st["_nt"] = nf_, nt_
+            U_.graph_step_done(lays, lr_state, ts_cfg, step, ts)
+        else:
+            _CG.update(sig=sig, ts0=ts, step0=step)
+        ts_cfg.pop("_dev", None); ts_cfg.pop("_dev_ts", None)
+    _CG["graphs"] = graphs        # (kept at least until the next step starts: the replays may still be running)
     return last_loss, sum_loss
 
 
@@ -1040,7 +1079,8 @@ def main():
               else "off for this run (" + ", ".join(_why) + ")"), flush=True)
         if _cg_ok:
             from . import update as _UPD
-            _UPD.GRAPH_STATE[0] = True
+            from . import layers as _LYR
+            _UPD.GRAPH_STATE[0] = True; _LYR.GRAPH_INPLACE[0] = True
     if args.fused_layer:
         from .layers import FUSED_LAYER as _FLY
         _FLY[0] = True
@@ -1106,7 +1146,7 @@ def main():
                       flush=True)
         for g in tail_opt.param_groups:
             g["lr"] = (g["rc_lr"] if g.get("rc_lr") else lr) * g.get("lr_mult", 1.0) * g.get("emb_mult", 1.0) * g.get("gate_mult", 1.0)
-        tail_opt.zero_grad(set_to_none=True)
+        tail_opt.zero_grad(set_to_none=not _cg_ok)   # (--cuda-graph: the replayed graphs accumulate into fixed .grad)
         last_loss = 0.0
         sum_loss = 0.0         # all micro-batches' losses: the step's loss over its grad_accum windows ("loss_mean")
         if args.ttf_rank:          # TTF: every ternary layer hands its gradient to the update (ts_layer)
@@ -1135,12 +1175,15 @@ def main():
                                                                                        dtype=torch.bfloat16))
             last_loss, sum_loss = last_loss.item(), sum_loss.item() * tc.grad_accum
             del _bt
-        _cg_step = _cg_ok and step >= start_step + CG_WARM and not (ts_cfg is not None and ts_cfg.get("vdiag"))
+        # (--cuda-graph after the warm-up steps and once the memory plan settled: a replayed step allocates nothing,
+        # so its measured peak would not show the graphs' memory; the plan is frozen from then on)
+        _cg_step = (_cg_ok and step >= start_step + CG_WARM and not (ts_cfg is not None and ts_cfg.get("vdiag"))
+                    and step >= (args.ttf_start or 0)
+                    and (_ck_auto is None or _ck_auto.settled or step >= start_step + CG_WARM_MAX))
         if _cg_step:
-            if ttf:
-                from .update import draw_step_sketches as _dss
-                _dss([m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)], lr_state, ts_cfg)
-            last_loss, sum_loss = _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, args.intk_emb)
+            last_loss, sum_loss = _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, args.intk_emb,
+                                                    [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)],
+                                                    lr_state, ts_cfg, step)
         for micro in range(0 if (_PP or _cg_step) else tc.grad_accum):
             if ttf and tc.grad_accum > 1:      # TTF with accumulation: sum the captured micro-batch gradients
                 _mark_micro(model, micro, tc.grad_accum, te, args.intk_emb)
@@ -1278,8 +1321,10 @@ def main():
                 mr = mem_report(model, tail_opt, lr_state)
                 log_metrics({"step": step, **mr})
                 print("  memory (MiB): " + ", ".join(f"{k[4:-3]} {v:.1f}" for k, v in mr.items()), flush=True)
-        if _ck_auto is not None:
+        if _ck_auto is not None and not _cg_step:
             _peak_all = max(_peak_all, _ck_auto.after_step())
+        elif _ck_auto is not None:   # (--cuda-graph: the plan stays as the graphs were captured with)
+            _peak_all = max(_peak_all, torch.cuda.max_memory_allocated()); torch.cuda.reset_peak_memory_stats()
         if step > 0 and step % tc.eval_interval == 0:
             vl = evaluate(model, val_data, tc, device)
             log_metrics({"step": step, "val_loss": vl, "val_ppl": math.exp(vl)})
