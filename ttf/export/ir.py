@@ -100,16 +100,20 @@ def op_embed(ins, node, W, st, D):
     return [w.reshape(*idx.shape, -1).to(D).float()]
 
 
-def _intk_w(W, p, g, D):
-    q = W[p + ".codes_u8"].float()
-    w = W[p + ".lo"].float()[..., None] + W[p + ".s"].float()[..., None] * q.reshape(q.shape[0], -1, g)
-    return w.reshape(q.shape[0], -1).to(D)
+def _intk_rows(W, p, g, D, i, j):
+    q = W[p + ".codes_u8"][i:j].float()
+    w = W[p + ".lo"][i:j].float()[..., None] + W[p + ".s"][i:j].float()[..., None] * q.reshape(j - i, -1, g)
+    return w.reshape(j - i, -1).to(D)
 
 
 def op_head(ins, node, W, st, D):
     a = node.get("attr", {})
-    w = _intk_w(W, node["p"], a["g"], D) if a.get("kind") == "intk" else W[node["p"] + ".weight"].to(D)
-    return [(ins[0].to(D) @ w.t()).float()]
+    x = ins[0].to(D)
+    if a.get("kind") != "intk":
+        return [(x @ W[node["p"] + ".weight"].to(D).t()).float()]
+    V, c = W[node["p"] + ".codes_u8"].shape[0], 32768          # by vocabulary chunks: no [V, K] fp32 copy (27B: 5 GB)
+    return [torch.cat([(x @ _intk_rows(W, node["p"], a["g"], D, i, min(i + c, V)).t()).float()
+                       for i in range(0, V, c)], -1)]
 
 
 def op_matmul(ins, node, W, st, D):

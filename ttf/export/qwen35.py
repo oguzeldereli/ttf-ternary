@@ -213,8 +213,13 @@ def check(m, path, n=12, n_pre=8, dev="cuda", float_mode=True):
     g = torch.Generator().manual_seed(0)
     ids = torch.randint(0, 50000, (n,), generator=g)
     with (float_path() if float_mode else contextlib.nullcontext()):
+        e = m.hf.model.embed_tokens
+        # (an int-k lookup returns bf16 by default: in an fp32 model, the group parameters' dtype)
+        hk = e.register_forward_hook(lambda mod, i, o: o.to(mod.m.lo.dtype)) if hasattr(e, "m") else None
         with _ref_kernels():
             ref = m(ids[None].to(dev))[0][0].float().cpu()
+        if hk is not None:
+            hk.remove()
         R = ttf_ir.Runner(ir, W, D, dev)
         full = R("step", ids=ids, pos=torch.arange(n))["logits"].cpu()
         R.reset()

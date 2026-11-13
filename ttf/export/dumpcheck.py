@@ -22,7 +22,8 @@ from . import ir as ttf_ir
 def _load(ddir, idx, name):
     e = idx[name]
     ne = e["ne"]
-    nd = max([i + 1 for i, n in enumerate(ne) if n > 1] + [1])
+    # the torch rank when the dump gives it (at T = 1 ggml drops trailing 1s: trimming ne would guess wrong)
+    nd = e.get("nd") or max([i + 1 for i, n in enumerate(ne) if n > 1] + [1])
     a = np.fromfile(f"{ddir}/{name}.bin", np.float32 if e["type"] == "f32" else np.int32)
     return torch.from_numpy(a.reshape(list(reversed(ne[:nd]))))
 

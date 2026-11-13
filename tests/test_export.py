@@ -134,7 +134,7 @@ def test_dumpcheck_on_reference_dump(tmp_path):
     for k, v in R.last_values.items():
         f32 = v.is_floating_point()
         np.asarray(v.cpu().float().numpy() if f32 else v.cpu().to(torch.int32).numpy()).tofile(d / f"{k}.bin")
-        idx[k] = {"type": "f32" if f32 else "i32", "ne": list(reversed(v.shape)) + [1] * (4 - v.dim())}
+        idx[k] = {"type": "f32" if f32 else "i32", "ne": list(reversed(v.shape)) + [1] * (4 - v.dim()), "nd": v.dim()}
     json.dump(idx, open(d / "index.json", "w"))
     res = check_dump(p, str(d), log=lambda *a: None)
     assert res and all(r[0] == 0 for r in res.values()), res
