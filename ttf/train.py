@@ -133,7 +133,16 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
     side = _CG.get("side") or _CG.setdefault("side", torch.cuda.Stream())   # (one capture stream for the run: the
     # allocator keeps freed blocks per stream, so a new stream each step would never reuse the pool's memory)
     if _CG["pool"] is None:   # (the eager steps' cached blocks back to the GPU: the graphs' pool is separate memory)
+        # the int8 trit caches were made one by one inside eager steps, between activations: their blocks pin the
+        # allocator's segments, so the freed activations around them stay reserved (0.8B: 2.6 GiB) where the graphs'
+        # pool cannot use them. Dropped before the release and made again together, they fill whole segments
+        w8k = {l_: list(l_.__dict__.get("_w8c", {})) for l_ in model.modules() if hasattr(l_, "_w8c")}
+        for l_ in w8k:
+            l_.__dict__.pop("_w8c", None)
         torch.cuda.empty_cache()
+        for l_, ks in w8k.items():
+            for t_ in ks:
+                l_.w8(t=t_)
         _CG["pool"] = torch.cuda.graph_pool_handle()   # a small graph that lives as long as the run holds the pool (a
         _a = torch.cuda.CUDAGraph(); _t = torch.zeros(1, device="cuda")   # pool with no graph left is released, and
         side.wait_stream(cur)                                              # the next capture into it fails)
@@ -177,6 +186,10 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
                 _mark_micro(model, micro, M, te, intk)
             sx, sy = x.clone(), y.clone()
             _tc0 = time.time()
+            if os.environ.get("CG_DEBUG"):
+                print(f"  cg before {kind}: GiB allocated {torch.cuda.memory_allocated() / 2**30:.2f}, reserved "
+                      f"{torch.cuda.memory_reserved() / 2**30:.2f}, free {torch.cuda.mem_get_info()[0] / 2**30:.2f}",
+                      flush=True)
             g_ = torch.cuda.CUDAGraph()
             side.wait_stream(cur)
             with torch.cuda.stream(side):
@@ -189,7 +202,9 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
                 finally:
                     g_.capture_end()
             if os.environ.get("CG_DEBUG"):
-                print(f"  cg capture {kind}: python {_tc1 - _tc0:.3f} s, end+instantiate {time.time() - _tc1:.3f} s",
+                print(f"  cg capture {kind}: python {_tc1 - _tc0:.3f} s, end+instantiate {time.time() - _tc1:.3f} s; "
+                      f"GiB allocated {torch.cuda.memory_allocated() / 2**30:.2f}, reserved "
+                      f"{torch.cuda.memory_reserved() / 2**30:.2f}, free {torch.cuda.mem_get_info()[0] / 2**30:.2f}",
                       flush=True)
             cur.wait_stream(side)
             graphs[kind] = (g_, sx, sy, loss_)

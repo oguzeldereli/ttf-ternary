@@ -625,6 +625,56 @@ def test_fused_layer(K, N, dx):
         L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0] = old
 
 
+@pytest.mark.parametrize("K,N,dx,centre", [(1024, 2816, "int8x2", False), (2816, 1024, "int8x2", True),
+                                          (1024, 1024, "bf16", False), (4096, 1024, "int8x2", False)])
+def test_fused_layer_adapter(K, N, dx, centre):
+    """--fused-layer on a layer with the rank-16 additive float adapter (the from-scratch preset's layers) against the
+    unfused path (_ColScaleFn, _KernelTernFn, the adapter's two GEMMs, _AddRowFn): output (with and without grad), input
+    gradient, the TTF factors and the adapter's gradients bit-identical; the scales' gradients within bf16 rounding
+    (fp32 sums). K 4096: the cutlass GEMM + separate epilogue"""
+    import ttf.kernel as KN
+    import ttf.layers as L
+    from ttf.layers import KernelTernaryLinear
+    dev, T = "cuda", 512
+    old = (L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], L.W8_CACHE[0])
+    L.DX_MODE[0], L.FACTORED[0], L.W8_CACHE[0] = dx, True, True
+    try:
+        torch.manual_seed(0)
+        l = KernelTernaryLinear(K, N, 8, beta=True).to(dev); l.enable_rc_scale(); l.enable_lowrank_mag("add", 16)
+        l.wpacked.copy_(KN.pack_rows(torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8)))
+        with torch.no_grad():
+            l.row_scale.uniform_(0.5, 1.5); l.col_scale.uniform_(0.5, 1.5); l.mag_A.normal_(0, 0.05)
+        if centre:
+            l.enable_centering(torch.randn(K, device=dev) * 0.3, torch.randn(N, device=dev) * 0.1)
+        cap = {}
+        l.capture = True
+        l.on_grad = lambda l_, g_: cap.setdefault(0, (g_[0].clone(), g_[1].clone()))
+        x0 = torch.randn(T, K, device=dev, dtype=torch.bfloat16) * 2
+        gy = torch.randn(T, N, device=dev, dtype=torch.bfloat16)
+
+        def run(fused):
+            L.FUSED_LAYER[0] = fused; cap.clear()
+            for p_ in l.parameters():
+                p_.grad = None
+            x = x0.clone().requires_grad_(True)
+            with torch.no_grad():
+                y_ng = l(x0)
+            y = l(x); y.backward(gy)
+            return y.detach(), y_ng, x.grad, {n: p_.grad.clone() for n, p_ in l.named_parameters()}, cap[0]
+        A, B = run(False), run(True)
+        for i in range(3):
+            assert torch.equal(A[i], B[i]), i
+        for n in A[3]:
+            ga, gb = A[3][n], B[3][n]
+            if n.startswith("mag_"):
+                assert torch.equal(ga, gb), n
+            else:
+                assert ((ga - gb).abs().max() / ga.abs().max().clamp_min(1e-30)).item() < 8e-3, n
+        assert torch.equal(A[4][0], B[4][0]) and torch.equal(A[4][1], B[4][1])
+    finally:
+        L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], L.W8_CACHE[0] = old
+
+
 def test_intk_codes_fire_in_range():
     """--intk-emb: the dense TTF update moves int-k codes by one level where the accumulator reaches theta, never out
     of 0 .. levels; the leaf's gradient reaches the group parameters"""

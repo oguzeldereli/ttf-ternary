@@ -142,10 +142,11 @@ FUSED_LAYER = [False]    # --fused-layer: centring, column scale, act-quant, GEM
 
 
 def _fused_ok(l, x):
-    """the layers _FusedTernFn takes: bf16 CUDA input, row / column scales, no float adapter; with capture on, only the
-    factored TTF update (--dw factored) and no --dw-thin dense"""
+    """the layers _FusedTernFn takes: bf16 CUDA input, row / column scales, at most the additive float adapter; with
+    capture on, only the factored TTF update (--dw factored) and no --dw-thin dense"""
     if not (FUSED_LAYER[0] and x.is_cuda and x.dtype == torch.bfloat16
-            and l.col_scale is not None and l.row_scale is not None and getattr(l, "mag_A", None) is None
+            and l.col_scale is not None and l.row_scale is not None
+            and (getattr(l, "mag_A", None) is None or getattr(l, "mag_kind", "add") == "add")
             and l.K % 16 == 0 and l.N % 8 == 0 and x.numel() // l.K > 16):   # (K % 16: kernel.tern_gemm_i8)
         return False
     if l.capture and torch.is_grad_enabled():
@@ -154,7 +155,9 @@ def _fused_ok(l, x):
 
 
 def _fused_fwd(l, x2, acc2, save):
-    """x2 [M, K] -> (out [M, N] bf16, saved tensors or None)"""
+    """x2 [M, K] -> (out [M, N] bf16, saved tensors or None). With the float adapter (mag_A, mag_B): its term
+    a = (xs B) A^T on the scaled input xs = bf16(bf16(x - mu) c) (the prologue writes xs), added to the ternary product
+    before the row scale in the GEMM's epilogue: the unfused path's (_ColScaleFn, two GEMMs, _AddRowFn) values"""
     mu = getattr(l, "in_mean", None)
     mu_b = mu.to(torch.bfloat16) if mu is not None else None
     cb, rb = l.col_scale.to(torch.bfloat16), l.row_scale.to(torch.bfloat16)
@@ -162,27 +165,40 @@ def _fused_fwd(l, x2, acc2, save):
     bb = ob.to(torch.bfloat16) if ob is not None else None
     # (the input itself is kept for the backward, which re-forms bf16(x - mu): one tensor for all the readers of one
     # input, bit-identical)
-    xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, l.act_bits, False)
+    mag = getattr(l, "mag_A", None) is not None
+    if mag:
+        xq, xs, _, xo = _K.fused_prologue(x2, mu_b, cb, l.act_bits, False, True)
+        Ab, Bb = l.mag_A.to(torch.bfloat16), l.mag_B.to(torch.bfloat16)
+        h = xo @ Bb
+        a = h @ Ab.T
+    else:
+        xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, l.act_bits, False)
+        a = None
     beta = l._cached_beta(l.wpacked) if l.use_beta else None
-    t, o = _K.fused_fwd_gemm(xq, l.w8(), xs, beta if beta is not None else 1.0, rb, bb, acc2, save)
-    return o, ((xq, xs, x2, t, cb, rb, beta) if save else None)
+    t, o = _K.fused_fwd_gemm(xq, l.w8(), xs, beta if beta is not None else 1.0, rb, bb, acc2, save, a)
+    if not save:
+        return o, None
+    return o, (xq, xs, x2, t, cb, rb, beta) + ((xo, h, Ab, Bb) if mag else ())
 
 
 class _FusedTernFn(torch.autograd.Function):
     """out = acc + ((T(c (x - mu)) * beta) * r + bias), the ternary layer with its scales, centring and an added input
     (the sum of a converted layer's parts) as one Function; the TTF update gets the same (gy, x) factors"""
     @staticmethod
-    def forward(ctx, x, c, r, bias, acc, layer):
+    def forward(ctx, x, c, r, bias, acc, layer, mA=None, mB=None):
         x2 = x.reshape(-1, layer.K)
         if not x2.is_contiguous():
             x2 = x2.contiguous()
         acc2 = acc.reshape(-1, layer.N).contiguous() if acc is not None else None
         with _rf("tern.fwd"):
             o, sv = _fused_fwd(layer, x2, acc2, True)
-        xq, xs, xc, t, cb, rb, beta = sv
+        xq, xs, xc, t, cb, rb, beta = sv[:7]
+        ctx.has_mag = mA is not None
+        if ctx.has_mag:
+            ctx.mdt = (mA.dtype, mB.dtype)
         ctx.mu_b = (layer.in_mean.to(torch.bfloat16) if getattr(layer, "in_mean", None) is not None
                     else None)   # (xc above is the input, its centring redone in the backward)
-        ctx.save_for_backward(xq, xs, xc, t, cb, rb)
+        ctx.save_for_backward(xq, xs, xc, t, cb, rb, *sv[7:])
         ctx.layer, ctx.beta, ctx.xshape = layer, beta, x.shape
         ctx.cdt, ctx.rdt, ctx.has_bias, ctx.has_acc = c.dtype, r.dtype, bias is not None, acc is not None
         ctx.bdt = bias.dtype if bias is not None else None
@@ -190,24 +206,35 @@ class _FusedTernFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g):
-        xq, xs, xc, t, cb, rb = ctx.saved_tensors
+        sv = ctx.saved_tensors          # (read once: a checkpointed layer's saved tensors unpack only once)
+        xq, xs, xc, t, cb, rb = sv[:6]
         l = ctx.layer
         g2 = g.reshape(-1, l.N).contiguous()
         bb = (ctx.beta if ctx.beta is not None else torch.ones((), device=g.device)).reshape(()).to(torch.bfloat16)
         sl = {"int8x2": 2, "int8": 1}.get(DX_MODE[0], 0)
+        gA = gB = gxa = None
         with _rf("tern.dx"):
-            f, q1, q2, s, gbias, grow = _K.fused_bwd_rows(g2, t, rb, bb, sl)
+            f, q1, q2, s, gbias, grow, *gt = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=ctx.has_mag)
+            if ctx.has_mag:      # the float adapter a = (xs B) A^T: its gradients as autograd's mm backward forms them
+                xo, h, Ab, Bb = sv[6:]
+                gt = gt[0]                                    # bf16(g * r)
+                gA = torch.mm(h.t(), gt).t().to(ctx.mdt[0])
+                gh = torch.mm(gt, Ab)
+                gB = torch.mm(xo.t(), gh).to(ctx.mdt[1])
+                gxa = torch.mm(gh, Bb.t())                    # (added to the ternary input gradient before the scale)
+                del gt, gh
             if sl:
-                gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xc, ctx.mu_b)
+                gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xc, ctx.mu_b, gxa)
                 del q1, q2
             else:
-                gx, gc = _K.scale_bwd(_grad_x(l, f, l.wpacked), cb, xc, ctx.mu_b)   # (the centring in the kernel)
+                gxt = _grad_x(l, f, l.wpacked)
+                gx, gc = _K.scale_bwd(gxt if gxa is None else gxt + gxa, cb, xc, ctx.mu_b)   # (the centring in the kernel)
         if l.capture and getattr(l, "on_grad", None) is not None:    # (_fused_ok: the factored TTF update)
             if getattr(l, "cap_accum", False):
                 l._ts_final = getattr(l, "cap_final", True); l._ts_micro = getattr(l, "cap_micro", None)
             l.on_grad(l, (f, _K.dequant_i8(xq, xs)))
         return (gx.view(ctx.xshape), gc.to(ctx.cdt), grow.to(ctx.rdt), gbias.to(ctx.bdt) if ctx.has_bias else None,
-                g if ctx.has_acc else None, None)
+                g if ctx.has_acc else None, None, gA, gB)
 
 
 class KernelTernaryLinear(nn.Module):
@@ -352,7 +379,8 @@ class KernelTernaryLinear(nn.Module):
                 o, _ = _fused_fwd(self, x2 if x2.is_contiguous() else x2.contiguous(),
                                   acc.reshape(-1, self.N).contiguous() if acc is not None else None, False)
                 return o.view(*x.shape[:-1], self.N)
-            return _FusedTernFn.apply(x, self.col_scale, self.row_scale, getattr(self, "out_bias", None), acc, self)
+            return _FusedTernFn.apply(x, self.col_scale, self.row_scale, getattr(self, "out_bias", None), acc, self,
+                                      getattr(self, "mag_A", None), getattr(self, "mag_B", None))
         y = self._forward(x)
         return y if acc is None else acc + y
 

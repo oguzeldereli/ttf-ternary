@@ -1217,9 +1217,10 @@ def _rbf(x):
 # unfused path's roundings in its order (every bf16 op rounds its fp32 result to bf16), so the layer's output and input
 # gradient are bit-identical; the scale and bias gradients' sums run in fp32 without the final bf16 rounding.
 @triton.jit
-def _pro_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, K, sxm, qp, rqp, lo, HAS_MU: tl.constexpr,
-                SAVE_XC: tl.constexpr, BK: tl.constexpr):
-    """xc = bf16(x - mu), xs = bf16(xc * c), then act_quant_i8 of xs (_actq_kernel's arithmetic); xs is not stored"""
+def _pro_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, xo_ptr, K, sxm, qp, rqp, lo, HAS_MU: tl.constexpr,
+                SAVE_XC: tl.constexpr, BK: tl.constexpr, SAVE_XS: tl.constexpr = False):
+    """xc = bf16(x - mu), xs = bf16(xc * c), then act_quant_i8 of xs (_actq_kernel's arithmetic); xs stored to xo with
+    SAVE_XS (the float adapter's input)"""
     row = tl.program_id(0)
     amax = tl.zeros((BK,), dtype=tl.float32)
     for k0 in range(0, K, BK):
@@ -1240,33 +1241,42 @@ def _pro_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, K, sxm, qp, rqp, lo,
             if SAVE_XC:
                 tl.store(xc_ptr + row * K + offs, x.to(tl.bfloat16), mask=offs < K)
         x = _rbf(x * tl.load(c_ptr + offs, mask=offs < K, other=0.0).to(tl.float32))
+        if SAVE_XS:
+            tl.store(xo_ptr + row * K + offs, x.to(tl.bfloat16), mask=offs < K)
         q = tl.extra.cuda.libdevice.rint(tl.div_rn(x, scale))
         q = tl.minimum(tl.maximum(q, -qp - 1.0), qp)
         tl.store(q_ptr + row * K + offs, q.to(tl.int8), mask=offs < K)
 
 
-def fused_prologue(x2, mu_b, c_b, bits, save_xc):
-    """x2 [M, K] bf16 -> (int8 codes, fp32 row scales, xc = bf16(x - mu) if save_xc and mu_b is not None else None)"""
+def fused_prologue(x2, mu_b, c_b, bits, save_xc, save_xs=False):
+    """x2 [M, K] bf16 -> (int8 codes, fp32 row scales, xc = bf16(x - mu) if save_xc and mu_b is not None else None);
+    save_xs: a fourth output, the scaled input bf16(bf16(x - mu) c) (the float adapter's input)"""
     M, K = x2.shape
     q = torch.empty(M, K, dtype=torch.int8, device=x2.device)
     sc = torch.empty(M, dtype=torch.float32, device=x2.device)
     xc = torch.empty(M, K, dtype=torch.bfloat16, device=x2.device) if (save_xc and mu_b is not None) else None
+    xo = torch.empty(M, K, dtype=torch.bfloat16, device=x2.device) if save_xs else None
     qp, rqp, lo = _actq_consts(bits, x2.dtype)
-    _pro_kernel[(M,)](x2, mu_b if mu_b is not None else c_b, c_b, q, sc, xc if xc is not None else q, K, x2.stride(0),
-                      qp, rqp, lo, HAS_MU=mu_b is not None, SAVE_XC=xc is not None, BK=1024)
-    return q, sc, xc
+    _pro_kernel[(M,)](x2, mu_b if mu_b is not None else c_b, c_b, q, sc, xc if xc is not None else q,
+                      xo if xo is not None else q, K, x2.stride(0), qp, rqp, lo, HAS_MU=mu_b is not None,
+                      SAVE_XC=xc is not None, BK=1024, SAVE_XS=save_xs)
+    return (q, sc, xc, xo) if save_xs else (q, sc, xc)
 
 
 @triton.jit
-def _epi_fwd_kernel(y_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, t_ptr, o_ptr, M, N, HAS_BIAS: tl.constexpr,
-                    HAS_ACC: tl.constexpr, SAVE_T: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
-    """t = bf16(y32 * xs * beta) (_i8_epi_kernel's order), o = bf16(t * r), o = bf16(o + bias), o = bf16(acc + o)"""
+def _epi_fwd_kernel(y_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, pre_ptr, t_ptr, o_ptr, M, N, HAS_BIAS: tl.constexpr,
+                    HAS_ACC: tl.constexpr, SAVE_T: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                    HAS_PRE: tl.constexpr = False):
+    """t = bf16(y32 * xs * beta) (_i8_epi_kernel's order), HAS_PRE: t = bf16(t + pre) (the float adapter's term, as
+    _addrow_fwd_kernel), o = bf16(t * r), o = bf16(o + bias), o = bf16(acc + o)"""
     rows = tl.program_id(0) * BM + tl.arange(0, BM); cols = tl.program_id(1) * BN + tl.arange(0, BN)
     m = (rows[:, None] < M) & (cols[None, :] < N)
     off = rows[:, None] * N + cols[None, :]
     y = tl.load(y_ptr + off, mask=m, other=0).to(tl.float32)
     xs = tl.load(xs_ptr + rows, mask=rows < M, other=0.0)
     t = _rbf((y * xs[:, None]) * tl.load(b_ptr))
+    if HAS_PRE:
+        t = _rbf(t + tl.load(pre_ptr + off, mask=m, other=0.0).to(tl.float32))
     if SAVE_T:
         tl.store(t_ptr + off, t.to(tl.bfloat16), mask=m)
     o = _rbf(t * tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)[None, :])
@@ -1277,16 +1287,17 @@ def _epi_fwd_kernel(y_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, t_ptr, o_ptr
     tl.store(o_ptr + off, o.to(tl.bfloat16), mask=m)
 
 
-def fused_epilogue(y32, xs, beta, r_b, bias_b, acc, save_t):
-    """the int32 GEMM result -> (t = the ternary product before the row scale if save_t, the layer's bf16 output)"""
+def fused_epilogue(y32, xs, beta, r_b, bias_b, acc, save_t, pre=None):
+    """the int32 GEMM result -> (t = the ternary product (+ pre) before the row scale if save_t, the layer's bf16
+    output)"""
     M, N = y32.shape
     o = torch.empty(M, N, dtype=torch.bfloat16, device=y32.device)
     t = torch.empty_like(o) if save_t else None
     BM, BN = 32, 128
     _epi_fwd_kernel[(triton.cdiv(M, BM), triton.cdiv(N, BN))](
         y32, xs, _dev_scalar(beta, y32.device), r_b, bias_b if bias_b is not None else r_b,
-        acc if acc is not None else o, t if t is not None else o, o, M, N, HAS_BIAS=bias_b is not None,
-        HAS_ACC=acc is not None, SAVE_T=save_t, BM=BM, BN=BN)
+        acc if acc is not None else o, pre if pre is not None else o, t if t is not None else o, o, M, N,
+        HAS_BIAS=bias_b is not None, HAS_ACC=acc is not None, SAVE_T=save_t, BM=BM, BN=BN, HAS_PRE=pre is not None)
     return t, o
 
 
@@ -1421,9 +1432,9 @@ def dense_fire(A, wpacked, K, theta, spend_theta):
 
 
 @triton.jit
-def _fwd_gemm_kernel(a_ptr, w_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, t_ptr, o_ptr, M, N, K, sam, swn,
+def _fwd_gemm_kernel(a_ptr, w_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, pre_ptr, t_ptr, o_ptr, M, N, K, sam, swn,
                      HAS_BIAS: tl.constexpr, HAS_ACC: tl.constexpr, SAVE_T: tl.constexpr, BM: tl.constexpr,
-                     BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr):
+                     BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr, HAS_PRE: tl.constexpr = False):
     """the fused layer's forward GEMM with its epilogue: y = xq W^T (int8 x trits, int32: exact) and then
     _epi_fwd_kernel's arithmetic on the tile, so the int32 [M, N] is never written; bit-identical to the two kernels"""
     pid = tl.program_id(0)
@@ -1441,6 +1452,8 @@ def _fwd_gemm_kernel(a_ptr, w_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, t_pt
     off = rows[:, None] * N + cols[None, :]
     xs = tl.load(xs_ptr + rows, mask=rows < M, other=0.0)
     t = _rbf((acc.to(tl.float32) * xs[:, None]) * tl.load(b_ptr))
+    if HAS_PRE:
+        t = _rbf(t + tl.load(pre_ptr + off, mask=m, other=0.0).to(tl.float32))
     if SAVE_T:
         tl.store(t_ptr + off, t.to(tl.bfloat16), mask=m)
     o = _rbf(t * tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)[None, :])
@@ -1451,7 +1464,7 @@ def _fwd_gemm_kernel(a_ptr, w_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, t_pt
     tl.store(o_ptr + off, o.to(tl.bfloat16), mask=m)
 
 
-def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t):
+def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t, pre=None):
     """xq int8 [M, K] (fused_prologue), the trits w8 int8 [N, K] (KernelTernaryLinear.w8()) -> (t, out) as
     fused_epilogue(torch._int_mm(xq, w8.t()), ...) gives them, bit for bit. One Triton kernel (no int32 round trip)
     for short reductions (K <= 2048: the adapters' up factors, whose int32 [M, N] and epilogue cost as much as their
@@ -1460,21 +1473,21 @@ def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t):
     M, K = xq.shape
     N = w8.shape[0]
     if K > 2048:
-        return fused_epilogue(torch._int_mm(xq, w8.t()), xs, beta, r_b, bias_b, acc, save_t)
+        return fused_epilogue(torch._int_mm(xq, w8.t()), xs, beta, r_b, bias_b, acc, save_t, pre)
     o = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device)
     t = torch.empty_like(o) if save_t else None
     BM, BN, BK, nw = (64, 128, 64, 8) if N >= 16384 else (128, 64, 64, 4)
     _fwd_gemm_kernel[(triton.cdiv(M, BM) * triton.cdiv(N, BN),)](
         xq, w8, xs, _dev_scalar(beta, xq.device), r_b, bias_b if bias_b is not None else r_b,
-        acc if acc is not None else o, t if t is not None else o, o, M, N, K, xq.stride(0), w8.stride(0),
-        HAS_BIAS=bias_b is not None, HAS_ACC=acc is not None, SAVE_T=save_t, BM=BM, BN=BN, BK=BK, GM=8,
-        num_warps=nw, num_stages=3)
+        acc if acc is not None else o, pre if pre is not None else o, t if t is not None else o, o, M, N, K,
+        xq.stride(0), w8.stride(0), HAS_BIAS=bias_b is not None, HAS_ACC=acc is not None, SAVE_T=save_t, BM=BM, BN=BN,
+        BK=BK, GM=8, num_warps=nw, num_stages=3, HAS_PRE=pre is not None)
     return t, o
 
 
 @triton.jit
-def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, pb_ptr, pr_ptr, M, N,
-                     SLICES: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, pb_ptr, pr_ptr, gt_ptr, M, N,
+                     SLICES: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, SAVE_GT: tl.constexpr = False):
     """from the output gradient g [M, N]: gyf = bf16(bf16(g * r) * bf16(beta)) (the GEMM's gradient, stored), the
     column sums of g (bias) and of bf16(g * t) (row scale) per row block, and with SLICES = 2 gyf's two int8 slices
     (_slice2_kernel's arithmetic), SLICES = 1 the first only (--dx int8)"""
@@ -1489,7 +1502,10 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
         g = tl.load(g_ptr + off, mask=m, other=0.0).to(tl.float32)
         t = tl.load(t_ptr + off, mask=m, other=0.0).to(tl.float32)
         r = tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
-        f = _rbf(_rbf(g * r[None, :]) * bb)
+        gr_ = _rbf(g * r[None, :])
+        if SAVE_GT:      # bf16(g * r): the float adapter's output gradient (as _AddRowFn's)
+            tl.store(gt_ptr + off, gr_.to(tl.bfloat16), mask=m)
+        f = _rbf(gr_ * bb)
         tl.store(f_ptr + off, f.to(tl.bfloat16), mask=m)
         amax = tl.maximum(amax, tl.max(tl.abs(f), axis=1))
         tl.store(pb_ptr + pm * N + cols, tl.sum(g, axis=0), mask=cols < N)
@@ -1511,9 +1527,9 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
                 tl.store(q2_ptr + off, tl.minimum(tl.maximum(q2, -127.0), 127.0).to(tl.int8), mask=m)
 
 
-def fused_bwd_rows(g, t, r_b, beta_b, slices):
+def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False):
     """-> (gyf bf16 [M, N], q1, q2, s (None without slices; q2 None with one), bias gradient fp32 [N], row-scale
-    gradient fp32 [N]); slices: 0, 1 or 2 int8 slices of gyf"""
+    gradient fp32 [N]); slices: 0, 1 or 2 int8 slices of gyf. save_gt: a seventh output, bf16(g * r)"""
     M, N = g.shape
     f = torch.empty_like(g)
     BM, BN = 16, 256
@@ -1524,15 +1540,17 @@ def fused_bwd_rows(g, t, r_b, beta_b, slices):
         s = torch.empty(M, dtype=torch.float32, device=g.device)
     else:
         q1 = q2 = s = None
+    gt = torch.empty_like(g) if save_gt else None
     _bwd_rows_kernel[(nb,)](g, t, r_b, beta_b, f, q1 if slices else f, q2 if q2 is not None else f,
-                            s if slices else pb, pb, pr, M, N, SLICES=int(slices), BM=BM, BN=BN)
-    return f, q1, q2, s, pb.sum(0), pr.sum(0)
+                            s if slices else pb, pb, pr, gt if gt is not None else f, M, N, SLICES=int(slices), BM=BM,
+                            BN=BN, SAVE_GT=save_gt)
+    return (f, q1, q2, s, pb.sum(0), pr.sum(0)) + ((gt,) if save_gt else ())
 
 
 @triton.jit
-def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, gx_ptr, pc_ptr, M, N, K, sam, sbk,
+def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr, gx_ptr, pc_ptr, M, N, K, sam, sbk,
                     HAS_MU: tl.constexpr, TWO: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
-                    GM: tl.constexpr):
+                    GM: tl.constexpr, HAS_ADD: tl.constexpr = False):
     """the input gradient on the int8 tensor cores with its epilogue in one kernel: y1 = q1 W, y2 = q2 W (gy's two int8
     slices [M, N] against the trits, b [K, N]: row k is column k of W; two int32 accumulators, exact), then as
     _dx2_epi_kernel + _scale_bwd_kernel: g = bf16((y1 + y2 / 254) s), gx = bf16(g c) and per BM-row block the column
@@ -1560,6 +1578,8 @@ def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, gx_ptr, 
         g = _rbf((acc1.to(tl.float32) + acc2.to(tl.float32) * (1.0 / 254.0)) * s[:, None])
     else:
         g = _rbf(acc1.to(tl.float32) * s[:, None])
+    if HAS_ADD:      # the float adapter's input gradient, added as autograd sums the two (bf16)
+        g = _rbf(g + tl.load(add_ptr + off, mask=m, other=0.0).to(tl.float32))
     c = tl.load(c_ptr + cols, mask=cols < K, other=0.0).to(tl.float32)
     x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
     if HAS_MU:
@@ -1578,7 +1598,7 @@ def _dx2_tile(N, K):
     return 64, 128, 64, 4
 
 
-def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None):
+def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None):
     """(gx bf16 [M, K], the column scale's gradient fp32 [K]) from gy's int8 slices q1, q2 [M, N] and scale s [M]
     (fused_bwd_rows; q2 None: one slice, --dx int8), the trits w8t [K, N] (KernelTernaryLinear.w8(t=True)), the column
     scale c_b and the layer's input x (centred here with mu_b)"""
@@ -1589,9 +1609,10 @@ def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None):
     nb = triton.cdiv(M, BM)
     pc = torch.empty(nb, K, dtype=torch.float32, device=q1.device)
     _dx2_col_kernel[(nb * triton.cdiv(K, BK),)](q1, q2 if q2 is not None else q1, w8t, s, c_b, x,
-                                                mu_b if mu_b is not None else c_b, gx, pc, M, N, K, q1.stride(0),
-                                                w8t.stride(0), HAS_MU=mu_b is not None, TWO=q2 is not None, BM=BM,
-                                                BK=BK, BN=BN, GM=8, num_warps=nw, num_stages=3)
+                                                mu_b if mu_b is not None else c_b, add if add is not None else gx, gx,
+                                                pc, M, N, K, q1.stride(0), w8t.stride(0), HAS_MU=mu_b is not None,
+                                                TWO=q2 is not None, BM=BM, BK=BK, BN=BN, GM=8, num_warps=nw,
+                                                num_stages=3, HAS_ADD=add is not None)
     return gx, pc.sum(0)
 
 
