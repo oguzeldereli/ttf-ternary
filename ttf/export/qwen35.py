@@ -225,12 +225,34 @@ def check(m, path, n=12, n_pre=8, dev="cuda", float_mode=True):
             "top-1 agree": float((full.argmax(-1) == ref.argmax(-1)).float().mean())}
 
 
+def check_slice(m, hf_dir, out, n, dev="cuda", dtype=None):
+    """a model too big for one GPU (27B): keep its first n decoder layers (embedding, final norm and head as they are),
+    move that to the GPU, export it to `out` and run check on it. Checks the emitters on this model's own modules and
+    tensors (n >= full_attention_interval reaches an attention layer)."""
+    tm = m.hf.model
+    tm.layers = torch.nn.ModuleList(list(tm.layers)[:n])
+    tm.config.num_hidden_layers = n
+    tm.config.layer_types = tm.config.layer_types[:n]
+    m.to(dev)
+    if dtype is not None:
+        m.to(dtype)
+    export(m, hf_dir, out, {"slice": n})
+    return check(m, out, dev=dev)
+
+
 if __name__ == "__main__":
     hf_dir, ck, out = sys.argv[1:4]
     from ttfconv.model import load_converted
-    dt = torch.float32 if "--f32" in sys.argv else torch.bfloat16
-    m, _ = load_converted(hf_dir, ck, "cuda")
-    m = m.to(dt).eval()
+    dev = "cpu" if "--cpu" in sys.argv else "cuda"             # --cpu: a model larger than the GPU (27B); beta on CUDA
+    m, _ = load_converted(hf_dir, ck, dev)
+    dt = torch.float32 if "--f32" in sys.argv else (torch.bfloat16 if "--bf16" in sys.argv else None)
+    m = m.eval()
+    if "--check-slice" in sys.argv:                             # (the cast after the cut: the slice only)
+        n = int(sys.argv[sys.argv.index("--check-slice") + 1])
+        print(f"slice {n} layers, float path", check_slice(m, hf_dir, out, n, dtype=dt), flush=True)
+        sys.exit(0)
+    if dt is not None:                                          # else the checkpoint's own dtypes
+        m = m.to(dt)
     ir = export(m, hf_dir, out, {"ckpt": os.path.abspath(ck)})
     ops = {}
     for nd in ir["graphs"]["step"]["nodes"]:
