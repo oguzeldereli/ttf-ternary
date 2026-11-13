@@ -16,6 +16,7 @@ dependencies = ["torch>=2.13", "numpy", "safetensors"]
 qwen = ["transformers==5.19.0", "flash-linear-attention==0.5.2"]   # Qwen3.5 / 3.8 training and evaluation
 data = ["datasets", "tokenizers", "pyarrow"]                        # scripts/data, scripts/quant/sft_mix.py
 test = ["pytest"]
+export = ["gguf>=0.10"]                                             # ttf.export: the .ttf (GGUF) writer / reader
 
 [project.scripts]
 ttf-train = "ttf.train:cli"
