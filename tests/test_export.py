@@ -112,3 +112,29 @@ def test_ir_state_ops_stream():
     assert torch.allclose(torch.cat(parts, -1), full, atol=1e-6)
     ref = torch.nn.functional.silu(torch.nn.functional.conv1d(x[None], W["c.weight"], padding=K - 1, groups=C)[0, :, :11])
     assert torch.allclose(full, ref, atol=1e-6)
+
+
+@pytest.mark.gpu
+def test_dumpcheck_on_reference_dump(tmp_path):
+    """a dump in the runtime's format made from the reference's own values checks at 0 on every op"""
+    import numpy as np
+    from ttf.export.emit import build_ir
+    from ttf.export import ir as I
+    from ttf.export.dumpcheck import check_dump
+    m = _tiny()
+    ir, tensors = build_ir(m, "bit_transformer", {"name": "lm", "graphs": {"step": "step"}, "attr": {}}, m.state_dict())
+    p = str(tmp_path / "tiny.ttf")
+    write_ttf(p, tensors, {}, ir, "bit_transformer", {}, "bf16")
+    kv, W = read_ttf(p)
+    R = I.Runner(json.loads(kv["ttf.ir"]), W, torch.bfloat16)
+    R("step", ids=torch.arange(7) * 13, pos=torch.arange(7))
+    d = tmp_path / "dump"
+    d.mkdir()
+    idx = {}
+    for k, v in R.last_values.items():
+        f32 = v.is_floating_point()
+        np.asarray(v.cpu().float().numpy() if f32 else v.cpu().to(torch.int32).numpy()).tofile(d / f"{k}.bin")
+        idx[k] = {"type": "f32" if f32 else "i32", "ne": list(reversed(v.shape)) + [1] * (4 - v.dim())}
+    json.dump(idx, open(d / "index.json", "w"))
+    res = check_dump(p, str(d), log=lambda *a: None)
+    assert res and all(r[0] == 0 for r in res.values()), res

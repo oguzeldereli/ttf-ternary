@@ -397,4 +397,5 @@ class Runner:
                     vals[name] = v
         finally:
             torch.backends.cuda.matmul.allow_tf32 = tf32
+        self.last_values = vals                                 # every value of the call (dumps, tests)
         return {o["name"]: vals[o["of"]] for o in g["outputs"]}
