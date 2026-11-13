@@ -100,8 +100,15 @@ def op_embed(ins, node, W, st, D):
     return [w.reshape(*idx.shape, -1).to(D).float()]
 
 
+def _intk_w(W, p, g, D):
+    q = W[p + ".codes_u8"].float()
+    w = W[p + ".lo"].float()[..., None] + W[p + ".s"].float()[..., None] * q.reshape(q.shape[0], -1, g)
+    return w.reshape(q.shape[0], -1).to(D)
+
+
 def op_head(ins, node, W, st, D):
-    w = W[node["p"] + ".weight"].to(D)
+    a = node.get("attr", {})
+    w = _intk_w(W, node["p"], a["g"], D) if a.get("kind") == "intk" else W[node["p"] + ".weight"].to(D)
     return [(ins[0].to(D) @ w.t()).float()]
 
 
@@ -292,14 +299,14 @@ def _tail(st, a, x, n):
 
 def op_conv1d_causal(ins, node, W, st, D):
     """x [C, T] -> [Cout, T']: conv1d over (left context `ctx` frames, x); the context is the state (streaming) or
-    zeros. <p>.weight [Cout, C / groups, k], <p>.bias when attr bias"""
+    zeros. <p>.weight [Cout, C / groups, k], <p>.bias when attr bias; act: none / silu"""
     a, p = node["attr"], node["p"]
     x = ins[0].float()
     full = _tail(st, a, x, a["ctx"])
     b = W[p + ".bias"].float() if a.get("bias") else None
     y = F.conv1d(full[None], W[p + ".weight"].float(), b, stride=a.get("stride", 1),
-                 dilation=a.get("dilation", 1), groups=a.get("groups", 1))
-    return [y[0]]
+                 dilation=a.get("dilation", 1), groups=a.get("groups", 1))[0]
+    return [F.silu(y) if a.get("act") == "silu" else y]
 
 
 def op_conv_transpose1d_causal(ins, node, W, st, D):
@@ -313,11 +320,39 @@ def op_conv_transpose1d_causal(ins, node, W, st, D):
     return [y[:, c * s: y.shape[-1] - a["trim"]]]
 
 
+def op_delta_rule(ins, node, W, st, D):
+    """gated delta rule, recurrent form in fp32 (the semantic definition; a chunked prefill is a T-class variant):
+    q / k [T, Hk, dk], v [T, Hv, dv], g [T, Hv] (log decay), b [T, Hv] (beta); v head h reads q / k head h // (Hv / Hk).
+    qk_l2norm: q, k <- x / sqrt(|x|^2 + 1e-6); q *= scale. Per token: S <- S exp(g); S <- S + k (b (v - S^T k))^T;
+    o = S^T q. State rec [Hv, dk, dv] (zeros at start)."""
+    q, k, v, g, b = (t.float() for t in ins[:5])
+    a = node["attr"]
+    r = v.shape[1] // q.shape[1]
+    if r > 1:
+        q, k = q.repeat_interleave(r, 1), k.repeat_interleave(r, 1)
+    if a.get("qk_l2norm", True):
+        q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6)
+        k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    q = q * a.get("scale", q.shape[-1] ** -0.5)
+    S = st.get(a["state"])
+    if S is None:
+        S = torch.zeros(v.shape[1], q.shape[-1], v.shape[-1], dtype=torch.float32, device=v.device)
+    out = torch.empty_like(v)
+    for t in range(v.shape[0]):
+        S = S * g[t].exp()[:, None, None]
+        kv = (S * k[t][:, :, None]).sum(-2)
+        d = (v[t] - kv) * b[t][:, None]
+        S = S + k[t][:, :, None] * d[:, None, :]
+        out[t] = (S * q[t][:, :, None]).sum(-2)
+    st[a["state"]] = S
+    return [out]
+
+
 OPS = {"ttf.linear": op_ttf_linear, "ttf.embed": op_embed, "ttf.head": op_head, "matmul": op_matmul,
        "rms_norm": op_rms_norm, "rope": op_rope, "attn": op_attn, "glu": op_glu, "reshape": op_reshape,
        "permute": op_permute, "add": op_add, "sub": op_sub, "mul": op_mul, "div": op_div, "scale": op_scale,
        "silu": _unary(F.silu), "tanh": _unary(torch.tanh), "sigmoid": _unary(torch.sigmoid),
-       "round": _unary(torch.round), "exp": _unary(torch.exp), "neg": _unary(torch.neg),
+       "round": _unary(torch.round), "softplus": _unary(F.softplus), "delta_rule": op_delta_rule, "exp": _unary(torch.exp), "neg": _unary(torch.neg),
        "concat": op_concat, "slice": op_slice, "repeat": op_repeat, "const": op_const, "arange": op_arange,
        "timestep_embed": op_timestep_embed, "snake": op_snake, "conv1d_causal": op_conv1d_causal,
        "conv_transpose1d_causal": op_conv_transpose1d_causal}
@@ -337,12 +372,13 @@ class Runner:
                     a = n["attr"]
                     for sub, K in (a.get("Ks") or {"": a["K"]}).items():
                         ks[n["p"] + sub] = K
-                elif n["op"] == "ttf.embed" and n.get("attr", {}).get("kind") == "intk":
-                    kn[n["p"]] = n["attr"]["K"]
+                elif n["op"] in ("ttf.embed", "ttf.head") and n.get("attr", {}).get("kind") == "intk":
+                    kn[n["p"]] = (n["attr"]["K"], n["attr"]["bits"])
         for p, K in ks.items():
             self.W[p + ".trits_i8"] = unpack_rows5(self.W[p + ".wpacked"], K)
-        for p, K in kn.items():
-            self.W[p + ".codes_u8"] = unpack_nib2(self.W[p + ".codes"], K)
+        for p, (K, bits) in kn.items():
+            c = self.W[p + ".codes"]
+            self.W[p + ".codes_u8"] = unpack_nib2(c, K) if bits <= 4 else c.to(torch.uint8)
 
     def reset(self):
         self.state = {}

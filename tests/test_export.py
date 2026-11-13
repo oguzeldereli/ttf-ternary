@@ -81,3 +81,34 @@ def test_export_float_path(tmp_path):
     write_ttf(p, tensors, {}, ir, "bit_transformer", {}, "bf16")
     r, i, t1 = float_check(m, p, n=10, n_pre=6)
     assert r < 1e-5 and i < 1e-5 and t1 == 1.0, (r, i, t1)
+
+
+def test_ir_state_ops_stream():
+    """delta_rule against HF's recurrent rule (plain torch), and both stateful ops: chunked calls == one call"""
+    from ttf.export import ir as I
+    from ttf.export.qwen35 import _ref_delta
+    g = torch.Generator().manual_seed(0)
+    T, Hk, Hv, dk, dv = 9, 2, 4, 8, 6
+    q, k = torch.randn(T, Hk, dk, generator=g), torch.randn(T, Hk, dk, generator=g)
+    v = torch.randn(T, Hv, dv, generator=g)
+    gl, b = -torch.rand(T, Hv, generator=g), torch.rand(T, Hv, generator=g)
+    node = {"op": "delta_rule", "attr": {"state": "rec.0", "qk_l2norm": True, "scale": dk ** -0.5}}
+    full = I.op_delta_rule([q, k, v, gl, b], node, {}, {}, torch.float32)[0]
+    r = Hv // Hk
+    ref, _ = _ref_delta(q.repeat_interleave(r, 1)[None], k.repeat_interleave(r, 1)[None], v[None], gl[None], b[None],
+                        use_qk_l2norm_in_kernel=True)
+    assert torch.allclose(full, ref[0], atol=1e-6)
+    st = {}
+    parts = [I.op_delta_rule([t[i:j] for t in (q, k, v, gl, b)], node, {}, st, torch.float32)[0]
+             for i, j in ((0, 5), (5, 6), (6, 9))]
+    assert torch.allclose(torch.cat(parts), full, atol=1e-6)
+    C, K = 5, 4
+    W = {"c.weight": torch.randn(C, 1, K, generator=g)}
+    x = torch.randn(C, 11, generator=g)
+    cn = {"op": "conv1d_causal", "p": "c", "attr": {"ctx": K - 1, "groups": C, "act": "silu", "state": "conv.0"}}
+    full = I.op_conv1d_causal([x], cn, W, {}, torch.float32)[0]
+    st = {}
+    parts = [I.op_conv1d_causal([x[:, i:j]], cn, W, st, torch.float32)[0] for i, j in ((0, 2), (2, 3), (3, 11))]
+    assert torch.allclose(torch.cat(parts, -1), full, atol=1e-6)
+    ref = torch.nn.functional.silu(torch.nn.functional.conv1d(x[None], W["c.weight"], padding=K - 1, groups=C)[0, :, :11])
+    assert torch.allclose(full, ref, atol=1e-6)

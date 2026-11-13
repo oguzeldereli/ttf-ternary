@@ -128,6 +128,24 @@ def _e_flin(ctx, m, p, x):
     return ctx.node("matmul", [x], p, {"K": m.in_features, "N": m.out_features, "bias": m.bias is not None})
 
 
+@emits(torch.nn.Embedding)
+def _e_femb(ctx, m, p, ids):
+    ctx.use(p + ".weight")
+    return ctx.node("ttf.embed", [ids], p, {"kind": "float"})
+
+
+def intk_tensors(ctx, m, p):
+    """an IntKMatrix's tensors for the file: codes nib2 (bits <= 4) or one byte per code, lo / s f32"""
+    c = m.codes.detach().to(torch.uint8)
+    if m.bits <= 4:
+        c = (c[:, 0::2] | (c[:, 1::2] << 4)).contiguous()
+    ctx.replace[p + ".codes"] = c.cpu()
+    ctx.replace[p + ".lo"] = m.lo.detach().float().cpu()
+    ctx.replace[p + ".s"] = m.s.detach().float().cpu()
+    ctx.use(p + ".codes", p + ".lo", p + ".s")
+    return {"kind": "intk", "bits": m.bits, "g": m.g, "K": m.K, "V": m.N}
+
+
 @emits(torch.nn.SiLU)
 def _e_silu(ctx, m, p, x):
     return ctx.node("silu", [x])
