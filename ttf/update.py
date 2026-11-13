@@ -214,9 +214,48 @@ def _host_put(d, k, v, off):
 def _host_put_(d, k, v, off):
     """--ttf-offload async: write a state tuple back to its pinned host buffers (reused across steps)"""
     if not off:
-        d[k] = v
+        _keep(d, k, v)
         return
     _OFFLOAD.put(d, k, v)
+
+
+GRAPH_STATE = [False]   # --cuda-graph: a state write goes into the tensors that state already has (_keep), so its
+                        # address stays fixed and a replayed micro-batch graph reads what the previous replay wrote
+_PERSIST = {}           # (id(dict), key) -> the state's own tensors (made on its first write, outside a capture)
+
+
+def _same(a, b):
+    if torch.is_tensor(a):
+        return torch.is_tensor(b) and a.shape == b.shape and a.dtype == b.dtype and a.device == b.device
+    if isinstance(a, (tuple, list)):
+        return isinstance(b, (tuple, list)) and len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return not torch.is_tensor(b) and not isinstance(b, (tuple, list)) and a == b
+
+
+def _copy_into(a, b):
+    if torch.is_tensor(a):
+        if a is not b:
+            a.copy_(b)
+    elif isinstance(a, (tuple, list)):
+        for x, y in zip(a, b):
+            _copy_into(x, y)
+
+
+def _keep(d, k, v):
+    """d[k] = v; with --cuda-graph into d[k]'s own tensors (the same values: a copy)"""
+    if not GRAPH_STATE[0]:
+        d[k] = v
+        return
+    rk = (id(d), k)
+    old = _PERSIST.get(rk)
+    if old is not None and _same(old, v):
+        _copy_into(old, v)
+        d[k] = old
+        return
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(f"--cuda-graph: TTF state {k!r} first written inside a capture (no warm-up step made it)")
+    _PERSIST[rk] = v
+    d[k] = v
 
 
 def _ts_state_bytes(lr_state):
@@ -487,7 +526,7 @@ def ts_layer(l, g, state, c):
             # the full [N, K] v only where it is read: --ttf-vdiag (the micro-batch u uses the factored v of the steps before)
             v = R[:, None] * C[None, :] / R.mean().clamp_min(1e-30) / (1 - b2o ** (t // M_)) if c.get("vdiag") else None
         else:
-            st[("mx", key)] = (PS, SP, rs, cs, ds, es); v = None
+            _keep(st, ("mx", key), (PS, SP, rs, cs, ds, es)); v = None
         del PS, SP
     else:
         if ("v", key) in st:
@@ -624,16 +663,52 @@ def _layer_gen(l, dev):
     return g
 
 
-def _row_sketch(l, dev, gen, k, c, Q=None):
+def _row_sketch(l, dev, gen, k, c, Q=None, R=None):
     """Sc [k, N] with E[Sc^T Sc] = I, fixed within a step (gen seeded by the step): dense normal / sqrt(k). Q [N, kw]
     orthonormal (--dw-sketch-warm, the accumulator's range from the step before): Sc = [Q^T; R (I - Q Q^T)] with R the
     k - kw random rows, so Sc^T Sc's expectation is Q Q^T + (I - Q Q^T) = I and the sketched products are exact on Q"""
     kr = k - (Q.shape[1] if Q is not None else 0)
-    R = torch.randn(kr, l.N, device=dev, generator=gen) / kr ** 0.5
+    if R is None:   # (R given: drawn before a --cuda-graph capture by draw_step_sketches, the same numbers)
+        R = torch.randn(kr, l.N, device=dev, generator=gen) / kr ** 0.5
     if Q is None:
         return R
     Q = Q.float()
     return torch.cat([Q.T, R - (R @ Q) @ Q.T])
+
+
+_SK = {}   # --cuda-graph: id(layer) -> (step index, Sr, the row sketch's random rows R, the warm basis' random matrix)
+
+
+def draw_step_sketches(layers, state, c):
+    """--cuda-graph, before a step's capture: each factored layer's random numbers for the step (a CUDA generator cannot
+    be re-seeded inside a capture), drawn as _ts_layer_factored draws them: the layer's generator seeded by the step,
+    Sr then R; the --dw-sketch-warm matrix from its own seed. Layers with no step before (no index yet) are skipped
+    (the capture then stops with an error: the warm-up steps make every layer's state)"""
+    st = state.get("_ts", {})
+    k_ = int(c.get("factored") or 0)
+    M_ = int(c.get("micro") or 1)
+    if not k_:
+        return
+    for l in layers:
+        key = id(l)
+        last = st.get(("tsl", key))
+        if last is None:
+            continue
+        ts_ = last + 1
+        dev = l.wpacked.device
+        Q = st.get(("wq", key)) if M_ > 1 else None
+        kr = k_ - (Q.shape[1] if Q is not None else 0)
+        gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
+        Sr = torch.randn(l.K, k_, device=dev, generator=gen) / k_ ** 0.5
+        R = torch.randn(kr, l.N, device=dev, generator=gen) / kr ** 0.5
+        Wr = None
+        ra = min(getattr(l, "ts_rank", None) or c["r"], l.N, l.K)
+        if c.get("sketch_warm") and M_ > 1:
+            kw = min(int(round(c["sketch_warm"] * k_)), k_ - 1, ra)
+            if kw > 0:
+                gw = torch.Generator(device=dev).manual_seed(7_000_003 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
+                Wr = torch.randn(ra, kw, device=dev, generator=gw)
+        _SK[key] = (ts_, Sr, R, Wr)
 
 
 def _ts_layer_factored(l, fg, state, c):
@@ -658,9 +733,21 @@ def _ts_layer_factored(l, fg, state, c):
     lk = 1 - 1 / tau
     k_ = int(c["factored"])
     ts_ = (t - 1) // M_
-    gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
-    Sr = torch.randn(l.K, k_, device=dev, generator=gen) / k_ ** 0.5
-    Sc = _row_sketch(l, dev, gen, k_, c, st.get(("wq", key)) if M_ > 1 else None)
+    Q_ = st.get(("wq", key)) if M_ > 1 else None
+    pre = _SK.get(key) if GRAPH_STATE[0] else None
+    if pre is not None and pre[0] == ts_:     # --cuda-graph: the step's random numbers, drawn before the capture
+        _, Sr, R_, Wr_ = pre
+        Sc = _row_sketch(l, dev, None, k_, c, Q_, R_)
+    else:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(f"--cuda-graph: layer {getattr(l, '_ts_idx', '?')}'s sketch for step {ts_} not drawn "
+                               f"before the capture (draw_step_sketches)")
+        Wr_ = None
+        gen = _layer_gen(l, dev).manual_seed(11_000_000 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
+        Sr = torch.randn(l.K, k_, device=dev, generator=gen) / k_ ** 0.5
+        Sc = _row_sketch(l, dev, gen, k_, c, Q_)
+    if GRAPH_STATE[0]:
+        st[("tsl", key)] = ts_                # (draw_step_sketches: the next step's index is this + 1)
     if MICRO_FUSED[0] and M_ > 1 and dev.type == "cuda" and not c.get("vdiag"):
         # --accum M > 1 on the GPU: each sketch side's statistics (its squares, the cross terms with the step's
         # running sum, v's EMA, the scale and its bounded reciprocal) in two kernels (kernel.micro_sketch) instead of
@@ -685,7 +772,7 @@ def _ts_layer_factored(l, fg, state, c):
             _host_put(st, ("v", key), (R, C), off)
             turn_ = (SP, PS) + _step_scale(R, C, b2, ts_ + 1)       # (Sc sum g)^T [K, k], (sum g) Sr: the turn's sketches
         else:
-            st[("mx", key)] = (PS, SP, rs, cs, ds, es)
+            _keep(st, ("mx", key), (PS, SP, rs, cs, ds, es))
         del PS, SP
     else:
         gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                    # g Sr  [N, k]
@@ -718,7 +805,7 @@ def _ts_layer_factored(l, fg, state, c):
                     sp_ = float((rsq.sum() / (l.N * l.K)) / (C.mean() / (1 - b2 ** (t // M_))).clamp_min(1e-30))
                     _ts_rec(st, "g2_over_v", sp_); _ts_recmax(st, "g2_over_v", sp_)
             else:
-                st[("mx", key)] = (PS.to(torch.bfloat16), SP.to(torch.bfloat16), rs, cs, ds, es)
+                _keep(st, ("mx", key), (PS.to(torch.bfloat16), SP.to(torch.bfloat16), rs, cs, ds, es))
             del PS, SP
             a = (r0 / m_).sqrt_(); b = c0.sqrt()                              # sqrt(v_ij) = a_i b_j
         else:        # 16 x 1: v includes this step's g^2
@@ -759,8 +846,10 @@ def _ts_layer_factored(l, fg, state, c):
             if c.get("sketch_warm"):   # --dw-sketch-warm: the next step's sketch rows on the accumulator's range
                 kw = min(int(round(c["sketch_warm"] * k_)), k_ - 1, U.shape[1])
             if c.get("sketch_warm") and kw > 0:
-                gw = torch.Generator(device=dev).manual_seed(7_000_003 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
-                st[("wq", key)] = _orth(U.float() @ torch.randn(U.shape[1], kw, device=dev, generator=gw)).to(torch.bfloat16)
+                if Wr_ is None:
+                    gw = torch.Generator(device=dev).manual_seed(7_000_003 + 2 * getattr(l, "_ts_idx", 0) + 1_000_003 * ts_)
+                    Wr_ = torch.randn(U.shape[1], kw, device=dev, generator=gw)
+                st[("wq", key)] = _orth(U.float() @ Wr_).to(torch.bfloat16)
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         A_prev = U @ V.T if c.get("band") else None
