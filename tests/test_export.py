@@ -74,10 +74,10 @@ def test_export_float_path(tmp_path):
     """core model -> .ttf -> the reference runner: float path vs PyTorch to fp32 rounding; incremental decode = prefill"""
     from ttf.export.emit import build_ir, float_check
     m = _tiny()
-    ir, derived = build_ir(m, "bit_transformer", {"name": "lm", "graphs": {"step": "step"}, "attr": {}})
+    ir, tensors = build_ir(m, "bit_transformer", {"name": "lm", "graphs": {"step": "step"}, "attr": {}}, m.state_dict())
     ops = {n["op"] for n in ir["graphs"]["step"]["nodes"]}
     assert ops == {"ttf.embed", "rms_norm", "ttf.linear", "reshape", "mul", "rope", "attn", "add", "glu", "ttf.head"}
     p = str(tmp_path / "tiny.ttf")
-    write_ttf(p, m.state_dict(), derived, ir, "bit_transformer", {}, "bf16")
+    write_ttf(p, tensors, {}, ir, "bit_transformer", {}, "bf16")
     r, i, t1 = float_check(m, p, n=10, n_pre=6)
     assert r < 1e-5 and i < 1e-5 and t1 == 1.0, (r, i, t1)

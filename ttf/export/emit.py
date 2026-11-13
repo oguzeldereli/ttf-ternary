@@ -17,23 +17,56 @@ from ..kernel import trit_nnz, beta_from_nnz
 from .io import write_ttf, read_ttf
 from . import ir as ttf_ir
 
-EMIT = {}
+EMIT = {}          # module class -> emitter
+EMIT_BY_NAME = {}  # class name -> emitter (families whose module classes live outside ttf: registered without importing)
+PART_TENSORS = ("wpacked", "row_scale", "col_scale", "in_mean", "out_bias", "mag_A", "mag_B")
 
 
 def emits(cls):
     def reg(f):
-        EMIT[cls] = f
+        if isinstance(cls, str):
+            EMIT_BY_NAME[cls] = f
+        else:
+            EMIT[cls] = f
         return f
     return reg
 
 
 class Ctx:
-    def __init__(self):
-        self.nodes, self.state, self.derived, self.n = [], [], {}, 0
+    """the exporter's state: graphs (one current), declared state, derived tensors, and the state-dict tensors the
+    emitted nodes use (the file carries those + the derived ones, nothing else)"""
+
+    def __init__(self, sd=None):
+        self.graphs, self.state, self.derived, self.replace, self.used, self.n = {}, [], {}, {}, set(), 0
+        self.sd = sd
+        self.nodes = []
+        self.cfg = None
+
+    def begin(self, name, inputs):
+        """start graph `name`; inputs: [(name, shape, dtype)]"""
+        self.nodes = []
+        self.graphs[name] = {"inputs": [{"name": n, "shape": s, "dtype": d} for n, s, d in inputs], "nodes": self.nodes}
+        return [n for n, _, _ in inputs]
+
+    def end(self, **outputs):
+        g = self.graphs[list(self.graphs)[-1]]
+        g["outputs"] = [{"name": k, "of": v} for k, v in outputs.items()]
 
     def v(self, hint="v"):
         self.n += 1
         return f"{hint}{self.n}"
+
+    def use(self, *names):
+        for n in names:
+            if self.sd is not None:
+                assert n in self.sd or n in self.derived or n in self.replace, f"no tensor {n}"
+            self.used.add(n)
+
+    def use_part(self, p):
+        """a TTF linear part's tensors (those present)"""
+        for t in PART_TENSORS:
+            if self.sd is None or f"{p}.{t}" in self.sd:
+                self.used.add(f"{p}.{t}")
 
     def node(self, op, ins, p=None, attr=None, n_out=1, hint="v"):
         outs = [self.v(hint) for _ in range(n_out)]
@@ -45,26 +78,81 @@ class Ctx:
         self.nodes.append(d)
         return outs[0] if n_out == 1 else outs
 
+    def add_state(self, sid, kind, **kw):
+        if not any(s["id"] == sid for s in self.state):
+            self.state.append({"id": sid, "kind": kind, **kw})
+        return sid
+
     def emit(self, mod, path, *ins, **kw):
-        return EMIT[type(mod)](self, mod, path, *ins, **kw)
+        f = EMIT.get(type(mod)) or EMIT_BY_NAME.get(type(mod).__name__)
+        if f is None:
+            raise NotImplementedError(f"no IR emitter for {type(mod).__module__}.{type(mod).__name__} at '{path}'")
+        return f(self, mod, path, *ins, **kw)
+
+    def tensors(self):
+        """{name: tensor} for the file: the used state-dict tensors (replaced where an emitter re-laid one out) + derived"""
+        out = {}
+        for n in sorted(self.used):
+            if n in self.replace:
+                out[n] = self.replace[n]
+            elif n in self.derived:
+                continue
+            else:
+                out[n] = self.sd[n]
+        out.update(self.derived)
+        return out
+
+
+def _beta_cuda(m):
+    """beta evaluated on CUDA, as trained: torch's CUDA rsqrt is not correctly rounded (1 ulp vs CPU)"""
+    if not m.use_beta:
+        return torch.ones(1)
+    assert torch.cuda.is_available(), "beta must be computed on CUDA (the trainer's value); no CUDA device"
+    return beta_from_nnz(trit_nnz(m.wpacked.cuda(), m.K), m.N).float().reshape(1).cpu()
 
 
 @emits(KernelTernaryLinear)
 def _e_lin(ctx, m, p, x, acc=None):
-    if m.use_beta:      # evaluated on CUDA, as trained: torch's CUDA rsqrt is not correctly rounded (1 ulp vs CPU)
-        dev = "cuda" if torch.cuda.is_available() else None
-        assert dev, "beta must be computed on CUDA (the trainer's value); no CUDA device"
-        ctx.derived[p + ".beta"] = beta_from_nnz(trit_nnz(m.wpacked.to(dev), m.K), m.N).float().reshape(1).cpu()
-    else:
-        ctx.derived[p + ".beta"] = torch.ones(1)
+    ctx.derived[p + ".beta"] = _beta_cuda(m)
+    ctx.use_part(p)
     attr = {"K": m.K, "N": m.N, "act_bits": m.act_bits, "use_beta": bool(m.use_beta)}
     if getattr(m, "mag_A", None) is not None:
         attr["mag_rank"] = int(m.mag_A.shape[1])
     return ctx.node("ttf.linear", [x] + ([acc] if acc is not None else []), p, attr)
 
 
+@emits(torch.nn.Linear)
+def _e_flin(ctx, m, p, x):
+    """a float linear: matmul with the stored weight (+ bias)"""
+    ctx.use(p + ".weight", *([p + ".bias"] if m.bias is not None else []))
+    return ctx.node("matmul", [x], p, {"K": m.in_features, "N": m.out_features, "bias": m.bias is not None})
+
+
+@emits(torch.nn.SiLU)
+def _e_silu(ctx, m, p, x):
+    return ctx.node("silu", [x])
+
+
+@emits(torch.nn.Tanh)
+def _e_tanh(ctx, m, p, x):
+    return ctx.node("tanh", [x])
+
+
+@emits(torch.nn.Identity)
+def _e_id(ctx, m, p, x):
+    return x
+
+
+@emits(torch.nn.Sequential)
+def _e_seq(ctx, m, p, x):
+    for i, l in enumerate(m):
+        x = ctx.emit(l, f"{p}.{i}" if p else str(i), x)
+    return x
+
+
 @emits(TM.RMSNorm)
 def _e_norm(ctx, m, p, x):
+    ctx.use(p + ".weight")
     return ctx.node("rms_norm", [x], p, {"eps": m.eps})
 
 
@@ -82,8 +170,7 @@ def _e_attn(ctx, m, p, x, pos, layer):
         q = ctx.node("mul", [q], attr={"w": p + ".qk_scale"})      # [T, H, hd] * qk_scale [H, 1] (trailing-dim broadcast)
     q = ctx.node("rope", [q, pos], attr={"theta": ctx.cfg.rope_theta, "style": "interleaved"})
     k = ctx.node("rope", [k, pos], attr={"theta": ctx.cfg.rope_theta, "style": "interleaved"})
-    sid = f"kv.{layer}"
-    ctx.state.append({"id": sid, "kind": "kv", "heads_kv": Hkv, "head_dim": hd})
+    sid = ctx.add_state(f"kv.{layer}", "kv", heads_kv=Hkv, head_dim=hd)
     o = ctx.node("attn", [q, k, v, pos], attr={"causal": True, "state": sid, "scale": 1.0 / math.sqrt(hd)})
     o = ctx.node("reshape", [o], attr={"shape": ["T", H * hd]})
     return ctx.emit(m.wo, p + ".wo", o)
@@ -108,23 +195,46 @@ def _e_block(ctx, m, p, x, pos, layer):
 @emits(TM.BitTransformer)
 def _e_bit(ctx, m, p, ids, pos):
     ctx.cfg = m.c
+    ctx.use("tok_emb.weight")
     x = ctx.node("ttf.embed", [ids], "tok_emb", {"kind": "float"}, hint="x")
     for i, l in enumerate(m.layers):
         x = ctx.emit(l, f"layers.{i}", x, pos, i)
     h = ctx.emit(m.norm, "norm", x)
     head = "tok_emb" if m.lm_head is None else "lm_head"
+    ctx.use(head + ".weight")
     return ctx.node("ttf.head", [h], head, {"tied": m.lm_head is None, "out": "logits"}, hint="logits")
 
 
-def build_ir(model, family, driver):
-    ctx = Ctx()
-    out = ctx.emit(model, "", "ids", "pos")
-    ir = {"ir_version": 1, "dims": {"T": "dynamic"}, "state": ctx.state,
-          "graphs": {"step": {"inputs": [{"name": "ids", "shape": ["T"], "dtype": "i32"},
-                                         {"name": "pos", "shape": ["T"], "dtype": "i32"}],
-                              "nodes": ctx.nodes, "outputs": [{"name": "logits", "of": out}]}},
-          "driver": driver}
-    return ir, ctx.derived
+def build_ir(model, family, driver, sd=None):
+    """the core LM: one graph step(ids, pos) -> logits. Returns (ir, derived) or, with sd, (ir, tensors for the file)"""
+    ctx = Ctx(sd)
+    ids, pos = ctx.begin("step", [("ids", ["T"], "i32"), ("pos", ["T"], "i32")])
+    ctx.end(logits=ctx.emit(model, "", ids, pos))
+    ir = {"ir_version": 1, "dims": {"T": "dynamic"}, "state": ctx.state, "graphs": ctx.graphs, "driver": driver}
+    return ir, (ctx.tensors() if sd is not None else ctx.derived)
+
+
+class float_path:
+    """context: PyTorch's TTF products in float (fp64, no quantiser) and the runner likewise (IR I.9's float path)"""
+
+    def __enter__(self):
+        from .. import layers as TL
+        self.TL = TL
+
+        def apply(x, wpacked, layer):
+            beta = layer._cached_beta(wpacked) if layer.use_beta else None
+            y = torch.nn.functional.linear(x.double(), layer.w8().double())
+            return (y * beta.double() if beta is not None else y).to(x.dtype)
+        self.orig, self.fused = TL._KernelTernFn.apply, TL.FUSED_LAYER[0]
+        TL._KernelTernFn.apply = staticmethod(apply)
+        TL.FUSED_LAYER[0] = False                   # (the fused layer path does not go through _KernelTernFn)
+        ttf_ir.FLOAT_PATH[0] = True
+        return self
+
+    def __exit__(self, *e):
+        self.TL._KernelTernFn.apply = self.orig
+        self.TL.FUSED_LAYER[0] = self.fused
+        ttf_ir.FLOAT_PATH[0] = False
 
 
 def load_core_safetensors(path):
@@ -161,12 +271,12 @@ def main():
     assert which == "core"
     m, sd, cfg, meta = load_core_safetensors(ck)
     m.eval()
-    ir, derived = build_ir(m, "bit_transformer", {"name": "lm", "graphs": {"step": "step"}, "attr": {}})
+    ir, tensors = build_ir(m, "bit_transformer", {"name": "lm", "graphs": {"step": "step"}, "attr": {}}, sd)
     ops = {}
     for n in ir["graphs"]["step"]["nodes"]:
         ops[n["op"]] = ops.get(n["op"], 0) + 1
     print("IR:", len(ir["graphs"]["step"]["nodes"]), "nodes", ops, "| state", len(ir["state"]), flush=True)
-    write_ttf(out, {k: v for k, v in sd.items()}, derived, ir, "bit_transformer", cfg, "bf16", tok, meta)
+    write_ttf(out, tensors, {}, ir, "bit_transformer", cfg, "bf16", tok, meta)
     print("wrote", out, f"{os.path.getsize(out) / 2 ** 20:.1f} MiB", flush=True)
 
     # --- check: the reference runner on the FILE (prefill 12, then prefill 8 + 4 decode steps) vs PyTorch bf16
@@ -196,32 +306,20 @@ def float_check(m, out, n=12, n_pre=8, dev="cuda"):
     """the float-path end-to-end test (IR I.9): PyTorch fp32 with the TTF product in float (no quantiser) vs the
     reference runner on the file, same mode; also prefill n_pre + single decode steps vs prefill n on the runner.
     Returns (rel L2 runner vs PyTorch, rel L2 incremental vs full, top-1 agreement)."""
-    from .. import layers as TL
     kv, W = read_ttf(out)
     ir2 = json.loads(kv["ttf.ir"])
-
-    def apply(x, wpacked, layer):
-        beta = layer._cached_beta(wpacked) if layer.use_beta else None
-        y = torch.nn.functional.linear(x.double(), layer.w8().double())
-        return (y * beta.double() if beta is not None else y).to(x.dtype)
-    orig = TL._KernelTernFn.apply
-    TL._KernelTernFn.apply = staticmethod(apply)
-    try:
+    with float_path():
         mm = m.to(dev).float()
         mm.freqs_cis = TM.precompute_rope(mm.c.dim // mm.c.n_heads, mm.c.max_seq_len * 2, mm.c.rope_theta).to(dev)
         g = torch.Generator().manual_seed(0)
         ids = torch.randint(0, mm.c.vocab_size, (n,), generator=g)
         with torch.no_grad():
             ref = mm(ids[None].to(dev))[0][0].float().cpu()
-        ttf_ir.FLOAT_PATH[0] = True
         W = {k: (v.float() if v.is_floating_point() else v) for k, v in W.items()}
-        full = ttf_ir.Runner(ir2, dict(W), torch.float32)("step", ids=ids, pos=torch.arange(n))["logits"]
-        R2 = ttf_ir.Runner(ir2, dict(W), torch.float32)
+        full = ttf_ir.Runner(ir2, W, torch.float32)("step", ids=ids, pos=torch.arange(n))["logits"]
+        R2 = ttf_ir.Runner(ir2, W, torch.float32)
         a = R2("step", ids=ids[:n_pre], pos=torch.arange(n_pre))["logits"]
         inc = torch.cat([a] + [R2("step", ids=ids[i:i + 1], pos=torch.tensor([i]))["logits"] for i in range(n_pre, n)])
-    finally:
-        TL._KernelTernFn.apply = orig
-        ttf_ir.FLOAT_PATH[0] = False
     rel = lambda x, y: float((x - y).norm() / y.norm())
     return rel(full, ref), rel(inc, full), float((full.argmax(-1) == ref.argmax(-1)).float().mean())
 

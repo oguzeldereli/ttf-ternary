@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 
-def write_ttf(path, sd, derived, ir, family, config, D, tok_dir=None, meta=None):
+def write_ttf(path, sd, derived, ir, family, config, D, tok_dir=None, meta=None, extra_kv=None):
     import gguf
     w = gguf.GGUFWriter(path, "ttf")
     w.add_uint32("ttf.format_version", 1)
@@ -17,6 +17,8 @@ def write_ttf(path, sd, derived, ir, family, config, D, tok_dir=None, meta=None)
     w.add_string("ttf.layout.trits", "rows5")
     w.add_string("ttf.ckpt_meta", json.dumps(meta or {}))
     w.add_string("ttf.ir", json.dumps(ir))
+    for k, v in (extra_kv or {}).items():
+        w.add_string(k, v)
     if tok_dir:
         for f, key in (("tokenizer.json", "ttf.tokenizer.json"), ("tokenizer_config.json", "ttf.tokenizer.config")):
             fp = os.path.join(tok_dir, f)
@@ -49,7 +51,7 @@ def read_ttf(path):
         shape = tuple(int(s) for s in reversed(t.shape))
         if t.tensor_type == gguf.GGMLQuantizationType.BF16:
             W[t.name] = torch.from_numpy(a.view(np.int16).copy()).view(torch.bfloat16).reshape(shape)
-        elif t.name.endswith(".wpacked"):
+        elif t.name.endswith((".wpacked", ".codes")):      # stored I8, read back as the bytes they are
             W[t.name] = torch.from_numpy(a.view(np.uint8).copy()).reshape(shape)
         else:
             W[t.name] = torch.from_numpy(a.copy()).reshape(shape)
