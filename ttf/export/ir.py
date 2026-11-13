@@ -194,7 +194,8 @@ def op_attn(ins, node, W, st, D):
 def op_glu(ins, node, W, st, D):
     g, u = ins[0], ins[1]
     act = node.get("attr", {}).get("act", "silu")
-    return [(F.silu(g) if act == "silu" else F.gelu(g)) * u]
+    a = {"silu": F.silu, "gelu": F.gelu, "relu2": lambda t: F.relu(t).square()}[act]       # relu2: BitNet's squared ReLU
+    return [a(g) * u]
 
 
 def _shape(spec, x):
