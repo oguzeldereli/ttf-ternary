@@ -200,6 +200,31 @@ class _ref_kernels:
         self.Q.torch_chunk_gated_delta_rule, self.Q.torch_recurrent_gated_delta_rule = self.o
 
 
+class _intk_as:
+    """the int-k lookup / head dequantize to bf16 (the trained arithmetic); for an fp32 reference (D fp32), to fp32
+    (the head by row chunks)"""
+    def __init__(self, m, D):
+        self.m, self.e, self.h, self.on = m, m.hf.model.embed_tokens, m.hf.lm_head, D == torch.float32
+
+    def __enter__(self):
+        if self.on and hasattr(self.e, "m"):
+            me = self.e.m
+            self.e.forward = lambda idx: me.deq_idx(idx.reshape(-1), torch.float32).reshape(*idx.shape, me.K)
+        if self.on and hasattr(self.h, "m"):
+            mh, c = self.h.m, 32768
+            self.h.forward = lambda x: torch.cat([x.float() @ mh.deq_rows(i, min(i + c, mh.N), torch.float32).t()
+                                                  for i in range(0, mh.N, c)], -1)
+            # (QwenTern's logits read _head_w(), the bf16 leaf: its fp32 dequant here)
+            self.m._head_w = lambda: torch.cat([mh.deq_rows(i, min(i + c, mh.N), torch.float32)
+                                                for i in range(0, mh.N, c)])
+        return self
+
+    def __exit__(self, *a):
+        for mod in (self.e, self.h):
+            mod.__dict__.pop("forward", None)
+        self.m.__dict__.pop("_head_w", None)
+
+
 @torch.no_grad()
 def check(m, path, n=12, n_pre=8, dev="cuda", float_mode=True):
     """the runner on the file vs PyTorch (no cache, full prefill), and prefill n_pre + single decode steps vs prefill n
@@ -213,13 +238,8 @@ def check(m, path, n=12, n_pre=8, dev="cuda", float_mode=True):
     g = torch.Generator().manual_seed(0)
     ids = torch.randint(0, 50000, (n,), generator=g)
     with (float_path() if float_mode else contextlib.nullcontext()):
-        e = m.hf.model.embed_tokens
-        # (an int-k lookup returns bf16 by default: in an fp32 model, the group parameters' dtype)
-        hk = e.register_forward_hook(lambda mod, i, o: o.to(mod.m.lo.dtype)) if hasattr(e, "m") else None
-        with _ref_kernels():
+        with _ref_kernels(), _intk_as(m, D):
             ref = m(ids[None].to(dev))[0][0].float().cpu()
-        if hk is not None:
-            hk.remove()
         R = ttf_ir.Runner(ir, W, D, dev)
         full = R("step", ids=ids, pos=torch.arange(n))["logits"].cpu()
         R.reset()
