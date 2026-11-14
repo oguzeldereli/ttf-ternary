@@ -797,14 +797,15 @@ def test_scratch_fused_elementwise():
     assert M._FN["rope"] is M._rope_k and M._FN["rmsnorm"] is M._rmsnorm_k
 
 
-def test_train_head_ce():
+@pytest.mark.parametrize("V", [5000, 1000])   # (1000 < the kernel's block: lanes with no entry)
+def test_train_head_ce(V):
     """headloss.TrainHeadCE (the from-scratch model's trained-head loss, model.FUSED_HEAD) against the autograd chunk
     (BitTransformer._loss_chunk under bf16 autocast): the loss to fp32 / bf16-logit rounding, dh and dW within bf16
     rounding; ignored targets (-1) contribute nothing"""
     from ttf.headloss import TrainHeadCE
     from ttf.model import BitTransformer
     torch.manual_seed(0)
-    n, d, V = 700, 256, 5000
+    n, d = 700, 256
     h0 = torch.randn(n, d, device=dev, dtype=torch.bfloat16)
     w0 = torch.randn(V, d, device=dev) * 0.05
     t = torch.randint(0, V, (n,), device=dev); t[::7] = -1
@@ -1174,3 +1175,19 @@ def test_orth_fp32_under_tf32():
     finally:
         torch.backends.cuda.matmul.allow_tf32 = False
     assert torch.equal(q0, q1)
+
+
+def test_log_softmax_bf16():
+    """kernel.log_softmax_bf16 (the --distill teacher's log-probs) against F.log_softmax in fp32, rounded to bf16"""
+    import torch.nn.functional as F
+    from ttf.kernel import log_softmax_bf16
+    torch.manual_seed(0)
+    for V in (1000, 248320):
+        z = (torch.randn(37, V, device="cuda") * 4).to(torch.bfloat16)
+        ref = F.log_softmax(z.float(), -1).to(torch.bfloat16)
+        got = log_softmax_bf16(z.clone())
+        d = (got.float() - ref.float()).abs()
+        assert d.max() <= 2 ** -6 * ref.float().abs().max(), d.max()
+        assert (got != ref).float().mean() < 0.02
+        got32 = log_softmax_bf16(z.float())
+        assert torch.equal(got32, got)

@@ -112,7 +112,23 @@ CG_WARM_MAX = 20   # ... and at most this many while the memory plan (--ckpt-ski
 _CG = {"pool": None, "graphs": None}   # --cuda-graph: one memory pool for every step's graphs; the last step's graphs
 
 
-def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lays, lr_state, ts_cfg, step):
+FUSED_KD_LOGP = [True]   # --distill: the teacher's log-softmax as one Triton kernel (kernel.log_softmax_bf16)
+
+
+def _teacher_logp(teacher, x, device):
+    """--distill: the full-precision model's next-token log-probabilities for batch x, bf16 [B T, V]"""
+    with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
+        tz_, _ = teacher(x)
+    tz_ = tz_.reshape(-1, tz_.shape[-1])
+    if tz_.is_cuda and FUSED_KD_LOGP[0]:   # one Triton pass, in place over bf16 logits (no fp32 copy, no cat)
+        from .kernel import log_softmax_bf16
+        return log_softmax_bf16(tz_.contiguous())
+    # in row chunks of 512: one chunk's fp32 copy is 0.47 GiB at a 248k vocabulary (4096-row chunks made a 1.9 GiB
+    # transient, the 0.8B adapter step's memory peak); per-row ops: the same values
+    return torch.cat([F.log_softmax(c_.float(), -1).to(torch.bfloat16) for c_ in tz_.split(512)])
+
+
+def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lays, lr_state, ts_cfg, step, teacher=None):
     """--cuda-graph: one step's micro-batches. The first, a middle and the last micro-batch (forward under bf16 autocast,
     backward with the TTF updates inside it) are each captured on a side stream and replayed on the current one; the
     middle graph is replayed for micro-batches 1 .. M - 2, each batch copied into the static input first.
@@ -121,7 +137,9 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
     scalars rewritten before the replays (ts_cfg["_dev"]), the step's random sketches are drawn into fixed tensors, the
     TTF state is written in place (update._keep), the float gradients are zeroed in place, and the counters the updates
     keep in Python are set after the step (update.graph_step_done). With M = 1 (the one-batch update reads Python numbers)
-    the graph is captured fresh each step. Returns (last loss, sum of losses) as GPU tensors."""
+    the graph is captured fresh each step. --distill: the teacher's forward and log-softmax are a graph of their own,
+    replayed before each micro-batch; its output tensor is model.kd_logp for the student graphs. Returns (last loss, sum
+    of losses) as GPU tensors."""
     from . import update as U_
     from .layers import W8_CACHE
     M = tc.grad_accum
@@ -150,7 +168,7 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
             _a.capture_begin(pool=_CG["pool"]); _t.add_(1); _a.capture_end()
         cur.wait_stream(side)
         _CG["anchor"] = (_a, _t)
-    sig = (M, tc.batch_size, tc.seq_len, getattr(model, "ckpt_skip", None), W8_CACHE[0])
+    sig = (M, tc.batch_size, tc.seq_len, getattr(model, "ckpt_skip", None), W8_CACHE[0], teacher is not None)
     valid = reuse and _CG["graphs"] is not None and _CG.get("sig") == sig
     if not valid:
         _CG["graphs"] = None      # (the old graphs' memory back to the pool: the last step ended on a host read)
@@ -181,6 +199,25 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
     for micro in range(M):
         x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
         kind = (micro == 0, micro == M - 1)
+        if teacher is not None:   # the teacher's forward as its own graph (static input, its output tensor the kd
+            tg = _CG.get("tg")    # buffer the student graphs read); captured once per batch shape
+            if tg is None or tg[1].shape != x.shape:
+                tg = None; _CG["tg"] = None
+                tx = x.clone()
+                g_t = torch.cuda.CUDAGraph()
+                side.wait_stream(cur)
+                with torch.cuda.stream(side):
+                    g_t.capture_begin(pool=pool)
+                    try:
+                        kd_out = _teacher_logp(teacher, tx, device)
+                    finally:
+                        g_t.capture_end()
+                cur.wait_stream(side)
+                tg = _CG["tg"] = (g_t, tx, kd_out)
+            else:
+                tg[1].copy_(x, non_blocking=True)
+            tg[0].replay()
+            model.kd_logp = tg[2]
         if kind not in graphs:
             if ttf and M > 1:
                 _mark_micro(model, micro, M, te, intk)
@@ -229,6 +266,7 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
             _CG.update(sig=sig, ts0=ts, step0=step)
         ts_cfg.pop("_dev", None); ts_cfg.pop("_dev_ts", None)
     _CG["graphs"] = graphs        # (kept at least until the next step starts: the replays may still be running)
+    model.kd_logp = None
     return last_loss, sum_loss
 
 
@@ -539,7 +577,7 @@ def main():
         _qt = _QT.from_pretrained(args.teacher, dtype=torch.bfloat16).to(device).eval()
         for p_ in _qt.parameters():
             p_.requires_grad_(False)
-        _teacher = lambda x_: (_qt(input_ids=x_).logits, None)
+        _teacher = lambda x_: (_qt(input_ids=x_, use_cache=False).logits, None)   # (no KV cache: same logits)
         model.kd_w = args.kd_weight
         print(f"--distill {args.teacher} (Qwen): teacher in bf16, loss (1 - {args.kd_weight}) CE + {args.kd_weight} KL", flush=True)
     elif args.teacher:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels
@@ -1086,7 +1124,7 @@ def main():
     _cg_ok = False
     if args.cuda_graph:   # --cuda-graph: which runs it takes (the others run as before, with a note)
         _why = [w_ for w_, bad in (("not CUDA", device != "cuda"), ("--pipe", _PP), ("--kd-cache", bool(args.kd_cache)),
-                                   ("--distill", _teacher is not None), ("--tern-emb", bool(te)),
+                                   ("--tern-emb", bool(te)),
                                    ("--intk-emb", bool(args.intk_emb)), ("data parallel", _WS > 1),
                                    ("--ttf-offload", ttf and args.ttf_offload != "none")) if bad]
         _cg_ok = not _why
@@ -1198,7 +1236,7 @@ def main():
         if _cg_step:
             last_loss, sum_loss = _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, args.intk_emb,
                                                     [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)],
-                                                    lr_state, ts_cfg, step)
+                                                    lr_state, ts_cfg, step, teacher=_teacher)
         for micro in range(0 if (_PP or _cg_step) else tc.grad_accum):
             if ttf and tc.grad_accum > 1:      # TTF with accumulation: sum the captured micro-batch gradients
                 _mark_micro(model, micro, tc.grad_accum, te, args.intk_emb)
@@ -1209,11 +1247,7 @@ def main():
             else:
                 x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
             if _teacher is not None:   # --distill: the full-precision model's next-token distribution for this batch
-                with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
-                    tz_, _ = _teacher(x)
-                tz_ = tz_.reshape(-1, tz_.shape[-1])   # in row chunks of 512: one chunk's fp32 copy is 0.47 GiB at a 248k
-                # vocabulary (4096-row chunks made a 1.9 GiB transient, the 0.8B adapter step's memory peak); per-row ops: the same values
-                model.kd_logp = torch.cat([F.log_softmax(c_.float(), -1).to(torch.bfloat16) for c_ in tz_.split(512)]); del tz_
+                model.kd_logp = _teacher_logp(_teacher, x, device)
             with torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16), \
                     torch.profiler.record_function("model.fwd"):
                 _, loss = model(x, y)

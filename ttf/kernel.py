@@ -1747,11 +1747,11 @@ def _ce_rows_kernel(z_ptr, t_ptr, loss_ptr, V, sz, BV: tl.constexpr):
     row = tl.program_id(0)
     base = z_ptr + row.to(tl.int64) * sz
     t = tl.load(t_ptr + row)
-    m = tl.full((BV,), float("-inf"), tl.float32)
+    m = tl.full((BV,), -1e30, tl.float32)   # (finite: a lane with no entry < V would give exp(-inf + inf))
     acc = tl.zeros((BV,), tl.float32)
     for v0 in range(0, V, BV):
         v = v0 + tl.arange(0, BV)
-        z = tl.load(base + v, mask=v < V, other=float("-inf")).to(tl.float32)
+        z = tl.load(base + v, mask=v < V, other=-1e30).to(tl.float32)
         mn = tl.maximum(m, z)
         acc = acc * tl.exp(m - mn) + tl.where(v < V, tl.exp(z - mn), 0.0)
         m = mn
@@ -1775,3 +1775,35 @@ def ce_rows_(z, t):
     loss = torch.empty(n, dtype=torch.float32, device=z.device)
     _ce_rows_kernel[(n,)](z, t.contiguous(), loss, V, z.stride(0), BV=2048, num_warps=8)
     return loss
+
+
+@triton.jit
+def _logsoftmax_rows_kernel(z_ptr, o_ptr, V, sz, so, BV: tl.constexpr):
+    """one row: o = bf16(z - logsumexp(z)) in fp32 registers (z any float dtype; o may alias z)"""
+    row = tl.program_id(0)
+    zb = z_ptr + row.to(tl.int64) * sz
+    ob = o_ptr + row.to(tl.int64) * so
+    m = tl.full((BV,), -1e30, tl.float32)   # (finite: a lane with no entry < V would give exp(-inf + inf))
+    acc = tl.zeros((BV,), tl.float32)
+    for v0 in range(0, V, BV):
+        v = v0 + tl.arange(0, BV)
+        z = tl.load(zb + v, mask=v < V, other=-1e30).to(tl.float32)
+        mn = tl.maximum(m, z)
+        acc = acc * tl.exp(m - mn) + tl.where(v < V, tl.exp(z - mn), 0.0)
+        m = mn
+    mx = tl.max(m, axis=0)
+    lse = mx + tl.log(tl.sum(acc * tl.exp(m - mx), axis=0))
+    for v0 in range(0, V, BV):
+        v = v0 + tl.arange(0, BV)
+        z = tl.load(zb + v, mask=v < V, other=0.0).to(tl.float32)
+        tl.store(ob + v, (z - lse).to(tl.bfloat16), mask=v < V)
+
+
+def log_softmax_bf16(z):
+    """[n, V] logits -> bf16 log-probabilities, one pass of reads (two over the row) and one write; a bf16 z is
+    overwritten in place (the --distill teacher's logits: F.log_softmax(z.float()).bf16() without the fp32 copy)"""
+    n, V = z.shape
+    assert z.stride(1) == 1
+    out = z if z.dtype == torch.bfloat16 else torch.empty(n, V, dtype=torch.bfloat16, device=z.device)
+    _logsoftmax_rows_kernel[(n,)](z, out, V, z.stride(0), out.stride(0), BV=2048, num_warps=8)
+    return out
