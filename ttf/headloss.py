@@ -20,7 +20,7 @@ def ce_kd_dz(z, tgt, tlp, a):
     lp = F.log_softmax(z, -1)
     del z
     ok = tgt != -1
-    nll = -lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0][ok].sum()
+    nll = -torch.where(ok, lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0], 0.0).sum()   # (no boolean index: no host sync)
     p = lp.exp()
     if tlp is not None:
         tl = tlp.float(); pt = tl.exp()
@@ -145,7 +145,8 @@ def topk_dz(z, tgt, ids, tlp, a, mode):
     if a >= 1.0:
         return kd, dz
     ok = tgt != -1
-    ce = -(z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0][ok].sum()
+    ce = -torch.where(ok, (z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0], 0.0).sum()   # (no boolean index: no host
+    # sync, --cuda-graph; the loss value only: dz below does not read it)
     dz.mul_(a).add_(s * ((1 - a) * ok.float()[:, None]))
     idx = tgt.clamp_min(0)[:, None]
     dz.scatter_add_(1, idx, torch.full_like(idx, -(1 - a), dtype=dz.dtype) * ok[:, None])

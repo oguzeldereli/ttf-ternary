@@ -128,7 +128,8 @@ def _teacher_logp(teacher, x, device):
     return torch.cat([F.log_softmax(c_.float(), -1).to(torch.bfloat16) for c_ in tz_.split(512)])
 
 
-def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lays, lr_state, ts_cfg, step, teacher=None):
+def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lays, lr_state, ts_cfg, step, teacher=None,
+                      batch=None):
     """--cuda-graph: one step's micro-batches. The first, a middle and the last micro-batch (forward under bf16 autocast,
     backward with the TTF updates inside it) are each captured on a side stream and replayed on the current one; the
     middle graph is replayed for micro-batches 1 .. M - 2, each batch copied into the static input first.
@@ -138,8 +139,9 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
     TTF state is written in place (update._keep), the float gradients are zeroed in place, and the counters the updates
     keep in Python are set after the step (update.graph_step_done). With M = 1 (the one-batch update reads Python numbers)
     the graph is captured fresh each step. --distill: the teacher's forward and log-softmax are a graph of their own,
-    replayed before each micro-batch; its output tensor is model.kd_logp for the student graphs. Returns (last loss, sum
-    of losses) as GPU tensors."""
+    replayed before each micro-batch; its output tensor is model.kd_logp for the student graphs. batch (--kd-cache):
+    micro -> (x, y, (ids, log-probs)), the teacher's top k copied into fixed tensors (model.kd_topk at capture).
+    Returns (last loss, sum of losses) as GPU tensors."""
     from . import update as U_
     from .layers import W8_CACHE
     M = tc.grad_accum
@@ -197,7 +199,18 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
     pool = _CG["pool"]
     last_loss, sum_loss = None, 0.0
     for micro in range(M):
-        x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
+        if batch is not None:
+            x, y, tk = batch(micro)
+            st_ = _CG.get("tk")
+            if st_ is None or st_[0].shape != tk[0].shape or st_[1].shape != tk[1].shape:
+                assert not graphs, "--cuda-graph --kd-cache: the cached top k changed shape under captured graphs"
+                st_ = _CG["tk"] = (tk[0].clone(), tk[1].clone())
+            else:
+                st_[0].copy_(tk[0], non_blocking=True); st_[1].copy_(tk[1], non_blocking=True)
+            model.kd_topk = st_
+            del tk
+        else:
+            x, y = get_batch(train_data, tc.batch_size, tc.seq_len, device, sampler)
         kind = (micro == 0, micro == M - 1)
         if teacher is not None:   # the teacher's forward as its own graph (static input, its output tensor the kd
             tg = _CG.get("tg")    # buffer the student graphs read); captured once per batch shape
@@ -267,6 +280,8 @@ def _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, intk, lay
         ts_cfg.pop("_dev", None); ts_cfg.pop("_dev_ts", None)
     _CG["graphs"] = graphs        # (kept at least until the next step starts: the replays may still be running)
     model.kd_logp = None
+    if batch is not None:
+        model.kd_topk = None
     return last_loss, sum_loss
 
 
@@ -1123,7 +1138,7 @@ def main():
                       f"(N K < (N + K)(k + 2 r))", flush=True)
     _cg_ok = False
     if args.cuda_graph:   # --cuda-graph: which runs it takes (the others run as before, with a note)
-        _why = [w_ for w_, bad in (("not CUDA", device != "cuda"), ("--pipe", _PP), ("--kd-cache", bool(args.kd_cache)),
+        _why = [w_ for w_, bad in (("not CUDA", device != "cuda"), ("--pipe", _PP),
                                    ("--tern-emb", bool(te)),
                                    ("--intk-emb", bool(args.intk_emb)), ("data parallel", _WS > 1),
                                    ("--ttf-offload", ttf and args.ttf_offload != "none")) if bad]
@@ -1236,7 +1251,11 @@ def main():
         if _cg_step:
             last_loss, sum_loss = _graph_micro_loop(model, tc, train_data, sampler, device, ttf, te, args.intk_emb,
                                                     [m_ for m_ in model.modules() if isinstance(m_, KernelTernaryLinear)],
-                                                    lr_state, ts_cfg, step, teacher=_teacher)
+                                                    lr_state, ts_cfg, step, teacher=_teacher,
+                                                    batch=(lambda mi_: _kd_cache_batch(
+                                                        args, ((step - args.kd_cache_start) * tc.grad_accum + mi_) * _WS
+                                                        + _RK, train_data, tc.seq_len, device, bs=tc.batch_size))
+                                                    if args.kd_cache else None)
         for micro in range(0 if (_PP or _cg_step) else tc.grad_accum):
             if ttf and tc.grad_accum > 1:      # TTF with accumulation: sum the captured micro-batch gradients
                 _mark_micro(model, micro, tc.grad_accum, te, args.intk_emb)
