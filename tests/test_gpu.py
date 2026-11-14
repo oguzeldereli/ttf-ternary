@@ -284,39 +284,6 @@ def test_micro_fused_matches_torch():
         assert float(((a - b).abs() / a.abs().clamp_min(1e-30)).max()) < 1e-5
 
 
-def test_cat_sketch_matches_separate():
-    """--accum M > 1, bf16 factors: the row side's products and the accumulator's term as one wide GEMM each way
-    (update.CAT_SKETCH) against the separate products + kernel.acc_gemm, over 3 steps x 4 micro-batches; the first
-    micro-batch's term to fp32 rounding, after 12 the accumulator within the drift any two summation orders show with
-    bf16 factors (~0.5%: test_micro_fused_matches_torch), v to bf16 rounding"""
-    from ttf import update as U
-    N, K, T, M = 200, 136, 384, 4
-
-    def run(cat, n=3 * M):
-        U.CAT_SKETCH[0] = cat
-        l = _layer(N, K, 0); l._ts_idx = 2; state = {}
-        gen = torch.Generator(device=dev).manual_seed(7)
-        for j in range(n):
-            s, i = divmod(j, M)
-            gy = (torch.randn(T, N, device=dev, generator=gen) * 1e-3).to(torch.bfloat16)
-            x = (torch.randn(T, K, device=dev, generator=gen) + 0.2).to(torch.bfloat16)
-            l._ts_final = i == M - 1
-            U.ts_layer(l, (gy, x), state, _cfg(r=24, theta=1e9, factored=64, step=10 + s, micro=M))
-        Uu, V = U._load_pair(state[id(l)])
-        return Uu @ V.T, state["_ts"].get(("v", id(l)))
-    old = U.CAT_SKETCH[0]
-    try:
-        A0, v0 = run(False); A1, v1 = run(True)
-        B0, _ = run(False, M + 1); B1, _ = run(True, M + 1)   # (step 2's first micro-batch: one term on the turned basis)
-    finally:
-        U.CAT_SKETCH[0] = old
-    assert not torch.equal(B1, B0)                         # (the wide path ran)
-    assert float((B1 - B0).norm() / B0.norm()) < 1e-3
-    assert float((A1 - A0).norm() / A0.norm()) < 2e-2
-    for a, b in zip(v0, v1):
-        assert float(((a - b).abs() / a.abs().clamp_min(1e-30)).max()) < 2e-2
-
-
 def _run(out, extra, steps, data):
     cmd = [sys.executable, os.path.join(ROOT, "scripts", "tests", "det_run.py"), "ttf.train", "--preset", "small",
            "--data", data, "--val", data, "--seq-len", "128", "--batch-size", "2", "--accum", "2", "--steps", "8",

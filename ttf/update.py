@@ -657,8 +657,6 @@ def _fg_mm_l(fg, a, W):
     return b[:, None] * _mmb(x.T, _mmb(gy, a[:, None] * W))
 
 
-CAT_SKETCH = [True]    # --accum M > 1 on the GPU: x [Sr | ib V] and gy^T (.) as one GEMM each (rounding level vs the separate
-                       # products and kernel.acc_gemm: the sums in another order)
 DP_REDUCE = [None]     # data parallel (set by train.py): t -> the mean of t over the ranks, in place
 
 
@@ -785,12 +783,12 @@ def _ts_layer_factored(l, fg, state, c):
         Sc = _row_sketch(l, dev, gen, k_, c, Q_)
     if GRAPH_STATE[0]:
         st[("tsl", key)] = ts_                # (draw_step_sketches: the next step's index is this + 1)
-    pu_ = None
     if MICRO_FUSED[0] and M_ > 1 and dev.type == "cuda" and not c.get("vdiag"):
         # --accum M > 1 on the GPU: each sketch side's statistics (its squares, the cross terms with the step's
         # running sum, v's EMA, the scale and its bounded reciprocal) in two kernels (kernel.micro_sketch) instead of
         # ~50 small ops; the running sum of the column side is kept as (Sc g)^T [K, k], so no transpose copy
         from .kernel import micro_sketch
+        gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                # g Sr  [N, k]
         SgT = _dpm(_mmb(x.T, _mmb(gy, Sc.T)))                             # (Sc g)^T  [K, k]
         R0 = C0 = None
         if ("v", key) in st and ts_ > 0:
@@ -799,23 +797,8 @@ def _ts_layer_factored(l, fg, state, c):
         if c.get("_dev") is not None:
             assert c["_dev_ts"] == ts_, (c["_dev_ts"], ts_)   # (the device scalars are the step's: same index)
         PS, SP, rs, cs, ds, es = st.pop(("mx", key), None) or (None,) * 6
-        ib, cs, es, SP = micro_sketch(SgT, SP, cs, es, C0, M_, l.N, b2, bc_, False)
-        ra_ = min(r, l.N, l.K)
-        if (CAT_SKETCH[0] and key in state and not off and gy.dtype == x.dtype == torch.bfloat16
-                and not (c.get("start") and c.get("step", 0) < c["start"])
-                and not ((dense_acc(l, ra_) or is_dense_state(state[key])) and not c.get("band") and not c.get("hspend"))):
-            # the row side's two products with x and the accumulator's term as one wide GEMM each way:
-            # x [Sr | ib V] [T, k + r], then gy^T (.) [N, k + r] = [g Sr | g (ib V)] (the column side first: ib)
-            U_, V_ = _load_pair(_host_get(state, key, dev, off))
-            W_ = torch.empty(l.K, k_ + V_.shape[1], dtype=torch.bfloat16, device=dev)
-            W_[:, :k_].copy_(Sr); torch.mul(ib[:, None], V_, out=W_[:, k_:])
-            o_ = torch.mm(gy.T, torch.mm(x, W_), out_dtype=torch.float32)
-            gS = _dpm(o_[:, :k_].contiguous())                            # g Sr  [N, k]
-            pu_ = (U_, V_, o_[:, k_:])
-            del W_
-        else:
-            gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                            # g Sr  [N, k]
         ia, rs, ds, PS = micro_sketch(gS, PS, rs, ds, R0, M_, l.K, b2, bc_, True)
+        ib, cs, es, SP = micro_sketch(SgT, SP, cs, es, C0, M_, l.N, b2, bc_, False)
         del gS, SgT, R0, C0
         if final_:
             rs, cs = torch.maximum(rs, ds / M_), torch.maximum(cs, es / M_)
@@ -888,13 +871,8 @@ def _ts_layer_factored(l, fg, state, c):
         V = _orth(-lr_ratio * _dpm(_fg_mm_l(fgb, ia, torch.randn(l.N, ra, device=dev, generator=g_))))
         U = -lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
     elif M_ > 1:   # basis fixed within the step (every micro-batch's u enters on it), turned on the last (_acc_turn)
-        if pu_ is not None:      # (the term's product from the wide GEMM above: cs U + alpha ia * (g (ib V)))
-            U, V, ut_ = pu_; cs_ = lk if (t - 1) % M_ == 0 else 1.0; al_ = _dv(c, "neg_lr", -lr_ratio)
-            U = torch.addcmul(U * cs_ if cs_ != 1.0 else U, ia[:, None] * al_, ut_)
-            del ut_
-        else:
-            U, V = _load_pair(_host_get(state, key, dev, off))
-            U = _fg_add_r(U, fgb, ia, V, _dv(c, "neg_lr", -lr_ratio), lk if (t - 1) % M_ == 0 else 1.0)   # (data parallel: this rank's term,
+        U, V = _load_pair(_host_get(state, key, dev, off))
+        U = _fg_add_r(U, fgb, ia, V, _dv(c, "neg_lr", -lr_ratio), lk if (t - 1) % M_ == 0 else 1.0)   # (data parallel: this rank's term,
         # averaged on the last one)
         if final_:
             # data parallel: the micro-batches' terms are linear in g and V is fixed within the step, so each rank
