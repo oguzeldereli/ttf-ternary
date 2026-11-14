@@ -830,6 +830,30 @@ def test_scratch_fused_elementwise():
     assert M._FN["rope"] is M._rope_k and M._FN["rmsnorm"] is M._rmsnorm_k
 
 
+def test_train_head_ce():
+    """headloss.TrainHeadCE (the from-scratch model's trained-head loss, model.FUSED_HEAD) against the autograd chunk
+    (BitTransformer._loss_chunk under bf16 autocast): the loss to fp32 / bf16-logit rounding, dh and dW within bf16
+    rounding; ignored targets (-1) contribute nothing"""
+    from ttf.headloss import TrainHeadCE
+    from ttf.model import BitTransformer
+    torch.manual_seed(0)
+    n, d, V = 700, 256, 5000
+    h0 = torch.randn(n, d, device=dev, dtype=torch.bfloat16)
+    w0 = torch.randn(V, d, device=dev) * 0.05
+    t = torch.randint(0, V, (n,), device=dev); t[::7] = -1
+    h1, w1 = h0.clone().requires_grad_(True), w0.clone().requires_grad_(True)
+    l1 = TrainHeadCE.apply(h1, w1.to(torch.bfloat16), t) * 0.37
+    l1.backward()
+    h2, w2 = h0.clone().requires_grad_(True), w0.clone().requires_grad_(True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        l2 = BitTransformer._loss_chunk(h2, w2, t) * 0.37
+    l2.backward()
+    assert abs(float(l1) - float(l2)) < 2e-3 * abs(float(l2))
+    for a, b in ((h1.grad, h2.grad), (w1.grad, w2.grad)):
+        assert a.dtype == b.dtype
+        assert float((a.float() - b.float()).norm() / b.float().norm()) < 1e-2
+
+
 def test_w8_cache_follows_trits():
     """KernelTernaryLinear.w8: the cached int8 trits (both layouts) equal a fresh unpack after the fused firing (in place,
     no version bump) and after a copy_ into the packed buffer"""

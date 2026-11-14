@@ -240,3 +240,34 @@ class _HeadLossTrainFn(torch.autograd.Function):
 
 def head_loss_train_chunk(h, w, tgt, tlp, a, acc):
     return _HeadLossTrainFn.apply(h, w, tgt, tlp, float(a), acc)
+
+
+class TrainHeadCE(torch.autograd.Function):
+    """the from-scratch model's chunked head + cross-entropy with a TRAINED head (BitTransformer.forward, no teacher):
+    the forward forms z = h W^T (fp32 out of the GEMM), the summed loss and dz = softmax(z) - onehot(t) (rows with
+    t = -1 zero), kept in bf16; the backward is the two GEMMs dh = g dz W, dW = g dz^T h. Replaces the checkpointed
+    chunk (GEMM, cast, log_softmax, nll; in the backward the GEMM and the softmax again, nll's fp32 [n, V] gradient,
+    the softmax backward and the cast): the head's GEMM once instead of twice, two passes over [n, V] instead of ~8.
+    Rounding level: z is not rounded to bf16 before the softmax, dz is rounded before the scale g (autograd: after)"""
+    @staticmethod
+    def forward(ctx, h, wb, tgt):
+        z = torch.mm(h, wb.t(), out_dtype=torch.float32)
+        lse = torch.logsumexp(z, 1)
+        ok = tgt != -1
+        tc = tgt.clamp_min(0)
+        nll = ((lse - z.gather(1, tc[:, None])[:, 0]) * ok).sum()
+        z.sub_(lse[:, None]).exp_()
+        z.scatter_add_(1, tc[:, None], -ok.to(z.dtype)[:, None])
+        z.mul_(ok[:, None])
+        dz = z.to(h.dtype)
+        del z
+        ctx.save_for_backward(h, wb, dz)
+        return nll
+
+    @staticmethod
+    def backward(ctx, g):
+        h, wb, dz = ctx.saved_tensors
+        gs = g.to(torch.float32)
+        dh = torch.mm(dz, wb, out_dtype=torch.float32).mul_(gs).to(h.dtype)
+        dw = torch.mm(dz.t(), h, out_dtype=torch.float32).mul_(gs).to(wb.dtype)
+        return dh, dw, None
