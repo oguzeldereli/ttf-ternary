@@ -31,8 +31,41 @@ def _rope_rot(x, freqs_cis):
     return torch.view_as_real(xc * f).flatten(-2).type_as(x)
 
 
+FUSED_ELEM = [True]   # bf16 CUDA activations: the RMSNorm and the SwiGLU in one Triton kernel each way (kernel.rms_norm,
+                      # kernel.swiglu: the same fp32 formulas and bf16 roundings as the torch pieces above, which stay
+                      # the CPU / fp32 path and the tests' reference)
+
+
+FUSED_HEAD = [True]   # training, no teacher, bf16 CUDA: headloss.TrainHeadCE per loss chunk (else the checkpointed autograd chunk)
+
+
+def _fused(x):
+    return FUSED_ELEM[0] and x.is_cuda and x.dtype == torch.bfloat16
+
+
+def _rmsnorm_k(x, w, eps: float):
+    if _fused(x):
+        from .kernel import rms_norm
+        return rms_norm(x, w, eps)
+    return _rmsnorm(x, w, eps)
+
+
+def _swiglu_k(a, b):
+    if _fused(a) and b.dtype == a.dtype and a.shape == b.shape:
+        from .kernel import swiglu
+        return swiglu(a, b)
+    return _swiglu(a, b)
+
+
+def _rope_k(x, freqs_cis):
+    if _fused(x) and x.dim() == 4 and (x.shape[-1] // 2) & (x.shape[-1] // 2 - 1) == 0:   # (head dim / 2 a power of 2)
+        from .kernel import rope
+        return rope(x, freqs_cis)
+    return _rope_rot(x, freqs_cis)
+
+
 # elementwise pieces, swappable (tests)
-_FN = {"rmsnorm": _rmsnorm, "swiglu": _swiglu, "rope": _rope_rot}
+_FN = {"rmsnorm": _rmsnorm_k, "swiglu": _swiglu_k, "rope": _rope_k}
 
 
 class RMSNorm(nn.Module):
@@ -278,15 +311,21 @@ class BitTransformer(nn.Module):
         n = self.loss_chunk
         total = hf.new_zeros((), dtype=torch.float32)
         kd = self.kd_logp
-        for i in range(0, hf.shape[0], n):
-            hc, tc = hf[i:i + n], tf[i:i + n]
-            if kd is not None:
-                tl = kd[i:i + n]
-                total = total + (checkpoint(self._loss_chunk_kd, hc, w, tc, tl, self.kd_w, use_reentrant=False)
-                                 if ckpt else self._loss_chunk_kd(hc, w, tc, tl, self.kd_w))
-                continue
-            total = total + (checkpoint(self._loss_chunk, hc, w, tc, use_reentrant=False)
-                             if ckpt else self._loss_chunk(hc, w, tc))
+        if kd is None and self.training and FUSED_HEAD[0] and hf.is_cuda and hf.dtype == torch.bfloat16:
+            from .headloss import TrainHeadCE      # (the head GEMM once per chunk, the softmax's gradient formed with the loss)
+            wb = w.to(hf.dtype)
+            for i in range(0, hf.shape[0], n):
+                total = total + TrainHeadCE.apply(hf[i:i + n], wb, tf[i:i + n])
+        else:
+            for i in range(0, hf.shape[0], n):
+                hc, tc = hf[i:i + n], tf[i:i + n]
+                if kd is not None:
+                    tl = kd[i:i + n]
+                    total = total + (checkpoint(self._loss_chunk_kd, hc, w, tc, tl, self.kd_w, use_reentrant=False)
+                                     if ckpt else self._loss_chunk_kd(hc, w, tc, tl, self.kd_w))
+                    continue
+                total = total + (checkpoint(self._loss_chunk, hc, w, tc, use_reentrant=False)
+                                 if ckpt else self._loss_chunk(hc, w, tc))
         loss = total / (tf != -1).sum().clamp_min(1)
         aux = [l.ffn.aux_loss for l in self.layers if getattr(l.ffn, "aux_loss", None) is not None]
         if aux and self.moe_aux_w:

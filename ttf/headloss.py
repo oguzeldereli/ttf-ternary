@@ -20,7 +20,7 @@ def ce_kd_dz(z, tgt, tlp, a):
     lp = F.log_softmax(z, -1)
     del z
     ok = tgt != -1
-    nll = -lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0][ok].sum()
+    nll = -torch.where(ok, lp.gather(1, tgt.clamp_min(0)[:, None])[:, 0], 0.0).sum()   # (no boolean index: no host sync)
     p = lp.exp()
     if tlp is not None:
         tl = tlp.float(); pt = tl.exp()
@@ -145,7 +145,8 @@ def topk_dz(z, tgt, ids, tlp, a, mode):
     if a >= 1.0:
         return kd, dz
     ok = tgt != -1
-    ce = -(z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0][ok].sum()
+    ce = -torch.where(ok, (z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0], 0.0).sum()   # (no boolean index: no host
+    # sync, --cuda-graph; the loss value only: dz below does not read it)
     dz.mul_(a).add_(s * ((1 - a) * ok.float()[:, None]))
     idx = tgt.clamp_min(0)[:, None]
     dz.scatter_add_(1, idx, torch.full_like(idx, -(1 - a), dtype=dz.dtype) * ok[:, None])
@@ -240,3 +241,28 @@ class _HeadLossTrainFn(torch.autograd.Function):
 
 def head_loss_train_chunk(h, w, tgt, tlp, a, acc):
     return _HeadLossTrainFn.apply(h, w, tgt, tlp, float(a), acc)
+
+
+class TrainHeadCE(torch.autograd.Function):
+    """the from-scratch model's chunked head + cross-entropy with a TRAINED head (BitTransformer.forward, no teacher):
+    the forward forms the logits z = bf16(h W^T) (the autocast GEMM's rounding, as the autograd chunk), then one kernel
+    (kernel.ce_rows_) gives the loss and, in z's memory, dz = bf16(softmax(z) - onehot(t)) (rows with t = -1 zero); the
+    backward is the two GEMMs dh = g dz W, dW = g dz^T h. Replaces the checkpointed chunk (GEMM, fp32 cast, log_softmax,
+    nll; in the backward the GEMM and the softmax again, nll's fp32 [n, V] gradient, the softmax backward and the cast):
+    the head GEMM once instead of twice, two passes over a bf16 [n, V] instead of ~8 fp32 ones. Rounding level: dz is
+    rounded before the scale g (autograd: after); the softmax sums run in another order"""
+    @staticmethod
+    def forward(ctx, h, wb, tgt):
+        from .kernel import ce_rows_
+        z = torch.mm(h, wb.t())
+        nll = ce_rows_(z, tgt).sum()
+        ctx.save_for_backward(h, wb, z)
+        return nll
+
+    @staticmethod
+    def backward(ctx, g):
+        h, wb, dz = ctx.saved_tensors
+        gs = g.to(torch.float32)
+        dh = torch.mm(dz, wb, out_dtype=torch.float32).mul_(gs).to(h.dtype)
+        dw = torch.mm(dz.t(), h, out_dtype=torch.float32).mul_(gs).to(wb.dtype)
+        return dh, dw, None

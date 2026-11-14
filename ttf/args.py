@@ -160,6 +160,11 @@ def build_parser():
                         "kernel, the GEMM's epilogue with the row scale, bias and the sum of a converted layer's parts, "
                         "the backward's elementwise work in two kernels (output, input gradient and the TTF factors "
                         "bit-identical; the scale / bias gradients summed in fp32)")
+    g.add_argument("--cuda-graph", action=ON, default=False,
+                   help="each step's micro-batches (forward, backward, the TTF updates inside it) as CUDA graphs: the "
+                        "first, a middle and the last micro-batch are captured once per step and the middle one is "
+                        "replayed for the others (the launch and Python cost of a step falls from M micro-batches to 3; "
+                        "the same values: the TTF state is written into fixed tensors, update._keep)")
     g.add_argument("--ckpt", default="layer", choices=["layer", "block"],
                    help="activation checkpointing: attention and MLP separately, or each block once (half the memory)")
     g.add_argument("--ckpt-skip", default="auto",

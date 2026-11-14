@@ -421,7 +421,7 @@ def _kd_topk_chunk(h, w, tgt, ids, tlp, a, mode="rest"):
     if a >= 1.0:
         return kd
     ok = tgt != -1
-    ce = -(z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0][ok].sum()
+    ce = -torch.where(ok, (z.gather(1, tgt.clamp_min(0)[:, None]) - lse)[:, 0], 0.0).sum()   # (no host sync)
     return (1 - a) * ce + a * kd
 
 

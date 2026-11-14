@@ -339,6 +339,30 @@ def test_train_resume_round_trip_sketch_warm(tmp_path):
             assert all(torch.equal(x, y) for x, y in zip(pa, pb) if torch.is_tensor(x))
 
 
+def test_cuda_graph_matches_eager(tmp_path):
+    """--cuda-graph (the first, a middle and the last micro-batch captured once, then replayed every step; the middle one
+    twice a step at --accum 4): in deterministic mode the same per-step losses, accumulators and trits as the eager loop,
+    bit for bit, over steps that move trits (3 eager warm-up steps, a capture step, replayed steps); and a run saved after
+    replayed steps resumes onto the same path"""
+    data = str(tmp_path / "tok.bin")
+    np.random.default_rng(0).integers(0, 32000, 200_000, dtype=np.uint16).tofile(data)
+    w = ["--accum", "4", "--dw-sketch-warm", "0.75", "--dw-sketch", "32", "--lr", "3e-3", "--ttf-theta", "4"]
+    a = _train(str(tmp_path / "a"), w, 8, data)
+    b = _train(str(tmp_path / "b"), w + ["--cuda-graph"], 8, data)
+    assert len(a) == 8 and a == b, (a, b)
+    assert len(_train(str(tmp_path / "c"), w + ["--cuda-graph"], 6, data)) == 6   # (replayed steps 4, 5, then saved:
+    c = _train(str(tmp_path / "c"), w + ["--cuda-graph", "--resume"], 8, data)      # the counters graph_step_done sets)
+    assert a == c, (a, c)
+    ma = [json.loads(l) for l in open(tmp_path / "a" / "metrics.jsonl") if '"loss"' in l]
+    assert sum(m_.get("ts_frac", 0) for m_ in ma[3:]) > 0, "no trit moved in the graph steps: the test sees no firing"
+    ca, cb = (torch.load(str(tmp_path / d / "ckpt.pt"), map_location="cpu", weights_only=False) for d in "ab")
+    for k in ca["model"]:
+        assert torch.equal(ca["model"][k], cb["model"][k]), k
+    for pa, pb in zip(ca["lowrank"], cb["lowrank"]):
+        if pa is not None:
+            assert all(torch.equal(x, y) for x, y in zip(pa, pb) if torch.is_tensor(x))
+
+
 def test_move_capture_plugin(tmp_path):
     """scripts/analysis/move_capture.py: resumed from a snapshot it captures the gradients through the grad hook, moves
     nothing, and writes its file"""
@@ -601,6 +625,63 @@ def test_fused_layer(K, N, dx):
         L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0] = old
 
 
+@pytest.mark.parametrize("K,N,dx,centre", [(1024, 2816, "int8x2", False), (2816, 1024, "int8x2", True),
+                                          (1024, 1024, "bf16", False), (4096, 1024, "int8x2", False)])
+def test_fused_layer_adapter(K, N, dx, centre):
+    """--fused-layer on a layer with the rank-16 additive float adapter (the from-scratch preset's layers) against the
+    unfused path (_ColScaleFn, _KernelTernFn, the adapter's two GEMMs, _AddRowFn): output (with and without grad), the
+    TTF factors and mag_A's gradient bit-identical; with --dx int8x2 the input gradient and mag_B's within bf16
+    rounding (the adapter's products formed inside the row and dx kernels), else bit-identical; the scales' gradients
+    within bf16 rounding (fp32 sums). K 4096: the cutlass GEMM + separate epilogue"""
+    import ttf.kernel as KN
+    import ttf.layers as L
+    from ttf.layers import KernelTernaryLinear
+    dev, T = "cuda", 512
+    old = (L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], L.W8_CACHE[0])
+    L.DX_MODE[0], L.FACTORED[0], L.W8_CACHE[0] = dx, True, True
+    try:
+        torch.manual_seed(0)
+        l = KernelTernaryLinear(K, N, 8, beta=True).to(dev); l.enable_rc_scale(); l.enable_lowrank_mag("add", 16)
+        l.wpacked.copy_(KN.pack_rows(torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8)))
+        with torch.no_grad():
+            l.row_scale.uniform_(0.5, 1.5); l.col_scale.uniform_(0.5, 1.5); l.mag_A.normal_(0, 0.05)
+        if centre:
+            l.enable_centering(torch.randn(K, device=dev) * 0.3, torch.randn(N, device=dev) * 0.1)
+        cap = {}
+        l.capture = True
+        l.on_grad = lambda l_, g_: cap.setdefault(0, (g_[0].clone(), g_[1].clone()))
+        x0 = torch.randn(T, K, device=dev, dtype=torch.bfloat16) * 2
+        gy = torch.randn(T, N, device=dev, dtype=torch.bfloat16)
+
+        def run(fused):
+            L.FUSED_LAYER[0] = fused; cap.clear()
+            for p_ in l.parameters():
+                p_.grad = None
+            x = x0.clone().requires_grad_(True)
+            with torch.no_grad():
+                y_ng = l(x0)
+            y = l(x); y.backward(gy)
+            return y.detach(), y_ng, x.grad, {n: p_.grad.clone() for n, p_ in l.named_parameters()}, cap[0]
+        A, B = run(False), run(True)
+        lr = dx == "int8x2"    # (the adapter's gh in the row kernel, gh B^T in the dx kernel: their sums in another
+        for i in range(2 if lr else 3):    # order, so the input gradient and mag_B's within bf16 rounding)
+            assert torch.equal(A[i], B[i]), i
+        if lr:
+            d = (A[2].float() - B[2].float()).abs()
+            assert (d.max() / A[2].float().abs().max()).item() < 1e-2 and (d.mean() / A[2].float().abs().mean()).item() < 2e-3
+        for n in A[3]:
+            ga, gb = A[3][n], B[3][n]
+            if n == "mag_B" and lr:
+                assert ((ga - gb).abs().max() / ga.abs().max()).item() < 1e-2, n
+            elif n.startswith("mag_"):
+                assert torch.equal(ga, gb), n
+            else:
+                assert ((ga - gb).abs().max() / ga.abs().max().clamp_min(1e-30)).item() < 8e-3, n
+        assert torch.equal(A[4][0], B[4][0]) and torch.equal(A[4][1], B[4][1])
+    finally:
+        L.DX_MODE[0], L.FACTORED[0], L.FUSED_LAYER[0], L.W8_CACHE[0] = old
+
+
 def test_intk_codes_fire_in_range():
     """--intk-emb: the dense TTF update moves int-k codes by one level where the accumulator reaches theta, never out
     of 0 .. levels; the leaf's gradient reaches the group parameters"""
@@ -675,6 +756,70 @@ def test_qwen_fused_kernels(wdt):
     both(lambda x, z, w: KN.gated_norm_qwen(x, z, w, eps),
          lambda x, z, w: ((w * (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype))
                           * F.silu(z.float())).to(x.dtype), [x, z, wg])
+
+
+def test_scratch_fused_elementwise():
+    """The from-scratch model's fused elementwise kernels (model.FUSED_ELEM, bf16 CUDA): RMSNorm (gain w), SwiGLU and
+    RoPE against the torch pieces model._rmsnorm / _swiglu / _rope_rot, forward and every input's gradient. The outputs
+    and input gradients agree to a few bf16 ulps (fp32 internals in both); reported: the share of bit-identical values"""
+    import ttf.model as M
+    import ttf.kernel as KN
+    dev = "cuda"
+    torch.manual_seed(0)
+    B, T, H, Dh, eps = 2, 96, 4, 64, 1e-5
+    D = H * Dh
+
+    def both(fk, fr, xs, tol=1e-2):
+        a = [x.detach().clone().requires_grad_(x.is_floating_point()) for x in xs]
+        b = [x.detach().clone().requires_grad_(x.is_floating_point()) for x in xs]
+        ya, yb = fk(*a), fr(*b)
+        g = torch.randn_like(yb)
+        ya.backward(g); yb.backward(g)
+        assert ya.dtype == yb.dtype and ya.shape == yb.shape
+        rel = ((ya.float() - yb.float()).abs().max() / yb.float().abs().max()).item()
+        assert rel < tol, rel
+        for p, q in zip(a, b):
+            if q.grad is not None:
+                r = ((p.grad.float() - q.grad.float()).abs().max() / q.grad.float().abs().max()).item()
+                assert r < 2 * tol, (p.shape, r)
+        return float((ya == yb).float().mean())
+
+    x = torch.randn(B, T, D, device=dev, dtype=torch.bfloat16) * 3
+    w = 1 + torch.randn(D, device=dev) * 0.1
+    same = both(lambda x, w: KN.rms_norm(x, w, eps), lambda x, w: M._rmsnorm(x, w, eps), [x, w])
+    assert same > 0.98, same
+    g, u = (torch.randn(B, T, 3 * D, device=dev, dtype=torch.bfloat16) * 2 for _ in range(2))
+    both(KN.swiglu, M._swiglu, [g, u])
+    q = torch.randn(B, T, H, Dh, device=dev, dtype=torch.bfloat16)
+    f = M.precompute_rope(Dh, 2 * T, 10000.0).to(dev)
+    same = both(lambda q: KN.rope(q, f), lambda q: M._rope_rot(q, f), [q])
+    assert same > 0.98, same
+    assert M._FN["rope"] is M._rope_k and M._FN["rmsnorm"] is M._rmsnorm_k
+
+
+@pytest.mark.parametrize("V", [5000, 1000])   # (1000 < the kernel's block: lanes with no entry)
+def test_train_head_ce(V):
+    """headloss.TrainHeadCE (the from-scratch model's trained-head loss, model.FUSED_HEAD) against the autograd chunk
+    (BitTransformer._loss_chunk under bf16 autocast): the loss to fp32 / bf16-logit rounding, dh and dW within bf16
+    rounding; ignored targets (-1) contribute nothing"""
+    from ttf.headloss import TrainHeadCE
+    from ttf.model import BitTransformer
+    torch.manual_seed(0)
+    n, d = 700, 256
+    h0 = torch.randn(n, d, device=dev, dtype=torch.bfloat16)
+    w0 = torch.randn(V, d, device=dev) * 0.05
+    t = torch.randint(0, V, (n,), device=dev); t[::7] = -1
+    h1, w1 = h0.clone().requires_grad_(True), w0.clone().requires_grad_(True)
+    l1 = TrainHeadCE.apply(h1, w1.to(torch.bfloat16), t) * 0.37
+    l1.backward()
+    h2, w2 = h0.clone().requires_grad_(True), w0.clone().requires_grad_(True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        l2 = BitTransformer._loss_chunk(h2, w2, t) * 0.37
+    l2.backward()
+    assert abs(float(l1) - float(l2)) < 2e-3 * abs(float(l2))
+    for a, b in ((h1.grad, h2.grad), (w1.grad, w2.grad)):
+        assert a.dtype == b.dtype
+        assert float((a.float() - b.float()).norm() / b.float().norm()) < 1e-2
 
 
 def test_w8_cache_follows_trits():
@@ -1030,3 +1175,19 @@ def test_orth_fp32_under_tf32():
     finally:
         torch.backends.cuda.matmul.allow_tf32 = False
     assert torch.equal(q0, q1)
+
+
+def test_log_softmax_bf16():
+    """kernel.log_softmax_bf16 (the --distill teacher's log-probs) against F.log_softmax in fp32, rounded to bf16"""
+    import torch.nn.functional as F
+    from ttf.kernel import log_softmax_bf16
+    torch.manual_seed(0)
+    for V in (1000, 248320):
+        z = (torch.randn(37, V, device="cuda") * 4).to(torch.bfloat16)
+        ref = F.log_softmax(z.float(), -1).to(torch.bfloat16)
+        got = log_softmax_bf16(z.clone())
+        d = (got.float() - ref.float()).abs()
+        assert d.max() <= 2 ** -6 * ref.float().abs().max(), d.max()
+        assert (got != ref).float().mean() < 0.02
+        got32 = log_softmax_bf16(z.float())
+        assert torch.equal(got32, got)
