@@ -284,6 +284,39 @@ def test_micro_fused_matches_torch():
         assert float(((a - b).abs() / a.abs().clamp_min(1e-30)).max()) < 1e-5
 
 
+def test_cat_sketch_matches_separate():
+    """--accum M > 1, bf16 factors: the row side's products and the accumulator's term as one wide GEMM each way
+    (update.CAT_SKETCH) against the separate products + kernel.acc_gemm, over 3 steps x 4 micro-batches; the first
+    micro-batch's term to fp32 rounding, after 12 the accumulator within the drift any two summation orders show with
+    bf16 factors (~0.5%: test_micro_fused_matches_torch), v to bf16 rounding"""
+    from ttf import update as U
+    N, K, T, M = 200, 136, 384, 4
+
+    def run(cat, n=3 * M):
+        U.CAT_SKETCH[0] = cat
+        l = _layer(N, K, 0); l._ts_idx = 2; state = {}
+        gen = torch.Generator(device=dev).manual_seed(7)
+        for j in range(n):
+            s, i = divmod(j, M)
+            gy = (torch.randn(T, N, device=dev, generator=gen) * 1e-3).to(torch.bfloat16)
+            x = (torch.randn(T, K, device=dev, generator=gen) + 0.2).to(torch.bfloat16)
+            l._ts_final = i == M - 1
+            U.ts_layer(l, (gy, x), state, _cfg(r=24, theta=1e9, factored=64, step=10 + s, micro=M))
+        Uu, V = U._load_pair(state[id(l)])
+        return Uu @ V.T, state["_ts"].get(("v", id(l)))
+    old = U.CAT_SKETCH[0]
+    try:
+        A0, v0 = run(False); A1, v1 = run(True)
+        B0, _ = run(False, M + 1); B1, _ = run(True, M + 1)   # (step 2's first micro-batch: one term on the turned basis)
+    finally:
+        U.CAT_SKETCH[0] = old
+    assert not torch.equal(B1, B0)                         # (the wide path ran)
+    assert float((B1 - B0).norm() / B0.norm()) < 1e-3
+    assert float((A1 - A0).norm() / A0.norm()) < 2e-2
+    for a, b in zip(v0, v1):
+        assert float(((a - b).abs() / a.abs().clamp_min(1e-30)).max()) < 2e-2
+
+
 def _run(out, extra, steps, data):
     cmd = [sys.executable, os.path.join(ROOT, "scripts", "tests", "det_run.py"), "ttf.train", "--preset", "small",
            "--data", data, "--val", data, "--seq-len", "128", "--batch-size", "2", "--accum", "2", "--steps", "8",
@@ -629,9 +662,10 @@ def test_fused_layer(K, N, dx):
                                           (1024, 1024, "bf16", False), (4096, 1024, "int8x2", False)])
 def test_fused_layer_adapter(K, N, dx, centre):
     """--fused-layer on a layer with the rank-16 additive float adapter (the from-scratch preset's layers) against the
-    unfused path (_ColScaleFn, _KernelTernFn, the adapter's two GEMMs, _AddRowFn): output (with and without grad), input
-    gradient, the TTF factors and the adapter's gradients bit-identical; the scales' gradients within bf16 rounding
-    (fp32 sums). K 4096: the cutlass GEMM + separate epilogue"""
+    unfused path (_ColScaleFn, _KernelTernFn, the adapter's two GEMMs, _AddRowFn): output (with and without grad), the
+    TTF factors and mag_A's gradient bit-identical; with --dx int8x2 the input gradient and mag_B's within bf16
+    rounding (the adapter's products formed inside the row and dx kernels), else bit-identical; the scales' gradients
+    within bf16 rounding (fp32 sums). K 4096: the cutlass GEMM + separate epilogue"""
     import ttf.kernel as KN
     import ttf.layers as L
     from ttf.layers import KernelTernaryLinear
@@ -662,11 +696,17 @@ def test_fused_layer_adapter(K, N, dx, centre):
             y = l(x); y.backward(gy)
             return y.detach(), y_ng, x.grad, {n: p_.grad.clone() for n, p_ in l.named_parameters()}, cap[0]
         A, B = run(False), run(True)
-        for i in range(3):
+        lr = dx == "int8x2"    # (the adapter's gh in the row kernel, gh B^T in the dx kernel: their sums in another
+        for i in range(2 if lr else 3):    # order, so the input gradient and mag_B's within bf16 rounding)
             assert torch.equal(A[i], B[i]), i
+        if lr:
+            d = (A[2].float() - B[2].float()).abs()
+            assert (d.max() / A[2].float().abs().max()).item() < 1e-2 and (d.mean() / A[2].float().abs().mean()).item() < 2e-3
         for n in A[3]:
             ga, gb = A[3][n], B[3][n]
-            if n.startswith("mag_"):
+            if n == "mag_B" and lr:
+                assert ((ga - gb).abs().max() / ga.abs().max()).item() < 1e-2, n
+            elif n.startswith("mag_"):
                 assert torch.equal(ga, gb), n
             else:
                 assert ((ga - gb).abs().max() / ga.abs().max().clamp_min(1e-30)).item() < 8e-3, n
@@ -749,6 +789,45 @@ def test_qwen_fused_kernels(wdt):
     both(lambda x, z, w: KN.gated_norm_qwen(x, z, w, eps),
          lambda x, z, w: ((w * (x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype))
                           * F.silu(z.float())).to(x.dtype), [x, z, wg])
+
+
+def test_scratch_fused_elementwise():
+    """The from-scratch model's fused elementwise kernels (model.FUSED_ELEM, bf16 CUDA): RMSNorm (gain w), SwiGLU and
+    RoPE against the torch pieces model._rmsnorm / _swiglu / _rope_rot, forward and every input's gradient. The outputs
+    and input gradients agree to a few bf16 ulps (fp32 internals in both); reported: the share of bit-identical values"""
+    import ttf.model as M
+    import ttf.kernel as KN
+    dev = "cuda"
+    torch.manual_seed(0)
+    B, T, H, Dh, eps = 2, 96, 4, 64, 1e-5
+    D = H * Dh
+
+    def both(fk, fr, xs, tol=1e-2):
+        a = [x.detach().clone().requires_grad_(x.is_floating_point()) for x in xs]
+        b = [x.detach().clone().requires_grad_(x.is_floating_point()) for x in xs]
+        ya, yb = fk(*a), fr(*b)
+        g = torch.randn_like(yb)
+        ya.backward(g); yb.backward(g)
+        assert ya.dtype == yb.dtype and ya.shape == yb.shape
+        rel = ((ya.float() - yb.float()).abs().max() / yb.float().abs().max()).item()
+        assert rel < tol, rel
+        for p, q in zip(a, b):
+            if q.grad is not None:
+                r = ((p.grad.float() - q.grad.float()).abs().max() / q.grad.float().abs().max()).item()
+                assert r < 2 * tol, (p.shape, r)
+        return float((ya == yb).float().mean())
+
+    x = torch.randn(B, T, D, device=dev, dtype=torch.bfloat16) * 3
+    w = 1 + torch.randn(D, device=dev) * 0.1
+    same = both(lambda x, w: KN.rms_norm(x, w, eps), lambda x, w: M._rmsnorm(x, w, eps), [x, w])
+    assert same > 0.98, same
+    g, u = (torch.randn(B, T, 3 * D, device=dev, dtype=torch.bfloat16) * 2 for _ in range(2))
+    both(KN.swiglu, M._swiglu, [g, u])
+    q = torch.randn(B, T, H, Dh, device=dev, dtype=torch.bfloat16)
+    f = M.precompute_rope(Dh, 2 * T, 10000.0).to(dev)
+    same = both(lambda q: KN.rope(q, f), lambda q: M._rope_rot(q, f), [q])
+    assert same > 0.98, same
+    assert M._FN["rope"] is M._rope_k and M._FN["rmsnorm"] is M._rmsnorm_k
 
 
 def test_w8_cache_follows_trits():

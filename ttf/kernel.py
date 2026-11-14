@@ -1022,25 +1022,27 @@ def scale_bwd(g, s_bf16, x, mu=None):
 
 
 @triton.jit
-def _rms_fwd_kernel(x_ptr, w_ptr, y_ptr, r_ptr, K, sx, sy, eps, BK: tl.constexpr):
-    """one row: y = (x * rsqrt(mean(x^2) + eps)) * (1 + w) in fp32, stored in y's dtype; rstd kept for the backward
-    (Qwen3.5's RMSNorm: the gain is 1 + w and the product is taken before the cast)"""
+def _rms_fwd_kernel(x_ptr, w_ptr, y_ptr, r_ptr, K, sx, sy, eps, BK: tl.constexpr, OFF: tl.constexpr = 1.0):
+    """one row: y = (x * rsqrt(mean(x^2) + eps)) * (OFF + w) in fp32, stored in y's dtype; rstd kept for the backward
+    (OFF 1: Qwen3.5's RMSNorm, the gain is 1 + w; OFF 0: the from-scratch model's, the gain is w; the product is taken
+    before the cast)"""
     row = tl.program_id(0)
     k = tl.arange(0, BK); m = k < K
     x = tl.load(x_ptr + row * sx + k, mask=m, other=0.0).to(tl.float32)
     rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / K + eps)
     w = tl.load(w_ptr + k, mask=m, other=0.0).to(tl.float32)
-    tl.store(y_ptr + row * sy + k, (x * rstd * (1.0 + w)).to(y_ptr.dtype.element_ty), mask=m)
+    tl.store(y_ptr + row * sy + k, (x * rstd * (OFF + w)).to(y_ptr.dtype.element_ty), mask=m)
     tl.store(r_ptr + row, rstd)
 
 
 @triton.jit
-def _rms_bwd_kernel(x_ptr, w_ptr, g_ptr, r_ptr, gx_ptr, gw_ptr, M, K, sx, sg, sgx, RPB: tl.constexpr, BK: tl.constexpr):
-    """RPB rows per program: gx = rstd (g' - xh mean(g' xh)), g' = g (1 + w), xh = x rstd; the gain's gradient
+def _rms_bwd_kernel(x_ptr, w_ptr, g_ptr, r_ptr, gx_ptr, gw_ptr, M, K, sx, sg, sgx, RPB: tl.constexpr, BK: tl.constexpr,
+                    OFF: tl.constexpr = 1.0):
+    """RPB rows per program: gx = rstd (g' - xh mean(g' xh)), g' = g (OFF + w), xh = x rstd; the gain's gradient
     sum(g xh) over the program's rows, written per program (summed afterwards: deterministic)"""
     pid = tl.program_id(0)
     k = tl.arange(0, BK); m = k < K
-    w1 = 1.0 + tl.load(w_ptr + k, mask=m, other=0.0).to(tl.float32)
+    w1 = OFF + tl.load(w_ptr + k, mask=m, other=0.0).to(tl.float32)
     gw = tl.zeros((BK,), dtype=tl.float32)
     for i in range(RPB):
         row = pid * RPB + i
@@ -1058,12 +1060,12 @@ def _rms_bwd_kernel(x_ptr, w_ptr, g_ptr, r_ptr, gx_ptr, gw_ptr, M, K, sx, sg, sg
 
 class RMSNormFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w, eps):
+    def forward(ctx, x, w, eps, off=1.0):
         sh = x.shape; x2 = x.reshape(-1, sh[-1]).contiguous(); M, K = x2.shape
         y = torch.empty_like(x2); r = torch.empty(M, dtype=torch.float32, device=x.device)
         BK = triton.next_power_of_2(K)
-        _rms_fwd_kernel[(M,)](x2, w, y, r, K, x2.stride(0), y.stride(0), float(eps), BK=BK)
-        ctx.save_for_backward(x2, w, r); ctx.sh = sh
+        _rms_fwd_kernel[(M,)](x2, w, y, r, K, x2.stride(0), y.stride(0), float(eps), BK=BK, OFF=float(off))
+        ctx.save_for_backward(x2, w, r); ctx.sh = sh; ctx.off = float(off)
         return y.view(sh)
 
     @staticmethod
@@ -1073,13 +1075,64 @@ class RMSNormFn(torch.autograd.Function):
         gx = torch.empty_like(x2)
         RPB = 16; nb = triton.cdiv(M, RPB); BK = triton.next_power_of_2(K)
         gw = torch.empty(nb, K, dtype=torch.float32, device=x2.device)
-        _rms_bwd_kernel[(nb,)](x2, w, g2, r, gx, gw, M, K, x2.stride(0), g2.stride(0), gx.stride(0), RPB=RPB, BK=BK)
-        return gx.view(ctx.sh), gw.sum(0).to(w.dtype), None
+        _rms_bwd_kernel[(nb,)](x2, w, g2, r, gx, gw, M, K, x2.stride(0), g2.stride(0), gx.stride(0), RPB=RPB, BK=BK,
+                               OFF=ctx.off)
+        return gx.view(ctx.sh), gw.sum(0).to(w.dtype), None, None
 
 
 def rms_norm_qwen(x, w, eps):
     """Qwen3.5 RMSNorm, (x / rms(x)) (1 + w) in fp32 cast to x's dtype, forward and backward in one kernel each"""
-    return RMSNormFn.apply(x, w, eps)
+    return RMSNormFn.apply(x, w, eps, 1.0)
+
+
+def rms_norm(x, w, eps):
+    """the from-scratch model's RMSNorm, (x / rms(x)) w in fp32 cast to x's dtype (model._rmsnorm), one kernel each way"""
+    return RMSNormFn.apply(x, w, eps, 0.0)
+
+
+@triton.jit
+def _rope_kernel(x_ptr, f_ptr, y_ptr, R, T, H, RB: tl.constexpr, HD: tl.constexpr, SIGN: tl.constexpr):
+    """RB rows (b, t, h) of x [B, T, H, 2 HD] (contiguous): each pair (x0, x1) rotated by token t's angle,
+    (x0 c - x1 s, x0 s + x1 c) in fp32 (SIGN -1: by minus the angle, the backward), stored in y's dtype; f [T, HD, 2]
+    fp32 (cos, sin): torch's complex product (model._rope_rot) and its conjugate"""
+    rows = tl.program_id(0) * RB + tl.arange(0, RB)
+    i = tl.arange(0, HD)
+    m = rows[:, None] < R
+    t = (rows // H) % T
+    base = rows[:, None].to(tl.int64) * (2 * HD) + 2 * i[None, :]
+    x0 = tl.load(x_ptr + base, mask=m, other=0.0).to(tl.float32)
+    x1 = tl.load(x_ptr + base + 1, mask=m, other=0.0).to(tl.float32)
+    fo = t[:, None] * (2 * HD) + 2 * i[None, :]
+    c = tl.load(f_ptr + fo, mask=m, other=0.0)
+    sn = tl.load(f_ptr + fo + 1, mask=m, other=0.0) * SIGN
+    tl.store(y_ptr + base, (x0 * c - x1 * sn).to(y_ptr.dtype.element_ty), mask=m)
+    tl.store(y_ptr + base + 1, (x0 * sn + x1 * c).to(y_ptr.dtype.element_ty), mask=m)
+
+
+def _rope_launch(x, f, sign):
+    B, T, H, D = x.shape
+    y = torch.empty_like(x); R = B * T * H; RB = 16
+    _rope_kernel[(triton.cdiv(R, RB),)](x, f, y, R, T, H, RB=RB, HD=D // 2, SIGN=float(sign))
+    return y
+
+
+class RopeFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, f):
+        x = x.contiguous(); ctx.save_for_backward(f)
+        return _rope_launch(x, f, 1.0)
+
+    @staticmethod
+    def backward(ctx, g):
+        f, = ctx.saved_tensors
+        return _rope_launch(g.contiguous(), f, -1.0), None
+
+
+def rope(x, freqs_cis):
+    """x [B, T, H, D] bf16 rotated as model._rope_rot (one kernel each way); freqs_cis complex [>= T, D / 2]"""
+    T = x.shape[1]
+    f = torch.view_as_real(freqs_cis[:T]).contiguous()     # [T, D/2, 2] fp32
+    return RopeFn.apply(x, f)
 
 
 @triton.jit
@@ -1487,14 +1540,19 @@ def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t, pre=None):
 
 @triton.jit
 def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, pb_ptr, pr_ptr, gt_ptr, M, N,
-                     SLICES: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, SAVE_GT: tl.constexpr = False):
+                     SLICES: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, SAVE_GT: tl.constexpr = False,
+                     a_ptr=None, gh_ptr=None, R=0, RA: tl.constexpr = 16, HAS_GH: tl.constexpr = False):
     """from the output gradient g [M, N]: gyf = bf16(bf16(g * r) * bf16(beta)) (the GEMM's gradient, stored), the
     column sums of g (bias) and of bf16(g * t) (row scale) per row block, and with SLICES = 2 gyf's two int8 slices
-    (_slice2_kernel's arithmetic), SLICES = 1 the first only (--dx int8)"""
+    (_slice2_kernel's arithmetic), SLICES = 1 the first only (--dx int8). HAS_GH: also the float adapter's
+    gh = bf16(bf16(g * r) A) [M, R] (A [N, R] bf16; fp32 sums, as torch.mm(gt, A)), from the same pass over g"""
     pm = tl.program_id(0)
     rows = pm * BM + tl.arange(0, BM)
     bb = tl.load(bb_ptr).to(tl.float32)
     amax = tl.zeros((BM,), tl.float32)
+    if HAS_GH:
+        ra = tl.arange(0, RA)
+        gh = tl.zeros((BM, RA), tl.float32)
     for n0 in range(0, N, BN):
         cols = n0 + tl.arange(0, BN)
         m = (rows[:, None] < M) & (cols[None, :] < N)
@@ -1505,11 +1563,16 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
         gr_ = _rbf(g * r[None, :])
         if SAVE_GT:      # bf16(g * r): the float adapter's output gradient (as _AddRowFn's)
             tl.store(gt_ptr + off, gr_.to(tl.bfloat16), mask=m)
+        if HAS_GH:
+            av = tl.load(a_ptr + cols[:, None] * R + ra[None, :], mask=(cols[:, None] < N) & (ra[None, :] < R), other=0.0)
+            gh = tl.dot(gr_.to(tl.bfloat16), av, gh)
         f = _rbf(gr_ * bb)
         tl.store(f_ptr + off, f.to(tl.bfloat16), mask=m)
         amax = tl.maximum(amax, tl.max(tl.abs(f), axis=1))
         tl.store(pb_ptr + pm * N + cols, tl.sum(g, axis=0), mask=cols < N)
         tl.store(pr_ptr + pm * N + cols, tl.sum(_rbf(g * t), axis=0), mask=cols < N)
+    if HAS_GH:
+        tl.store(gh_ptr + rows[:, None] * R + ra[None, :], gh.to(tl.bfloat16), mask=(rows[:, None] < M) & (ra[None, :] < R))
     if SLICES > 0:
         s = tl.maximum(amax, 1e-30) / 127.0
         tl.store(s_ptr + rows, s, mask=rows < M)
@@ -1527,10 +1590,15 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
                 tl.store(q2_ptr + off, tl.minimum(tl.maximum(q2, -127.0), 127.0).to(tl.int8), mask=m)
 
 
-def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False):
+def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None):
     """-> (gyf bf16 [M, N], q1, q2, s (None without slices; q2 None with one), bias gradient fp32 [N], row-scale
-    gradient fp32 [N]); slices: 0, 1 or 2 int8 slices of gyf. save_gt: a seventh output, bf16(g * r)"""
+    gradient fp32 [N]); slices: 0, 1 or 2 int8 slices of gyf. save_gt: a seventh output, bf16(g * r); a_b (the float
+    adapter's A [N, R] bf16, with save_gt): an eighth, gh = bf16(bf16(g * r) A) [M, R]"""
     M, N = g.shape
+    if a_b is not None:
+        assert save_gt
+        R = a_b.shape[1]; a_b = a_b.contiguous()
+        gh = torch.empty(M, R, dtype=torch.bfloat16, device=g.device)
     f = torch.empty_like(g)
     BM, BN = 16, 256
     nb = triton.cdiv(M, BM)
@@ -1541,16 +1609,18 @@ def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False):
     else:
         q1 = q2 = s = None
     gt = torch.empty_like(g) if save_gt else None
+    gk = dict(a_ptr=a_b, gh_ptr=gh, R=R, RA=max(16, triton.next_power_of_2(R)), HAS_GH=True) if a_b is not None else {}
     _bwd_rows_kernel[(nb,)](g, t, r_b, beta_b, f, q1 if slices else f, q2 if q2 is not None else f,
                             s if slices else pb, pb, pr, gt if gt is not None else f, M, N, SLICES=int(slices), BM=BM,
-                            BN=BN, SAVE_GT=save_gt)
-    return (f, q1, q2, s, pb.sum(0), pr.sum(0)) + ((gt,) if save_gt else ())
+                            BN=BN, SAVE_GT=save_gt, **gk)
+    return (f, q1, q2, s, pb.sum(0), pr.sum(0)) + ((gt,) if save_gt else ()) + ((gh,) if a_b is not None else ())
 
 
 @triton.jit
 def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr, gx_ptr, pc_ptr, M, N, K, sam, sbk,
                     HAS_MU: tl.constexpr, TWO: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
-                    GM: tl.constexpr, HAS_ADD: tl.constexpr = False):
+                    GM: tl.constexpr, HAS_ADD: tl.constexpr = False, gh_ptr=None, bt_ptr=None, R=0,
+                    RA: tl.constexpr = 16, HAS_LR: tl.constexpr = False):
     """the input gradient on the int8 tensor cores with its epilogue in one kernel: y1 = q1 W, y2 = q2 W (gy's two int8
     slices [M, N] against the trits, b [K, N]: row k is column k of W; two int32 accumulators, exact), then as
     _dx2_epi_kernel + _scale_bwd_kernel: g = bf16((y1 + y2 / 254) s), gx = bf16(g c) and per BM-row block the column
@@ -1580,6 +1650,11 @@ def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr,
         g = _rbf(acc1.to(tl.float32) * s[:, None])
     if HAS_ADD:      # the float adapter's input gradient, added as autograd sums the two (bf16)
         g = _rbf(g + tl.load(add_ptr + off, mask=m, other=0.0).to(tl.float32))
+    if HAS_LR:       # the same, formed here: bf16(gh B^T) for this tile (gh [M, R], B [K, R] bf16; no [M, K] round trip)
+        ra = tl.arange(0, RA)
+        ghv = tl.load(gh_ptr + rows[:, None] * R + ra[None, :], mask=(rows[:, None] < M) & (ra[None, :] < R), other=0.0)
+        btv = tl.load(bt_ptr + cols[None, :] * R + ra[:, None], mask=(cols[None, :] < K) & (ra[:, None] < R), other=0.0)
+        g = _rbf(g + _rbf(tl.dot(ghv, btv)))
     c = tl.load(c_ptr + cols, mask=cols < K, other=0.0).to(tl.float32)
     x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
     if HAS_MU:
@@ -1598,21 +1673,26 @@ def _dx2_tile(N, K):
     return 64, 128, 64, 4
 
 
-def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None):
+def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None):
     """(gx bf16 [M, K], the column scale's gradient fp32 [K]) from gy's int8 slices q1, q2 [M, N] and scale s [M]
     (fused_bwd_rows; q2 None: one slice, --dx int8), the trits w8t [K, N] (KernelTernaryLinear.w8(t=True)), the column
-    scale c_b and the layer's input x (centred here with mu_b)"""
+    scale c_b and the layer's input x (centred here with mu_b). add [M, K] bf16, or lr = (gh [M, R], B [K, R]) bf16
+    whose product gh B^T is formed in the kernel: added to the ternary input gradient before the column scale"""
     M, N = q1.shape
     K = w8t.shape[0]
     gx = torch.empty(M, K, dtype=torch.bfloat16, device=q1.device)
     BM, BK, BN, nw = _dx2_tile(N, K)
     nb = triton.cdiv(M, BM)
     pc = torch.empty(nb, K, dtype=torch.float32, device=q1.device)
+    lk = {}
+    if lr is not None:
+        gh, bt = lr[0].contiguous(), lr[1].contiguous()
+        lk = dict(gh_ptr=gh, bt_ptr=bt, R=gh.shape[1], RA=max(16, triton.next_power_of_2(gh.shape[1])), HAS_LR=True)
     _dx2_col_kernel[(nb * triton.cdiv(K, BK),)](q1, q2 if q2 is not None else q1, w8t, s, c_b, x,
                                                 mu_b if mu_b is not None else c_b, add if add is not None else gx, gx,
                                                 pc, M, N, K, q1.stride(0), w8t.stride(0), HAS_MU=mu_b is not None,
                                                 TWO=q2 is not None, BM=BM, BK=BK, BN=BN, GM=8, num_warps=nw,
-                                                num_stages=3, HAS_ADD=add is not None)
+                                                num_stages=3, HAS_ADD=add is not None, **lk)
     return gx, pc.sum(0)
 
 

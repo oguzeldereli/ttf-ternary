@@ -214,8 +214,17 @@ class _FusedTernFn(torch.autograd.Function):
         sl = {"int8x2": 2, "int8": 1}.get(DX_MODE[0], 0)
         gA = gB = gxa = None
         with _rf("tern.dx"):
-            f, q1, q2, s, gbias, grow, *gt = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=ctx.has_mag)
-            if ctx.has_mag:      # the float adapter a = (xs B) A^T: its gradients as autograd's mm backward forms them
+            lr = None
+            if ctx.has_mag and sl:   # the float adapter a = (xs B) A^T: gh = bf16(g r) A from the row pass, its input
+                xo, h, Ab, Bb = sv[6:]   # gradient gh B^T formed inside the dx kernel (no [M, K] round trip)
+                f, q1, q2, s, gbias, grow, gt, gh = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=True, a_b=Ab)
+                gA = torch.mm(h.t(), gt).t().to(ctx.mdt[0])
+                gB = torch.mm(xo.t(), gh).to(ctx.mdt[1])
+                lr = (gh, Bb)
+                del gt
+            else:
+                f, q1, q2, s, gbias, grow, *gt = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=ctx.has_mag)
+            if ctx.has_mag and lr is None:   # (one slice off: the adapter's gradients as autograd's mm backward forms them)
                 xo, h, Ab, Bb = sv[6:]
                 gt = gt[0]                                    # bf16(g * r)
                 gA = torch.mm(h.t(), gt).t().to(ctx.mdt[0])
@@ -224,7 +233,7 @@ class _FusedTernFn(torch.autograd.Function):
                 gxa = torch.mm(gh, Bb.t())                    # (added to the ternary input gradient before the scale)
                 del gt, gh
             if sl:
-                gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xc, ctx.mu_b, gxa)
+                gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xc, ctx.mu_b, None, lr)
                 del q1, q2
             else:
                 gxt = _grad_x(l, f, l.wpacked)

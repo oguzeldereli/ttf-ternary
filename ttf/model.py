@@ -31,8 +31,38 @@ def _rope_rot(x, freqs_cis):
     return torch.view_as_real(xc * f).flatten(-2).type_as(x)
 
 
+FUSED_ELEM = [True]   # bf16 CUDA activations: the RMSNorm and the SwiGLU in one Triton kernel each way (kernel.rms_norm,
+                      # kernel.swiglu: the same fp32 formulas and bf16 roundings as the torch pieces above, which stay
+                      # the CPU / fp32 path and the tests' reference)
+
+
+def _fused(x):
+    return FUSED_ELEM[0] and x.is_cuda and x.dtype == torch.bfloat16
+
+
+def _rmsnorm_k(x, w, eps: float):
+    if _fused(x):
+        from .kernel import rms_norm
+        return rms_norm(x, w, eps)
+    return _rmsnorm(x, w, eps)
+
+
+def _swiglu_k(a, b):
+    if _fused(a) and b.dtype == a.dtype and a.shape == b.shape:
+        from .kernel import swiglu
+        return swiglu(a, b)
+    return _swiglu(a, b)
+
+
+def _rope_k(x, freqs_cis):
+    if _fused(x) and x.dim() == 4 and (x.shape[-1] // 2) & (x.shape[-1] // 2 - 1) == 0:   # (head dim / 2 a power of 2)
+        from .kernel import rope
+        return rope(x, freqs_cis)
+    return _rope_rot(x, freqs_cis)
+
+
 # elementwise pieces, swappable (tests)
-_FN = {"rmsnorm": _rmsnorm, "swiglu": _swiglu, "rope": _rope_rot}
+_FN = {"rmsnorm": _rmsnorm_k, "swiglu": _swiglu_k, "rope": _rope_k}
 
 
 class RMSNorm(nn.Module):
