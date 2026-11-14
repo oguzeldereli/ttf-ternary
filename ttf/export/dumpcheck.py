@@ -1,5 +1,4 @@
-"""ttf.export.dumpcheck: teacher-forced per-op check of the runtime against the IR reference (taken
-into ttf.export).
+"""ttf.export.dumpcheck: teacher-forced per-op check of the runtime against the IR reference.
 
 Run the runtime with TTF_DUMP=DIR (every IR value of one graph call as raw f32 / i32 + DIR/index.json with the ggml ne
 of each), then

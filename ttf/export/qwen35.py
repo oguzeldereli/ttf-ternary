@@ -278,7 +278,7 @@ if __name__ == "__main__":
         sys.exit(0)
     if dt is not None:                                          # else the checkpoint's own dtypes
         m = m.to(dt)
-    ir = export(m, hf_dir, out, {"ckpt": os.path.abspath(ck)})
+    ir = export(m, hf_dir, out, {"ckpt": os.path.basename(os.path.normpath(ck))})
     ops = {}
     for nd in ir["graphs"]["step"]["nodes"]:
         ops[nd["op"]] = ops.get(nd["op"], 0) + 1

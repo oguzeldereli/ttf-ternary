@@ -21,7 +21,7 @@ LaTeX source in [paper/](paper/)). It has every result below with its run, and a
 |---|---|
 | **ttf-ternary** (this one) | the trainer: TTF from scratch or from a ternary checkpoint, Llama-style models and Qwen3.5 / 3.8 (dense and Flash-Next MoE), BitNet b1.58 and full-precision baselines, evaluation |
 | [ttf-conversion](https://github.com/oguzeldereli/ttf-conversion) | converts a pretrained Hugging Face model to a ternary checkpoint this trainer continues from |
-| [ttf-home](https://github.com/oguzeldereli/ttf-home) | one command line for a home computer: prepare data, train, convert, fine-tune, export to GGUF, chat / serve with llama.cpp |
+| [ttf-home](https://github.com/oguzeldereli/ttf-home) | one command line for a home computer: prepare data, train, convert, fine-tune, and its own ternary runtime (ggml; CPU and CUDA) to run, chat and serve `.ttf` models |
 | [spanqr](https://github.com/oguzeldereli/spanqr) (optional) | a faster robust orthonormal basis for the accumulator, used automatically when installed |
 
 **Released models** (Hugging Face; GGUF files for ttf-home's llama.cpp):
@@ -120,6 +120,16 @@ and `--recipe continue-27b` here (2 x 8 micro-batches of 2048 tokens on one 24 G
 
 ## Run a trained model
 
+- **`.ttf` for the ttf runtime:** `ttf.export` writes one `.ttf` file (a GGUF container: the model's graph IR, the trits
+  in their packed layout, the side vectors and the tokenizer) that ttf-home's runtime runs with no Python (`pip install "ttf-ternary[export]"` adds the gguf writer):
+  - models trained here: `python scripts/infer/ttf_run.py export runs/demo-ttf/ckpt.pt demo.safetensors`, then
+    `python -m ttf.export.emit core demo.safetensors demo.ttf --tokenizer DIR` (DIR: the run's Hugging Face tokenizer);
+  - converted Qwen3.5 / 3.8 (needs ttf-conversion): `python -m ttf.export.qwen35 HF_DIR CKPT out.ttf [--check]`;
+  - BitNet b1.58 checkpoints (microsoft/bitnet-b1.58-2B-4T, tiiuae/Falcon3-*-1.58bit):
+    `python -m ttf.export.bitnet HF_DIR out.ttf [--check] [--intk 4]`.
+
+  `--check` runs the IR's Python reference on the written file against the PyTorch model. `ttf.export.dumpcheck`
+  compares a runtime dump (`TTF_DUMP=DIR`) op by op with that reference.
 - **GGUF / llama.cpp:** `ttf export` in [ttf-home](https://github.com/oguzeldereli/ttf-home) writes an ordinary GGUF
   file. The export is exact (llama.cpp's next-token loss matches the trainer's).
 - **In Python:** `python scripts/infer/ttf_run.py run runs/demo-ttf/ckpt.pt -p "The history of"` (models trained
@@ -185,8 +195,15 @@ weight at every size: about one byte per weight at the 12 bits the accumulator t
   - 4 x 4 does not fit in 16 GB: the teacher's logits alone need 3.8 GiB.
 - **The loss head** of large vocabularies (Qwen's 248k) runs in one Triton kernel: 3.3x faster and 2.4 GiB less
   transient memory per 512-token chunk than the PyTorch ops.
-- **Orthonormal bases** come from [spanqr](https://github.com/oguzeldereli/spanqr) at accumulator ranks of 256 and up
-  when it is installed (`--ttf-orth auto`). Below 256, Householder QR is as fast.
+- **CUDA graphs** (`--cuda-graph`): a step's micro-batches are captured once and replayed. A 0.8B conversion step
+  with distillation takes 14.9 s instead of 18.6 s eager (the teacher runs as a graph of its own), and 6.9 s instead
+  of 16.4 s without distillation.
+- **Fused elementwise kernels:** RMSNorm, SwiGLU, RoPE and the trained head's cross-entropy run as Triton kernels.
+  With CUDA graphs on, 110M steps (16 x 2048 tokens) drop from 1.21 to 1.12 s, and d1536 steps from 4.23 to 3.78 s,
+  faster there than bf16 AdamW on the same model code (4.04 s). The final loss is unchanged within noise (four paired
+  seeds).
+- **Orthonormal bases** come from [spanqr](https://github.com/oguzeldereli/spanqr) at accumulator ranks of 64 and up
+  when it is installed (`--ttf-orth auto`). Below 64, Householder QR is as fast.
 
 ## Main options
 
@@ -206,6 +223,7 @@ weight at every size: about one byte per weight at the 12 bits the accumulator t
 | `--ttf-store fp32 / bf16 / fp12s` | accumulator format |
 | `--ttf-offload async` | TTF state in pinned host memory, copies overlapped with the backward |
 | `--ttf-orth auto / qr / spanqr` | the accumulator basis' orthonormalisation |
+| `--cuda-graph` | each step's micro-batches as CUDA graphs (also with `--teacher` / `--kd-cache`) |
 | `--adapter-rank R` | rank-R float adapter beside the trits (16) |
 | `--arch-hf DIR`, `--init-ckpt CKPT` | a Hugging Face architecture (Llama, Qwen3.5 / 3.8) and a ternary checkpoint of it |
 | `--teacher DIR`, `--kd-weight W`, `--kd-cache DIR` | distillation from the full-precision model, or from cached top-k targets |
@@ -224,6 +242,7 @@ ttf/            the package
   memplan.py      --ckpt-skip auto
   qwen.py         Qwen3.5 / 3.8 (Gated DeltaNet + attention) with ternary linears, pipeline stages
   q38/            Qwen3.8-Flash-Next (MoE) in TTF: batched expert TTF, grouped GEMMs, layer-major trainer
+  export/         .ttf export for the ttf runtime: module IR emitters, the IR's Python reference, GGUF io, checks
   model.py, config.py, master.py, data.py, eval.py, schedule.py, ...
 recipes/        demo-15m, scratch-110m, continue-27b
 scripts/        data/ (Wikipedia, FineWeb-Edu), eval/, infer/, prof/ (step time and memory profilers), analysis/

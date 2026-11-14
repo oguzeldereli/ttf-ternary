@@ -12,7 +12,7 @@ Output: OUT/parts.pt = {"D", "parts": {name: {...}}, "index": [(name, kind, K, N
   python -m ttf.export.refdump core [--dtype bf16]
 Other models (conversions): build the model with its own code and call dump_parts(model, run, out, D).       a random-init core BitTransformer on CUDA (spec-vs-training self test)
 """
-import os, sys, math
+import os, sys, math, tempfile
 import torch
 
 from ..layers import KernelTernaryLinear
@@ -131,7 +131,7 @@ def _core_selftest(D):
         TL.FUSED_LAYER[0] = fused
         for M in (40, 1):           # M > 16: int_mm / fused path; M = 1: the small-M branch (decode)
             print(f"fused {fused} M {M}:", end=" ")
-            dump_parts(m, lambda: m(idx[:, :M]), f"/tmp/refdump_core_{str(D)[6:]}_f{int(fused)}_M{M}", D)
+            dump_parts(m, lambda: m(idx[:, :M]), os.path.join(tempfile.gettempdir(), f"refdump_core_{str(D)[6:]}_f{int(fused)}_M{M}"), D)
 
 
 if __name__ == "__main__":
