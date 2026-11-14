@@ -244,24 +244,18 @@ def head_loss_train_chunk(h, w, tgt, tlp, a, acc):
 
 class TrainHeadCE(torch.autograd.Function):
     """the from-scratch model's chunked head + cross-entropy with a TRAINED head (BitTransformer.forward, no teacher):
-    the forward forms z = h W^T (fp32 out of the GEMM), the summed loss and dz = softmax(z) - onehot(t) (rows with
-    t = -1 zero), kept in bf16; the backward is the two GEMMs dh = g dz W, dW = g dz^T h. Replaces the checkpointed
-    chunk (GEMM, cast, log_softmax, nll; in the backward the GEMM and the softmax again, nll's fp32 [n, V] gradient,
-    the softmax backward and the cast): the head's GEMM once instead of twice, two passes over [n, V] instead of ~8.
-    Rounding level: z is not rounded to bf16 before the softmax, dz is rounded before the scale g (autograd: after)"""
+    the forward forms the logits z = bf16(h W^T) (the autocast GEMM's rounding, as the autograd chunk), then one kernel
+    (kernel.ce_rows_) gives the loss and, in z's memory, dz = bf16(softmax(z) - onehot(t)) (rows with t = -1 zero); the
+    backward is the two GEMMs dh = g dz W, dW = g dz^T h. Replaces the checkpointed chunk (GEMM, fp32 cast, log_softmax,
+    nll; in the backward the GEMM and the softmax again, nll's fp32 [n, V] gradient, the softmax backward and the cast):
+    the head GEMM once instead of twice, two passes over a bf16 [n, V] instead of ~8 fp32 ones. Rounding level: dz is
+    rounded before the scale g (autograd: after); the softmax sums run in another order"""
     @staticmethod
     def forward(ctx, h, wb, tgt):
-        z = torch.mm(h, wb.t(), out_dtype=torch.float32)
-        lse = torch.logsumexp(z, 1)
-        ok = tgt != -1
-        tc = tgt.clamp_min(0)
-        nll = ((lse - z.gather(1, tc[:, None])[:, 0]) * ok).sum()
-        z.sub_(lse[:, None]).exp_()
-        z.scatter_add_(1, tc[:, None], -ok.to(z.dtype)[:, None])
-        z.mul_(ok[:, None])
-        dz = z.to(h.dtype)
-        del z
-        ctx.save_for_backward(h, wb, dz)
+        from .kernel import ce_rows_
+        z = torch.mm(h, wb.t())
+        nll = ce_rows_(z, tgt).sum()
+        ctx.save_for_backward(h, wb, z)
         return nll
 
     @staticmethod

@@ -1737,3 +1737,41 @@ def group_sums(g, q, G):
     BG = 64
     _group_sums_kernel[(triton.cdiv(NG, BG),)](g, q, o0, o1, NG, G=G, BG=BG)
     return o0, o1
+
+
+@triton.jit
+def _ce_rows_kernel(z_ptr, t_ptr, loss_ptr, V, sz, BV: tl.constexpr):
+    """one row of logits z (bf16, as the autocast head GEMM rounds them): its cross-entropy (fp32: lse - z_t, 0 for
+    t = -1) and, in place, dz = bf16(softmax(z) - onehot(t)) (0 for t = -1). Two passes over the row: an online max /
+    sum of exp, then the gradient"""
+    row = tl.program_id(0)
+    base = z_ptr + row.to(tl.int64) * sz
+    t = tl.load(t_ptr + row)
+    m = tl.full((BV,), float("-inf"), tl.float32)
+    acc = tl.zeros((BV,), tl.float32)
+    for v0 in range(0, V, BV):
+        v = v0 + tl.arange(0, BV)
+        z = tl.load(base + v, mask=v < V, other=float("-inf")).to(tl.float32)
+        mn = tl.maximum(m, z)
+        acc = acc * tl.exp(m - mn) + tl.where(v < V, tl.exp(z - mn), 0.0)
+        m = mn
+    mx = tl.max(m, axis=0)
+    se = tl.sum(acc * tl.exp(m - mx), axis=0)
+    lse = mx + tl.log(se)
+    ok = t >= 0
+    zt = tl.load(base + tl.maximum(t, 0)).to(tl.float32)
+    tl.store(loss_ptr + row, tl.where(ok, lse - zt, 0.0))
+    for v0 in range(0, V, BV):
+        v = v0 + tl.arange(0, BV)
+        z = tl.load(base + v, mask=v < V, other=0.0).to(tl.float32)
+        d = tl.exp(z - lse) - tl.where(v == t, 1.0, 0.0)
+        tl.store(base + v, tl.where(ok, d, 0.0).to(tl.bfloat16), mask=v < V)
+
+
+def ce_rows_(z, t):
+    """z [n, V] bf16 (overwritten with dz = softmax(z) - onehot(t), bf16), t [n] (-1: ignored) -> per-row loss fp32"""
+    n, V = z.shape
+    assert z.dtype == torch.bfloat16 and z.stride(1) == 1
+    loss = torch.empty(n, dtype=torch.float32, device=z.device)
+    _ce_rows_kernel[(n,)](z, t.contiguous(), loss, V, z.stride(0), BV=2048, num_warps=8)
+    return loss
