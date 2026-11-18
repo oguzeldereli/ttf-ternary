@@ -845,7 +845,8 @@ def main():
                 print(_lmsg, flush=True)
             if args.mode == "ttf":
                 _tmsg = resume_theta_check(blob.get("args") or {}, args.ttf_theta, args.ttf_theta_start,
-                                           args.ttf_theta_end, args.allow_leak_change, blob.get("theta_shape"))
+                                           args.ttf_theta_end, args.allow_leak_change, blob.get("theta_shape"),
+                                           args.ttf_theta_hold)
                 if _tmsg:
                     print(_tmsg, flush=True)
         if mag and any(k.endswith("mag_A") or ".mag_At." in k for k in blob["model"]):
@@ -1091,8 +1092,8 @@ def main():
                       store_a=store, offload=args.ttf_offload == "async",
                       progress=0.0, factored=args.factored_k, band=args.ttf_band, band_lo=args.ttf_band_lo,
                       hspend=args.ttf_hspend, sketch_warm=args.dw_sketch_warm)
-        print(f"TTF theta schedule: {args.ttf_theta_start:g} -> {args.ttf_theta:g} over the lr warmup, then "
-              f"up to {args.ttf_theta_end:g} at the end (rescale form: bar {args.ttf_theta:g}, step "
+        print(f"TTF theta schedule: {args.ttf_theta_start:g} -> {args.ttf_theta:g} over the lr warmup, held until "
+              f"progress {args.ttf_theta_hold:g}, then up to {args.ttf_theta_end:g} at the end (rescale form: bar {args.ttf_theta:g}, step "
               f"{args.ttf_theta:g} / theta(t))", flush=True)
     if ttf and args.intk_emb and args.intk_update == "factored":   # the int-k matrices update inside their backward
         for m_ in _intk_lays(model):

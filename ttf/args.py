@@ -12,7 +12,7 @@ import os
 import tomllib
 
 from .config import PRESETS, DEFAULT_PRESET
-from .schedule import THETA_START_X, THETA_END_X
+from .schedule import THETA_START_X, THETA_END_X, THETA_HOLD
 
 RECIPES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "recipes")
 ON = argparse.BooleanOptionalAction
@@ -106,6 +106,9 @@ def build_parser():
                    "--ttf-theta: no start phase)" % THETA_START_X)
     g.add_argument("--ttf-theta-end", type=float, default=None, help="theta at the last step (default %g x --ttf-theta; "
                    "= --ttf-theta: no end rise)" % THETA_END_X)
+    g.add_argument("--ttf-theta-hold", type=float, default=None, help="progress where the rise to --ttf-theta-end starts; "
+                   "the base holds from the warmup's end until then (default %g from scratch; with --init-ckpt 0 = the "
+                   "rise starts at the warmup's end, the form the 0.8B recovery was tuned on)" % THETA_HOLD)
     g.add_argument("--ttf-tau", type=float, default=1000.0, help="the accumulator's leak time constant: A <- (1 - 1 / TAU) A "
                    "every step, a memory of TAU steps")
     g.add_argument("--ttf-b2", type=float, default=0.95, help="decay of the factored second moment")
@@ -258,6 +261,8 @@ def resolve(a):
         a.ttf_theta_start = THETA_START_X * a.ttf_theta    # 0.25 -> 1 -> 0.2 whatever the base)
     if a.ttf_theta_end is None:
         a.ttf_theta_end = THETA_END_X * a.ttf_theta
+    if a.ttf_theta_hold is None:       # (from scratch: hold the base to 0.6, 18 Nov 2026; from a checkpoint: the 8 Nov form)
+        a.ttf_theta_hold = 0.0 if getattr(a, "init_ckpt", "") else THETA_HOLD
     a.u32 = a.data_dtype == "u32"
     if a.adapter_schedule:
         f = a.adapter_schedule.split(":")

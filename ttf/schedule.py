@@ -11,12 +11,21 @@ LR_REWARM = [0, 0]                # --lr-rewarm S:W: from step S, linear warmup 
 
 
 THETA_START_X, THETA_END_X = 4.0, 5.0   # the schedule's default start / end as multiples of the base (16: 64 -> 16 -> 80)
+THETA_HOLD = 0.6                        # the default progress where the rise to END starts (from scratch; see theta_at)
 
 
-def theta_at(prog, base, start, end, warm):
-    """the theta schedule (one default, three knobs; no p, no lr coupling): theta START at progress 0, BASE at the end of
-    the lr warmup (progress WARM), END at progress 1, with cosines between them in the step BASE / theta (the step scale
-    of _ts_scale), not in theta. start = end = base: constant theta.
+def theta_at(prog, base, start, end, warm, hold=0.0):
+    """the theta schedule (no p, no lr coupling): theta START at progress 0, BASE at the end of the lr warmup (progress
+    WARM), held at BASE until progress HOLD, then END at progress 1, with cosines between them in the step BASE / theta
+    (the step scale of _ts_scale), not in theta. start = end = base: constant theta. hold <= warm: the rise starts at
+    the warmup's end (the 8 Nov form).
+    Why the hold (18 Nov 2026, S, 15M + 110M from scratch): starting the rise at the warmup's end anneals the trits'
+    step from 0.2 of the run, while the gradient still carries signal; holding the base to 0.6 and rising after it
+    is better at every condition tested: 15M B16 S2000 3.494 / 3.486 / 3.524 (3 seeds, cold start + flat base 11.3 to
+    0.6 + rise to 5x) against 3.850 with the rise from the warmup's end; 110M 2000 steps 3.166 (cold 64 -> 16 over 20%,
+    hold to 0.6, rise) against 3.261 (2 seeds each); ternary VoxCPM2 DiT from scratch 6000 steps 0.2564 against 0.2629.
+    The hold also makes TTF beat latent-Adam STE (bitnet) at 15M: B16 S2000 -0.061 (3 seeds), S8000 -0.10 (2 seeds),
+    B64 -0.012 / -0.025. A cosine decay of the step over the whole run hurts (+0.07 to +0.19): moves go as ~step^2.
     Why the step (8 Nov 2026): a cosine in theta puts the step on a hyperbola that drops early (110M from scratch, 64 ->
     16 -> 80: step 0.35 at mid-run, 2.7320 on the 974 Wikipedia windows); the cosine in the step gives 0.62 there, close
     to paper 1's lr-tied step (lr / peak)^0.75 (0.66), and reproduces its 2.6728 (2.6741, one seed; log theta 2.6980,
@@ -26,9 +35,10 @@ def theta_at(prog, base, start, end, warm):
     prog = min(max(float(prog), 0.0), 1.0)
     if warm > 0 and prog < warm:
         return _step_interp(start, base, 0.5 * (1 - math.cos(math.pi * prog / warm)))
-    if warm >= 1:
+    r0 = max(warm, hold)
+    if r0 >= 1 or prog <= r0:
         return base
-    return _step_interp(base, end, 0.5 * (1 - math.cos(math.pi * (prog - warm) / (1 - warm))))
+    return _step_interp(base, end, 0.5 * (1 - math.cos(math.pi * (prog - r0) / (1 - r0))))
 
 
 def _step_interp(a, b, w):
@@ -44,7 +54,7 @@ def _ts_scale(args, step, tc, lr):
     theta falls, as a moving bar gives; the leak 1 - 1 / tau is not touched). Theta alone sets the step (since 6 Nov
     2026); the profilers in scripts/prof hook this per-step call."""
     th = theta_at(step / max(1, tc.max_steps), args.ttf_theta, args.ttf_theta_start, args.ttf_theta_end,
-                  tc.warmup_steps / max(1, tc.max_steps))
+                  tc.warmup_steps / max(1, tc.max_steps), getattr(args, "ttf_theta_hold", 0.0) or 0.0)
     return args.ttf_theta / th
 
 
@@ -70,7 +80,7 @@ def resume_leak_check(ck_leak, ck_args, allow=False):
     return "resume: --allow-leak-change: " + "; ".join(ch)
 
 
-def resume_theta_check(ck_args, base, start, end, allow=False, ck_shape=None):
+def resume_theta_check(ck_args, base, start, end, allow=False, ck_shape=None, hold=0.0):
     """a resume must keep the checkpoint's TTF rule. A checkpoint from before the theta schedule (7 Nov 2026: no
     ttf_theta_start in its args) ran at constant theta; one with a schedule but no theta_shape "step" (7-8 Nov 2026) ran
     the cosines in theta, not in the step. Resuming either under this core's schedule would change the step mid-run:
@@ -86,10 +96,17 @@ def resume_theta_check(ck_args, base, start, end, allow=False, ck_shape=None):
     else:
         cb = float(ck_args.get("ttf_theta", base))
         cs, ce = float(ck_args["ttf_theta_start"]), float(ck_args.get("ttf_theta_end", cb))
-        if ck_shape == "step" or cs == ce == cb:
+        ch_ = float(ck_args.get("ttf_theta_hold") or 0.0)    # (no hold in the args: before 18 Nov 2026, rise from the warmup)
+        if cs == ce == cb:
             return None
-        ch = (f"the checkpoint's theta schedule {cs:g} -> {cb:g} -> {ce:g} ran its cosines in theta (7-8 Nov 2026), this "
-              f"core in the step base / theta")
+        if ck_shape == "step":
+            if ce == cb or ch_ == float(hold or 0.0):
+                return None
+            ch = (f"the checkpoint's rise to {ce:g} started at progress {ch_:g} (0: the warmup's end), this run's at "
+                  f"{float(hold or 0.0):g} (--ttf-theta-hold)")
+        else:
+            ch = (f"the checkpoint's theta schedule {cs:g} -> {cb:g} -> {ce:g} ran its cosines in theta (7-8 Nov 2026), "
+                  f"this core in the step base / theta")
     if not allow:
         raise SystemExit(f"resume: {ch}: the step would change mid-run, refusing (--allow-leak-change accepts it)")
     return "resume: --allow-leak-change: " + ch

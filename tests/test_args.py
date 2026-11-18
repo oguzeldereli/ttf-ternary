@@ -120,3 +120,10 @@ def test_theta_schedule_defaults_follow_the_base():
     assert (a.ttf_theta_start, a.ttf_theta_end) == (32.0, 40.0)
     a = A.parse(["--ttf-theta", "8", "--ttf-theta-start", "8", "--ttf-theta-end", "8"])
     assert (a.ttf_theta_start, a.ttf_theta_end) == (8.0, 8.0)
+
+
+def test_theta_hold_default():
+    """--ttf-theta-hold: 0.6 from scratch, 0 (rise from the warmup's end) with --init-ckpt, a value given stays"""
+    assert A.parse([]).ttf_theta_hold == 0.6
+    assert A.parse(["--init-ckpt", "x.pt"]).ttf_theta_hold == 0.0
+    assert A.parse(["--init-ckpt", "x.pt", "--ttf-theta-hold", "0.5"]).ttf_theta_hold == 0.5

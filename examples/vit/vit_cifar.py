@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from ttf.layers import KernelTernaryLinear, DX_MODE, FUSED_LAYER, FACTORED
 from ttf.master import MasterTernaryLinear
 from ttf.model import RMSNorm
-from ttf.schedule import theta_at, THETA_START_X, THETA_END_X
+from ttf.schedule import theta_at, THETA_START_X, THETA_END_X, THETA_HOLD
 from ttf.update import ts_layer, ts_step
 
 
@@ -110,6 +110,8 @@ def main():
                     "(default 4 x --theta)")
     ap.add_argument("--theta-end", type=float, default=None, help="theta at the last step (default 5 x --theta; start = "
                     "end = theta: constant)")
+    ap.add_argument("--theta-hold", type=float, default=THETA_HOLD, help="progress where the rise to --theta-end starts "
+                    "(ttf.train --ttf-theta-hold; 0: from the warmup's end)")
     ap.add_argument("--rank", type=int, default=512)        # >= min(N, K) here: every layer full rank (dense state)
     ap.add_argument("--adapter-rank", type=int, default=16)
     ap.add_argument("--resid", choices=["fp32", "bf16"], default="fp32",
@@ -192,7 +194,7 @@ def main():
                 g["lr"] = lr
             if cfg is not None:
                 # the core theta schedule in rescale form, as ttf.train (before 7 Nov: the step (lr / peak)^0.75)
-                cfg["lr_ratio"] = a.theta / theta_at(step / total, a.theta, a.theta_start, a.theta_end, warm / total)
+                cfg["lr_ratio"] = a.theta / theta_at(step / total, a.theta, a.theta_start, a.theta_end, warm / total, a.theta_hold)
                 cfg["progress"] = step / total
                 cfg["step"], cfg["start"], cfg["micro"], cfg["vdiag"] = step, 0, 1, False   # as ttf.train sets them
                 FACTORED[0] = True     # --dw factored (ttf.train's default): (gy, x) to the update, dense accumulator at full rank

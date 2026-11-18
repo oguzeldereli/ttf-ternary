@@ -47,6 +47,30 @@ def test_constant_when_off():
     assert all(_ts_scale(a, s, tc, 1e-3) == 1.0 for s in range(0, 1001, 7))
 
 
+def test_hold():
+    """--ttf-theta-hold H (18 Nov 2026): the base holds from the warmup's end to progress H, then the cosine rise in the
+    step; hold <= warm is the 8 Nov form"""
+    b, s, e, w, h = 16.0, 64.0, 80.0, 0.1, 0.6
+    assert theta_at(0.0, b, s, e, w, h) == s and theta_at(w, b, s, e, w, h) == b
+    assert all(theta_at(x / 100, b, s, e, w, h) == b for x in range(10, 61))
+    assert math.isclose(1 / theta_at(0.8, b, s, e, w, h), (1 / b + 1 / e) / 2)
+    assert theta_at(1.0, b, s, e, w, h) == e
+    assert theta_at(0.55, b, s, e, w, 0.05) == theta_at(0.55, b, s, e, w)       # (hold before the warmup's end: no hold)
+    a = SimpleNamespace(ttf_theta=16.0, ttf_theta_start=64.0, ttf_theta_end=80.0, ttf_theta_hold=0.6)
+    tc = SimpleNamespace(max_steps=1000, warmup_steps=100)
+    assert _ts_scale(a, 600, tc, 0.0) == 1.0 and math.isclose(_ts_scale(a, 800, tc, 0.0), 0.6)
+
+
+def test_resume_hold_change_refused():
+    """a checkpoint from before the hold (rise from the warmup's end) resumed under a hold would change the step"""
+    ck = {"ttf_theta": 16.0, "ttf_theta_start": 64.0, "ttf_theta_end": 80.0}
+    with pytest.raises(SystemExit):
+        resume_theta_check(ck, 16.0, 64.0, 80.0, ck_shape="step", hold=0.6)
+    assert resume_theta_check(ck, 16.0, 64.0, 80.0, ck_shape="step", hold=0.0) is None
+    assert resume_theta_check(dict(ck, ttf_theta_hold=0.6), 16.0, 64.0, 80.0, ck_shape="step", hold=0.6) is None
+    assert "0.6" in resume_theta_check(ck, 16.0, 64.0, 80.0, allow=True, ck_shape="step", hold=0.6)
+
+
 def test_rescale_step():
     a = SimpleNamespace(ttf_theta=16.0, ttf_theta_start=64.0, ttf_theta_end=80.0)
     tc = SimpleNamespace(max_steps=1000, warmup_steps=100)
