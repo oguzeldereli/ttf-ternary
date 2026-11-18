@@ -71,15 +71,22 @@ class _AddRowFn(torch.autograd.Function):
 FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
 DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices (int8: one)
 GRAD_BITS = [0]                # --grad-bits b: gy (the gradient entering each ternary product) in b-bit integers, below
+GRAD_GROUP = [0]               # --grad-group G: one scale per G consecutive entries of a row instead of one per row
 
 
-def grad_quant(gy, bits):
+def grad_quant(gy, bits, group=0):
     """--grad-bits (18 Nov 2026, user: "a from scratch 110M ternary with 4 bit and 2 bit gradients"): gy [M, N] -> (qi int8
     [M, N], s fp32 [M], gq bf16 [M, N] = bf16(qi * s)). Per row (token) absmax scale s = amax / qmax, qmax = 2^(b-1) - 1
     (4 bit: -7..7; 2 bit: -1, 0, 1), stochastic rounding floor(gy / s + U[0, 1)): unbiased, E[gq] = gy. Both backward
     products use the quantized gy: the input gradient (qi against the trits, exact in int32) and the TTF update's factor
     (gq), so the whole backward of a ternary layer is integer x ternary / integer x int8"""
     qmax = (1 << (bits - 1)) - 1
+    if group:   # --grad-group G (18 Nov: per-token 2-bit was ~4x less step-efficient; one outlier set a row's scale):
+        M, N = gy.shape   # s [M, N / G]; the caller forms the input gradient from gq in bf16 (no per-row int8 path)
+        g = gy.float().view(M, N // group, group)
+        s = g.abs().amax(-1).clamp_min(1e-30) / qmax
+        qi = torch.floor(g / s[..., None] + torch.rand_like(g)).clamp_(-qmax, qmax)
+        return qi.view(M, N).to(torch.int8), s, (qi * s[..., None]).view(M, N).to(torch.bfloat16)
     g = gy.float()
     s = g.abs().amax(-1).clamp_min(1e-30) / qmax
     qi = torch.floor(g / s[:, None] + torch.rand_like(g)).clamp_(-qmax, qmax)
@@ -112,9 +119,11 @@ class _KernelTernFn(torch.autograd.Function):
             gyf = gyf * beta.to(gyf.dtype)       # y = beta * x@W^T: both grads carry beta
         xq, xs, wpacked = ctx.saved_tensors
         if GRAD_BITS[0]:
-            qi, qs, gyf = grad_quant(gyf, GRAD_BITS[0])
+            qi, qs, gyf = grad_quant(gyf, GRAD_BITS[0], GRAD_GROUP[0])
         with _rf("tern.dx"):
-            if GRAD_BITS[0] and gyf.is_cuda:   # qi against the trits, exact: bf16((qi W) s)
+            if GRAD_BITS[0] and GRAD_GROUP[0]:
+                gx = tern_gemm_dx(gyf, wpacked, layer.K).view(ctx.xshape)
+            elif GRAD_BITS[0] and gyf.is_cuda:   # qi against the trits, exact: bf16((qi W) s)
                 w8t = layer.w8(t=True) if wpacked.data_ptr() == layer.wpacked.data_ptr() else _K.unpack_t_i8(wpacked, layer.K)
                 gx = (torch.mm(qi.float(), w8t.t().float()) * qs[:, None]).to(torch.bfloat16).view(ctx.xshape)
             else:
@@ -245,9 +254,9 @@ class _FusedTernFn(torch.autograd.Function):
             else:
                 f, q1, q2, s, gbias, grow, *gt = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=ctx.has_mag)
             if GRAD_BITS[0]:   # --grad-bits: f (the gradient entering the ternary product) quantized; the float adapter's
-                q1, s, f = grad_quant(f, GRAD_BITS[0])   # own gradients (gt, gh) stay bf16
+                q1, s, f = grad_quant(f, GRAD_BITS[0], GRAD_GROUP[0])   # own gradients (gt, gh) stay bf16
                 q2 = None
-                if not sl:     # (bf16 dx: the quantized f through _grad_x, the same values)
+                if not sl or GRAD_GROUP[0]:   # (bf16 dx / group scales: the quantized f through the bf16 dx GEMM)
                     q1 = s = None
             if ctx.has_mag and lr is None:   # (one slice off: the adapter's gradients as autograd's mm backward forms them)
                 xo, h, Ab, Bb = sv[6:]
@@ -257,11 +266,13 @@ class _FusedTernFn(torch.autograd.Function):
                 gB = torch.mm(xo.t(), gh).to(ctx.mdt[1])
                 gxa = torch.mm(gh, Bb.t())                    # (added to the ternary input gradient before the scale)
                 del gt, gh
-            if sl:
+            if sl and q1 is not None:
                 gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xc, ctx.mu_b, None, lr)
                 del q1, q2
             else:
-                gxt = _grad_x(l, f, l.wpacked)
+                gxt = tern_gemm_dx(f, l.wpacked, l.K) if (GRAD_BITS[0] and GRAD_GROUP[0]) else _grad_x(l, f, l.wpacked)
+                if lr is not None:   # (the float adapter's input gradient, formed in dx2_col on the int8 path)
+                    gxt = gxt + torch.mm(lr[0], lr[1].t())
                 gx, gc = _K.scale_bwd(gxt if gxa is None else gxt + gxa, cb, xc, ctx.mu_b)   # (the centring in the kernel)
         if l.capture and getattr(l, "on_grad", None) is not None:    # (_fused_ok: the factored TTF update)
             if getattr(l, "cap_accum", False):

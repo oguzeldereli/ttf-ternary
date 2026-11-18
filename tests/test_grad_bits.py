@@ -26,3 +26,10 @@ def test_unbiased(bits):
         acc += qi.float() * s[:, None]
     m = acc / 4000
     assert (m - g).abs().max() < 0.06 * g.abs().max()
+
+
+def test_group_scales():
+    torch.manual_seed(0)
+    g = torch.randn(4, 128); g[:, 0] = 100.0     # one outlier per row: only its group's scale is large
+    qi, s, gq = grad_quant(g, 2, group=32)
+    assert s.shape == (4, 4) and torch.allclose(s[:, 1:], g[:, 32:].view(4, 3, 32).abs().amax(-1))
