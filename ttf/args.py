@@ -154,6 +154,10 @@ def build_parser():
                    "+0.0023 vs int8x2, the paired train-loss gap -0.003..+0.007 throughout; 27B slice 5.77 -> 5.27 "
                    "s/step on the laptop. int8x2: two slices, as accurate as bf16, the 110M conversion recipe 2.6675 "
                    "vs 2.6672)")
+    g.add_argument("--grad-bits", type=int, default=0, choices=[0, 2, 3, 4, 8],
+                   help="0: off. b: the gradient entering each ternary product (gy) in b-bit integers per token (absmax "
+                   "scale, stochastic rounding, unbiased), used by both backward products: the input gradient and the "
+                   "TTF update's factor (18 Nov 2026 experiment: 4 / 2-bit gradients from scratch)")
     g.add_argument("--tf32", action=ON, default=False, help="the fp32 matrix products on the TF32 tensor cores (10-bit "
                    "mantissa products, fp32 sums: the accumulator's basis turn, the int-k head's products, the sketch "
                    "cross terms); the orthonormalisation stays in full fp32. 0.8B 1000 steps, 26 Oct: level with "

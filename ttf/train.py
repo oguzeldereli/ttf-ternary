@@ -318,8 +318,12 @@ def main():
     te = args.tern_emb if args.tern_emb != "none" else ""            # the ternary embedding's kind ("": none)
     mag = f"add:{args.adapter_rank}" if args.adapter_rank else ""     # the adapter ("": none)
     store = args.ttf_store if args.ttf_store != "fp32" else ""      # the accumulator's codec ("": fp32)
-    from .layers import DX_MODE as _DXM
+    from .layers import DX_MODE as _DXM, GRAD_BITS as _GB
     _DXM[0] = args.dx
+    _GB[0] = args.grad_bits
+    if args.grad_bits:
+        print(f"--grad-bits {args.grad_bits}: gy into every ternary layer's backward in {args.grad_bits}-bit integers "
+              "per token (stochastic rounding)", flush=True)
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         print("--tf32: fp32 matrix products on the TF32 tensor cores (the orthonormalisation in full fp32)", flush=True)

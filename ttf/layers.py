@@ -70,6 +70,20 @@ class _AddRowFn(torch.autograd.Function):
 
 FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
 DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices (int8: one)
+GRAD_BITS = [0]                # --grad-bits b: gy (the gradient entering each ternary product) in b-bit integers, below
+
+
+def grad_quant(gy, bits):
+    """--grad-bits (18 Nov 2026, user: "a from scratch 110M ternary with 4 bit and 2 bit gradients"): gy [M, N] -> (qi int8
+    [M, N], s fp32 [M], gq bf16 [M, N] = bf16(qi * s)). Per row (token) absmax scale s = amax / qmax, qmax = 2^(b-1) - 1
+    (4 bit: -7..7; 2 bit: -1, 0, 1), stochastic rounding floor(gy / s + U[0, 1)): unbiased, E[gq] = gy. Both backward
+    products use the quantized gy: the input gradient (qi against the trits, exact in int32) and the TTF update's factor
+    (gq), so the whole backward of a ternary layer is integer x ternary / integer x int8"""
+    qmax = (1 << (bits - 1)) - 1
+    g = gy.float()
+    s = g.abs().amax(-1).clamp_min(1e-30) / qmax
+    qi = torch.floor(g / s[:, None] + torch.rand_like(g)).clamp_(-qmax, qmax)
+    return qi.to(torch.int8), s, (qi * s[:, None]).to(torch.bfloat16)
 
 
 class _KernelTernFn(torch.autograd.Function):
@@ -97,8 +111,14 @@ class _KernelTernFn(torch.autograd.Function):
         if beta is not None:
             gyf = gyf * beta.to(gyf.dtype)       # y = beta * x@W^T: both grads carry beta
         xq, xs, wpacked = ctx.saved_tensors
+        if GRAD_BITS[0]:
+            qi, qs, gyf = grad_quant(gyf, GRAD_BITS[0])
         with _rf("tern.dx"):
-            gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
+            if GRAD_BITS[0] and gyf.is_cuda:   # qi against the trits, exact: bf16((qi W) s)
+                w8t = layer.w8(t=True) if wpacked.data_ptr() == layer.wpacked.data_ptr() else _K.unpack_t_i8(wpacked, layer.K)
+                gx = (torch.mm(qi.float(), w8t.t().float()) * qs[:, None]).to(torch.bfloat16).view(ctx.xshape)
+            else:
+                gx = _grad_x(layer, gyf, wpacked).view(ctx.xshape)
         if not layer.capture:     # no update asked for: the input gradient only (the trits stay as they are)
             return gx.to(gy.dtype), None, None
         if getattr(layer, "cap_accum", False):   # --accum > 1: the update sees every micro-batch (no gradient kept
@@ -224,6 +244,11 @@ class _FusedTernFn(torch.autograd.Function):
                 del gt
             else:
                 f, q1, q2, s, gbias, grow, *gt = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=ctx.has_mag)
+            if GRAD_BITS[0]:   # --grad-bits: f (the gradient entering the ternary product) quantized; the float adapter's
+                q1, s, f = grad_quant(f, GRAD_BITS[0])   # own gradients (gt, gh) stay bf16
+                q2 = None
+                if not sl:     # (bf16 dx: the quantized f through _grad_x, the same values)
+                    q1 = s = None
             if ctx.has_mag and lr is None:   # (one slice off: the adapter's gradients as autograd's mm backward forms them)
                 xo, h, Ab, Bb = sv[6:]
                 gt = gt[0]                                    # bf16(g * r)
