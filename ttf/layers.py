@@ -72,25 +72,32 @@ FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdi
 DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices (int8: one)
 GRAD_BITS = [0]                # --grad-bits b: gy (the gradient entering each ternary product) in b-bit integers, below
 GRAD_GROUP = [0]               # --grad-group G: one scale per G consecutive entries of a row instead of one per row
+GRAD_GRID = ["zero"]           # --grad-grid odd: all 2^b codes as odd integers, no zero level (see grad_quant)
 
 
 def grad_quant(gy, bits, group=0):
     """--grad-bits (18 Nov 2026, user: "a from scratch 110M ternary with 4 bit and 2 bit gradients"): gy [M, N] -> (qi int8
-    [M, N], s fp32 [M], gq bf16 [M, N] = bf16(qi * s)). Per row (token) absmax scale s = amax / qmax, qmax = 2^(b-1) - 1
-    (4 bit: -7..7; 2 bit: -1, 0, 1), stochastic rounding floor(gy / s + U[0, 1)): unbiased, E[gq] = gy. Both backward
-    products use the quantized gy: the input gradient (qi against the trits, exact in int32) and the TTF update's factor
-    (gq), so the whole backward of a ternary layer is integer x ternary / integer x int8"""
-    qmax = (1 << (bits - 1)) - 1
-    if group:   # --grad-group G (18 Nov: per-token 2-bit was ~4x less step-efficient; one outlier set a row's scale):
-        M, N = gy.shape   # s [M, N / G]; the caller forms the input gradient from gq in bf16 (no per-row int8 path)
-        g = gy.float().view(M, N // group, group)
-        s = g.abs().amax(-1).clamp_min(1e-30) / qmax
-        qi = torch.floor(g / s[..., None] + torch.rand_like(g)).clamp_(-qmax, qmax)
-        return qi.view(M, N).to(torch.int8), s, (qi * s[..., None]).view(M, N).to(torch.bfloat16)
+    [M, N], s fp32 [M] or [M, N / G], gq bf16 [M, N] = bf16(qi * s)). Absmax scale per row (token), or per G consecutive
+    entries (--grad-group G), stochastic rounding: unbiased, E[gq] = gy. Both backward products use the quantized gy: the
+    input gradient (qi against the trits) and the TTF update's factor (gq).
+    Grid (GRAD_GRID): "zero" = the integers -qmax..qmax, qmax = 2^(b-1) - 1 (4 bit: -7..7; 2 bit: -1, 0, 1 = 3 of the 4
+    codes). "odd" (18 Nov, user: "1 bit is sign, and the other bit could be literally 1 and 2"): all 2^b codes, the odd
+    integers -(2^b - 1)..(2^b - 1) (2 bit: -3, -1, 1, 3; 4 bit: -15..15), no zero; step 2 / (2^b - 1) of the scale against
+    1 / qmax: 2-bit rounding variance down to (2/3)^2 = 0.44x."""
+    odd = GRAD_GRID[0] == "odd"
+    qmax = (1 << bits) - 1 if odd else (1 << (bits - 1)) - 1
     g = gy.float()
+    if group:   # --grad-group G (18 Nov: per-token 2-bit was ~4x less step-efficient; one outlier set a row's scale)
+        M, N = gy.shape   # the caller forms the input gradient from gq in bf16 (no per-row int8 path)
+        g = g.view(M, N // group, group)
     s = g.abs().amax(-1).clamp_min(1e-30) / qmax
-    qi = torch.floor(g / s[:, None] + torch.rand_like(g)).clamp_(-qmax, qmax)
-    return qi.to(torch.int8), s, (qi * s[:, None]).to(torch.bfloat16)
+    t = g / s[..., None]
+    if odd:   # q = 2k - 1, k = floor((t + 1) / 2 + U): E[q] = t
+        qi = (2 * torch.floor((t + 1) * 0.5 + torch.rand_like(t)) - 1).clamp_(-qmax, qmax)
+    else:
+        qi = torch.floor(t + torch.rand_like(t)).clamp_(-qmax, qmax)
+    gq = (qi * s[..., None]).view(gy.shape).to(torch.bfloat16)
+    return qi.view(gy.shape).to(torch.int8), s, gq
 
 
 class _KernelTernFn(torch.autograd.Function):

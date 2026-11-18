@@ -323,9 +323,11 @@ def main():
     _GB[0] = args.grad_bits
     from .layers import GRAD_GROUP as _GG
     _GG[0] = args.grad_group
+    from .layers import GRAD_GRID as _GGR
+    _GGR[0] = args.grad_grid
     if args.grad_bits:
         print(f"--grad-bits {args.grad_bits}: gy into every ternary layer's backward in {args.grad_bits}-bit integers "
-              + (f"per {args.grad_group} entries" if args.grad_group else "per token") + " (stochastic rounding)", flush=True)
+              + (f"per {args.grad_group} entries" if args.grad_group else "per token") + f", grid {args.grad_grid} (stochastic rounding)", flush=True)
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         print("--tf32: fp32 matrix products on the TF32 tensor cores (the orthonormalisation in full fp32)", flush=True)

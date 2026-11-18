@@ -160,6 +160,9 @@ def build_parser():
                    "TTF update's factor (18 Nov 2026 experiment: 4 / 2-bit gradients from scratch)")
     g.add_argument("--grad-group", type=int, default=0, help="--grad-bits: one scale per this many consecutive entries "
                    "of a token's gradient (0: one per token)")
+    g.add_argument("--grad-grid", default="zero", choices=["zero", "odd"], help="--grad-bits grid. zero: -qmax..qmax, "
+                   "qmax = 2^(b-1) - 1 (2 bit: -1, 0, 1). odd: all 2^b codes as the odd integers, no zero (2 bit: -3, -1, "
+                   "1, 3)")
     g.add_argument("--tf32", action=ON, default=False, help="the fp32 matrix products on the TF32 tensor cores (10-bit "
                    "mantissa products, fp32 sums: the accumulator's basis turn, the int-k head's products, the sketch "
                    "cross terms); the orthonormalisation stays in full fp32. 0.8B 1000 steps, 26 Oct: level with "

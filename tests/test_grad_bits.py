@@ -33,3 +33,22 @@ def test_group_scales():
     g = torch.randn(4, 128); g[:, 0] = 100.0     # one outlier per row: only its group's scale is large
     qi, s, gq = grad_quant(g, 2, group=32)
     assert s.shape == (4, 4) and torch.allclose(s[:, 1:], g[:, 32:].view(4, 3, 32).abs().amax(-1))
+
+
+@pytest.mark.parametrize("bits", [2, 4])
+def test_odd_grid(bits):
+    from ttf.layers import GRAD_GRID
+    GRAD_GRID[0] = "odd"
+    try:
+        torch.manual_seed(0)
+        g = torch.randn(8, 128)
+        qi, s, _ = grad_quant(g, bits, group=32)
+        qmax = (1 << bits) - 1
+        assert set(qi.unique().tolist()) <= set(range(-qmax, qmax + 1, 2))   # odd codes only, all 2^b used
+        acc = torch.zeros_like(g)
+        for _ in range(4000):
+            qi, s, gq = grad_quant(g, bits, group=32)
+            acc += gq.float()
+        assert ((acc / 4000) - g).abs().max() < 0.06 * g.abs().max()
+    finally:
+        GRAD_GRID[0] = "zero"
