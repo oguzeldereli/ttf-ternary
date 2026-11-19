@@ -77,6 +77,59 @@ def test_resume_of_theta_space_checkpoint():
     assert resume_theta_check(const, 16.0, 16.0, 16.0) is None     # (constant theta: no shape)
 
 
+@pytest.mark.parametrize(
+    "start,end,expected",
+    [
+        (32.0, 80.0, ["start 64 (checkpoint) -> 32 (this run)"]),
+        (64.0, 40.0, ["end 80 (checkpoint) -> 40 (this run)"]),
+        (32.0, 40.0, [
+            "start 64 (checkpoint) -> 32 (this run)",
+            "end 80 (checkpoint) -> 40 (this run)",
+        ]),
+    ],
+)
+def test_resume_notices_changed_step_schedule(start, end, expected):
+    ck = {
+        "ttf_theta": 16.0,
+        "ttf_theta_start": 64.0,
+        "ttf_theta_end": 80.0,
+    }
+    msg = resume_theta_check(ck, 16.0, start, end, ck_shape="step")
+    assert msg.startswith("resume: theta schedule changed:")
+    assert msg.endswith("; continuing")
+    assert all(value in msg for value in expected)
+    assert resume_theta_check(ck, 16.0, start, end, allow=True, ck_shape="step") == msg
+
+
+def test_resume_accepts_unchanged_step_schedule():
+    ck = {
+        "ttf_theta": 16.0,
+        "ttf_theta_start": 64.0,
+        "ttf_theta_end": 80.0,
+    }
+    assert resume_theta_check(ck, 16.0, 64.0, 80.0, ck_shape="step") is None
+
+
+def test_resume_step_base_change_remains_outside_theta_schedule_guard():
+    ck = {
+        "ttf_theta": 16.0,
+        "ttf_theta_start": 64.0,
+        "ttf_theta_end": 80.0,
+    }
+    assert resume_theta_check(ck, 32.0, 64.0, 80.0, ck_shape="step") is None
+
+
+def test_resume_does_not_infer_unrecorded_end():
+    ck = {"ttf_theta": 16.0, "ttf_theta_start": 64.0}
+    assert resume_theta_check(ck, 16.0, 64.0, 40.0, ck_shape="step") is None
+
+
+def test_legacy_theta_space_checkpoint_still_refuses_on_changed_schedule():
+    ck = {"ttf_theta": 16.0, "ttf_theta_start": 64.0, "ttf_theta_end": 80.0}
+    with pytest.raises(SystemExit, match="in theta"):
+        resume_theta_check(ck, 16.0, 32.0, 80.0)
+
+
 def test_legacy_linear_schedule_refused():
     with pytest.raises(ValueError):
         from_legacy(["--ts_theta_sched", "8:16"])
