@@ -521,6 +521,9 @@ def main():
 
     if _init_ck:   # --init-ckpt: a converted checkpoint's weights, a fresh run (step 0, no optimizer / TTF state)
         _resume_path = args.init_ckpt
+        if not args.arch_hf:   # (19 Nov 2026: on a native --preset it was silently ignored and the run trained from init)
+            raise SystemExit(f"--init-ckpt {args.init_ckpt}: loads --arch-hf models only; for a native --preset copy the "
+                             "checkpoint to <out-dir>/ckpt.pt and pass --resume")
     args.gate_split = args.gate_lr_mult != 1.0          # (a resume below: the checkpoint's)
     if args.arch_hf and _from_ckpt:   # the checkpoint holds the converted model (trits, scales, float parts)
         print(f"--arch-hf: {'resuming from' if _resuming else '--init-ckpt'} {_resume_path}", flush=True)
