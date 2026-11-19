@@ -71,11 +71,10 @@ def resume_leak_check(ck_leak, ck_args, allow=False):
 
 
 def resume_theta_check(ck_args, base, start, end, allow=False, ck_shape=None):
-    """a resume must keep the checkpoint's TTF rule. A checkpoint from before the theta schedule (7 Nov 2026: no
-    ttf_theta_start in its args) ran at constant theta; one with a schedule but no theta_shape "step" (7-8 Nov 2026) ran
-    the cosines in theta, not in the step. Resuming either under this core's schedule would change the step mid-run:
-    refused (SystemExit) unless the schedule is off on both sides (start = end = base) or allow; returns the message of an
-    accepted change, else None."""
+    """Keep legacy resume guards for constant-theta and theta-space checkpoints.
+    Step-space checkpoints may change schedule start/end without an override; report
+    these changes without blocking resume. Base changes are handled by resume_acc_scale.
+    Returns a notice or accepted-override message, otherwise None."""
     if not ck_args:
         return None
     if "ttf_theta_start" not in ck_args:
@@ -86,14 +85,19 @@ def resume_theta_check(ck_args, base, start, end, allow=False, ck_shape=None):
     else:
         cb = float(ck_args.get("ttf_theta", base))
         cs, ce = float(ck_args["ttf_theta_start"]), float(ck_args.get("ttf_theta_end", cb))
-        if cb != base or cs != start or ("ttf_theta_end" in ck_args and ce != end):
-            ch = (f"theta schedule {cs:g} -> {cb:g} -> {ce:g} (checkpoint) vs "
-                  f"{start:g} -> {base:g} -> {end:g} (this run)")
-        elif ck_shape == "step" or cs == ce == cb:
+        if ck_shape == "step":
+            changed = []
+            if cs != start:
+                changed.append(f"start {cs:g} (checkpoint) -> {start:g} (this run)")
+            if "ttf_theta_end" in ck_args and ce != end:
+                changed.append(f"end {ce:g} (checkpoint) -> {end:g} (this run)")
+            if changed:
+                return "resume: theta schedule changed: " + "; ".join(changed) + "; continuing"
             return None
-        else:
-            ch = (f"the checkpoint's theta schedule {cs:g} -> {cb:g} -> {ce:g} ran its cosines in theta (7-8 Nov 2026), "
-                  f"this core in the step base / theta")
+        if cs == ce == cb:
+            return None
+        ch = (f"the checkpoint's theta schedule {cs:g} -> {cb:g} -> {ce:g} ran its cosines in theta (7-8 Nov 2026), "
+              f"this core in the step base / theta")
     if not allow:
         raise SystemExit(f"resume: {ch}: the step would change mid-run, refusing (--allow-leak-change accepts it)")
     return "resume: --allow-leak-change: " + ch
