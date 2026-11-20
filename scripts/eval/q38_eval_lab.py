@@ -14,6 +14,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ttf.q38 import model as QM
 from ttf.q38.load import load_slim
+from ttf.q38.train import tern_modules
 
 GSM = ("{q}\n\nSolve the problem step by step. End with the final answer on its own line in the form "
        "\"Answer: <number>\".")
