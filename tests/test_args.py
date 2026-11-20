@@ -123,7 +123,8 @@ def test_theta_schedule_defaults_follow_the_base():
 
 
 def test_theta_hold_default():
-    """--ttf-theta-hold: 0.6 from scratch, 0 (rise from the warmup's end) with --init-ckpt, a value given stays"""
+    """--ttf-theta-hold: 0.6 from scratch, 0 (rise from the warmup's end) with --init-ckpt or --arch-hf, a value given stays"""
     assert A.parse([]).ttf_theta_hold == 0.6
     assert A.parse(["--init-ckpt", "x.pt"]).ttf_theta_hold == 0.0
     assert A.parse(["--init-ckpt", "x.pt", "--ttf-theta-hold", "0.5"]).ttf_theta_hold == 0.5
+    assert A.parse(["--arch-hf", "some/hf_dir", "--resume"]).ttf_theta_hold == 0.0   # a converted model resumed

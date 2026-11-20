@@ -270,8 +270,9 @@ def resolve(a):
         a.ttf_theta_start = THETA_START_X * a.ttf_theta    # 0.25 -> 1 -> 0.2 whatever the base)
     if a.ttf_theta_end is None:
         a.ttf_theta_end = THETA_END_X * a.ttf_theta
-    if a.ttf_theta_hold is None:       # (from scratch: hold the base to 0.6, 18 Nov 2026; from a checkpoint: the 8 Nov form)
-        a.ttf_theta_hold = 0.0 if getattr(a, "init_ckpt", "") else THETA_HOLD
+    if a.ttf_theta_hold is None:       # (from scratch: hold the base to 0.6, 18 Nov 2026; a converted model, by --init-ckpt
+        # or by --arch-hf with --resume, keeps the 8 Nov form its recipe was tuned on)
+        a.ttf_theta_hold = 0.0 if (getattr(a, "init_ckpt", "") or getattr(a, "arch_hf", "")) else THETA_HOLD
     a.u32 = a.data_dtype == "u32"
     if a.adapter_schedule:
         f = a.adapter_schedule.split(":")
