@@ -128,3 +128,11 @@ def test_theta_hold_default():
     assert A.parse(["--init-ckpt", "x.pt"]).ttf_theta_hold == 0.0
     assert A.parse(["--init-ckpt", "x.pt", "--ttf-theta-hold", "0.5"]).ttf_theta_hold == 0.5
     assert A.parse(["--arch-hf", "some/hf_dir", "--resume"]).ttf_theta_hold == 0.0   # a converted model resumed
+
+
+def test_grad_grid_odd_8bit_refused():
+    """--grad-grid odd at 8 bits would put codes up to 255 into int8"""
+    import pytest
+    with pytest.raises(SystemExit):
+        A.parse(["--grad-bits", "8", "--grad-grid", "odd"])
+    assert A.parse(["--grad-bits", "4", "--grad-grid", "odd"]).grad_bits == 4

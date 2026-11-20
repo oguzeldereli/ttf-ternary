@@ -270,6 +270,9 @@ def resolve(a):
         a.ttf_theta_start = THETA_START_X * a.ttf_theta    # 0.25 -> 1 -> 0.2 whatever the base)
     if a.ttf_theta_end is None:
         a.ttf_theta_end = THETA_END_X * a.ttf_theta
+    if getattr(a, "grad_grid", "zero") == "odd" and getattr(a, "grad_bits", 0) == 8:
+        raise SystemExit("--grad-grid odd with --grad-bits 8: codes up to 255 do not fit the int8 code tensor (use 2-4 bits, "
+                         "or the zero grid at 8)")
     if a.ttf_theta_hold is None:       # (from scratch: hold the base to 0.6, 18 Nov 2026; a converted model, by --init-ckpt
         # or by --arch-hf with --resume, keeps the 8 Nov form its recipe was tuned on)
         a.ttf_theta_hold = 0.0 if (getattr(a, "init_ckpt", "") or getattr(a, "arch_hf", "")) else THETA_HOLD
