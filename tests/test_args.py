@@ -136,3 +136,13 @@ def test_grad_grid_odd_8bit_refused():
     with pytest.raises(SystemExit):
         A.parse(["--grad-bits", "8", "--grad-grid", "odd"])
     assert A.parse(["--grad-bits", "4", "--grad-grid", "odd"]).grad_bits == 4
+
+
+def test_grad_group_needs_grad_bits():
+    """--grad-group / --grad-grid only shape the quantized gradient: refused without --grad-bits"""
+    import pytest
+    with pytest.raises(SystemExit):
+        A.parse(["--grad-group", "64"])
+    with pytest.raises(SystemExit):
+        A.parse(["--grad-grid", "odd"])
+    assert A.parse(["--grad-bits", "2", "--grad-group", "64"]).grad_group == 64

@@ -270,6 +270,10 @@ def resolve(a):
         a.ttf_theta_start = THETA_START_X * a.ttf_theta    # 0.25 -> 1 -> 0.2 whatever the base)
     if a.ttf_theta_end is None:
         a.ttf_theta_end = THETA_END_X * a.ttf_theta
+    if (getattr(a, "grad_group", 0) or getattr(a, "grad_grid", "zero") != "zero") and not getattr(a, "grad_bits", 0):
+        raise SystemExit("--grad-group / --grad-grid set without --grad-bits: they only shape the quantized gradient")
+    if getattr(a, "grad_group", 0) < 0:
+        raise SystemExit("--grad-group must be >= 0")
     if getattr(a, "grad_grid", "zero") == "odd" and getattr(a, "grad_bits", 0) == 8:
         raise SystemExit("--grad-grid odd with --grad-bits 8: codes up to 255 do not fit the int8 code tensor (use 2-4 bits, "
                          "or the zero grid at 8)")

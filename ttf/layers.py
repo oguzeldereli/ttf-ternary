@@ -89,6 +89,8 @@ def grad_quant(gy, bits, group=0):
     g = gy.float()
     if group:   # --grad-group G (18 Nov: per-token 2-bit was ~4x less step-efficient; one outlier set a row's scale)
         M, N = gy.shape   # the caller forms the input gradient from gq in bf16 (no per-row int8 path)
+        if N % group:
+            raise ValueError(f"--grad-group {group}: a ternary layer's output width {N} is not a multiple of it")
         g = g.view(M, N // group, group)
     s = g.abs().amax(-1).clamp_min(1e-30) / qmax
     t = g / s[..., None]
