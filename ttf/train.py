@@ -445,6 +445,12 @@ def main():
             assert args.fuse_proj == "shared" or args.ttf_dense_g, "--fuse-proj split: with --ttf-dense-g"
             print(f"--fuse-proj {args.fuse_proj}: q/k/v and gate/up fused", flush=True)
         model = build_kernel_transformer(mc, grad_checkpoint=tc.grad_checkpoint, beta=use_beta)
+        if getattr(args, "tern_adapter", 0):
+            from . import tern_ad as _TA
+            assert not args.fuse_proj, "--tern-adapter: without --fuse-proj"
+            _ta_n, _ta_t = _TA.enable(model, args.tern_adapter,
+                                      lambda i_, o_: KernelTernaryLinear(i_, o_, mc.act_bits, beta=use_beta))
+            print(f"--tern-adapter {args.tern_adapter}: {_ta_n} ternary adapters, {_ta_t / 1e6:.2f}M adapter trits", flush=True)
         if getattr(args, "act_group", 0):
             from .layers import ACT_GROUP as _AG
             _AG[0] = args.act_group
@@ -523,6 +529,9 @@ def main():
                     if isinstance(m_, KernelTernaryLinear) and m_.row_scale is not None:
                         m_.row_scale.requires_grad_(False); m_.col_scale.requires_grad_(False)
                 print("--lin-scales none: the linear layers' row / column scales held at 1", flush=True)
+            if getattr(args, "tern_adapter", 0):
+                from . import tern_ad as _TA
+                _TA.UP_INIT[0] = args.tern_adapter_up; _TA.init_up_scales(model)
     _resume_path = os.path.join(tc.out_dir, "ckpt.pt")
     if (_PP or _WS > 1) and not os.path.exists(_resume_path) and os.path.exists(os.path.join(_base_out, "ckpt.pt")):
         _resume_path = os.path.join(_base_out, "ckpt.pt")    # --pipe: a single-GPU checkpoint (or stage 0's) for all;

@@ -61,6 +61,9 @@ def build_parser():
                    "column scales trained (rc) or held at 1 (none: W = beta T; the fused kernels still run)")
     g.add_argument("--rc-lr", type=float, default=0.0, help="constant lr of the scales (0: the schedule's)")
     g.add_argument("--qk-temp", action=ON, default=True, help="learnable per-head attention temperature")
+    g.add_argument("--tern-adapter", type=float, default=0.0, help="ternary low-rank adapters U(Dx) beside every "
+                   "decoder ternary layer, rank R min(N, K) (21 Nov; 0: none; use with --adapter-rank 0)")
+    g.add_argument("--tern-adapter-up", type=float, default=0.5, help="--tern-adapter: the up layer's initial row scale")
     g.add_argument("--adapter-rank", type=int, default=16, help="rank of the float adapter A B^T beside the trits (0: none)")
     g.add_argument("--adapter-schedule", default="", help="R0:R1[:START:END[:STEP]]: the adapter rank goes from R0 "
                    "(--adapter-rank) down to R1 between the fractions START and END of training (default 0.125:0.75), "
