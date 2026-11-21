@@ -199,7 +199,7 @@ def _fused_ok(l, x):
 MAG_FUSED = [False]   # --mag-fused: the float adapter inside the fused kernels (its gradients from the dense TTF g)
 
 
-def _fused_fwd(l, x2, acc2, save, t_rows=None):
+def _fused_fwd(l, x2, acc2, save, t_rows=None, u2=None):
     """x2 [M, K] -> (out [M, N] bf16, saved tensors or None). With the float adapter (mag_A, mag_B): its term
     a = (xs B) A^T on the scaled input xs = bf16(bf16(x - mu) c) (the prologue writes xs), added to the ternary product
     before the row scale in the GEMM's epilogue: the unfused path's (_ColScaleFn, two GEMMs, _AddRowFn) values"""
@@ -224,16 +224,16 @@ def _fused_fwd(l, x2, acc2, save, t_rows=None):
         abits = l.act_bits
     lr = None
     if mag and MAG_FUSED[0]:   # --mag-fused: h = xs (xq B) from the int8 codes, a = h A^T in the GEMM's epilogue
-        xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, abits, False)
+        xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, abits, False, u2=u2)
         Ab, Bb = l.mag_A.to(torch.bfloat16), l.mag_B.to(torch.bfloat16)
         h = _K.mag_h(xq, xs, Bb); xo = None; a = None; lr = (h, Ab)
     elif mag:
-        xq, xs, _, xo = _K.fused_prologue(x2, mu_b, cb, abits, False, True)
+        xq, xs, _, xo = _K.fused_prologue(x2, mu_b, cb, abits, False, True, u2=u2)
         Ab, Bb = l.mag_A.to(torch.bfloat16), l.mag_B.to(torch.bfloat16)
         h = xo @ Bb
         a = h @ Ab.T
     else:
-        xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, abits, False)
+        xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, abits, False, u2=u2)
         a = None
     beta = l._cached_beta(l.wpacked) if l.use_beta else None
     t, o = _K.fused_fwd_gemm(xq, l.w8(), xs, beta if beta is not None else 1.0, rb, bb, acc2, save, a,
@@ -247,18 +247,33 @@ class _FusedTernFn(torch.autograd.Function):
     """out = acc + ((T(c (x - mu)) * beta) * r + bias), the ternary layer with its scales, centring and an added input
     (the sum of a converted layer's parts) as one Function; the TTF update gets the same (gy, x) factors"""
     @staticmethod
-    def forward(ctx, x, c, r, bias, acc, layer, mA=None, mB=None):
-        x2 = x.reshape(-1, layer.K)
-        if not x2.is_contiguous():
-            x2 = x2.contiguous()
+    def forward(ctx, x, c, r, bias, acc, layer, mA=None, mB=None, up=None, halves=False):
+        # --fuse-swiglu: the input is bf16(bf16(silu(gate)) up), formed in the prologue: gate x and up separate [.., K]
+        # tensors, or (halves) x [.., 2K] = [gate | up] (the fused gate-up layer's output, read in place)
+        ctx.swi = 2 if halves else (1 if up is not None else 0)
+        if halves:
+            xx = x.reshape(-1, 2 * layer.K)
+            if not xx.is_contiguous():
+                xx = xx.contiguous()
+            x2, u2 = xx[:, :layer.K], xx[:, layer.K:]
+        else:
+            x2 = x.reshape(-1, layer.K)
+            if not x2.is_contiguous():
+                x2 = x2.contiguous()
+            u2 = None
+            if up is not None:
+                u2 = up.reshape(-1, layer.K)
+                u2 = u2 if u2.is_contiguous() else u2.contiguous()
         acc2 = acc.reshape(-1, layer.N).contiguous() if acc is not None else None
         ctx.has_mag = mA is not None
         ctx.lean = bool(SAVE_LEAN[0] and (mA is None or LEAN_MAG[0] or MAG_FUSED[0]) and DX_MODE[0] in ("int8", "int8x2")
                         and not GRAD_BITS[0] and getattr(layer, "in_mean", None) is None)
         M_ = x2.shape[0]
         tm_ = max(1, M_ // SAVE_LEAN[0]) if ctx.lean else M_
+        if ctx.swi:
+            assert ctx.lean and not ACT_GROUP[0], "--fuse-swiglu needs the lean int8 path (KernelTernaryLinear.swi_ok)"
         with _rf("tern.fwd"):   # (--save-lean: the GEMM stores t for the token subset only)
-            o, sv = _fused_fwd(layer, x2, acc2, True, t_rows=tm_ if tm_ < M_ else None)
+            o, sv = _fused_fwd(layer, x2, acc2, True, t_rows=tm_ if tm_ < M_ else None, u2=u2)
         xq, xs, xc, t, cb, rb, beta = sv[:7]
         if ctx.lean:   # --save-lean: no bf16 input kept (the column-scale gradient from xq xs / c), t on 1 / SAVE_LEAN
             xc = xs    # of the tokens (the row-scale gradient's sum x SAVE_LEAN)
@@ -270,7 +285,7 @@ class _FusedTernFn(torch.autograd.Function):
         mg = list(sv[7:])
         if ctx.lean and ctx.has_mag:   # (--save-lean with the float adapter: its input xo re-formed from xq xs)
             mg[0] = None
-        ctx.save_for_backward(xq, xs, xc, t, cb, rb, *mg)
+        ctx.save_for_backward(xq, xs, xc, t, cb, rb, *mg, *((x2, u2) if ctx.swi else ()))
         ctx.layer, ctx.beta, ctx.xshape = layer, beta, x.shape
         ctx.cdt, ctx.rdt, ctx.has_bias, ctx.has_acc = c.dtype, r.dtype, bias is not None, acc is not None
         ctx.bdt = bias.dtype if bias is not None else None
@@ -279,6 +294,9 @@ class _FusedTernFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, g):
         sv = ctx.saved_tensors          # (read once: a checkpointed layer's saved tensors unpack only once)
+        swt = None
+        if ctx.swi:
+            swt = sv[-2:]; sv = sv[:-2]
         xq, xs, xc, t, cb, rb = sv[:6]
         l = ctx.layer
         g2 = g.reshape(-1, l.N).contiguous()
@@ -335,7 +353,11 @@ class _FusedTernFn(torch.autograd.Function):
                 F8 = I8Factors(q1, s, xq, xs, (lambda: _K.bwd_gyf(g2, rb, bb)) if skip_f else None,
                                q1t=_K.LAST_Q1T[0] if wq1t else None)
             _K.LAST_Q1T[0] = None
-            if sl and q1 is not None and ctx.lean:
+            gup = None
+            if sl and q1 is not None and ctx.lean and swt is not None:   # --fuse-swiglu: gate / up gradients here
+                gx, gc, gup = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xq, None, None, lr, xs=xs, swi=swt)
+                del q1, q2
+            elif sl and q1 is not None and ctx.lean:
                 gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xq, None, None, lr, xs=xs)
                 del q1, q2
             elif sl and q1 is not None:
@@ -353,8 +375,14 @@ class _FusedTernFn(torch.autograd.Function):
             if f is None and (F8 is None or _GH):
                 f = _K.bwd_gyf(g2, rb, bb)
             l.on_grad(l, (f, _K.dequant_i8(xq, xs) if F8 is None or _GH else None) + ((F8,) if F8 is not None else ()))
+        if ctx.swi:
+            assert gup is not None
+            if ctx.swi == 2:
+                gx, gup = gup.full, None
+            else:
+                gup = gup.view(ctx.xshape)
         return (gx.view(ctx.xshape), gc.to(ctx.cdt), grow.to(ctx.rdt), gbias.to(ctx.bdt) if ctx.has_bias else None,
-                g if ctx.has_acc else None, None, gA, gB)
+                g if ctx.has_acc else None, None, gA, gB, gup, None)
 
 
 class KernelTernaryLinear(nn.Module):
@@ -492,6 +520,28 @@ class KernelTernaryLinear(nn.Module):
         """centred layer (a gptqc conversion): y = layer(x - mu) + bias, mu a fixed buffer, bias a float parameter (init W mu)"""
         self.register_buffer("in_mean", mu.detach().clone().float())
         self.out_bias = nn.Parameter(bias.detach().clone().float())
+
+    def swi_ok(self, x):
+        """--fuse-swiglu applies: the fused lean int8 path (its backward needs no bf16 input)"""
+        return (_fused_ok(self, x) and bool(SAVE_LEAN[0]) and DX_MODE[0] in ("int8", "int8x2") and not GRAD_BITS[0]
+                and not ACT_GROUP[0] and getattr(self, "in_mean", None) is None
+                and (getattr(self, "mag_A", None) is None or LEAN_MAG[0] or MAG_FUSED[0]))
+
+    def forward_swiglu(self, g, u=None, acc=None):
+        """self(bf16(bf16(silu(g)) u)) with the product formed in the prologue (swi_ok): g, u [.., K]; or u None and
+        g [.., 2K] = [gate | up]"""
+        halves = u is None
+        sh = g.shape[:-1]
+        if not torch.is_grad_enabled():
+            if halves:
+                gg = g.reshape(-1, 2 * self.K); gg = gg if gg.is_contiguous() else gg.contiguous()
+                x2, u2 = gg[:, :self.K], gg[:, self.K:]
+            else:
+                x2, u2 = g.reshape(-1, self.K).contiguous(), u.reshape(-1, self.K).contiguous()
+            o, _ = _fused_fwd(self, x2, acc.reshape(-1, self.N).contiguous() if acc is not None else None, False, u2=u2)
+            return o.view(*sh, self.N)
+        return _FusedTernFn.apply(g, self.col_scale, self.row_scale, getattr(self, "out_bias", None), acc, self,
+                                  getattr(self, "mag_A", None), getattr(self, "mag_B", None), u, halves)
 
     def forward(self, x, acc=None):
         if _fused_ok(self, x):    # --fused-layer (acc: a tensor added to the output, the sum of a converted layer's parts)

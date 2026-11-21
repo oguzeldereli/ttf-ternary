@@ -39,6 +39,7 @@ FUSED_ELEM = [True]   # bf16 CUDA activations: the RMSNorm and the SwiGLU in one
 ATTN_FP8 = [False]    # --attn-fp8 (fp8attn.py)
 FUSE_PROJ = [""]      # --fuse-proj split | shared: q/k/v and gate/up each one ternary layer ("" off)
 HEAD_ALL = [False]    # --head-fused: headloss.TrainHeadAll (the head's backward in the forward; fp32 weight-gradient sum)
+FUSE_SWI = [False]    # --fuse-swiglu: silu(gate) up formed in w_down's prologue, its backward in w_down's dx epilogue
 FUSE_RES = [False]    # --fuse-res: the residual add in the sublayer's last ternary GEMM, its gradient in the norm's backward
 FUSED_HEAD = [True]   # training, no teacher, bf16 CUDA: headloss.TrainHeadCE per loss chunk (else the checkpointed autograd chunk)
 
@@ -150,6 +151,10 @@ class FeedForward(nn.Module):
 
     def forward(self, x, res=None):
         kw = {} if res is None else {"acc": res}
+        if FUSE_SWI[0] and hasattr(self.w_down, "swi_ok") and self.w_down.swi_ok(x):
+            if hasattr(self, "w_gu"):
+                return self.w_down.forward_swiglu(self.w_gu(x), None, **kw)
+            return self.w_down.forward_swiglu(self.w_gate(x), self.w_up(x), **kw)
         if hasattr(self, "w_gu"):
             g_, u_ = self.w_gu(x).chunk(2, dim=-1)
             return self.w_down(_FN["swiglu"](g_.contiguous(), u_.contiguous()), **kw)

@@ -1357,19 +1357,30 @@ def _rbf(x):
     return b.to(tl.float32, bitcast=True)
 
 
+@triton.jit
+def _swi_(g, u):
+    """bf16(bf16(silu(g)) u) as fp32 (_swiglu_fwd_kernel's arithmetic)"""
+    s = (g / (1.0 + tl.exp(-g))).to(tl.bfloat16).to(tl.float32)
+    return (s * u).to(tl.bfloat16).to(tl.float32)
+
+
 # --fused-layer: a ternary layer's elementwise work around its int8 GEMMs in a few passes. Each kernel repeats the
 # unfused path's roundings in its order (every bf16 op rounds its fp32 result to bf16), so the layer's output and input
 # gradient are bit-identical; the scale and bias gradients' sums run in fp32 without the final bf16 rounding.
 @triton.jit
 def _pro_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, xo_ptr, K, sxm, qp, rqp, lo, HAS_MU: tl.constexpr,
-                SAVE_XC: tl.constexpr, BK: tl.constexpr, SAVE_XS: tl.constexpr = False):
+                SAVE_XC: tl.constexpr, BK: tl.constexpr, SAVE_XS: tl.constexpr = False, u_ptr=None,
+                SWI: tl.constexpr = False):
     """xc = bf16(x - mu), xs = bf16(xc * c), then act_quant_i8 of xs (_actq_kernel's arithmetic); xs stored to xo with
-    SAVE_XS (the float adapter's input)"""
+    SAVE_XS (the float adapter's input). SWI (--fuse-swiglu): x = bf16(bf16(silu(x)) u) formed here from the gate x and
+    up u (_swiglu_fwd_kernel's roundings)"""
     row = tl.program_id(0)
     amax = tl.zeros((BK,), dtype=tl.float32)
     for k0 in range(0, K, BK):
         offs = k0 + tl.arange(0, BK)
         x = tl.load(x_ptr + row * sxm + offs, mask=offs < K, other=0.0).to(tl.float32)
+        if SWI:
+            x = _swi_(x, tl.load(u_ptr + row * sxm + offs, mask=offs < K, other=0.0).to(tl.float32))
         if HAS_MU:
             x = _rbf(x - tl.load(mu_ptr + offs, mask=offs < K, other=0.0).to(tl.float32))
         x = _rbf(x * tl.load(c_ptr + offs, mask=offs < K, other=0.0).to(tl.float32))
@@ -1380,6 +1391,8 @@ def _pro_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, xo_ptr, K, sxm, qp, 
     for k0 in range(0, K, BK):
         offs = k0 + tl.arange(0, BK)
         x = tl.load(x_ptr + row * sxm + offs, mask=offs < K, other=0.0).to(tl.float32)
+        if SWI:
+            x = _swi_(x, tl.load(u_ptr + row * sxm + offs, mask=offs < K, other=0.0).to(tl.float32))
         if HAS_MU:
             x = _rbf(x - tl.load(mu_ptr + offs, mask=offs < K, other=0.0).to(tl.float32))
             if SAVE_XC:
@@ -1394,11 +1407,14 @@ def _pro_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, xo_ptr, K, sxm, qp, 
 
 @triton.jit
 def _pro1_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, xo_ptr, M, K, sxm, qp, rqp, lo, HAS_MU: tl.constexpr,
-                 SAVE_XC: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, SAVE_XS: tl.constexpr = False):
+                 SAVE_XC: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, SAVE_XS: tl.constexpr = False, u_ptr=None,
+                 SWI: tl.constexpr = False):
     """_pro_kernel for K <= BK: BM whole rows per program, x read once (the same arithmetic, so the same codes)"""
     rows = tl.program_id(0) * BM + tl.arange(0, BM); offs = tl.arange(0, BK)
     m = (rows[:, None] < M) & (offs[None, :] < K)
     x = tl.load(x_ptr + rows[:, None] * sxm + offs[None, :], mask=m, other=0.0).to(tl.float32)
+    if SWI:
+        x = _swi_(x, tl.load(u_ptr + rows[:, None] * sxm + offs[None, :], mask=m, other=0.0).to(tl.float32))
     if HAS_MU:
         x = _rbf(x - tl.load(mu_ptr + offs, mask=offs < K, other=0.0).to(tl.float32)[None, :])
         if SAVE_XC:
@@ -1416,7 +1432,7 @@ def _pro1_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, xo_ptr, M, K, sxm, 
 PRO1 = [True]   # (the one-read prologue where K <= 4096; False: the two-pass _pro_kernel)
 
 
-def fused_prologue(x2, mu_b, c_b, bits, save_xc, save_xs=False):
+def fused_prologue(x2, mu_b, c_b, bits, save_xc, save_xs=False, u2=None):
     """x2 [M, K] bf16 -> (int8 codes, fp32 row scales, xc = bf16(x - mu) if save_xc and mu_b is not None else None);
     save_xs: a fourth output, the scaled input bf16(bf16(x - mu) c) (the float adapter's input)"""
     M, K = x2.shape
@@ -1426,14 +1442,17 @@ def fused_prologue(x2, mu_b, c_b, bits, save_xc, save_xs=False):
     xo = torch.empty(M, K, dtype=torch.bfloat16, device=x2.device) if save_xs else None
     qp, rqp, lo = _actq_consts(bits, x2.dtype)
     a = (x2, mu_b if mu_b is not None else c_b, c_b, q, sc, xc if xc is not None else q, xo if xo is not None else q)
+    sk = {} if u2 is None else dict(u_ptr=u2, SWI=True)   # (--fuse-swiglu: x2 the gate, u2 the up projection)
+    if u2 is not None:
+        assert u2.shape == x2.shape and u2.stride(0) == x2.stride(0)
     if PRO1[0] and K <= 4096:
         BK = triton.next_power_of_2(K); BM = max(1, 4096 // BK)
         _pro1_kernel[(triton.cdiv(M, BM),)](*a, M, K, x2.stride(0), qp, rqp, lo, HAS_MU=mu_b is not None,
                                             SAVE_XC=xc is not None, BM=BM, BK=BK, SAVE_XS=save_xs,
-                                            num_warps=4 if BK * BM <= 2048 else 8)
+                                            num_warps=4 if BK * BM <= 2048 else 8, **sk)
     else:
         _pro_kernel[(M,)](*a, K, x2.stride(0), qp, rqp, lo, HAS_MU=mu_b is not None,
-                          SAVE_XC=xc is not None, BK=1024, SAVE_XS=save_xs)
+                          SAVE_XC=xc is not None, BK=1024, SAVE_XS=save_xs, **sk)
     return (q, sc, xc, xo) if save_xs else (q, sc, xc)
 
 
@@ -1823,7 +1842,8 @@ def bwd_gyf(g, r_b, beta_b):
 def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr, gx_ptr, pc_ptr, M, N, K, sam, sbk,
                     HAS_MU: tl.constexpr, TWO: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
                     GM: tl.constexpr, HAS_ADD: tl.constexpr = False, gh_ptr=None, bt_ptr=None, R=0,
-                    RA: tl.constexpr = 16, HAS_LR: tl.constexpr = False, xs_ptr=None, XQ: tl.constexpr = False):
+                    RA: tl.constexpr = 16, HAS_LR: tl.constexpr = False, xs_ptr=None, XQ: tl.constexpr = False,
+                    sg_ptr=None, su_ptr=None, gu_ptr=None, SWI: tl.constexpr = False, SW=1):
     """the input gradient on the int8 tensor cores with its epilogue in one kernel: y1 = q1 W, y2 = q2 W (gy's two int8
     slices [M, N] against the trits, b [K, N]: row k is column k of W; two int32 accumulators, exact), then as
     _dx2_epi_kernel + _scale_bwd_kernel: g = bf16((y1 + y2 / 254) s), gx = bf16(g c) and per BM-row block the column
@@ -1859,7 +1879,18 @@ def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr,
         btv = tl.load(bt_ptr + cols[None, :] * R + ra[:, None], mask=(cols[None, :] < K) & (ra[:, None] < R), other=0.0)
         g = _rbf(g + _rbf(tl.dot(ghv, btv)))
     c = tl.load(c_ptr + cols, mask=cols < K, other=0.0).to(tl.float32)
-    tl.store(gx_ptr + off, (g * c[None, :]).to(tl.bfloat16), mask=m)
+    if SWI:   # --fuse-swiglu: the input was bf16(bf16(silu(a)) b): its gradient gs = bf16(g c) goes straight to a and b
+        gs_ = _rbf(g * c[None, :])          # (_swiglu_bwd_kernel's arithmetic; gs never written)
+        so = rows[:, None] * SW + cols[None, :]   # (gate / up and their gradients: row stride SW, e.g. halves of [M, 2K])
+        av = tl.load(sg_ptr + so, mask=m, other=0.0).to(tl.float32)
+        bv = tl.load(su_ptr + so, mask=m, other=0.0).to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-av))
+        sl = (av * sig).to(tl.bfloat16).to(tl.float32)
+        tl.store(gu_ptr + so, (gs_ * sl).to(tl.bfloat16), mask=m)
+        gb = (gs_ * bv).to(tl.bfloat16).to(tl.float32)
+        tl.store(gx_ptr + so, (gb * (sig * (1.0 + av * (1.0 - sig)))).to(tl.bfloat16), mask=m)
+    else:
+        tl.store(gx_ptr + off, (g * c[None, :]).to(tl.bfloat16), mask=m)
     if XQ:   # --save-lean: the (centred) input from its int8 codes, x = xq xs / c (the prologue quantized c (x - mu))
         xs = tl.load(xs_ptr + rows, mask=rows < M, other=0.0)
         x = tl.load(x_ptr + off, mask=m, other=0).to(tl.float32) * xs[:, None]
@@ -1888,14 +1919,14 @@ def _dx2_tile(N, K):
     return 64, 128, 64, 4
 
 
-def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None):
+def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None, swi=None):
     """(gx bf16 [M, K], the column scale's gradient fp32 [K]) from gy's int8 slices q1, q2 [M, N] and scale s [M]
     (fused_bwd_rows; q2 None: one slice, --dx int8), the trits w8t [K, N] (KernelTernaryLinear.w8(t=True)), the column
     scale c_b and the layer's input x (centred here with mu_b). add [M, K] bf16, or lr = (gh [M, R], B [K, R]) bf16
     whose product gh B^T is formed in the kernel: added to the ternary input gradient before the column scale"""
     M, N = q1.shape
     K = w8t.shape[0]
-    gx = torch.empty(M, K, dtype=torch.bfloat16, device=q1.device)
+    gx = torch.empty(M, K, dtype=torch.bfloat16, device=q1.device) if swi is None else None
     BM, BK, BN, nw = DX2_TILE[0] if DX2_TILE[0] is not None else _dx2_tile(N, K)
     nb = triton.cdiv(M, BM)
     pc = torch.empty(nb, K, dtype=torch.float32, device=q1.device)
@@ -1905,12 +1936,24 @@ def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None):
         lk = dict(gh_ptr=gh, bt_ptr=bt, R=gh.shape[1], RA=max(16, triton.next_power_of_2(gh.shape[1])), HAS_LR=True)
     if xs is not None:   # (x is the int8 xq of the prologue, xs its row scales: --save-lean)
         lk.update(xs_ptr=xs, XQ=True)
+    gu = None
+    if swi is not None:  # (--fuse-swiglu: swi = (gate, up) [M, K] bf16 views with one row stride (separate tensors, or
+        # the halves of one [M, 2K]); returns (g_gate, col grad, g_up) laid out the same (one [M, 2K] buffer for halves)
+        ga, ua = swi; SW = ga.stride(0)
+        assert ua.stride(0) == SW and ga.stride(1) == 1 and ua.stride(1) == 1
+        if SW == 2 * K and ua.data_ptr() == ga.data_ptr() + K * ga.element_size():
+            buf = torch.empty(M, 2 * K, dtype=torch.bfloat16, device=q1.device); gx, gu = buf[:, :K], buf[:, K:]
+            gu.full = buf
+        else:
+            assert SW == K
+            gx = torch.empty(M, K, dtype=torch.bfloat16, device=q1.device); gu = torch.empty_like(gx)
+        lk.update(sg_ptr=ga, su_ptr=ua, gu_ptr=gu, SWI=True, SW=SW)
     _dx2_col_kernel[(nb * triton.cdiv(K, BK),)](q1, q2 if q2 is not None else q1, w8t, s, c_b, x,
                                                 mu_b if mu_b is not None else c_b, add if add is not None else gx, gx,
                                                 pc, M, N, K, q1.stride(0), w8t.stride(0), HAS_MU=mu_b is not None,
                                                 TWO=q2 is not None, BM=BM, BK=BK, BN=BN, GM=8, num_warps=nw,
                                                 num_stages=3, HAS_ADD=add is not None, **lk)
-    return gx, pc.sum(0)
+    return (gx, pc.sum(0)) if gu is None else (gx, pc.sum(0), gu)
 
 
 @triton.jit

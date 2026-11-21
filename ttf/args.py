@@ -216,6 +216,9 @@ def build_parser():
                    "accumulator per sub-layer (needs --ttf-dense-g), shared one for the group (rank of the group's min(N, K))")
     g.add_argument("--attn-fp8", action=ON, default=False, help="training attention's forward on FP8 tensor cores "
                    "(e4m3, per-tile scales; fp8attn.py), the backward aten's bf16 flash backward at that output")
+    g.add_argument("--fuse-swiglu", action="store_true", help="silu(gate) up formed in w_down's int8 prologue and its "
+                   "backward in w_down's dx epilogue (no swiglu kernels; with a fused gate-up layer its output read in "
+                   "place: no split copies). Bit-identical; needs --save-lean and int8 dx")
     g.add_argument("--fuse-res", action="store_true", help="the residual add of each sublayer in its last ternary layer's "
                    "GEMM epilogue, and its gradient added inside the norm's backward kernel (bit-identical; fused kernels)")
     g.add_argument("--mag-fused", action="store_true", help="the float adapter inside the fused ternary kernels: h = "

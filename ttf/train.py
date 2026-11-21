@@ -1271,6 +1271,10 @@ def main():
             "--ttf-batch-update: with --ttf-dense-g, one batch per step, no --pipe / --ttf-offload"
         _UPDB.BATCH[0] = True; _UPDB.BATCH_N[0] = int(args.ttf_batch_n); _UPDB.BATCH_BF16[0] = bool(args.ttf_batch_bf16)
         print("--ttf-batch-update: turn, orth and firing after the backward, batched by layer shape", flush=True)
+    if getattr(args, "fuse_swiglu", False):
+        from .model import FUSE_SWI as _FS
+        _FS[0] = True
+        print("--fuse-swiglu: swiglu in w_down's prologue / dx epilogue", flush=True)
     if getattr(args, "fuse_res", False):
         from .model import FUSE_RES as _FR
         _FR[0] = True
