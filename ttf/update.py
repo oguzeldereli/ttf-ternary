@@ -550,6 +550,8 @@ def remove_grad_hook(fn):
 BATCH = [False]   # --ttf-batch-update
 BATCH_N = [12]    # --ttf-batch-update N: a group's update runs once N layers of one shape are queued
 BATCH_BF16 = [False]   # --ttf-batch-bf16: the turn's two big products (g with the bases) on the bf16 tensor cores
+BATCH_F16 = [False]    # --ttf-batch-f16: the turn's r x r products and the batched orth on the fp16 tensor cores (fp32 sums,
+                       # each operand scaled by a power of two per matrix; Cholesky and the triangular inverse in fp32)
 BATCHQ = {}       # the deferred (layer, dense g, state, settings) of this backward, by group key
 
 
@@ -589,6 +591,33 @@ def _borth(X):
         return Y
     finally:
         torch.backends.cuda.matmul.allow_tf32 = tf
+
+
+def _p2(X):
+    """a power of two per matrix of X [B, ., .] near its largest |entry| (shape [B, 1, 1]): X / s fits fp16"""
+    return torch.exp2(torch.round(torch.log2(X.abs().amax(dim=(1, 2), keepdim=True).clamp_min(1e-30))))
+
+
+def _bmm16(A, B_):
+    """A @ B_ (batched, fp32 in and out) on the fp16 tensor cores, fp32 sums; each operand scaled by a power of two"""
+    sa, sb = _p2(A), _p2(B_)
+    return torch.bmm((A / sa).half(), (B_ / sb).half(), out_dtype=torch.float32).mul_(sa * sb)
+
+
+def _borth16(X):
+    """_borth with the Grams and the solves on the fp16 tensor cores: two Cholesky QR passes, Y <- (Y / s) L^-T with
+    L the fp32 Cholesky factor of the fp16 Gram (L^-1 by an fp32 triangular solve, r x r). Orthogonality ~3e-4 rms
+    (b27 shapes; the fp12s store's own rounding of the basis: 1.9e-3)"""
+    Y = X
+    for p in range(2):
+        Yh = (Y / _p2(Y)).half()
+        G = torch.bmm(Yh.transpose(1, 2), Yh, out_dtype=torch.float32)
+        if p == 0:
+            G.diagonal(dim1=1, dim2=2).add_(1e-7 * torch.linalg.matrix_norm(G).reshape(-1, 1))
+        L, _ = torch.linalg.cholesky_ex(G)
+        Li = torch.linalg.solve_triangular(L, torch.eye(L.shape[-1], device=L.device).expand_as(L), upper=False)
+        Y = torch.bmm(Yh, Li.transpose(1, 2).half(), out_dtype=torch.float32)
+    return Y
 
 
 def ts_flush():
@@ -634,12 +663,18 @@ def _flush_group(its):
     del Us, Vs, a_, b_
     P = torch.bmm(G.transpose(1, 2), (A * U).to(lp), out_dtype=torch.float32) if lp != torch.float32 else \
         torch.bmm(G.transpose(1, 2), A * U)
-    X = torch.baddbmm(P.mul_(Bc).mul_(-lr_ratio), V, torch.bmm(U.transpose(1, 2), U))
+    if BATCH_F16[0]:
+        X = P.mul_(Bc).mul_(-lr_ratio).add_(_bmm16(V, _bmm16(U.transpose(1, 2), U)))
+    else:
+        X = torch.baddbmm(P.mul_(Bc).mul_(-lr_ratio), V, torch.bmm(U.transpose(1, 2), U))
     del P
-    Vn = _borth(X)
+    Vn = _borth16(X) if BATCH_F16[0] else _borth(X)
     del X
     Q = torch.bmm(G, (Bc * Vn).to(lp), out_dtype=torch.float32) if lp != torch.float32 else torch.bmm(G, Bc * Vn)
-    U = torch.baddbmm(Q.mul_(A).mul_(-lr_ratio), U, torch.bmm(V.transpose(1, 2), Vn))
+    if BATCH_F16[0]:
+        U = Q.mul_(A).mul_(-lr_ratio).add_(_bmm16(U, _bmm16(V.transpose(1, 2), Vn)))
+    else:
+        U = torch.baddbmm(Q.mul_(A).mul_(-lr_ratio), U, torch.bmm(V.transpose(1, 2), Vn))
     del G, V, Q
     for i, (l, g, _, c) in enumerate(its):
         key = id(l)

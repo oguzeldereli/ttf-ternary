@@ -1272,7 +1272,7 @@ def main():
     if ttf and args.ttf_batch_update:
         assert args.ttf_dense_g and tc.grad_accum == 1 and not _PP and args.ttf_offload == "none", \
             "--ttf-batch-update: with --ttf-dense-g, one batch per step, no --pipe / --ttf-offload"
-        _UPDB.BATCH[0] = True; _UPDB.BATCH_N[0] = int(args.ttf_batch_n); _UPDB.BATCH_BF16[0] = bool(args.ttf_batch_bf16)
+        _UPDB.BATCH[0] = True; _UPDB.BATCH_N[0] = int(args.ttf_batch_n); _UPDB.BATCH_BF16[0] = bool(args.ttf_batch_bf16); _UPDB.BATCH_F16[0] = bool(getattr(args, "ttf_batch_f16", False))
         print("--ttf-batch-update: turn, orth and firing after the backward, batched by layer shape", flush=True)
     if getattr(args, "attn_f16", False):
         from .model import ATTN_F16 as _AF

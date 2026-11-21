@@ -118,6 +118,9 @@ def build_parser():
     g.add_argument("--ttf-batch-update", action=ON, default=False, help="--ttf-dense-g: each layer's dense g kept "
                    "through the backward, then v, the basis turn (u never formed), the orth (batched Cholesky QR) and "
                    "the firing per group of layers of one shape (fewer, larger kernels; the same update up to rounding)")
+    g.add_argument("--ttf-batch-f16", action="store_true", help="--ttf-batch-update: the turn's r x r products and the "
+                   "orth on the fp16 tensor cores (power-of-two scaled operands, fp32 sums; orthogonality ~3e-4 vs the fp12s "
+                   "store's 1.9e-3); not loss-validated")
     g.add_argument("--ttf-batch-n", type=int, default=12, help="--ttf-batch-update: layers per batched group (a group "
                    "runs inside the backward once this many of one shape are queued)")
     g.add_argument("--ttf-batch-bf16", action=ON, default=False, help="--ttf-batch-update: the turn's products of g with "
