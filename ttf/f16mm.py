@@ -58,7 +58,13 @@ def _tile(M, N, K):
     t = TILE.get((M, N, K))
     if t is not None:
         return t
-    return (256, 128, 32, 8, 3) if M >= 256 and N >= 128 else (128, 128, 32, 4, 3)
+    # (t_f16mm_tune.py, lab 4070 Ti Super, 21 Nov, the 110M head n 2048 V 32768 d 768: z = h W^T 0.91 ms vs bf16 1.23;
+    # dh = dz W (long K) 1.01 vs 1.25; dW += dz^T h 1.00 vs 1.22)
+    if K <= 1024:
+        return 128, 128, 32, 4, 3
+    if K >= 8192:
+        return 64, 128, 32, 4, 3
+    return 64, 256, 32, 4, 3
 
 
 def prescale(amax_a, amax_b, BK=64, cap=2.0 ** 14):
