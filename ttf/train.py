@@ -19,6 +19,8 @@ import torch.nn.functional as F
 
 
 
+from . import update as _UPDB   # (--ttf-batch-update: BATCH, ts_flush)
+
 SIDE = [None]   # --ttf-side-stream: the CUDA stream the per-layer TTF updates run on
 
 
@@ -1264,6 +1266,15 @@ def main():
             from .layers import LEAN_MAG as _LM
             _LM[0] = True
         print(f"--save-lean {args.save_lean}: no bf16 inputs saved by the ternary layers, t on 1/{args.save_lean} of the tokens", flush=True)
+    if ttf and args.ttf_batch_update:
+        assert args.ttf_dense_g and tc.grad_accum == 1 and not _PP and args.ttf_offload == "none", \
+            "--ttf-batch-update: with --ttf-dense-g, one batch per step, no --pipe / --ttf-offload"
+        _UPDB.BATCH[0] = True; _UPDB.BATCH_N[0] = int(args.ttf_batch_n); _UPDB.BATCH_BF16[0] = bool(args.ttf_batch_bf16)
+        print("--ttf-batch-update: turn, orth and firing after the backward, batched by layer shape", flush=True)
+    if getattr(args, "fuse_res", False):
+        from .model import FUSE_RES as _FR
+        _FR[0] = True
+        print("--fuse-res: residual adds in the GEMM epilogues / norm backward", flush=True)
     if getattr(args, "mag_fused", False):
         assert args.ttf_dense_g and args.ttf_upd_i8 and args.dx in ("int8", "int8x2") and not args.ttf_side_stream, \
             "--mag-fused: with --ttf-dense-g --ttf-upd-i8, --dx int8 / int8x2, no --ttf-side-stream"
@@ -1423,6 +1434,8 @@ def main():
             torch.cuda.synchronize(); _t1 = time.time()
             _m1, _p1 = torch.cuda.memory_allocated() / 2**30, torch.cuda.max_memory_allocated() / 2**30
         _rfu = torch.profiler.record_function("step.update"); _rfu.__enter__()   # TERN_PROF: after the backward
+        if ttf and _UPDB.BATCH[0]:   # --ttf-batch-update: the deferred layers' updates, batched by shape
+            _UPDB.ts_flush()
         if ttf:
             with torch.profiler.record_function("ttf.step"):
                 rs_info = ts_step(model, lr_state, ts_cfg)

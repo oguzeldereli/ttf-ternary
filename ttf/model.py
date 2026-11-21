@@ -39,6 +39,7 @@ FUSED_ELEM = [True]   # bf16 CUDA activations: the RMSNorm and the SwiGLU in one
 ATTN_FP8 = [False]    # --attn-fp8 (fp8attn.py)
 FUSE_PROJ = [""]      # --fuse-proj split | shared: q/k/v and gate/up each one ternary layer ("" off)
 HEAD_ALL = [False]    # --head-fused: headloss.TrainHeadAll (the head's backward in the forward; fp32 weight-gradient sum)
+FUSE_RES = [False]    # --fuse-res: the residual add in the sublayer's last ternary GEMM, its gradient in the norm's backward
 FUSED_HEAD = [True]   # training, no teacher, bf16 CUDA: headloss.TrainHeadCE per loss chunk (else the checkpointed autograd chunk)
 
 
@@ -108,7 +109,7 @@ class Attention(nn.Module):
             self.wv = make_linear(c.dim, self.n_kv * self.head_dim)
         self.wo = make_linear(self.n_heads * self.head_dim, c.dim)
 
-    def forward(self, x, freqs_cis):
+    def forward(self, x, freqs_cis, res=None):
         B, T, _ = x.shape
         if hasattr(self, "wqkv"):
             q, k, v = self.wqkv(x).split(self.wqkv.row_blocks, dim=-1)
@@ -133,7 +134,7 @@ class Attention(nn.Module):
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.wo(out)
+        return self.wo(out) if res is None else self.wo(out, acc=res)
 
 
 class FeedForward(nn.Module):
@@ -147,11 +148,12 @@ class FeedForward(nn.Module):
             self.w_up = make_linear(c.dim, c.hidden_dim)
         self.w_down = make_linear(c.hidden_dim, c.dim)
 
-    def forward(self, x):
+    def forward(self, x, res=None):
+        kw = {} if res is None else {"acc": res}
         if hasattr(self, "w_gu"):
             g_, u_ = self.w_gu(x).chunk(2, dim=-1)
-            return self.w_down(_FN["swiglu"](g_.contiguous(), u_.contiguous()))
-        return self.w_down(_FN["swiglu"](self.w_gate(x), self.w_up(x)))
+            return self.w_down(_FN["swiglu"](g_.contiguous(), u_.contiguous()), **kw)
+        return self.w_down(_FN["swiglu"](self.w_gate(x), self.w_up(x)), **kw)
 
 
 class MoEFeedForward(nn.Module):
@@ -223,7 +225,25 @@ class Block(nn.Module):
     def _ffn(self, x):
         return self.ffn(self.ffn_norm(x))
 
+    def _fres(self, x):
+        """--fuse-res applies: fused elementwise kernels, ternary last layers that take the residual (acc), dense FFN"""
+        return (FUSE_RES[0] and _fused(x) and getattr(self.attn.wo, "takes_acc", False)
+                and isinstance(self.ffn, FeedForward) and getattr(self.ffn.w_down, "takes_acc", False)
+                and getattr(self.attn_norm, "eps", None) is not None)
+
+    def _attn_r(self, x, freqs_cis):   # x + attn(norm(x)), the add in wo's epilogue
+        from .kernel import res_norm
+        xr, n = res_norm(x, self.attn_norm.weight, self.attn_norm.eps)
+        return self.attn(n, freqs_cis, res=xr)
+
+    def _ffn_r(self, x):
+        from .kernel import res_norm
+        xr, n = res_norm(x, self.ffn_norm.weight, self.ffn_norm.eps)
+        return self.ffn(n, res=xr)
+
     def _block(self, x, freqs_cis):
+        if self._fres(x):
+            return self._ffn_r(self._attn_r(x, freqs_cis))
         x = x + self._attn(x, freqs_cis)
         return x + self._ffn(x)
 
@@ -238,9 +258,14 @@ class Block(nn.Module):
             # checkpoints, for a larger recompute (attention + MLP of one block at once); for the ternary kernels,
             # which never build a dense weight
             x = checkpoint(self._block, x, freqs_cis, use_reentrant=False)
+        elif ckpt and self._fres(x):
+            x = checkpoint(self._attn_r, x, freqs_cis, use_reentrant=False)
+            x = checkpoint(self._ffn_r, x, use_reentrant=False)
         elif ckpt:
             x = x + checkpoint(self._attn, x, freqs_cis, use_reentrant=False)
             x = x + checkpoint(self._ffn, x, use_reentrant=False)
+        elif self._fres(x):
+            x = self._ffn_r(self._attn_r(x, freqs_cis))
         else:
             x = x + self._attn(x, freqs_cis)
             x = x + self._ffn(x)

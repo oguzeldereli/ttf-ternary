@@ -113,6 +113,13 @@ def build_parser():
                    "the accumulator's projections) on the int8 tensor cores from the layer's own int8 factors (x's codes, "
                    "gy's int8 slice; --dx int8 / int8x2), the thin operands in int8 with per-column / per-128-token "
                    "scales (i8upd; 20 Nov: 2-2.7x the bf16 products' speed, 8-bit rounding of the thin operands)")
+    g.add_argument("--ttf-batch-update", action=ON, default=False, help="--ttf-dense-g: each layer's dense g kept "
+                   "through the backward, then v, the basis turn (u never formed), the orth (batched Cholesky QR) and "
+                   "the firing per group of layers of one shape (fewer, larger kernels; the same update up to rounding)")
+    g.add_argument("--ttf-batch-n", type=int, default=12, help="--ttf-batch-update: layers per batched group (a group "
+                   "runs inside the backward once this many of one shape are queued)")
+    g.add_argument("--ttf-batch-bf16", action=ON, default=False, help="--ttf-batch-update: the turn's products of g with "
+                   "the bases on the bf16 tensor cores (fp32 sums; g is an int8 product)")
     g.add_argument("--ttf-side-stream", action=ON, default=False, help="each layer's TTF update on a second CUDA "
                    "stream, overlapping the rest of the backward (same kernels, same order per stream: the same "
                    "result); the main stream waits for it after the backward")
@@ -209,6 +216,8 @@ def build_parser():
                    "accumulator per sub-layer (needs --ttf-dense-g), shared one for the group (rank of the group's min(N, K))")
     g.add_argument("--attn-fp8", action=ON, default=False, help="training attention's forward on FP8 tensor cores "
                    "(e4m3, per-tile scales; fp8attn.py), the backward aten's bf16 flash backward at that output")
+    g.add_argument("--fuse-res", action="store_true", help="the residual add of each sublayer in its last ternary layer's "
+                   "GEMM epilogue, and its gradient added inside the norm's backward kernel (bit-identical; fused kernels)")
     g.add_argument("--mag-fused", action="store_true", help="the float adapter inside the fused ternary kernels: h = "
                    "xs (xq B) from the int8 codes, a = h A^T in the GEMM's epilogue, gh in the row pass, gh B^T in dx2_col, "
                    "and its gradients G B / beta, G^T A / beta from the dense TTF gradient (needs --ttf-dense-g "

@@ -1082,10 +1082,19 @@ def _rms_fwd_kernel(x_ptr, w_ptr, y_ptr, r_ptr, K, sx, sy, eps, BK: tl.constexpr
 
 
 @triton.jit
+def _rbf_(x):
+    """(_rbf, defined before its first user here) fp32 -> the nearest bf16 (ties to even), as fp32"""
+    b = x.to(tl.uint32, bitcast=True)
+    b = (b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF0000
+    return b.to(tl.float32, bitcast=True)
+
+
+@triton.jit
 def _rms_bwd_kernel(x_ptr, w_ptr, g_ptr, r_ptr, gx_ptr, gw_ptr, M, K, sx, sg, sgx, RPB: tl.constexpr, BK: tl.constexpr,
-                    OFF: tl.constexpr = 1.0):
+                    OFF: tl.constexpr = 1.0, res_ptr=None, HAS_RES: tl.constexpr = False):
     """RPB rows per program: gx = rstd (g' - xh mean(g' xh)), g' = g (OFF + w), xh = x rstd; the gain's gradient
-    sum(g xh) over the program's rows, written per program (summed afterwards: deterministic)"""
+    sum(g xh) over the program's rows, written per program (summed afterwards: deterministic). HAS_RES (--fuse-res):
+    gx = bf16(res + bf16(gx)), the residual stream's gradient added as autograd's sum of the two would"""
     pid = tl.program_id(0)
     k = tl.arange(0, BK); m = k < K
     w1 = OFF + tl.load(w_ptr + k, mask=m, other=0.0).to(tl.float32)
@@ -1099,7 +1108,11 @@ def _rms_bwd_kernel(x_ptr, w_ptr, g_ptr, r_ptr, gx_ptr, gw_ptr, M, K, sx, sg, sg
             xh = x * rstd
             gp = g * w1
             c = tl.sum(gp * xh, axis=0) / K
-            tl.store(gx_ptr + row * sgx + k, (rstd * (gp - xh * c)).to(gx_ptr.dtype.element_ty), mask=m)
+            if HAS_RES:
+                v = _rbf_(rstd * (gp - xh * c)) + tl.load(res_ptr + row * sgx + k, mask=m, other=0.0).to(tl.float32)
+                tl.store(gx_ptr + row * sgx + k, v.to(gx_ptr.dtype.element_ty), mask=m)
+            else:
+                tl.store(gx_ptr + row * sgx + k, (rstd * (gp - xh * c)).to(gx_ptr.dtype.element_ty), mask=m)
             gw += g * xh
     tl.store(gw_ptr + pid * K + k, gw, mask=m)
 
@@ -1124,6 +1137,38 @@ class RMSNormFn(torch.autograd.Function):
         _rms_bwd_kernel[(nb,)](x2, w, g2, r, gx, gw, M, K, x2.stride(0), g2.stride(0), gx.stride(0), RPB=RPB, BK=BK,
                                OFF=ctx.off)
         return gx.view(ctx.sh), gw.sum(0).to(w.dtype), None, None
+
+
+class ResNormFn(torch.autograd.Function):
+    """--fuse-res: (x, rmsnorm(x) w) from x: the residual stream passed on (its consumer, the sublayer's last ternary
+    layer, adds it in its GEMM epilogue) and the normed input; the backward adds the residual's gradient inside the norm's
+    backward kernel (no separate add of the two gradients). Bit-identical to x + f(norm(x))"""
+    @staticmethod
+    def forward(ctx, x, w, eps):
+        sh = x.shape; x2 = x.reshape(-1, sh[-1]).contiguous(); M, K = x2.shape
+        y = torch.empty_like(x2); r = torch.empty(M, dtype=torch.float32, device=x.device)
+        BK = triton.next_power_of_2(K)
+        _rms_fwd_kernel[(M,)](x2, w, y, r, K, x2.stride(0), y.stride(0), float(eps), BK=BK, OFF=0.0)
+        ctx.save_for_backward(x2, w, r); ctx.sh = sh
+        return x.view_as(x), y.view(sh)
+
+    @staticmethod
+    def backward(ctx, gres, g):
+        x2, w, r = ctx.saved_tensors; M, K = x2.shape
+        gx = torch.empty_like(x2)
+        RPB = 16; nb = triton.cdiv(M, RPB); BK = triton.next_power_of_2(K)
+        gw = torch.empty(nb, K, dtype=torch.float32, device=x2.device)
+        if g is None:
+            return gres, None, None
+        g2 = g.reshape(M, K).contiguous()
+        rk = dict(res_ptr=gres.reshape(M, K).contiguous(), HAS_RES=True) if gres is not None else {}
+        _rms_bwd_kernel[(nb,)](x2, w, g2, r, gx, gw, M, K, x2.stride(0), g2.stride(0), gx.stride(0), RPB=RPB, BK=BK,
+                               OFF=0.0, **rk)
+        return gx.view(ctx.sh), gw.sum(0).to(w.dtype), None
+
+
+def res_norm(x, w, eps):
+    return ResNormFn.apply(x, w, eps)
 
 
 def rms_norm_qwen(x, w, eps):

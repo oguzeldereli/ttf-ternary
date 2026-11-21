@@ -360,6 +360,7 @@ class _FusedTernFn(torch.autograd.Function):
 class KernelTernaryLinear(nn.Module):
     """Pure-ternary linear, forward on the Triton packed-ternary GEMM (weights
     stay packed, never materialized dense). Row-packed 5-trits/byte along K."""
+    takes_acc = True   # forward(x, acc): acc added to the output (in the fused GEMM's epilogue)
     def __init__(self, in_features, out_features, act_bits: int = 8, beta: bool = False):
         super().__init__()
         self.use_beta = beta      # scale output by 1/sqrt(K*rho); False = legacy raw trits

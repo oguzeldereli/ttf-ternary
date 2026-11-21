@@ -547,6 +547,112 @@ def remove_grad_hook(fn):
         GRAD_HOOKS.remove(fn)
 
 
+BATCH = [False]   # --ttf-batch-update
+BATCH_N = [12]    # --ttf-batch-update N: a group's update runs once N layers of one shape are queued
+BATCH_BF16 = [False]   # --ttf-batch-bf16: the turn's two big products (g with the bases) on the bf16 tensor cores
+BATCHQ = {}       # the deferred (layer, dense g, state, settings) of this backward, by group key
+
+
+def _bkey(l, state, c):
+    ra = min(getattr(l, "ts_rank", None) or c["r"], l.N, l.K)
+    return (l.N, l.K, ra, c["lr_ratio"], c["tau"], c["b2"], id(state), c.get("store_a", ""))
+
+
+def _batchable(l, g, state, c):
+    """the one-batch dense path with its fused kernels, a layer with state already (not its first update), nothing
+    that needs the per-layer path (micro-batches, offload, int-k codes, flip tracking, held basis, frozen start, --pipe)"""
+    if not (g.is_cuda and g.dtype == torch.float32 and FAST1[0] and FIRE_FUSED[0] and DEFER[0] is None):
+        return False
+    if int(c.get("micro") or 1) > 1 or c.get("vdiag") or c.get("offload") or c.get("band") or c.get("hspend"):
+        return False
+    if getattr(l, "codes", None) is not None or not hasattr(l, "_after_fire") or getattr(l, "track", False):
+        return False
+    if TURN_EVERY[0] > 1 or (c.get("start") and c.get("step", 0) < c["start"]):
+        return False
+    key = id(l)
+    return key in state and not is_dense_state(state[key])
+
+
+def _borth(X):
+    """orthonormal bases of a batch of tall X [B, K, r]: two Cholesky QR passes (the first shifted by 1e-7 ||G||_F), the
+    Gram and the triangular solve in full fp32 (torch batched Cholesky / trsm); only the span matters to TTF"""
+    tf = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        Y = X
+        for p in range(2):
+            G = Y.transpose(1, 2) @ Y
+            if p == 0:
+                G.diagonal(dim1=1, dim2=2).add_(1e-7 * torch.linalg.matrix_norm(G).reshape(-1, 1))
+            L, _ = torch.linalg.cholesky_ex(G)
+            Y = torch.linalg.solve_triangular(L, Y.transpose(1, 2), upper=False).transpose(1, 2)
+        return Y
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf
+
+
+def ts_flush():
+    """--ttf-batch-update: the deferred layers' updates, grouped by shape and settings: v, then the basis turn on the
+    whole group at once (u = -lr a_i g_ij b_j with 1 / sqrt(v) = a_i b_j, never formed: u^T U = -lr b (g^T (a U)),
+    u V' = -lr a (g (b V'))), the batched orth, then each layer's fused firing and spend. The same update as ts_layer's
+    dense path up to rounding (and its eps 1e-8 in u, below any v that occurs)"""
+    groups = list(BATCHQ.values())
+    BATCHQ.clear()
+    with _rf("ttf.batch"):
+        for its in groups:
+            _flush_group(its)
+
+
+def _flush_group(its):
+    from .kernel import sq_sums, ttf_fire
+    l0, g0, state, c0 = its[0]
+    lr_ratio, tau, b2 = c0["lr_ratio"], c0["tau"], c0["b2"]
+    lk = 1 - 1 / tau
+    st = state.setdefault("_ts", {})
+    dev = g0.device
+    sa = _store_codec(c0.get("store_a", ""))
+    a_, b_, Us, Vs = [], [], [], []
+    for l, g, _, c in its:
+        key = id(l); t = _micro_t(l, st, key, 1, c)
+        _rsq, _csq = sq_sums(g)
+        if ("v", key) in st:
+            R, C = _host_get(st, ("v", key), dev, False); R = b2 * R + (1 - b2) * (_rsq / l.K); C = b2 * C + (1 - b2) * (_csq / l.N)
+        else:
+            R, C = (1 - b2) * (_rsq / l.K), (1 - b2) * (_csq / l.N)
+        _host_put(st, ("v", key), (R, C), False)
+        m = R.mean().clamp_min(1e-30)
+        a_.append((m / R.clamp_min(1e-30)).sqrt()); b_.append((C / (1 - b2 ** t)).clamp_min(1e-30).rsqrt())
+        U, V = _load_pair(_host_get(state, key, dev, False))
+        Us.append(U); Vs.append(V)
+    lp = torch.bfloat16 if BATCH_BF16[0] else torch.float32   # (g is an int8 product: bf16 keeps what it has)
+    G = torch.empty((len(its),) + tuple(g0.shape), dtype=lp, device=dev)
+    for i, it in enumerate(its):
+        G[i].copy_(it[1])
+    its = [(l, None, s_, c) for l, _, s_, c in its]     # (the per-layer g freed)
+    A = torch.stack(a_)[:, :, None]; Bc = torch.stack(b_)[:, :, None]
+    U = torch.stack(Us).float().mul_(lk); V = torch.stack(Vs).float()
+    del Us, Vs, a_, b_
+    P = torch.bmm(G.transpose(1, 2), (A * U).to(lp), out_dtype=torch.float32) if lp != torch.float32 else \
+        torch.bmm(G.transpose(1, 2), A * U)
+    X = torch.baddbmm(P.mul_(Bc).mul_(-lr_ratio), V, torch.bmm(U.transpose(1, 2), U))
+    del P
+    Vn = _borth(X)
+    del X
+    Q = torch.bmm(G, (Bc * Vn).to(lp), out_dtype=torch.float32) if lp != torch.float32 else torch.bmm(G, Bc * Vn)
+    U = torch.baddbmm(Q.mul_(A).mul_(-lr_ratio), U, torch.bmm(V.transpose(1, 2), Vn))
+    del G, V, Q
+    for i, (l, g, _, c) in enumerate(its):
+        key = id(l)
+        th_ = _dv(c, "theta", c["theta"])
+        Ui, Vi = U[i], Vn[i]
+        DV, nf, dnnz = ttf_fire(Ui, Vi, l.wpacked, l.K, th_)
+        DV = _dpm(DV)
+        l._after_fire(dnnz)
+        Ui = Ui - c["spend"] * (th_ * DV); del DV
+        _host_put(state, key, _store_pair(sa, Ui, Vi.clone()) if sa else (Ui, Vi.clone()), False)
+        st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
+
+
 def _mag_grads(l, g):
     """--mag-fused: the float adapter a = (xs B) A^T's gradients from the dense TTF gradient G = sum_t gy_t x_t^T
     (gy = bf16(g r) beta, x the int8 codes x row scale): dA = sum_t gt_t h_t^T = G B / beta, dB = sum_t x_t gh_t^T =
@@ -597,6 +703,13 @@ def ts_layer(l, g, state, c):
             return
     if not torch.is_tensor(g):           # --dw factored: the backward passed (gy, x) instead of the dense gradient
         return _ts_layer_factored(l, g, state, c)
+    if BATCH[0] and _batchable(l, g, state, c):   # --ttf-batch-update: this layer's turn, orth and firing batched with
+        k_ = _bkey(l, state, c)                     # the next layers of its shape: a group runs once BATCH_N are queued
+        BATCHQ.setdefault(k_, []).append((l, g, state, c))   # (inside the backward, overlapping it), the rest after it
+        if len(BATCHQ[k_]) >= BATCH_N[0]:
+            with _rf("ttf.batch"):
+                _flush_group(BATCHQ.pop(k_))
+        return
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
     r = getattr(l, "ts_rank", None) or r   # a layer's own accumulator rank (set by a plug-in, e.g. thin adapter factors)
     M_ = int(c.get("micro") or 1)   # --accum M: the accumulator takes every micro-batch's u
