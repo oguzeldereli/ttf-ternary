@@ -817,7 +817,7 @@ def main():
         from .master import MasterTernaryLinear
         for m in model.modules():
             if isinstance(m, (KernelTernaryLinear, MasterTernaryLinear)):
-                newp += m.enable_lowrank_mag(kind, int(r))
+                newp += m.enable_lowrank_mag(kind, int(r) * len(getattr(m, "row_blocks", None) or [0]))   # (--fuse-proj: the fused layer's adapter has the parts' summed rank)
         if not newp:        # --mode fp32: no ternary layers to adapt (an empty group would break a later resume)
             mag_on[0] = True
             return
