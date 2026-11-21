@@ -36,6 +36,9 @@ FUSED_ELEM = [True]   # bf16 CUDA activations: the RMSNorm and the SwiGLU in one
                       # the CPU / fp32 path and the tests' reference)
 
 
+ATTN_FP8 = [False]    # --attn-fp8 (fp8attn.py)
+FUSE_PROJ = [""]      # --fuse-proj split | shared: q/k/v and gate/up each one ternary layer ("" off)
+HEAD_ALL = [False]    # --head-fused: headloss.TrainHeadAll (the head's backward in the forward; fp32 weight-gradient sum)
 FUSED_HEAD = [True]   # training, no teacher, bf16 CUDA: headloss.TrainHeadCE per loss chunk (else the checkpointed autograd chunk)
 
 
@@ -96,16 +99,26 @@ class Attention(nn.Module):
         self.n_kv = c.n_kv_heads
         self.head_dim = c.dim // c.n_heads
         self.rep = self.n_heads // self.n_kv
-        self.wq = make_linear(c.dim, self.n_heads * self.head_dim)
-        self.wk = make_linear(c.dim, self.n_kv * self.head_dim)
-        self.wv = make_linear(c.dim, self.n_kv * self.head_dim)
+        if FUSE_PROJ[0]:   # --fuse-proj: q, k, v as one [Nq + 2 Nkv, dim] layer (one prologue, GEMM, dx; shared column scale)
+            self.wqkv = make_linear(c.dim, (self.n_heads + 2 * self.n_kv) * self.head_dim)
+            self.wqkv.row_blocks = [self.n_heads * self.head_dim, self.n_kv * self.head_dim, self.n_kv * self.head_dim]
+        else:
+            self.wq = make_linear(c.dim, self.n_heads * self.head_dim)
+            self.wk = make_linear(c.dim, self.n_kv * self.head_dim)
+            self.wv = make_linear(c.dim, self.n_kv * self.head_dim)
         self.wo = make_linear(self.n_heads * self.head_dim, c.dim)
 
     def forward(self, x, freqs_cis):
         B, T, _ = x.shape
-        q = self.wq(x).view(B, T, self.n_heads, self.head_dim)
-        k = self.wk(x).view(B, T, self.n_kv, self.head_dim)
-        v = self.wv(x).view(B, T, self.n_kv, self.head_dim)
+        if hasattr(self, "wqkv"):
+            q, k, v = self.wqkv(x).split(self.wqkv.row_blocks, dim=-1)
+            q = q.reshape(B, T, self.n_heads, self.head_dim)
+            k = k.reshape(B, T, self.n_kv, self.head_dim)
+            v = v.reshape(B, T, self.n_kv, self.head_dim)
+        else:
+            q = self.wq(x).view(B, T, self.n_heads, self.head_dim)
+            k = self.wk(x).view(B, T, self.n_kv, self.head_dim)
+            v = self.wv(x).view(B, T, self.n_kv, self.head_dim)
         if getattr(self, "qk_logscale", None) is not None:
             # learnable per-head temperature (--qk-temp): logits scale by exp(s_h)
             q = q * self.qk_logscale.exp().view(1, 1, -1, 1).to(q.dtype)
@@ -114,7 +127,11 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.rep, dim=2)
             v = v.repeat_interleave(self.rep, dim=2)
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))  # [B,H,T,hd]
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if ATTN_FP8[0] and q.is_cuda and q.dtype == torch.bfloat16 and torch.is_grad_enabled():
+            from .fp8attn import attention as _fa8      # --attn-fp8: the forward on FP8 tensor cores
+            out = _fa8(q, k, v)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -122,11 +139,18 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, c: ModelConfig, make_linear):
         super().__init__()
-        self.w_gate = make_linear(c.dim, c.hidden_dim)
-        self.w_up = make_linear(c.dim, c.hidden_dim)
+        if FUSE_PROJ[0]:   # --fuse-proj: gate and up as one [2 hidden, dim] layer
+            self.w_gu = make_linear(c.dim, 2 * c.hidden_dim)
+            self.w_gu.row_blocks = [c.hidden_dim, c.hidden_dim]
+        else:
+            self.w_gate = make_linear(c.dim, c.hidden_dim)
+            self.w_up = make_linear(c.dim, c.hidden_dim)
         self.w_down = make_linear(c.hidden_dim, c.dim)
 
     def forward(self, x):
+        if hasattr(self, "w_gu"):
+            g_, u_ = self.w_gu(x).chunk(2, dim=-1)
+            return self.w_down(_FN["swiglu"](g_.contiguous(), u_.contiguous()))
         return self.w_down(_FN["swiglu"](self.w_gate(x), self.w_up(x)))
 
 
@@ -311,7 +335,11 @@ class BitTransformer(nn.Module):
         n = self.loss_chunk
         total = hf.new_zeros((), dtype=torch.float32)
         kd = self.kd_logp
-        if kd is None and self.training and FUSED_HEAD[0] and hf.is_cuda and hf.dtype == torch.bfloat16:
+        if (kd is None and self.training and FUSED_HEAD[0] and HEAD_ALL[0] and hf.is_cuda and hf.dtype == torch.bfloat16
+                and torch.is_grad_enabled()):
+            from .headloss import TrainHeadAll     # (--head-fused: the head's backward GEMMs in the forward, no dz kept)
+            total = TrainHeadAll.apply(hf, w, tf, n)
+        elif kd is None and self.training and FUSED_HEAD[0] and hf.is_cuda and hf.dtype == torch.bfloat16:
             from .headloss import TrainHeadCE      # (the head GEMM once per chunk, the softmax's gradient formed with the loss)
             wb = w.to(hf.dtype)
             for i in range(0, hf.shape[0], n):

@@ -70,6 +70,7 @@ class _AddRowFn(torch.autograd.Function):
 
 FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
 ACT_GROUP = [0]    # --act-group G: --act-bits codes with one scale per G input columns (fake-quant study)
+SAVE_LEAN = [0]    # --save-lean S: the fused layer keeps no bf16 input and its pre-row-scale output t on 1 / S of the tokens
 UPD_I8 = [False]   # --ttf-upd-i8: the factored TTF update's products from the int8 factors (i8upd), where gy's int8 slice exists
 DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices (int8: one)
 GRAD_BITS = [0]                # --grad-bits b: gy (the gradient entering each ternary product) in b-bit integers, below
@@ -245,6 +246,14 @@ class _FusedTernFn(torch.autograd.Function):
             o, sv = _fused_fwd(layer, x2, acc2, True)
         xq, xs, xc, t, cb, rb, beta = sv[:7]
         ctx.has_mag = mA is not None
+        ctx.lean = bool(SAVE_LEAN[0] and mA is None and DX_MODE[0] in ("int8", "int8x2") and not GRAD_BITS[0]
+                        and getattr(layer, "in_mean", None) is None)
+        if ctx.lean:   # --save-lean: no bf16 input kept (the column-scale gradient from xq xs / c), t on 1 / SAVE_LEAN
+            tm_ = max(1, t.shape[0] // SAVE_LEAN[0])     # of the tokens (the row-scale gradient's sum x SAVE_LEAN)
+            if tm_ < t.shape[0]:
+                t = t[:tm_].clone()
+            xc = xs
+            ctx.t_rows = tm_ if tm_ < t.shape[0] or SAVE_LEAN[0] > 1 else None
         if ctx.has_mag:
             ctx.mdt = (mA.dtype, mB.dtype)
         ctx.mu_b = (layer.in_mean.to(torch.bfloat16) if getattr(layer, "in_mean", None) is not None
@@ -267,18 +276,21 @@ class _FusedTernFn(torch.autograd.Function):
         # --ttf-upd-i8: the update reads gy through its int8 slice q1, so the bf16 gy is not written (formed on demand)
         skip_f = bool(UPD_I8[0] and sl and not GRAD_BITS[0] and not ctx.has_mag and l.capture
                       and getattr(l, "on_grad", None) is not None)
+        wq1t = bool(UPD_I8[0] and sl and not GRAD_BITS[0] and l.capture and getattr(l, "on_grad", None) is not None)
         with _rf("tern.dx"):
             lr = None
             if ctx.has_mag and sl:   # the float adapter a = (xs B) A^T: gh = bf16(g r) A from the row pass, its input
                 xo, h, Ab, Bb = sv[6:]   # gradient gh B^T formed inside the dx kernel (no [M, K] round trip)
-                f, q1, q2, s, gbias, grow, gt, gh = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=True, a_b=Ab)
+                f, q1, q2, s, gbias, grow, gt, gh = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=True, a_b=Ab,
+                                                                      save_q1t=wq1t)
                 gA = torch.mm(h.t(), gt).t().to(ctx.mdt[0])
                 gB = torch.mm(xo.t(), gh).to(ctx.mdt[1])
                 lr = (gh, Bb)
                 del gt
             else:
                 f, q1, q2, s, gbias, grow, *gt = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=ctx.has_mag,
-                                                                   save_f=not skip_f)
+                                                                   save_f=not skip_f, save_q1t=wq1t,
+                                                                   t_rows=ctx.t_rows if ctx.lean else None)
             if GRAD_BITS[0]:   # --grad-bits: f (the gradient entering the ternary product) quantized; the float adapter's
                 q1, s, f = grad_quant(f, GRAD_BITS[0], GRAD_GROUP[0])   # own gradients (gt, gh) stay bf16
                 q2 = None
@@ -295,8 +307,13 @@ class _FusedTernFn(torch.autograd.Function):
             F8 = None
             if UPD_I8[0] and q1 is not None and not GRAD_BITS[0] and l.capture and getattr(l, "on_grad", None) is not None:
                 from .i8upd import I8Factors
-                F8 = I8Factors(q1, s, xq, xs, (lambda: _K.bwd_gyf(g2, rb, bb)) if skip_f else None)
-            if sl and q1 is not None:
+                F8 = I8Factors(q1, s, xq, xs, (lambda: _K.bwd_gyf(g2, rb, bb)) if skip_f else None,
+                               q1t=_K.LAST_Q1T[0] if wq1t else None)
+            _K.LAST_Q1T[0] = None
+            if sl and q1 is not None and ctx.lean:
+                gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xq, None, None, lr, xs=xs)
+                del q1, q2
+            elif sl and q1 is not None:
                 gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xc, ctx.mu_b, None, lr)
                 del q1, q2
             else:

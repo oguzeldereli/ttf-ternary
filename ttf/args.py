@@ -57,6 +57,8 @@ def build_parser():
 
     g = ap.add_argument_group("float extras of the ternary layers")
     g.add_argument("--rc-scale", action=ON, default=True, help="per-row and per-column scales (W = beta r_i c_j q_ij)")
+    g.add_argument("--lin-scales", default="rc", choices=["rc", "none"], help="the ternary linear layers' row / "
+                   "column scales trained (rc) or held at 1 (none: W = beta T; the fused kernels still run)")
     g.add_argument("--rc-lr", type=float, default=0.0, help="constant lr of the scales (0: the schedule's)")
     g.add_argument("--qk-temp", action=ON, default=True, help="learnable per-head attention temperature")
     g.add_argument("--adapter-rank", type=int, default=16, help="rank of the float adapter A B^T beside the trits (0: none)")
@@ -107,9 +109,17 @@ def build_parser():
                    "the accumulator's projections) on the int8 tensor cores from the layer's own int8 factors (x's codes, "
                    "gy's int8 slice; --dx int8 / int8x2), the thin operands in int8 with per-column / per-128-token "
                    "scales (i8upd; 20 Nov: 2-2.7x the bf16 products' speed, 8-bit rounding of the thin operands)")
+    g.add_argument("--ttf-dense-g", action=ON, default=False, help="--dw factored: the update from the dense gradient "
+                   "g = gy^T x, formed per layer (one int8 GEMM from the layer's int8 factors with --ttf-upd-i8, else one "
+                   "bf16 GEMM; a transient fp32 [N, K]) instead of the factored products: exact row / column sums of g^2 "
+                   "(no sketch); cheaper than the factored products from rank ratio ~0.25 up")
+    g.add_argument("--ttf-upd-tokens", type=float, default=1.0, help="--ttf-dense-g: the update's gradient from this "
+                   "share of each step's tokens (x 1 / share; the input gradient keeps all)")
+    g.add_argument("--ttf-turn-every", type=int, default=1, help="the accumulator's basis turns on every m-th update "
+                   "(one batch per step) and is held between (U += u V; no orthonormalisation)")
     g.add_argument("--ttf-step-fp32", action=ON, default=False, help="--accum M > 1: keep U in fp32 between a step's "
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
-    g.add_argument("--ttf-orth", default="auto", choices=["auto", "qr", "spanqr"],
+    g.add_argument("--ttf-orth", default="auto", choices=["auto", "qr", "spanqr", "c2"],
                    help="the accumulator basis' orthonormalisation: auto (default: spanqr when the package imports and "
                         "the run is on CUDA, else qr), Householder QR, or spanqr (the spanqr package on PYTHONPATH, github.com/oguzeldereli/spanqr; any "
                         "rank, padded to its widths; 110M 1.41 -> 1.37 s/step)")
@@ -187,6 +197,17 @@ def build_parser():
                         "kernel, the GEMM's epilogue with the row scale, bias and the sum of a converted layer's parts, "
                         "the backward's elementwise work in two kernels (output, input gradient and the TTF factors "
                         "bit-identical; the scale / bias gradients summed in fp32)")
+    g.add_argument("--fuse-proj", default="", choices=["", "split", "shared"], help="q/k/v and gate/up each as one "
+                   "ternary layer (one prologue, GEMM and input-gradient GEMM per group; one column scale): split keeps an "
+                   "accumulator per sub-layer (needs --ttf-dense-g), shared one for the group (rank of the group's min(N, K))")
+    g.add_argument("--attn-fp8", action=ON, default=False, help="training attention's forward on FP8 tensor cores "
+                   "(e4m3, per-tile scales; fp8attn.py), the backward aten's bf16 flash backward at that output")
+    g.add_argument("--save-lean", type=int, default=0, help="S > 0: the fused ternary layer saves no bf16 copy of its "
+                   "input (the column-scale gradient from the int8 codes, x = xq xs / c) and its pre-row-scale output on "
+                   "the first 1 / S of the tokens (the row-scale gradient's sum x S): less activation memory, less recompute")
+    g.add_argument("--head-fused", action=ON, default=False, help="the from-scratch head's backward GEMMs done in its "
+                   "forward (dh and the weight gradient kept, the [tokens, vocab] logits gradient not: 110M -2.1 GB), the "
+                   "weight gradient summed over the loss chunks in fp32 (was bf16)")
     g.add_argument("--cuda-graph", action=ON, default=False,
                    help="each step's micro-batches (forward, backward, the TTF updates inside it) as CUDA graphs: the "
                         "first, a middle and the last micro-batch are captured once per step and the middle one is "
@@ -235,6 +256,8 @@ def build_parser():
     g.add_argument("--kd-cache-start", type=int, default=0, help="the step that reads the cache's window 0")
     g.add_argument("--moe", default="", help="E:K[:H]: mixture of E ternary experts, top-K routing")
     g.add_argument("--moe-aux", type=float, default=0.01, help="load-balancing loss weight")
+    g.add_argument("--tern-emb-scales", default="rc", choices=["rc", "r", "none"], help="--tern-emb: its learned "
+                   "per-row and per-column scales (rc), per-row only (r), or none (all 1: W = s0 T)")
     g.add_argument("--tern-emb", default="none", help="none | tied | untied | tied_wide[:M]: ternary token embedding")
 
     g = ap.add_argument_group("evaluation, checkpoints, diagnostics")

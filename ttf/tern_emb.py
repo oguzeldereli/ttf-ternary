@@ -119,6 +119,13 @@ def tern_emb_layers(model):
     return [m for m in model.modules() if isinstance(m, TernEmbed)]
 
 
+def set_scales(model, which: str):
+    """--tern-emb-scales rc | r | none: which of the ternary embedding's learned scales train (the rest stay 1)"""
+    for m in tern_emb_layers(model):
+        m.row_scale.requires_grad_(which in ("rc", "r"))
+        m.col_scale.requires_grad_(which == "rc")
+
+
 def enable_tern_emb(model, kind: str, mode: str):
     """replace the float token embedding by a TernEmbed; `untied`: a second one as the output head"""
     V, d = model.tok_emb.weight.shape

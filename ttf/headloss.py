@@ -266,3 +266,37 @@ class TrainHeadCE(torch.autograd.Function):
         dh = torch.mm(dz, wb, out_dtype=torch.float32).mul_(gs).to(h.dtype)
         dw = torch.mm(dz.t(), h, out_dtype=torch.float32).mul_(gs).to(wb.dtype)
         return dh, dw, None
+
+
+class TrainHeadAll(torch.autograd.Function):
+    """--head-fused (21 Nov): the from-scratch model's whole chunked head + cross-entropy as one Function, the
+    backward's GEMMs done in the forward. Per chunk: z = bf16(h W^T), the loss and dz in z's memory (kernel.ce_rows_),
+    then at once dh_c = dz W (fp32, kept: n x d) and dW += dz^T h (one fp32 [V, d] buffer for all chunks), and dz is freed.
+    The backward only scales: dh = bf16(dh32 g), dW = dW32 g (all chunks share g: the loss is their sum over a count).
+    Against TrainHeadCE: no 16 x [n, V] bf16 dz held from the forward to the backward (110M: 2.1 GB), the head's
+    weight gradient summed in fp32 instead of 16 bf16 additions, and it is the fp32 weight's own gradient (no bf16
+    copy, no cast back). dh is TrainHeadCE's to the bit; dW differs by the fp32 sum (more exact)."""
+    @staticmethod
+    def forward(ctx, hf, w, tgt, n):
+        from .kernel import ce_rows_
+        wb = w.to(hf.dtype)
+        T = hf.shape[0]
+        dh = torch.empty(T, hf.shape[1], dtype=torch.float32, device=hf.device)
+        dw = torch.zeros(w.shape, dtype=torch.float32, device=hf.device)
+        total = torch.zeros((), dtype=torch.float32, device=hf.device)
+        for i in range(0, T, n):
+            hc = hf[i:i + n]
+            z = torch.mm(hc, wb.t())
+            total = total + ce_rows_(z, tgt[i:i + n]).sum()
+            dh[i:i + n] = torch.mm(z, wb, out_dtype=torch.float32)
+            dw.add_(torch.mm(z.t(), hc, out_dtype=torch.float32))
+            del z
+        ctx.save_for_backward(dh, dw)
+        ctx.hdt = hf.dtype
+        return total
+
+    @staticmethod
+    def backward(ctx, g):
+        dh, dw = ctx.saved_tensors
+        gs = g.to(torch.float32)
+        return dh.mul_(gs).to(ctx.hdt), dw.mul_(gs), None, None

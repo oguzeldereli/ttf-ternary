@@ -1618,7 +1618,7 @@ def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t, pre=None):
 def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, pb_ptr, pr_ptr, gt_ptr, M, N,
                      SLICES: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, SAVE_GT: tl.constexpr = False,
                      a_ptr=None, gh_ptr=None, R=0, RA: tl.constexpr = 16, HAS_GH: tl.constexpr = False,
-                     SAVE_F: tl.constexpr = True):
+                     SAVE_F: tl.constexpr = True, q1t_ptr=None, SAVE_Q1T: tl.constexpr = False, TM=-1):
     """from the output gradient g [M, N]: gyf = bf16(bf16(g * r) * bf16(beta)) (the GEMM's gradient, stored), the
     column sums of g (bias) and of bf16(g * t) (row scale) per row block, and with SLICES = 2 gyf's two int8 slices
     (_slice2_kernel's arithmetic), SLICES = 1 the first only (--dx int8). HAS_GH: also the float adapter's
@@ -1635,7 +1635,10 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
         m = (rows[:, None] < M) & (cols[None, :] < N)
         off = rows[:, None] * N + cols[None, :]
         g = tl.load(g_ptr + off, mask=m, other=0.0).to(tl.float32)
-        t = tl.load(t_ptr + off, mask=m, other=0.0).to(tl.float32)
+        if TM >= 0:      # --save-lean: t kept for the first TM rows only
+            t = tl.load(t_ptr + off, mask=m & (rows[:, None] < TM), other=0.0).to(tl.float32)
+        else:
+            t = tl.load(t_ptr + off, mask=m, other=0.0).to(tl.float32)
         r = tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
         gr_ = _rbf(g * r[None, :])
         if SAVE_GT:      # bf16(g * r): the float adapter's output gradient (as _AddRowFn's)
@@ -1662,13 +1665,16 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
             r = tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
             f = _rbf(_rbf(g * r[None, :]) * bb)
             q1 = tl.extra.cuda.libdevice.rint(f / s[:, None])
-            tl.store(q1_ptr + off, tl.minimum(tl.maximum(q1, -127.0), 127.0).to(tl.int8), mask=m)
+            q1c = tl.minimum(tl.maximum(q1, -127.0), 127.0).to(tl.int8)
+            tl.store(q1_ptr + off, q1c, mask=m)
+            if SAVE_Q1T:     # (the transposed copy [N, M] the update's token-contracting products read: no tr8 pass)
+                tl.store(q1t_ptr + cols[None, :] * M + rows[:, None], q1c, mask=m)
             if SLICES > 1:
                 q2 = tl.extra.cuda.libdevice.rint((f - q1 * s[:, None]) / (s[:, None] / 254.0))
                 tl.store(q2_ptr + off, tl.minimum(tl.maximum(q2, -127.0), 127.0).to(tl.int8), mask=m)
 
 
-def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None, save_f=True):
+def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None, save_f=True, save_q1t=False, t_rows=None):
     """-> (gyf bf16 [M, N], q1, q2, s (None without slices; q2 None with one), bias gradient fp32 [N], row-scale
     gradient fp32 [N]); slices: 0, 1 or 2 int8 slices of gyf. save_gt: a seventh output, bf16(g * r); a_b (the float
     adapter's A [N, R] bf16, with save_gt): an eighth, gh = bf16(bf16(g * r) A) [M, R]. save_f False (with slices):
@@ -1690,10 +1696,20 @@ def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None, save_f=Tr
         q1 = q2 = s = None
     gt = torch.empty_like(g) if save_gt else None
     gk = dict(a_ptr=a_b, gh_ptr=gh, R=R, RA=max(16, triton.next_power_of_2(R)), HAS_GH=True) if a_b is not None else {}
+    q1t = torch.empty(N, M, dtype=torch.int8, device=g.device) if (save_q1t and slices) else None
+    if q1t is not None:
+        gk.update(q1t_ptr=q1t, SAVE_Q1T=True)
+    if t_rows is not None:
+        gk.update(TM=int(t_rows))
     _bwd_rows_kernel[(nb,)](g, t, r_b, beta_b, f, q1 if slices else f, q2 if q2 is not None else f,
                             s if slices else pb, pb, pr, gt if gt is not None else f, M, N, SLICES=int(slices), BM=BM,
                             BN=BN, SAVE_GT=save_gt, SAVE_F=save_f, **gk)
-    return (f if save_f else None, q1, q2, s, pb.sum(0), pr.sum(0)) + ((gt,) if save_gt else ()) + ((gh,) if a_b is not None else ())
+    LAST_Q1T[0] = q1t
+    prs = pr.sum(0) if t_rows is None else pr.sum(0).mul_(M / max(int(t_rows), 1))   # (the subset's sum x M / TM)
+    return (f if save_f else None, q1, q2, s, pb.sum(0), prs) + ((gt,) if save_gt else ()) + ((gh,) if a_b is not None else ())
+
+
+LAST_Q1T = [None]   # fused_bwd_rows(save_q1t=True): the last call's q1^T (read once by the caller, then cleared)
 
 
 def bwd_gyf(g, r_b, beta_b):
@@ -1706,7 +1722,7 @@ def bwd_gyf(g, r_b, beta_b):
 def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr, gx_ptr, pc_ptr, M, N, K, sam, sbk,
                     HAS_MU: tl.constexpr, TWO: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
                     GM: tl.constexpr, HAS_ADD: tl.constexpr = False, gh_ptr=None, bt_ptr=None, R=0,
-                    RA: tl.constexpr = 16, HAS_LR: tl.constexpr = False):
+                    RA: tl.constexpr = 16, HAS_LR: tl.constexpr = False, xs_ptr=None, XQ: tl.constexpr = False):
     """the input gradient on the int8 tensor cores with its epilogue in one kernel: y1 = q1 W, y2 = q2 W (gy's two int8
     slices [M, N] against the trits, b [K, N]: row k is column k of W; two int32 accumulators, exact), then as
     _dx2_epi_kernel + _scale_bwd_kernel: g = bf16((y1 + y2 / 254) s), gx = bf16(g c) and per BM-row block the column
@@ -1742,11 +1758,17 @@ def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr,
         btv = tl.load(bt_ptr + cols[None, :] * R + ra[:, None], mask=(cols[None, :] < K) & (ra[:, None] < R), other=0.0)
         g = _rbf(g + _rbf(tl.dot(ghv, btv)))
     c = tl.load(c_ptr + cols, mask=cols < K, other=0.0).to(tl.float32)
-    x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
-    if HAS_MU:
-        x = _rbf(x - tl.load(mu_ptr + cols, mask=cols < K, other=0.0).to(tl.float32))
     tl.store(gx_ptr + off, (g * c[None, :]).to(tl.bfloat16), mask=m)
-    tl.store(pc_ptr + pm * K + cols, tl.sum(_rbf(g * x), axis=0), mask=cols < K)
+    if XQ:   # --save-lean: the (centred) input from its int8 codes, x = xq xs / c (the prologue quantized c (x - mu))
+        xs = tl.load(xs_ptr + rows, mask=rows < M, other=0.0)
+        x = tl.load(x_ptr + off, mask=m, other=0).to(tl.float32) * xs[:, None]
+        cs = tl.where(c >= 0, tl.maximum(c, 1e-6), tl.minimum(c, -1e-6))
+        tl.store(pc_ptr + pm * K + cols, tl.sum(g * x, axis=0) / cs, mask=cols < K)
+    else:
+        x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
+        if HAS_MU:
+            x = _rbf(x - tl.load(mu_ptr + cols, mask=cols < K, other=0.0).to(tl.float32))
+        tl.store(pc_ptr + pm * K + cols, tl.sum(_rbf(g * x), axis=0), mask=cols < K)
 
 
 def _dx2_tile(N, K):
@@ -1759,7 +1781,7 @@ def _dx2_tile(N, K):
     return 64, 128, 64, 4
 
 
-def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None):
+def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None):
     """(gx bf16 [M, K], the column scale's gradient fp32 [K]) from gy's int8 slices q1, q2 [M, N] and scale s [M]
     (fused_bwd_rows; q2 None: one slice, --dx int8), the trits w8t [K, N] (KernelTernaryLinear.w8(t=True)), the column
     scale c_b and the layer's input x (centred here with mu_b). add [M, K] bf16, or lr = (gh [M, R], B [K, R]) bf16
@@ -1774,6 +1796,8 @@ def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None):
     if lr is not None:
         gh, bt = lr[0].contiguous(), lr[1].contiguous()
         lk = dict(gh_ptr=gh, bt_ptr=bt, R=gh.shape[1], RA=max(16, triton.next_power_of_2(gh.shape[1])), HAS_LR=True)
+    if xs is not None:   # (x is the int8 xq of the prologue, xs its row scales: --save-lean)
+        lk.update(xs_ptr=xs, XQ=True)
     _dx2_col_kernel[(nb * triton.cdiv(K, BK),)](q1, q2 if q2 is not None else q1, w8t, s, c_b, x,
                                                 mu_b if mu_b is not None else c_b, add if add is not None else gx, gx,
                                                 pc, M, N, K, q1.stride(0), w8t.stride(0), HAS_MU=mu_b is not None,

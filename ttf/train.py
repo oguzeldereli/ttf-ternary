@@ -439,6 +439,11 @@ def main():
         if _PP:
             model.pp = {"rank": _PP[0], "n": _PP[1], "lo": _own[0], "hi": _own[1]}
     elif args.mode == "ttf":
+        if args.fuse_proj:
+            from . import model as _MD, update as _UPD3
+            _MD.FUSE_PROJ[0] = args.fuse_proj; _UPD3.SPLIT_BLOCKS[0] = args.fuse_proj == "split"
+            assert args.fuse_proj == "shared" or args.ttf_dense_g, "--fuse-proj split: with --ttf-dense-g"
+            print(f"--fuse-proj {args.fuse_proj}: q/k/v and gate/up fused", flush=True)
         model = build_kernel_transformer(mc, grad_checkpoint=tc.grad_checkpoint, beta=use_beta)
         if getattr(args, "act_group", 0):
             from .layers import ACT_GROUP as _AG
@@ -485,6 +490,8 @@ def main():
     if te:
         from .tern_emb import enable_tern_emb
         n_te = enable_tern_emb(model, te, "master" if args.mode == "bitnet" else "kernel")
+        from .tern_emb import set_scales as _te_sc
+        _te_sc(model, args.tern_emb_scales)
         assert args.mode == "bitnet" or (ttf and tc.grad_accum == 1), "--tern-emb with --mode ttf: --accum 1"
         print(f"--tern-emb {te}: {n_te / 1e6:.1f}M ternary embedding weights (+ row / column scales)", flush=True)
     _ck_auto = None     # --ckpt-skip auto: chosen per step from the measured peak (memplan.py), else the last N blocks
@@ -509,6 +516,11 @@ def main():
             print(f"row/column scales (master): {nrc / 1e3:.1f}k floats", flush=True)
         else:
             print(f"row/column scales: {enable_rc_scales(model) / 1e3:.1f}k floats", flush=True)
+            if args.lin_scales == "none":   # (held at 1: the fused kernels still run, no scale trains)
+                for m_ in model.modules():
+                    if isinstance(m_, KernelTernaryLinear) and m_.row_scale is not None:
+                        m_.row_scale.requires_grad_(False); m_.col_scale.requires_grad_(False)
+                print("--lin-scales none: the linear layers' row / column scales held at 1", flush=True)
     _resume_path = os.path.join(tc.out_dir, "ckpt.pt")
     if (_PP or _WS > 1) and not os.path.exists(_resume_path) and os.path.exists(os.path.join(_base_out, "ckpt.pt")):
         _resume_path = os.path.join(_base_out, "ckpt.pt")    # --pipe: a single-GPU checkpoint (or stage 0's) for all;
@@ -1189,6 +1201,26 @@ def main():
                     if hasattr(_m, "_invalidate"):
                         _m._invalidate()
         print(f"--ttf-24 {args.ttf_24}: {_n24} ternary layers pruned to 2:4 (nonzeros {_d0} -> {_d1})", flush=True)
+    if ttf and (args.ttf_dense_g or args.ttf_upd_tokens < 1 or args.ttf_turn_every > 1):
+        from . import update as _UPD2
+        _UPD2.DENSE_G[0] = bool(args.ttf_dense_g); _UPD2.UPD_TOKENS[0] = float(args.ttf_upd_tokens)
+        _UPD2.TURN_EVERY[0] = int(args.ttf_turn_every)
+        assert args.ttf_upd_tokens >= 1 or args.ttf_dense_g, "--ttf-upd-tokens: with --ttf-dense-g"
+        assert args.ttf_turn_every == 1 or tc.grad_accum == 1, "--ttf-turn-every: one batch per step (--accum 1)"
+        print(f"--ttf-dense-g {args.ttf_dense_g} (tokens {args.ttf_upd_tokens:g}), --ttf-turn-every {args.ttf_turn_every}",
+              flush=True)
+    if getattr(args, "attn_fp8", False):
+        from .model import ATTN_FP8 as _AF8
+        _AF8[0] = True
+        print("--attn-fp8: attention forward on FP8 tensor cores", flush=True)
+    if getattr(args, "save_lean", 0):
+        from .layers import SAVE_LEAN as _SL
+        _SL[0] = int(args.save_lean)
+        print(f"--save-lean {args.save_lean}: no bf16 inputs saved by the ternary layers, t on 1/{args.save_lean} of the tokens", flush=True)
+    if getattr(args, "head_fused", False):
+        from .model import HEAD_ALL as _HA
+        _HA[0] = True
+        print("--head-fused: the head's backward in its forward (no logits gradient kept; fp32 weight-gradient sum)", flush=True)
     if getattr(args, "ttf_upd_i8", False):
         from .layers import UPD_I8 as _UI8
         _UI8[0] = True

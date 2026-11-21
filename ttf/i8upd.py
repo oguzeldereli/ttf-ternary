@@ -46,17 +46,22 @@ def _rq_kernel(a_ptr, bt_ptr, sb_ptr, rs_ptr, yt_ptr, sy_ptr, T, D, J, BM: tl.co
 
 @triton.jit
 def _tn_kernel(at_ptr, yt_ptr, sy_ptr, o_ptr, T, D, J, NB_SPLIT, BM: tl.constexpr, BN: tl.constexpr,
-               BTK: tl.constexpr):
+               BTK: tl.constexpr, SA=None, SY=None):
     """partial[split, d, j] = sum over this split's token blocks of sY[blk, j] * sum_t A8[t, d] Y8[t, j], from the
-    transposed int8 A8^T [D, T] and Y8^T [J, T] (both contiguous along the tokens, the reduction)"""
+    transposed int8 A8^T [D, T] and Y8^T [J, T] (both contiguous along the tokens, the reduction; row strides SA, SY,
+    default T: a token-subset view of wider rows)"""
+    if SA is None:
+        SA = T
+    if SY is None:
+        SY = T
     pm = tl.program_id(0); pn = tl.program_id(1); ps = tl.program_id(2)
     rd = pm * BM + tl.arange(0, BM); cj = pn * BN + tl.arange(0, BN); rt = tl.arange(0, BTK)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     b0 = ps * NB_SPLIT
     for bi in range(b0, b0 + NB_SPLIT):
         tt = bi * BTK + rt
-        a = tl.load(at_ptr + rd[:, None] * T + tt[None, :], mask=(tt[None, :] < T) & (rd[:, None] < D), other=0)
-        y = tl.load(yt_ptr + cj[None, :] * T + tt[:, None], mask=(tt[:, None] < T) & (cj[None, :] < J), other=0)
+        a = tl.load(at_ptr + rd[:, None] * SA + tt[None, :], mask=(tt[None, :] < T) & (rd[:, None] < D), other=0)
+        y = tl.load(yt_ptr + cj[None, :] * SY + tt[:, None], mask=(tt[:, None] < T) & (cj[None, :] < J), other=0)
         sy = tl.load(sy_ptr + bi * J + cj, mask=(cj < J) & (bi * BTK < T), other=0.0)
         acc += tl.dot(a, y, out_dtype=tl.int32).to(tl.float32) * sy[None, :]
     tl.store(o_ptr + ps * D * J + rd[:, None] * J + cj[None, :], acc, mask=(rd[:, None] < D) & (cj[None, :] < J))
@@ -109,30 +114,97 @@ def _n_sm(dev):
     return torch.cuda.get_device_properties(dev).multi_processor_count
 
 
-def tn(At, Yt, sY):
-    """A8^T int8 [D, T], (Y8^T int8 [J, T], sY [ceil(T / BT), J]) -> A^T Y fp32 [D, J]"""
-    D, T = At.shape; J = Yt.shape[0]
-    BM, BN = 128, 64     # (t_i8tune.py: BN 64 w4 s3 best at every J; D 2048 J 307 359 -> 256 us with 4 x SMs of split)
+TN_WIDE = [None]   # tn for wide J (the dense gradient, J = K >= 512): BM, BN, warps, stages, split x SMs
+
+
+def tn(At, Yt, sY, T=None):
+    """A8^T int8 [D, T], (Y8^T int8 [J, T], sY [ceil(T / BT), J]) -> A^T Y fp32 [D, J]. T: only the first T tokens
+    (a token subset; the rows keep their full stride)"""
+    D, Tf = At.shape; J = Yt.shape[0]
+    T = Tf if T is None else T
+    if J >= 512:      # (the dense gradient g = gy^T x; t_dg.py 21 Nov, 4070 Ti Super: 128 x 128 w8 up to ~1M outputs,
+        # 128 x 64 w4 above: 768^2 222 us, 2048 x 768 497, 768 x 2048 542, 1024^2 303, 2816 x 1024 893)
+        BM, BN, nw, ns, sm = TN_WIDE[0] if TN_WIDE[0] is not None else (
+            (128, 128, 8, 3, 2) if D * J <= (1 << 20) + (1 << 18) else (128, 64, 4, 3, 2))
+    else:
+        BM, BN, nw, ns = 128, 64, 4, 3     # (t_i8tune.py: BN 64 w4 s3 best at every J; D 2048 J 307 359 -> 256 us with 4 x SMs of split)
+        sm = 4 if D >= 2048 else 2
     tiles = triton.cdiv(D, BM) * triton.cdiv(J, BN)
     nb = triton.cdiv(T, BT)
-    split = max(1, min(nb, ((4 if D >= 2048 else 2) * _n_sm(At.device)) // max(tiles, 1)))
+    split = max(1, min(nb, (sm * _n_sm(At.device)) // max(tiles, 1)))
     per = triton.cdiv(nb, split); split = triton.cdiv(nb, per)
     part = torch.empty(split, D, J, dtype=torch.float32, device=At.device)
     _tn_kernel[(triton.cdiv(D, BM), triton.cdiv(J, BN), split)](At, Yt, sY, part, T, D, J, per, BM=BM, BN=BN, BTK=BT,
-                                                                num_warps=4, num_stages=3)
+                                                                SA=At.stride(0), SY=Yt.stride(0),
+                                                                num_warps=nw, num_stages=ns)
     return part[0] if split == 1 else part.sum(0)
+
+
+@triton.jit
+def _rqx_kernel(x_ptr, rs_ptr, yt_ptr, sy_ptr, T, D, BT_: tl.constexpr, BD: tl.constexpr):
+    """Y = rs[t] * X8[t, d] for a [BT_, BD] tile, block-quantized as _rq_kernel's output (one scale per column and BT_
+    tokens, rint, +-127), written transposed: Y8^T [D, T]"""
+    pt = tl.program_id(0); pd = tl.program_id(1)
+    rows = pt * BT_ + tl.arange(0, BT_); cols = pd * BD + tl.arange(0, BD)
+    m = (rows[:, None] < T) & (cols[None, :] < D)
+    x = tl.load(x_ptr + rows[:, None] * D + cols[None, :], mask=m, other=0).to(tl.float32)
+    rs = tl.load(rs_ptr + rows, mask=rows < T, other=0.0)
+    y = x * rs[:, None]
+    sy = tl.maximum(tl.max(tl.abs(y), axis=0), 1e-30) / 127.0
+    q = tl.extra.cuda.libdevice.rint(y / sy[None, :])
+    tl.store(yt_ptr + cols[None, :] * T + rows[:, None], tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8), mask=m)
+    tl.store(sy_ptr + pt * D + cols, sy, mask=cols < D)
+
+
+def rqx(X8, rs):
+    """X8 int8 [T, D], rs fp32 [T] -> rs * X8 as (int8 Y^T [D, T], fp32 [ceil(T / BT), D]): the requantized operand of
+    the dense gradient (the row scales of both factors on one side)"""
+    T, D = X8.shape
+    Yt = torch.empty(D, T, dtype=torch.int8, device=X8.device)
+    sY = torch.empty(triton.cdiv(T, BT), D, dtype=torch.float32, device=X8.device)
+    _rqx_kernel[(triton.cdiv(T, BT), triton.cdiv(D, 64))](X8, rs, Yt, sY, T, D, BT_=BT, BD=64, num_warps=4)
+    return Yt, sY
+
+
+def dense_g(F, frac=1.0):
+    """g = gy^T x fp32 [N, K] from the int8 factors: q1^T (block-quantized rs * xq), one int8 GEMM (2 T N K) instead of
+    the factored update's four product chains (2 T (N + K)(2 k + 2 r)). frac < 1: the first frac of the tokens only,
+    scaled by 1 / frac (--ttf-upd-tokens)"""
+    T = F.q1.shape[0]
+    Tu = T if frac >= 1 else max(BT, (int(T * frac) // BT) * BT)
+    Yt, sY = rqx(F.xq[:Tu], F.rs[:Tu])
+    g = tn(F.q1t_(), Yt, sY, T=Tu)
+    return g if Tu == T else g.mul_(T / Tu)
 
 
 class I8Factors:
     """a ternary layer's gradient factors in int8: gy = s * q1 [T, N], x = xs * xq [T, K], with their transposes (the
     token-contracting products' layout); rs = s * xs (both row scales, which every product chain carries once)"""
-    __slots__ = ("q1", "s", "xq", "xs", "rs", "q1t", "xqt", "gy_fn")
+    __slots__ = ("q1", "s", "xq", "xs", "rs", "_q1t", "_xqt", "gy_fn")
 
-    def __init__(self, q1, s, xq, xs, gy_fn=None):
+    def __init__(self, q1, s, xq, xs, gy_fn=None, q1t=None):
         self.q1, self.s, self.xq, self.xs = q1, s, xq, xs
         self.gy_fn = gy_fn          # () -> gy bf16, where the layer did not keep it (kernel.fused_bwd_rows save_f False)
         self.rs = (s * xs).contiguous()
-        self.q1t, self.xqt = tr8(q1), tr8(xq)
+        self._q1t, self._xqt = q1t, None    # the transposes, made on first use (the dense gradient needs q1^T only)
+
+    def q1t_(self):
+        if self._q1t is None:
+            self._q1t = tr8(self.q1)
+        return self._q1t
+
+    def xqt_(self):
+        if self._xqt is None:
+            self._xqt = tr8(self.xq)
+        return self._xqt
+
+    @property
+    def q1t(self):
+        return self.q1t_()
+
+    @property
+    def xqt(self):
+        return self.xqt_()
 
     def gy(self):
         """gy itself, bf16 (the paths that read it: band, dense accumulator, grad hooks)"""

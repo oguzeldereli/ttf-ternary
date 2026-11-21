@@ -421,6 +421,9 @@ def _orth_(X):
     rp = -(-r // 64) * 64 if r <= 512 else -(-r // 256) * 256
     if not X.is_cuda or K < rp or r < SPANQR_MIN[0]:   # (0.8B at ranks 31-307 before --cuda-graph: all through
         return torch.linalg.qr(X)[0]                    # spanqr 16.1 vs 15.1 s/step; launch bound then)
+    if ORTH[0] == "c2":   # (21 Nov: real accumulators have cond(U^T U) <= ~2e3: two shifted Cholesky-QR passes suffice)
+        return _orth_c2(X if rp == r else torch.cat([X, X.new_zeros(K, rp - r)], 1))[:, :r].contiguous() if rp != r \
+            else _orth_c2(X.contiguous())
     if _SPANQR[0] is None:
         from orth import orth as _o
         _SPANQR[0] = _o
@@ -428,6 +431,97 @@ def _orth_(X):
         return _SPANQR[0](X.contiguous())
     Xp = X.new_zeros(K, rp); Xp[:, :r] = X
     return _SPANQR[0](Xp)[:, :r].contiguous()
+
+
+DENSE_G = [False]   # --ttf-dense-g: the update from the dense gradient g = gy^T x (one int8 GEMM from the layer's int8
+                    # factors with --ttf-upd-i8, else one bf16 GEMM), through the dense path (exact v sums, no sketch)
+UPD_TOKENS = [1.0]  # --ttf-upd-tokens F: the dense gradient from the first F of the step's tokens (x 1 / F)
+TURN_EVERY = [1]    # --ttf-turn-every m: the accumulator's basis turns on every m-th update (one batch per step), held
+                    # between (U += u V: no orthonormalisation, no u^T U product)
+FAST1 = [True]      # the dense path's one-batch v sums and u in fused kernels (False: the torch expressions; tests)
+
+
+def _hold_basis(t):
+    """--ttf-turn-every m: True on the updates that keep the basis (all but every m-th; the first update turns)"""
+    m = TURN_EVERY[0]
+    return m > 1 and (t - 1) % m != 0
+
+
+class _RowBlock:
+    """--fuse-proj split: rows a:b of a fused layer (q / k / v, gate / up) as a layer of its own for the update: its own
+    accumulator, v and rank; the trits are a view of the fused layer's packed rows (fired in place)"""
+    def __init__(self, l, a, b):
+        self.parent, self.a, self.b = l, a, b
+        self.N, self.K = b - a, l.K
+        self.track = False
+        self.ts_rank = getattr(l, "ts_rank", None)
+        self._ts_host = getattr(l, "_ts_host", True)
+
+    @property
+    def wpacked(self):
+        return self.parent.wpacked[self.a:self.b]
+
+    def _after_fire(self, dnnz):
+        self.parent._after_fire(dnnz)
+
+
+SPLIT_BLOCKS = [False]   # --fuse-proj split
+
+
+def _row_blocks(l):
+    if not SPLIT_BLOCKS[0] or getattr(l, "row_blocks", None) is None:
+        return None
+    b = l.__dict__.get("_rblk")
+    if b is None:
+        b, a = [], 0
+        for n_ in l.row_blocks:
+            b.append(_RowBlock(l, a, a + n_)); a += n_
+        l.__dict__["_rblk"] = b
+    return b
+
+
+def _dense_g_of(fg, c):
+    """--ttf-dense-g: g = gy^T x fp32 [N, K] from the backward's factors (gy, x[, I8Factors]); data parallel: the mean"""
+    gy, x = fg[:2]
+    F8 = fg[2] if len(fg) > 2 else None
+    fr = UPD_TOKENS[0]
+    with _rf("ttf.dense_g"):
+        if F8 is not None:
+            from . import i8upd
+            g = i8upd.dense_g(F8, fr)
+        else:
+            T = gy.shape[0]
+            Tu = T if fr >= 1 else max(128, (int(T * fr) // 128) * 128)
+            g = (torch.mm(gy[:Tu].T, x[:Tu], out_dtype=torch.float32) if gy.is_cuda and gy.dtype == torch.bfloat16
+                 else gy[:Tu].T.float() @ x[:Tu].float())
+            if Tu != T:
+                g.mul_(T / Tu)
+    return _dpm(g)
+
+
+ORTH_C2_PASSES = [2]
+
+
+def _orth_c2(X):
+    """--ttf-orth c2: Cholesky QR, ORTH_C2_PASSES passes on spanqr's kernels (its cooperative Cholesky with clamped
+    pivots: no breakdown, no host sync; its triangular solve), the Gram by cuBLAS in fp32, the first pass shifted by
+    1e-7 ||G||_F. Two passes leave orthogonality at fp32 rounding for cond(X) up to ~1e3-1e4 (measured on the 110M
+    combo checkpoint 21 Nov: cond(U) <= 42, so cond(X) ~ cond(U^T U) <= ~2e3); spanqr's 3 passes + 2 polish steps are
+    built for any conditioning. Zero / dependent columns come out as arbitrary directions only if the clamp lifts them
+    (the first update's X is a random projection: full rank)"""
+    from candidates import kchol, tri
+    from candidates.kcholqr import _pow2_scale
+    K, r = X.shape
+    s = _pow2_scale(torch.linalg.vector_norm(X, ord=float("inf"))).reshape(1)
+    Y = X
+    for p in range(ORTH_C2_PASSES[0]):
+        G = tri.gram_f(Y, s=s) if p == 0 else Y.T @ Y
+        nrm = torch.linalg.matrix_norm(G)
+        if p == 0:
+            G.diagonal().add_(1e-7 * nrm)
+        L, Li = kchol.chol32(G, (1e-8 * nrm + 1e-30).reshape(1))
+        Y = tri.trsm_f(Y, L, Li, s=s if p == 0 else None)
+    return Y
 
 
 DEFER = [None]   # --pipe, a stage after the first: the last micro-batch's per-layer updates collected here (qwen.pp_train)
@@ -474,6 +568,13 @@ def ts_layer(l, g, state, c):
             return
         if r_ is not None:
             g = r_
+    if not torch.is_tensor(g) and DENSE_G[0]:   # --ttf-dense-g: the dense gradient from the factors, then the dense path
+        g = _dense_g_of(g, c)
+        blk = _row_blocks(l)
+        if blk is not None:              # --fuse-proj split: each sub-layer's rows keep their own accumulator and v
+            for p_ in blk:
+                ts_layer(p_, g[p_.a:p_.b], state, c)
+            return
     if not torch.is_tensor(g):           # --dw factored: the backward passed (gy, x) instead of the dense gradient
         return _ts_layer_factored(l, g, state, c)
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
@@ -516,7 +617,8 @@ def ts_layer(l, g, state, c):
             sq_prev = (r0[:, None] * c0[None, :] / r0.mean().clamp_min(1e-30)).sqrt_()
         del r0, c0
     fs_ = mic_nm and _rsq is not None and not c.get("vdiag")   # the fused sums stand in for g^2's means
-    g2 = None if fs_ else g * g
+    f1_ = not mic_nm and g.is_cuda and not c.get("vdiag") and FAST1[0]   # one batch on the GPU: sq_sums + ttf_u
+    g2 = None if (fs_ or f1_) else g * g
     if M_ > 1:    # --accum M > 1: v is the batch's, stepped once per step with the step's beta2 as without micro-batches:
         # row / column means of (sum_i g_i)^2 = the micro-batches' own squares + 2 <g_i, sum of earlier g_i'>, the
         # cross terms through a k-dim random sketch of the running sum (unbiased; k (N + K) floats, held within the step)
@@ -542,6 +644,15 @@ def ts_layer(l, g, state, c):
         else:
             _keep(st, ("mx", key), (PS, SP, rs, cs, ds, es)); v = None
         del PS, SP
+    elif f1_:     # (the same v; its row / column means of g^2 from one pass, u below without the [N, K] v)
+        from .kernel import sq_sums as _sq_sums
+        _rsq, _csq = _sq_sums(g)
+        if ("v", key) in st:
+            R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * (_rsq / l.K); C = b2 * C + (1 - b2) * (_csq / l.N)
+        else:
+            R, C = (1 - b2) * (_rsq / l.K), (1 - b2) * (_csq / l.N)
+        _host_put(st, ("v", key), (R, C), off)
+        sq1 = (R, C / (1 - b2 ** t), R.mean().clamp_min(1e-30)); v = None
     else:
         if ("v", key) in st:
             R, C = _host_get(st, ("v", key), dev, off); R = b2 * R + (1 - b2) * g2.mean(1); C = b2 * C + (1 - b2) * g2.mean(0)
@@ -557,6 +668,9 @@ def ts_layer(l, g, state, c):
     if mic_nm and isinstance(sq_prev, tuple):
         from .kernel import ttf_u as _ttf_u
         u = _ttf_u(g, sq_prev[0], sq_prev[1], sq_prev[2], lr_ratio)
+    elif f1_:
+        from .kernel import ttf_u as _ttf_u
+        u = _ttf_u(g, sq1[0], sq1[1], sq1[2], lr_ratio); del sq1
     else:
         u = -g / ((sq_prev if mic_nm else v.sqrt()) + 1e-8) * lr_ratio
     if mic_nm:
@@ -589,14 +703,31 @@ def ts_layer(l, g, state, c):
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
-        Vn = _orth(V @ (U.T @ U) + u.T @ U)
-        U = U @ (V.T @ Vn) + u @ Vn; V = Vn
+        if _hold_basis(t):                            # --ttf-turn-every m: V held, the step's u projected on it
+            U = U + u @ V
+        else:
+            Vn = _orth(V @ (U.T @ U) + u.T @ U)
+            U = U @ (V.T @ Vn) + u @ Vn; V = Vn
     if mic_nm and not final_:   # --accum M > 1: not the last micro-batch: keep the accumulator, no firing
         _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
     del u
-    A = U @ V.T
     codes = getattr(l, "codes", None)         # int-k codes (intk_emb.IntKMatrix: levels 0 .. l.levels) instead of trits
+    if codes is None and FIRE_FUSED[0] and dev.type == "cuda" and U.dtype == torch.float32 and hasattr(l, "_after_fire"):
+        # (the factored path's fused firing: A, the moves, the repack and D V in one pass; A never formed)
+        from .kernel import ttf_fire
+        before = l.wpacked.clone() if l.track else None
+        th_ = _dv(c, "theta", theta)
+        DV, nf, dnnz = ttf_fire(U, V, l.wpacked, l.K, th_)
+        DV = _dpm(DV)
+        l._after_fire(dnnz)
+        U = U - c["spend"] * (th_ * DV); del DV
+        _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
+        st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
+        if before is not None:
+            l._record_flips(before, l.wpacked)
+        return
+    A = U @ V.T
     w0 = codes if codes is not None else unpack_rows(l.wpacked, l.K).to(torch.int8)
     d = A.sign()
     if codes is not None:
@@ -911,8 +1042,11 @@ def _ts_layer_factored(l, fg, state, c):
         U, V = _load_pair(_host_get(state, key, dev, off))
         A_prev = U @ V.T if c.get("band") else None
         U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
-        Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
-        U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
+        if _hold_basis(t):                            # --ttf-turn-every m: V held, the step's u projected on it
+            U = U - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
+        else:
+            Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
+            U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
     if not final_:
         if STEP_FP32[0] and sa and not off:   # --ttf-step-fp32: within the step U stays fp32 (V is fixed until the last
             # micro-batch: kept as stored); encoded once, on the last micro-batch. Skips U's encode / decode per micro-batch
