@@ -122,7 +122,7 @@ def build_parser():
                    "(one batch per step) and is held between (U += u V; no orthonormalisation)")
     g.add_argument("--ttf-step-fp32", action=ON, default=False, help="--accum M > 1: keep U in fp32 between a step's "
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
-    g.add_argument("--ttf-orth", default="auto", choices=["auto", "qr", "spanqr", "c2"],
+    g.add_argument("--ttf-orth", default="auto", choices=["auto", "qr", "spanqr", "c2", "c1"],
                    help="the accumulator basis' orthonormalisation: auto (default: spanqr when the package imports and "
                         "the run is on CUDA, else qr), Householder QR, or spanqr (the spanqr package on PYTHONPATH, github.com/oguzeldereli/spanqr; any "
                         "rank, padded to its widths; 110M 1.41 -> 1.37 s/step)")

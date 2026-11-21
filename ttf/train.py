@@ -1168,8 +1168,10 @@ def main():
             except ImportError:
                 args.ttf_orth = "qr"
         if args.ttf_orth != "qr":
-            from .update import ORTH as _OR
-            _OR[0] = args.ttf_orth
+            from .update import ORTH as _OR, ORTH_C2_PASSES as _OCP
+            _OR[0] = "c2" if args.ttf_orth == "c1" else args.ttf_orth
+            if args.ttf_orth == "c1":   # (one Cholesky-QR pass: orth error ~ eps cond(X)^2, re-done every step)
+                _OCP[0] = 1
         print(f"--ttf-orth {args.ttf_orth}", flush=True)
         if args.factored_k:
             print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
