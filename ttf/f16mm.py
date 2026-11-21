@@ -89,3 +89,42 @@ def mm16(a, b, out=None, acc=False, out_dtype=torch.bfloat16, alpha=1.0, sa=None
         float(alpha), BM=BM, BN=BN, BK=BK, ACC=acc, F16ACC=F16ACC[0], EVEN_K=(K % BK == 0), num_warps=nw,
         num_stages=ns, **({} if sa is None else dict(sa_ptr=sa, HAS_SA=True)))
     return out
+
+
+@triton.jit
+def _mm8_kernel(a_ptr, b_ptr, sa_ptr, sb_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                GM: tl.constexpr = 8):
+    """C = bf16(sa[m] sb[n] sum_k A8[m, k] B8[n, k]) (A8 [M, K], B8 [N, K], int8, K contiguous; int32 exact sums)"""
+    pid = tl.program_id(0); npm = tl.cdiv(M, BM); npn = tl.cdiv(N, BN)
+    g = pid // (GM * npn); fm = g * GM; gs = min(npm - fm, GM)
+    pm = fm + (pid % gs); pn = (pid % (GM * npn)) // gs
+    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN); rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype=tl.int32)
+    for k0 in range(0, K, BK):
+        kk = k0 + rk
+        a = tl.load(a_ptr + rm[:, None] * K + kk[None, :], mask=(rm[:, None] < M) & (kk[None, :] < K), other=0)
+        b = tl.load(b_ptr + rn[None, :] * K + kk[:, None], mask=(kk[:, None] < K) & (rn[None, :] < N), other=0)
+        acc += tl.dot(a, b, out_dtype=tl.int32)
+    sa = tl.load(sa_ptr + rm, mask=rm < M, other=0.0); sb = tl.load(sb_ptr + rn, mask=rn < N, other=0.0)
+    c = acc.to(tl.float32) * sa[:, None] * sb[None, :]
+    tl.store(c_ptr + rm[:, None] * N + rn[None, :], c.to(tl.bfloat16), mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+MM8_TILE = [(128, 128, 64, 4, 3)]
+
+
+def q8_rows(x):
+    """x [M, K] -> (int8 [M, K], fp32 [M]): one scale per row (max |x| / 127, round to nearest)"""
+    xf = x.float()
+    s = xf.abs().amax(1).clamp_min(1e-30) / 127.0
+    return torch.round(xf / s[:, None]).clamp_(-127, 127).to(torch.int8), s
+
+
+def mm8(a8, sa, b8, sb):
+    """bf16 (sa a8) (sb b8)^T: a8 [M, K], b8 [N, K] int8 with row scales"""
+    M, K = a8.shape; N = b8.shape[0]
+    c = torch.empty(M, N, dtype=torch.bfloat16, device=a8.device)
+    BM, BN, BK, nw, ns = MM8_TILE[0]
+    _mm8_kernel[(triton.cdiv(M, BM) * triton.cdiv(N, BN),)](a8, b8, sa, sb, c, M, N, K, BM=BM, BN=BN, BK=BK,
+                                                            num_warps=nw, num_stages=ns)
+    return c

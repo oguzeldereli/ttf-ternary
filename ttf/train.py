@@ -1282,6 +1282,10 @@ def main():
         from .headloss import HEAD_F16 as _HF
         _HF[0] = True
         print("--head-f16: head GEMMs on fp16 MMA (f16 block sums)", flush=True)
+    if getattr(args, "head_i8f", False):
+        assert getattr(args, "head_f16", False), "--head-i8f needs --head-f16"
+        from .headloss import HEAD_I8F as _HI
+        _HI[0] = True
     if getattr(args, "fuse_swiglu", False):
         from .model import FUSE_SWI as _FS
         _FS[0] = True

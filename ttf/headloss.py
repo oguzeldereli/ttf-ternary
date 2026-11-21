@@ -269,6 +269,7 @@ class TrainHeadCE(torch.autograd.Function):
 
 
 HEAD_F16 = [False]   # --head-f16 (TrainHeadAll's GEMMs on f16mm)
+HEAD_I8F = [False]   # --head-i8f (with --head-f16: the logits GEMM in int8)
 
 
 class TrainHeadAll(torch.autograd.Function):
@@ -292,9 +293,16 @@ class TrainHeadAll(torch.autograd.Function):
             one = torch.ones((), device=hf.device)
             s_dh = prescale(one, w.detach().abs().amax().float())
             s_dw = prescale(one, hf.detach().abs().amax().float())
+            if HEAD_I8F[0]:   # --head-i8f: the logits' GEMM W8A8 (h per token, W per vocabulary row, int32 sums)
+                from .f16mm import mm8, q8_rows
+                w8, ws8 = q8_rows(w.detach())
             for i in range(0, T, n):
                 hc = hf[i:i + n]
-                z = mm16(hc, wh.t(), out_dtype=torch.bfloat16)
+                if HEAD_I8F[0]:
+                    h8, hs8 = q8_rows(hc)
+                    z = mm8(h8, hs8, w8, ws8)
+                else:
+                    z = mm16(hc, wh.t(), out_dtype=torch.bfloat16)
                 total = total + ce_rows_(z, tgt[i:i + n]).sum()
                 mm16(z, wh, out=dh[i:i + n], sa=s_dh)
                 mm16(z.t(), hc, out=dw, acc=True, sa=s_dw)

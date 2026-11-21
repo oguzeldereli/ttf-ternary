@@ -220,6 +220,8 @@ def build_parser():
                    "requantized input (s xs) xq formed in the dx kernel's epilogue (xq read once; identical codes)")
     g.add_argument("--attn-f16", action="store_true", help="training attention on f16attn (own flash forward + backward: "
                    "scores and dP fp32-accumulated, PV / dV / dK / dQ on fp16 MMA with fp16 tile sums)")
+    g.add_argument("--head-i8f", action="store_true", help="with --head-f16: the logits GEMM z = h W^T W8A8 (h int8 per token, "
+                   "W int8 per row, int32 sums); the backward stays f16")
     g.add_argument("--head-f16", action="store_true", help="with --head-fused: the head's three GEMMs on fp16 MMA with "
                    "fp16 sums per K block (fp32 across blocks; 2x the fp32-accumulate rate on GeForce); W in fp16")
     g.add_argument("--fuse-swiglu", action="store_true", help="silu(gate) up formed in w_down's int8 prologue and its "
