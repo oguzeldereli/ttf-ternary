@@ -1927,7 +1927,8 @@ def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None, swi=N
     M, N = q1.shape
     K = w8t.shape[0]
     gx = torch.empty(M, K, dtype=torch.bfloat16, device=q1.device) if swi is None else None
-    BM, BK, BN, nw = DX2_TILE[0] if DX2_TILE[0] is not None else _dx2_tile(N, K)
+    BM, BK, BN, nw = DX2_TILE[0] if DX2_TILE[0] is not None else (
+        (64, 64, 128, 4) if swi is not None else _dx2_tile(N, K))   # (the swiglu epilogue: t_swi_tune.py 21 Nov, 5.5 -> 1.1 ms)
     nb = triton.cdiv(M, BM)
     pc = torch.empty(nb, K, dtype=torch.float32, device=q1.device)
     lk = {}
