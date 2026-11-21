@@ -735,7 +735,9 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     Ub, Vb = U.to(torch.bfloat16), V.to(torch.bfloat16)
     un, vn = U.norm(dim=1), V.norm(dim=1)
     D = torch.empty(N, K, dtype=torch.int8, device=U.device)
-    BN, BK5, RC = FIRE_TILE if FIRE_TILE else (64, 32, 64)            # (best measured, laptop 4080: 27B shapes)
+    # (best measured, laptop 4080: 27B shapes 64 x 32 x 64; rank <= 512 (110M): 32 x 32 x 32, -23..-30%, the same moves:
+    # t_fire_tune.py 21 Nov)
+    BN, BK5, RC = FIRE_TILE if FIRE_TILE else ((32, 32, 32) if R <= 512 else (64, 32, 64))
     g = (triton.cdiv(N, BN), triton.cdiv(K5, BK5))
     S = torch.full((g[0] * g[1] * FIRE_SLOTS,), -1, dtype=torch.int64, device=U.device)
     _fire_kernel[g](Ub, Vb, U, V, un, vn, packed, D, S, N, K, K5, R, U.stride(0), V.stride(0), packed.stride(0),
