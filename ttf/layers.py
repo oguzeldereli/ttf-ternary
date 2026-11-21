@@ -196,7 +196,10 @@ def _fused_ok(l, x):
     return True
 
 
-def _fused_fwd(l, x2, acc2, save):
+MAG_FUSED = [False]   # --mag-fused: the float adapter inside the fused kernels (its gradients from the dense TTF g)
+
+
+def _fused_fwd(l, x2, acc2, save, t_rows=None):
     """x2 [M, K] -> (out [M, N] bf16, saved tensors or None). With the float adapter (mag_A, mag_B): its term
     a = (xs B) A^T on the scaled input xs = bf16(bf16(x - mu) c) (the prologue writes xs), added to the ternary product
     before the row scale in the GEMM's epilogue: the unfused path's (_ColScaleFn, two GEMMs, _AddRowFn) values"""
@@ -219,7 +222,12 @@ def _fused_fwd(l, x2, acc2, save):
         abits = 8
     else:
         abits = l.act_bits
-    if mag:
+    lr = None
+    if mag and MAG_FUSED[0]:   # --mag-fused: h = xs (xq B) from the int8 codes, a = h A^T in the GEMM's epilogue
+        xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, abits, False)
+        Ab, Bb = l.mag_A.to(torch.bfloat16), l.mag_B.to(torch.bfloat16)
+        h = _K.mag_h(xq, xs, Bb); xo = None; a = None; lr = (h, Ab)
+    elif mag:
         xq, xs, _, xo = _K.fused_prologue(x2, mu_b, cb, abits, False, True)
         Ab, Bb = l.mag_A.to(torch.bfloat16), l.mag_B.to(torch.bfloat16)
         h = xo @ Bb
@@ -228,7 +236,8 @@ def _fused_fwd(l, x2, acc2, save):
         xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, abits, False)
         a = None
     beta = l._cached_beta(l.wpacked) if l.use_beta else None
-    t, o = _K.fused_fwd_gemm(xq, l.w8(), xs, beta if beta is not None else 1.0, rb, bb, acc2, save, a)
+    t, o = _K.fused_fwd_gemm(xq, l.w8(), xs, beta if beta is not None else 1.0, rb, bb, acc2, save, a,
+                             t_rows=t_rows if save else None, lr=lr)
     if not save:
         return o, None
     return o, (xq, xs, x2, t, cb, rb, beta) + ((xo, h, Ab, Bb) if mag else ())
@@ -243,18 +252,17 @@ class _FusedTernFn(torch.autograd.Function):
         if not x2.is_contiguous():
             x2 = x2.contiguous()
         acc2 = acc.reshape(-1, layer.N).contiguous() if acc is not None else None
-        with _rf("tern.fwd"):
-            o, sv = _fused_fwd(layer, x2, acc2, True)
-        xq, xs, xc, t, cb, rb, beta = sv[:7]
         ctx.has_mag = mA is not None
-        ctx.lean = bool(SAVE_LEAN[0] and (mA is None or LEAN_MAG[0]) and DX_MODE[0] in ("int8", "int8x2")
+        ctx.lean = bool(SAVE_LEAN[0] and (mA is None or LEAN_MAG[0] or MAG_FUSED[0]) and DX_MODE[0] in ("int8", "int8x2")
                         and not GRAD_BITS[0] and getattr(layer, "in_mean", None) is None)
+        M_ = x2.shape[0]
+        tm_ = max(1, M_ // SAVE_LEAN[0]) if ctx.lean else M_
+        with _rf("tern.fwd"):   # (--save-lean: the GEMM stores t for the token subset only)
+            o, sv = _fused_fwd(layer, x2, acc2, True, t_rows=tm_ if tm_ < M_ else None)
+        xq, xs, xc, t, cb, rb, beta = sv[:7]
         if ctx.lean:   # --save-lean: no bf16 input kept (the column-scale gradient from xq xs / c), t on 1 / SAVE_LEAN
-            tm_ = max(1, t.shape[0] // SAVE_LEAN[0])     # of the tokens (the row-scale gradient's sum x SAVE_LEAN)
-            if tm_ < t.shape[0]:
-                t = t[:tm_].clone()
-            xc = xs
-            ctx.t_rows = tm_ if tm_ < t.shape[0] or SAVE_LEAN[0] > 1 else None
+            xc = xs    # of the tokens (the row-scale gradient's sum x SAVE_LEAN)
+            ctx.t_rows = tm_ if tm_ < M_ or SAVE_LEAN[0] > 1 else None
         if ctx.has_mag:
             ctx.mdt = (mA.dtype, mB.dtype)
         ctx.mu_b = (layer.in_mean.to(torch.bfloat16) if getattr(layer, "in_mean", None) is not None
@@ -278,12 +286,20 @@ class _FusedTernFn(torch.autograd.Function):
         sl = {"int8x2": 2, "int8": 1}.get(DX_MODE[0], 0)
         gA = gB = gxa = None
         # --ttf-upd-i8: the update reads gy through its int8 slice q1, so the bf16 gy is not written (formed on demand)
-        skip_f = bool(UPD_I8[0] and sl and not GRAD_BITS[0] and not ctx.has_mag and l.capture
+        mf = bool(ctx.has_mag and MAG_FUSED[0] and sl)   # --mag-fused: gh from the row pass, gA / gB in the update
+        skip_f = bool(UPD_I8[0] and sl and not GRAD_BITS[0] and (not ctx.has_mag or mf) and l.capture
                       and getattr(l, "on_grad", None) is not None)
         wq1t = bool(UPD_I8[0] and sl and not GRAD_BITS[0] and l.capture and getattr(l, "on_grad", None) is not None)
         with _rf("tern.dx"):
             lr = None
-            if ctx.has_mag and sl:   # the float adapter a = (xs B) A^T: gh = bf16(g r) A from the row pass, its input
+            if mf:   # --mag-fused: gh = bf16(g r) A from the row pass (gt not written), gh B^T inside dx2_col; the
+                xo, h, Ab, Bb = sv[6:]   # adapter's own gradients G B / beta, G^T A / beta from the dense g (update)
+                f, q1, q2, s, gbias, grow, gh = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=False, a_b=Ab,
+                                                                  save_f=not skip_f, save_q1t=wq1t,
+                                                                  t_rows=ctx.t_rows if ctx.lean else None)
+                lr = (gh, Bb)
+                l._mag_pend = (bb, Ab, Bb)
+            elif ctx.has_mag and sl:   # the float adapter a = (xs B) A^T: gh = bf16(g r) A from the row pass, its input
                 xo, h, Ab, Bb = sv[6:]   # gradient gh B^T formed inside the dx kernel (no [M, K] round trip)
                 if xo is None:
                     xo = _K.dequant_i8(xq, xs)

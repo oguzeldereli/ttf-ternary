@@ -547,6 +547,21 @@ def remove_grad_hook(fn):
         GRAD_HOOKS.remove(fn)
 
 
+def _mag_grads(l, g):
+    """--mag-fused: the float adapter a = (xs B) A^T's gradients from the dense TTF gradient G = sum_t gy_t x_t^T
+    (gy = bf16(g r) beta, x the int8 codes x row scale): dA = sum_t gt_t h_t^T = G B / beta, dB = sum_t x_t gh_t^T =
+    G^T A / beta (A, B the forward's bf16 copies); added to .grad (micro-batches sum)"""
+    bb, Ab, Bb = l._mag_pend
+    l._mag_pend = None
+    ib = 1.0 / bb.float()
+    for p_, v_ in ((l.mag_A, torch.mm(g, Bb.float()).mul_(ib)), (l.mag_B, torch.mm(g.t(), Ab.float()).mul_(ib))):
+        v_ = v_.to(p_.dtype)
+        if p_.grad is None:
+            p_.grad = v_
+        else:
+            p_.grad.add_(v_)
+
+
 def ts_layer(l, g, state, c):
     """one layer of TTF (the no-momentum update): g is this layer's gradient (fp32), or its factors (gy, x) with
     --dw factored; c holds the settings and lr_ratio. Called from the layer's backward right after its input gradient
@@ -573,6 +588,8 @@ def ts_layer(l, g, state, c):
             g = r_
     if not torch.is_tensor(g) and DENSE_G[0]:   # --ttf-dense-g: the dense gradient from the factors, then the dense path
         g = _dense_g_of(g, c)
+        if getattr(l, "_mag_pend", None) is not None:   # --mag-fused: the float adapter's gradients from this g
+            _mag_grads(l, g)
         blk = _row_blocks(l)
         if blk is not None:              # --fuse-proj split: each sub-layer's rows keep their own accumulator and v
             for p_ in blk:

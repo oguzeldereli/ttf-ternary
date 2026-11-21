@@ -18,6 +18,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+
+SIDE = [None]   # --ttf-side-stream: the CUDA stream the per-layer TTF updates run on
+
+
+def _rec_stream(g, st):
+    """the backward's factors handed to an update on stream st: marked as used there, so the allocator does not give
+    their memory back to the main stream before the update has read them"""
+    if torch.is_tensor(g):
+        g.record_stream(st)
+    elif isinstance(g, (tuple, list)):
+        for x in g:
+            _rec_stream(x, st)
+    elif g is not None and hasattr(g, "__slots__"):
+        for a in g.__slots__:
+            x = getattr(g, a, None)
+            if torch.is_tensor(x):
+                x.record_stream(st)
+
 def _code_mult(args):
     """the int-k codes' rate: --intk-code-mult, else --emb-lr-mult (their threshold is theta / this)"""
     return args.emb_lr_mult if getattr(args, "intk_code_mult", None) is None else args.intk_code_mult
@@ -1157,6 +1175,12 @@ def main():
                 m_.on_grad = _og
             else:
                 def _og1(layer, g, _c=ts_cfg):
+                    if SIDE[0] is not None:    # --ttf-side-stream: the update on its own stream, overlapping the backward
+                        SIDE[0].wait_stream(torch.cuda.current_stream())
+                        _rec_stream(g, SIDE[0])
+                        with torch.cuda.stream(SIDE[0]), _rf("ttf.update"):
+                            ts_layer(layer, g, lr_state, _c)
+                        return
                     with _rf("ttf.update"):    # (a range per layer call: only while a profiler runs)
                         ts_layer(layer, g, lr_state, _c)
                 m_.on_grad = _og1
@@ -1225,6 +1249,10 @@ def main():
         assert args.ttf_turn_every == 1 or tc.grad_accum == 1, "--ttf-turn-every: one batch per step (--accum 1)"
         print(f"--ttf-dense-g {args.ttf_dense_g} (tokens {args.ttf_upd_tokens:g}), --ttf-turn-every {args.ttf_turn_every}",
               flush=True)
+    if ttf and args.ttf_side_stream and device == "cuda":
+        assert tc.grad_accum == 1 and _WS == 1 and not _PP, "--ttf-side-stream: one batch per step, one process"
+        SIDE[0] = torch.cuda.Stream()
+        print("--ttf-side-stream: the TTF updates on a second CUDA stream", flush=True)
     if getattr(args, "attn_fp8", False):
         from .model import ATTN_FP8 as _AF8
         _AF8[0] = True
@@ -1236,6 +1264,12 @@ def main():
             from .layers import LEAN_MAG as _LM
             _LM[0] = True
         print(f"--save-lean {args.save_lean}: no bf16 inputs saved by the ternary layers, t on 1/{args.save_lean} of the tokens", flush=True)
+    if getattr(args, "mag_fused", False):
+        assert args.ttf_dense_g and args.ttf_upd_i8 and args.dx in ("int8", "int8x2") and not args.ttf_side_stream, \
+            "--mag-fused: with --ttf-dense-g --ttf-upd-i8, --dx int8 / int8x2, no --ttf-side-stream"
+        from .layers import MAG_FUSED as _MF
+        _MF[0] = True
+        print("--mag-fused: the float adapters in the fused kernels, their gradients from the dense TTF g", flush=True)
     if getattr(args, "head_fused", False):
         from .model import HEAD_ALL as _HA
         _HA[0] = True
@@ -1367,6 +1401,8 @@ def main():
                 _, loss = model(x, y)
             with torch.profiler.record_function("model.bwd"):   # includes the fused TTF updates (ttf.update)
                 (loss / tc.grad_accum).backward()
+            if SIDE[0] is not None:   # (--ttf-side-stream: the trits / state the updates wrote, before anything reads them)
+                torch.cuda.current_stream().wait_stream(SIDE[0])
             model.kd_logp = None
             if args.kd_cache:
                 model.kd_topk = None

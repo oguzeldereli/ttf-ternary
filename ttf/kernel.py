@@ -1563,9 +1563,12 @@ def dense_fire(A, wpacked, K, theta, spend_theta):
 @triton.jit
 def _fwd_gemm_kernel(a_ptr, w_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, pre_ptr, t_ptr, o_ptr, M, N, K, sam, swn,
                      HAS_BIAS: tl.constexpr, HAS_ACC: tl.constexpr, SAVE_T: tl.constexpr, BM: tl.constexpr,
-                     BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr, HAS_PRE: tl.constexpr = False):
+                     BN: tl.constexpr, BK: tl.constexpr, GM: tl.constexpr, HAS_PRE: tl.constexpr = False, TM=-1,
+                     h_ptr=None, at_ptr=None, R=0, RA: tl.constexpr = 16, HAS_LR: tl.constexpr = False):
     """the fused layer's forward GEMM with its epilogue: y = xq W^T (int8 x trits, int32: exact) and then
-    _epi_fwd_kernel's arithmetic on the tile, so the int32 [M, N] is never written; bit-identical to the two kernels"""
+    _epi_fwd_kernel's arithmetic on the tile, so the int32 [M, N] is never written; bit-identical to the two kernels.
+    TM >= 0: t stored for the first TM rows only (--save-lean's token subset). HAS_LR (--mag-fused): the float
+    adapter's term a = bf16(h A^T) formed here from h [M, R] and A [N, R] (bf16), in place of a pre tensor"""
     pid = tl.program_id(0)
     npm = tl.cdiv(M, BM); npn = tl.cdiv(N, BN)
     gid = pid // (GM * npn); fm = gid * GM; gs = tl.minimum(npm - fm, GM)
@@ -1583,8 +1586,16 @@ def _fwd_gemm_kernel(a_ptr, w_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, pre_
     t = _rbf((acc.to(tl.float32) * xs[:, None]) * tl.load(b_ptr))
     if HAS_PRE:
         t = _rbf(t + tl.load(pre_ptr + off, mask=m, other=0.0).to(tl.float32))
+    if HAS_LR:
+        ra = tl.arange(0, RA)
+        hv = tl.load(h_ptr + rows[:, None] * R + ra[None, :], mask=(rows[:, None] < M) & (ra[None, :] < R), other=0.0)
+        av = tl.load(at_ptr + cols[None, :] * R + ra[:, None], mask=(cols[None, :] < N) & (ra[:, None] < R), other=0.0)
+        t = _rbf(t + _rbf(tl.dot(hv, av)))
     if SAVE_T:
-        tl.store(t_ptr + off, t.to(tl.bfloat16), mask=m)
+        if TM >= 0:
+            tl.store(t_ptr + off, t.to(tl.bfloat16), mask=m & (rows[:, None] < TM))
+        else:
+            tl.store(t_ptr + off, t.to(tl.bfloat16), mask=m)
     o = _rbf(t * tl.load(r_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)[None, :])
     if HAS_BIAS:
         o = _rbf(o + tl.load(bias_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)[None, :])
@@ -1593,7 +1604,35 @@ def _fwd_gemm_kernel(a_ptr, w_ptr, xs_ptr, b_ptr, r_ptr, bias_ptr, acc_ptr, pre_
     tl.store(o_ptr + off, o.to(tl.bfloat16), mask=m)
 
 
-def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t, pre=None):
+@triton.jit
+def _mag_h_kernel(q_ptr, s_ptr, b_ptr, h_ptr, M, K, R, RA: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr):
+    """h = bf16(xs * (xq B)) [M, R]: the float adapter's down product from the prologue's int8 codes (exact in bf16)
+    and row scales, B [K, R] bf16, fp32 sums (--mag-fused: no bf16 copy of the scaled input is written)"""
+    rows = tl.program_id(0) * BM + tl.arange(0, BM); ra = tl.arange(0, RA); rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, RA), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        kk = k0 + rk
+        q = tl.load(q_ptr + rows[:, None] * K + kk[None, :], mask=(rows[:, None] < M) & (kk[None, :] < K), other=0)
+        b = tl.load(b_ptr + kk[:, None] * R + ra[None, :], mask=(kk[:, None] < K) & (ra[None, :] < R), other=0.0)
+        acc = tl.dot(q.to(tl.bfloat16), b, acc)
+    s = tl.load(s_ptr + rows, mask=rows < M, other=0.0)
+    tl.store(h_ptr + rows[:, None] * R + ra[None, :], (acc * s[:, None]).to(tl.bfloat16),
+             mask=(rows[:, None] < M) & (ra[None, :] < R))
+
+
+def mag_h(xq, xs, B_b):
+    """--mag-fused: h = bf16(xs (xq B)) [M, R] (B [K, R] bf16)"""
+    M, K = xq.shape
+    R = B_b.shape[1]
+    B_b = B_b.contiguous()
+    h = torch.empty(M, R, dtype=torch.bfloat16, device=xq.device)
+    BM = 64
+    _mag_h_kernel[(triton.cdiv(M, BM),)](xq, xs, B_b, h, M, K, R, RA=max(16, triton.next_power_of_2(R)), BM=BM,
+                                         BK=128, num_warps=4)
+    return h
+
+
+def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t, pre=None, t_rows=None, lr=None):
     """xq int8 [M, K] (fused_prologue), the trits w8 int8 [N, K] (KernelTernaryLinear.w8()) -> (t, out) as
     fused_epilogue(torch._int_mm(xq, w8.t()), ...) gives them, bit for bit. One Triton kernel (no int32 round trip)
     for short reductions (K <= 2048: the adapters' up factors, whose int32 [M, N] and epilogue cost as much as their
@@ -1602,15 +1641,25 @@ def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t, pre=None):
     M, K = xq.shape
     N = w8.shape[0]
     if K > 2048:
-        return fused_epilogue(torch._int_mm(xq, w8.t()), xs, beta, r_b, bias_b, acc, save_t, pre)
+        if lr is not None:
+            pre = torch.mm(lr[0], lr[1].t())
+        t, o = fused_epilogue(torch._int_mm(xq, w8.t()), xs, beta, r_b, bias_b, acc, save_t, pre)
+        if t is not None and t_rows is not None and t_rows < M:
+            t = t[:t_rows].clone()
+        return t, o
     o = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device)
-    t = torch.empty_like(o) if save_t else None
+    tm = M if t_rows is None else min(int(t_rows), M)
+    t = torch.empty(tm, N, dtype=torch.bfloat16, device=xq.device) if save_t else None
+    lk = {}
+    if lr is not None:
+        h_, a_ = lr[0].contiguous(), lr[1].contiguous()
+        lk = dict(h_ptr=h_, at_ptr=a_, R=h_.shape[1], RA=max(16, triton.next_power_of_2(h_.shape[1])), HAS_LR=True)
     BM, BN, BK, nw = (64, 128, 64, 8) if N >= 16384 else (128, 64, 64, 4)
     _fwd_gemm_kernel[(triton.cdiv(M, BM) * triton.cdiv(N, BN),)](
         xq, w8, xs, _dev_scalar(beta, xq.device), r_b, bias_b if bias_b is not None else r_b,
         acc if acc is not None else o, pre if pre is not None else o, t if t is not None else o, o, M, N, K,
         xq.stride(0), w8.stride(0), HAS_BIAS=bias_b is not None, HAS_ACC=acc is not None, SAVE_T=save_t, BM=BM, BN=BN,
-        BK=BK, GM=8, num_warps=nw, num_stages=3, HAS_PRE=pre is not None)
+        BK=BK, GM=8, num_warps=nw, num_stages=3, HAS_PRE=pre is not None, TM=tm if tm < M else -1, **lk)
     return t, o
 
 
@@ -1682,7 +1731,6 @@ def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None, save_f=Tr
     M, N = g.shape
     assert save_f or slices
     if a_b is not None:
-        assert save_gt
         R = a_b.shape[1]; a_b = a_b.contiguous()
         gh = torch.empty(M, R, dtype=torch.bfloat16, device=g.device)
     f = torch.empty_like(g) if save_f else g    # (g: a placeholder pointer, never written)

@@ -113,6 +113,9 @@ def build_parser():
                    "the accumulator's projections) on the int8 tensor cores from the layer's own int8 factors (x's codes, "
                    "gy's int8 slice; --dx int8 / int8x2), the thin operands in int8 with per-column / per-128-token "
                    "scales (i8upd; 20 Nov: 2-2.7x the bf16 products' speed, 8-bit rounding of the thin operands)")
+    g.add_argument("--ttf-side-stream", action=ON, default=False, help="each layer's TTF update on a second CUDA "
+                   "stream, overlapping the rest of the backward (same kernels, same order per stream: the same "
+                   "result); the main stream waits for it after the backward")
     g.add_argument("--ttf-dense-g", action=ON, default=False, help="--dw factored: the update from the dense gradient "
                    "g = gy^T x, formed per layer (one int8 GEMM from the layer's int8 factors with --ttf-upd-i8, else one "
                    "bf16 GEMM; a transient fp32 [N, K]) instead of the factored products: exact row / column sums of g^2 "
@@ -206,6 +209,10 @@ def build_parser():
                    "accumulator per sub-layer (needs --ttf-dense-g), shared one for the group (rank of the group's min(N, K))")
     g.add_argument("--attn-fp8", action=ON, default=False, help="training attention's forward on FP8 tensor cores "
                    "(e4m3, per-tile scales; fp8attn.py), the backward aten's bf16 flash backward at that output")
+    g.add_argument("--mag-fused", action="store_true", help="the float adapter inside the fused ternary kernels: h = "
+                   "xs (xq B) from the int8 codes, a = h A^T in the GEMM's epilogue, gh in the row pass, gh B^T in dx2_col, "
+                   "and its gradients G B / beta, G^T A / beta from the dense TTF gradient (needs --ttf-dense-g "
+                   "--ttf-upd-i8, --dx int8)")
     g.add_argument("--save-lean-mag", action="store_true", help="--save-lean also on the layers with a float adapter (its input re-formed from the int8 codes)")
     g.add_argument("--save-lean", type=int, default=0, help="S > 0: the fused ternary layer saves no bf16 copy of its "
                    "input (the column-scale gradient from the int8 codes, x = xq xs / c) and its pre-row-scale output on "
