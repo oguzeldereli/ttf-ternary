@@ -256,6 +256,7 @@ def build_parser():
     g.add_argument("--kd-cache-start", type=int, default=0, help="the step that reads the cache's window 0")
     g.add_argument("--moe", default="", help="E:K[:H]: mixture of E ternary experts, top-K routing")
     g.add_argument("--moe-aux", type=float, default=0.01, help="load-balancing loss weight")
+    g.add_argument("--tern-emb-theta-mult", type=float, default=1.0, help="--tern-emb: its theta x this")
     g.add_argument("--tern-emb-scales", default="rc", choices=["rc", "r", "none"], help="--tern-emb: its learned "
                    "per-row and per-column scales (rc), per-row only (r), or none (all 1: W = s0 T)")
     g.add_argument("--tern-emb", default="none", help="none | tied | untied | tied_wide[:M]: ternary token embedding")

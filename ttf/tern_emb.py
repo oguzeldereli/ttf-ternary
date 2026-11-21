@@ -149,13 +149,16 @@ def enable_tern_emb(model, kind: str, mode: str):
     return sum(m.N * m.K for m in lays)
 
 
+THETA_MULT = [1.0]   # --tern-emb-theta-mult: the ternary embedding's theta x this (its own noise-matched bar)
+
+
 def tern_emb_step(model, state, c, ts_layer):
     """kernel mode, after the backward: the TTF update of each ternary embedding matrix"""
     for m in tern_emb_layers(model):
         g = m.grad_trits()
         if g is not None:
             before = m.wpacked.clone() if _DBG else None
-            ts_layer(m, g, state, c)
+            ts_layer(m, g, state, c if THETA_MULT[0] == 1.0 else dict(c, theta=c["theta"] * THETA_MULT[0]))
             if _DBG:
                 m._moves = int((unpack_rows(before, m.K) != unpack_rows(m.wpacked, m.K)).sum().item())
                 print(f"tern_emb {m._ts_idx}: moves {m._moves}, |g| {g.abs().mean().item():.3e}", flush=True)

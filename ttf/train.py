@@ -492,6 +492,8 @@ def main():
         n_te = enable_tern_emb(model, te, "master" if args.mode == "bitnet" else "kernel")
         from .tern_emb import set_scales as _te_sc
         _te_sc(model, args.tern_emb_scales)
+        from . import tern_emb as _TE
+        _TE.THETA_MULT[0] = float(args.tern_emb_theta_mult)
         assert args.mode == "bitnet" or (ttf and tc.grad_accum == 1), "--tern-emb with --mode ttf: --accum 1"
         print(f"--tern-emb {te}: {n_te / 1e6:.1f}M ternary embedding weights (+ row / column scales)", flush=True)
     _ck_auto = None     # --ckpt-skip auto: chosen per step from the measured peak (memplan.py), else the last N blocks
