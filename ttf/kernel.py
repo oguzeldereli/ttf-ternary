@@ -1768,6 +1768,9 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
                 tl.store(q2_ptr + off, tl.minimum(tl.maximum(q2, -127.0), 127.0).to(tl.int8), mask=m)
 
 
+ROWS_TILE = [None]   # fused_bwd_rows' (BM, BN, num_warps); None: by shape
+
+
 def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None, save_f=True, save_q1t=False, t_rows=None):
     """-> (gyf bf16 [M, N], q1, q2, s (None without slices; q2 None with one), bias gradient fp32 [N], row-scale
     gradient fp32 [N]); slices: 0, 1 or 2 int8 slices of gyf. save_gt: a seventh output, bf16(g * r); a_b (the float
@@ -1779,7 +1782,11 @@ def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None, save_f=Tr
         R = a_b.shape[1]; a_b = a_b.contiguous()
         gh = torch.empty(M, R, dtype=torch.bfloat16, device=g.device)
     f = torch.empty_like(g) if save_f else g    # (g: a placeholder pointer, never written)
-    BM, BN = 16, 256
+    # (t_rows_tune.py 21 Nov, 4070 Ti Super, 32768 rows, the fast recipe's call: N 768 297 -> 216 us, N 2048 752 -> 660;
+    # the same codes, the column sums in another order)
+    BM, BN, nw = ROWS_TILE[0] if ROWS_TILE[0] is not None else ((32, 256, 4) if N <= 1024 else (64, 256, 8))
+    if a_b is not None and ROWS_TILE[0] is None:   # (with the adapter's gh dot: N 768 423 -> 280 us, N 2048 1096 -> 701)
+        BM, BN, nw = (128, 64, 4) if N <= 1024 else (32, 128, 4)
     nb = triton.cdiv(M, BM)
     pb = torch.empty(nb, N, dtype=torch.float32, device=g.device); pr = torch.empty_like(pb)
     if slices:
@@ -1796,7 +1803,7 @@ def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None, save_f=Tr
         gk.update(TM=int(t_rows))
     _bwd_rows_kernel[(nb,)](g, t, r_b, beta_b, f, q1 if slices else f, q2 if q2 is not None else f,
                             s if slices else pb, pb, pr, gt if gt is not None else f, M, N, SLICES=int(slices), BM=BM,
-                            BN=BN, SAVE_GT=save_gt, SAVE_F=save_f, **gk)
+                            BN=BN, SAVE_GT=save_gt, SAVE_F=save_f, num_warps=nw, **gk)
     LAST_Q1T[0] = q1t
     prs = pr.sum(0) if t_rows is None else pr.sum(0).mul_(M / max(int(t_rows), 1))   # (the subset's sum x M / TM)
     return (f if save_f else None, q1, q2, s, pb.sum(0), prs) + ((gt,) if save_gt else ()) + ((gh,) if a_b is not None else ())
