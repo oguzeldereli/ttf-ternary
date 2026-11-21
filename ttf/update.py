@@ -595,22 +595,26 @@ def _borth(X):
 
 def _p2(X):
     """a power of two per matrix of X [B, ., .] near its largest |entry| (shape [B, 1, 1]): X / s fits fp16"""
-    return torch.exp2(torch.round(torch.log2(X.abs().amax(dim=(1, 2), keepdim=True).clamp_min(1e-30))))
+    m = torch.linalg.vector_norm(X, ord=float("inf"), dim=(1, 2), keepdim=True)
+    return torch.exp2(torch.round(torch.log2(m.clamp_min(1e-30))))
 
 
-def _bmm16(A, B_):
-    """A @ B_ (batched, fp32 in and out) on the fp16 tensor cores, fp32 sums; each operand scaled by a power of two"""
-    sa, sb = _p2(A), _p2(B_)
-    return torch.bmm((A / sa).half(), (B_ / sb).half(), out_dtype=torch.float32).mul_(sa * sb)
+def _h16(X, s=None):
+    """fp16 copy of X [B, M, N] (fp32), divided by s [B, 1, 1] (a power of two: exact) in the same pass"""
+    if s is None:
+        return X.half()
+    from .kernel import scale_half
+    return scale_half(X, s)
 
 
 def _borth16(X):
-    """_borth with the Grams and the solves on the fp16 tensor cores: two Cholesky QR passes, Y <- (Y / s) L^-T with
-    L the fp32 Cholesky factor of the fp16 Gram (L^-1 by an fp32 triangular solve, r x r). Orthogonality ~3e-4 rms
-    (b27 shapes; the fp12s store's own rounding of the basis: 1.9e-3)"""
+    """_borth with the Grams and the solves on the fp16 tensor cores: two Cholesky QR passes, Y <- Yh L^-T with L the
+    fp32 Cholesky factor of the fp16 Gram (L^-1 by an fp32 triangular solve, r x r). The first pass's X scaled by a
+    power of two per matrix (fp16 range); the second's Y has orthonormal-scale columns. Orthogonality ~3e-4 rms (b27
+    shapes; the fp12s store's own rounding of the basis: 1.9e-3)"""
     Y = X
     for p in range(2):
-        Yh = (Y / _p2(Y)).half()
+        Yh = _h16(Y, _p2(Y) if p == 0 else None)
         G = torch.bmm(Yh.transpose(1, 2), Yh, out_dtype=torch.float32)
         if p == 0:
             G.diagonal(dim1=1, dim2=2).add_(1e-7 * torch.linalg.matrix_norm(G).reshape(-1, 1))
@@ -663,8 +667,13 @@ def _flush_group(its):
     del Us, Vs, a_, b_
     P = torch.bmm(G.transpose(1, 2), (A * U).to(lp), out_dtype=torch.float32) if lp != torch.float32 else \
         torch.bmm(G.transpose(1, 2), A * U)
-    if BATCH_F16[0]:
-        X = P.mul_(Bc).mul_(-lr_ratio).add_(_bmm16(V, _bmm16(U.transpose(1, 2), U)))
+    if BATCH_F16[0]:   # (U scaled by a power of two per matrix, one fp16 copy for both of its products; V, Vn and
+        # V^T Vn have orthonormal-scale entries, U^T U is r x r)
+        sU = _p2(U); Uh = _h16(U, sU); Vh = V.half()
+        UtU = torch.bmm(Uh.transpose(1, 2), Uh, out_dtype=torch.float32)
+        sM = _p2(UtU)
+        X = P.mul_(Bc).mul_(-lr_ratio).add_(torch.bmm(Vh, (UtU / sM).half(), out_dtype=torch.float32).mul_(sM * sU * sU))
+        del UtU
     else:
         X = torch.baddbmm(P.mul_(Bc).mul_(-lr_ratio), V, torch.bmm(U.transpose(1, 2), U))
     del P
@@ -672,7 +681,9 @@ def _flush_group(its):
     del X
     Q = torch.bmm(G, (Bc * Vn).to(lp), out_dtype=torch.float32) if lp != torch.float32 else torch.bmm(G, Bc * Vn)
     if BATCH_F16[0]:
-        U = Q.mul_(A).mul_(-lr_ratio).add_(_bmm16(U, _bmm16(V.transpose(1, 2), Vn)))
+        VtV = torch.bmm(Vh.transpose(1, 2), Vn.half(), out_dtype=torch.float32)
+        U = Q.mul_(A).mul_(-lr_ratio).add_(torch.bmm(Uh, VtV.half(), out_dtype=torch.float32).mul_(sU))
+        del Uh, Vh, VtV
     else:
         U = torch.baddbmm(Q.mul_(A).mul_(-lr_ratio), U, torch.bmm(V.transpose(1, 2), Vn))
     del G, V, Q

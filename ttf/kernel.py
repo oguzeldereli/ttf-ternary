@@ -2098,3 +2098,25 @@ def log_softmax_bf16(z):
     out = z if z.dtype == torch.bfloat16 else torch.empty(n, V, dtype=torch.bfloat16, device=z.device)
     _logsoftmax_rows_kernel[(n,)](z, out, V, z.stride(0), out.stride(0), BV=2048, num_warps=8)
     return out
+
+
+@triton.jit
+def _scale_half_kernel(x_ptr, s_ptr, o_ptr, per, BLOCK: tl.constexpr):
+    """o = fp16(x / s[b]) over a batch of contiguous matrices of per entries each"""
+    b = tl.program_id(1)
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = i < per
+    inv = 1.0 / tl.load(s_ptr + b)
+    x = tl.load(x_ptr + b.to(tl.int64) * per + i, mask=m, other=0.0)
+    tl.store(o_ptr + b.to(tl.int64) * per + i, (x * inv).to(tl.float16), mask=m)
+
+
+def scale_half(X, s):
+    """X [B, M, N] fp32 -> fp16(X / s), s [B, 1, 1] (powers of two: the division exact); one pass"""
+    X = X.contiguous()
+    B = X.shape[0]; per = X[0].numel()
+    o = torch.empty(X.shape, dtype=torch.float16, device=X.device)
+    BLOCK = 4096
+    _scale_half_kernel[(triton.cdiv(per, BLOCK), B)](X, s.reshape(B).contiguous().float(), o, per, BLOCK=BLOCK,
+                                                    num_warps=8)
+    return o
