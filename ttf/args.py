@@ -206,6 +206,7 @@ def build_parser():
                    "accumulator per sub-layer (needs --ttf-dense-g), shared one for the group (rank of the group's min(N, K))")
     g.add_argument("--attn-fp8", action=ON, default=False, help="training attention's forward on FP8 tensor cores "
                    "(e4m3, per-tile scales; fp8attn.py), the backward aten's bf16 flash backward at that output")
+    g.add_argument("--save-lean-mag", action="store_true", help="--save-lean also on the layers with a float adapter (its input re-formed from the int8 codes)")
     g.add_argument("--save-lean", type=int, default=0, help="S > 0: the fused ternary layer saves no bf16 copy of its "
                    "input (the column-scale gradient from the int8 codes, x = xq xs / c) and its pre-row-scale output on "
                    "the first 1 / S of the tokens (the row-scale gradient's sum x S): less activation memory, less recompute")

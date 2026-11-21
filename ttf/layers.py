@@ -70,6 +70,7 @@ class _AddRowFn(torch.autograd.Function):
 
 FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
 ACT_GROUP = [0]    # --act-group G: --act-bits codes with one scale per G input columns (fake-quant study)
+LEAN_MAG = [False]   # --save-lean-mag: --save-lean also on layers with the float adapter (21 Nov)
 SAVE_LEAN = [0]    # --save-lean S: the fused layer keeps no bf16 input and its pre-row-scale output t on 1 / S of the tokens
 UPD_I8 = [False]   # --ttf-upd-i8: the factored TTF update's products from the int8 factors (i8upd), where gy's int8 slice exists
 DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices (int8: one)
@@ -246,8 +247,8 @@ class _FusedTernFn(torch.autograd.Function):
             o, sv = _fused_fwd(layer, x2, acc2, True)
         xq, xs, xc, t, cb, rb, beta = sv[:7]
         ctx.has_mag = mA is not None
-        ctx.lean = bool(SAVE_LEAN[0] and mA is None and DX_MODE[0] in ("int8", "int8x2") and not GRAD_BITS[0]
-                        and getattr(layer, "in_mean", None) is None)
+        ctx.lean = bool(SAVE_LEAN[0] and (mA is None or LEAN_MAG[0]) and DX_MODE[0] in ("int8", "int8x2")
+                        and not GRAD_BITS[0] and getattr(layer, "in_mean", None) is None)
         if ctx.lean:   # --save-lean: no bf16 input kept (the column-scale gradient from xq xs / c), t on 1 / SAVE_LEAN
             tm_ = max(1, t.shape[0] // SAVE_LEAN[0])     # of the tokens (the row-scale gradient's sum x SAVE_LEAN)
             if tm_ < t.shape[0]:
@@ -258,7 +259,10 @@ class _FusedTernFn(torch.autograd.Function):
             ctx.mdt = (mA.dtype, mB.dtype)
         ctx.mu_b = (layer.in_mean.to(torch.bfloat16) if getattr(layer, "in_mean", None) is not None
                     else None)   # (xc above is the input, its centring redone in the backward)
-        ctx.save_for_backward(xq, xs, xc, t, cb, rb, *sv[7:])
+        mg = list(sv[7:])
+        if ctx.lean and ctx.has_mag:   # (--save-lean with the float adapter: its input xo re-formed from xq xs)
+            mg[0] = None
+        ctx.save_for_backward(xq, xs, xc, t, cb, rb, *mg)
         ctx.layer, ctx.beta, ctx.xshape = layer, beta, x.shape
         ctx.cdt, ctx.rdt, ctx.has_bias, ctx.has_acc = c.dtype, r.dtype, bias is not None, acc is not None
         ctx.bdt = bias.dtype if bias is not None else None
@@ -281,8 +285,11 @@ class _FusedTernFn(torch.autograd.Function):
             lr = None
             if ctx.has_mag and sl:   # the float adapter a = (xs B) A^T: gh = bf16(g r) A from the row pass, its input
                 xo, h, Ab, Bb = sv[6:]   # gradient gh B^T formed inside the dx kernel (no [M, K] round trip)
+                if xo is None:
+                    xo = _K.dequant_i8(xq, xs)
                 f, q1, q2, s, gbias, grow, gt, gh = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=True, a_b=Ab,
-                                                                      save_q1t=wq1t)
+                                                                      save_q1t=wq1t,
+                                                                      t_rows=ctx.t_rows if ctx.lean else None)
                 gA = torch.mm(h.t(), gt).t().to(ctx.mdt[0])
                 gB = torch.mm(xo.t(), gh).to(ctx.mdt[1])
                 lr = (gh, Bb)
@@ -298,6 +305,8 @@ class _FusedTernFn(torch.autograd.Function):
                     q1 = s = None
             if ctx.has_mag and lr is None:   # (one slice off: the adapter's gradients as autograd's mm backward forms them)
                 xo, h, Ab, Bb = sv[6:]
+                if xo is None:
+                    xo = _K.dequant_i8(xq, xs)
                 gt = gt[0]                                    # bf16(g * r)
                 gA = torch.mm(h.t(), gt).t().to(ctx.mdt[0])
                 gh = torch.mm(gt, Ab)

@@ -1232,6 +1232,9 @@ def main():
     if getattr(args, "save_lean", 0):
         from .layers import SAVE_LEAN as _SL
         _SL[0] = int(args.save_lean)
+        if getattr(args, "save_lean_mag", False):
+            from .layers import LEAN_MAG as _LM
+            _LM[0] = True
         print(f"--save-lean {args.save_lean}: no bf16 inputs saved by the ternary layers, t on 1/{args.save_lean} of the tokens", flush=True)
     if getattr(args, "head_fused", False):
         from .model import HEAD_ALL as _HA
