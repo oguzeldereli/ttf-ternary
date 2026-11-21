@@ -172,7 +172,7 @@ def dense_g(F, frac=1.0):
     scaled by 1 / frac (--ttf-upd-tokens)"""
     T = F.q1.shape[0]
     Tu = T if frac >= 1 else max(BT, (int(T * frac) // BT) * BT)
-    Yt, sY = rqx(F.xq[:Tu], F.rs[:Tu])
+    Yt, sY = F.yq if (F.yq is not None and Tu == T) else rqx(F.xq[:Tu], F.rs[:Tu])
     g = tn(F.q1t_(), Yt, sY, T=Tu)
     return g if Tu == T else g.mul_(T / Tu)
 
@@ -180,13 +180,14 @@ def dense_g(F, frac=1.0):
 class I8Factors:
     """a ternary layer's gradient factors in int8: gy = s * q1 [T, N], x = xs * xq [T, K], with their transposes (the
     token-contracting products' layout); rs = s * xs (both row scales, which every product chain carries once)"""
-    __slots__ = ("q1", "s", "xq", "xs", "rs", "_q1t", "_xqt", "gy_fn")
+    __slots__ = ("q1", "s", "xq", "xs", "rs", "_q1t", "_xqt", "gy_fn", "yq")
 
     def __init__(self, q1, s, xq, xs, gy_fn=None, q1t=None):
         self.q1, self.s, self.xq, self.xs = q1, s, xq, xs
         self.gy_fn = gy_fn          # () -> gy bf16, where the layer did not keep it (kernel.fused_bwd_rows save_f False)
         self.rs = (s * xs).contiguous()
         self._q1t, self._xqt = q1t, None    # the transposes, made on first use (the dense gradient needs q1^T only)
+        self.yq = None      # rqx(xq, rs) when the dx kernel formed it (kernel.dx2_col rqx=True)
 
     def q1t_(self):
         if self._q1t is None:

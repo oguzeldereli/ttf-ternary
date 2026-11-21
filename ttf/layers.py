@@ -196,6 +196,7 @@ def _fused_ok(l, x):
     return True
 
 
+RQX_FUSED = [False]   # --ttf-rqx-fused: the dense TTF gradient's requantized input formed in the dx kernel
 MAG_FUSED = [False]   # --mag-fused: the float adapter inside the fused kernels (its gradients from the dense TTF g)
 
 
@@ -358,7 +359,11 @@ class _FusedTernFn(torch.autograd.Function):
                 gx, gc, gup = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xq, None, None, lr, xs=xs, swi=swt)
                 del q1, q2
             elif sl and q1 is not None and ctx.lean:
-                gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xq, None, None, lr, xs=xs)
+                gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xq, None, None, lr, xs=xs,
+                                    rqx=bool(RQX_FUSED[0] and F8 is not None))
+                if F8 is not None and _K.LAST_RQX[0] is not None:
+                    F8.yq = _K.LAST_RQX[0]
+                _K.LAST_RQX[0] = None
                 del q1, q2
             elif sl and q1 is not None:
                 gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xc, ctx.mu_b, None, lr)

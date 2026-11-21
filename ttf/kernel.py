@@ -1843,7 +1843,8 @@ def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr,
                     HAS_MU: tl.constexpr, TWO: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
                     GM: tl.constexpr, HAS_ADD: tl.constexpr = False, gh_ptr=None, bt_ptr=None, R=0,
                     RA: tl.constexpr = 16, HAS_LR: tl.constexpr = False, xs_ptr=None, XQ: tl.constexpr = False,
-                    sg_ptr=None, su_ptr=None, gu_ptr=None, SWI: tl.constexpr = False, SW=1):
+                    sg_ptr=None, su_ptr=None, gu_ptr=None, SWI: tl.constexpr = False, SW=1, yt_ptr=None, sy_ptr=None,
+                    RQX: tl.constexpr = False):
     """the input gradient on the int8 tensor cores with its epilogue in one kernel: y1 = q1 W, y2 = q2 W (gy's two int8
     slices [M, N] against the trits, b [K, N]: row k is column k of W; two int32 accumulators, exact), then as
     _dx2_epi_kernel + _scale_bwd_kernel: g = bf16((y1 + y2 / 254) s), gx = bf16(g c) and per BM-row block the column
@@ -1896,6 +1897,14 @@ def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr,
         x = tl.load(x_ptr + off, mask=m, other=0).to(tl.float32) * xs[:, None]
         cs = tl.where(c >= 0, tl.maximum(c, 1e-6), tl.minimum(c, -1e-6))
         tl.store(pc_ptr + pm * K + cols, tl.sum(g * x, axis=0) / cs, mask=cols < K)
+        if RQX:   # (the dense TTF gradient's operand, i8upd.rqx's arithmetic: Y = (s xs) xq block-quantized per BM = 128
+            rs = s * xs                                   # tokens and column, written transposed; xq read once)
+            y = tl.load(x_ptr + off, mask=m, other=0).to(tl.float32) * rs[:, None]
+            sy = tl.maximum(tl.max(tl.abs(y), axis=0), 1e-30) / 127.0
+            q = tl.extra.cuda.libdevice.rint(y / sy[None, :])
+            tl.store(yt_ptr + cols[None, :] * M + rows[:, None], tl.minimum(tl.maximum(q, -127.0), 127.0).to(tl.int8),
+                     mask=m)
+            tl.store(sy_ptr + pm * K + cols, sy, mask=cols < K)
     else:
         x = tl.load(x_ptr + off, mask=m, other=0.0).to(tl.float32)
         if HAS_MU:
@@ -1919,7 +1928,10 @@ def _dx2_tile(N, K):
     return 64, 128, 64, 4
 
 
-def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None, swi=None):
+LAST_RQX = [None]   # dx2_col(rqx=True): (Y^T int8 [K, M], sY [M / 128, K]), i8upd.rqx(xq, s xs)'s output
+
+
+def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None, swi=None, rqx=False):
     """(gx bf16 [M, K], the column scale's gradient fp32 [K]) from gy's int8 slices q1, q2 [M, N] and scale s [M]
     (fused_bwd_rows; q2 None: one slice, --dx int8), the trits w8t [K, N] (KernelTernaryLinear.w8(t=True)), the column
     scale c_b and the layer's input x (centred here with mu_b). add [M, K] bf16, or lr = (gh [M, R], B [K, R]) bf16
@@ -1949,6 +1961,12 @@ def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None, swi=N
             assert SW == K
             gx = torch.empty(M, K, dtype=torch.bfloat16, device=q1.device); gu = torch.empty_like(gx)
         lk.update(sg_ptr=ga, su_ptr=ua, gu_ptr=gu, SWI=True, SW=SW)
+    LAST_RQX[0] = None
+    if rqx and xs is not None and BM == 128:   # (--ttf-rqx-fused; the token block must be the row tile)
+        yt = torch.empty(K, M, dtype=torch.int8, device=q1.device)
+        sy = torch.empty(nb, K, dtype=torch.float32, device=q1.device)
+        lk.update(yt_ptr=yt, sy_ptr=sy, RQX=True)
+        LAST_RQX[0] = (yt, sy)
     _dx2_col_kernel[(nb * triton.cdiv(K, BK),)](q1, q2 if q2 is not None else q1, w8t, s, c_b, x,
                                                 mu_b if mu_b is not None else c_b, add if add is not None else gx, gx,
                                                 pc, M, N, K, q1.stride(0), w8t.stride(0), HAS_MU=mu_b is not None,
