@@ -199,7 +199,8 @@ def _bwd1_kernel(q_ptr, k_ptr, v_ptr, do_ptr, lse_ptr, dl_ptr, dk_ptr, dv_ptr, d
     tl.store(dv_ptr + offv + cn[:, None] * svt + rd[None, :], dv.to(dv_ptr.dtype.element_ty), mask=cn[:, None] < T)
 
 
-ONE_PASS = [True]
+ONE_PASS = [False]   # (lab 21 Nov: the atomic dQ pass 9.6 ms vs two passes 7.8, aten flash 6.5)
+BWD_ATEN = [True]    # the backward on aten's flash-attention kernel, fed this forward's O and log-sum-exp (exact)
 
 
 def _gl(x):
@@ -236,6 +237,13 @@ class F16AttnFn(torch.autograd.Function):
     def backward(ctx, do):
         q, k, v, o, lse = ctx.saved_tensors
         B, H, T, D = q.shape
+        if BWD_ATEN[0]:   # (lse: base 2 -> natural; flash's [B, H, T] layout)
+            from .fp8attn import _philox
+            ps, po = _philox(q.device)
+            dq, dk, dv = torch.ops.aten._scaled_dot_product_flash_attention_backward(
+                do if do.stride(-1) == 1 else do.contiguous(), q, k, v, o, (lse * 0.6931471805599453).view(B, H, T),
+                None, None, T, T, 0.0, True, ps, po)
+            return dq, dk, dv
         do = do if do.stride(-1) == 1 else do.contiguous()
         sm = D ** -0.5
         G = _gl(q); ST = _st(q, k, v, G)
