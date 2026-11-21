@@ -440,6 +440,16 @@ def main():
             model.pp = {"rank": _PP[0], "n": _PP[1], "lo": _own[0], "hi": _own[1]}
     elif args.mode == "ttf":
         model = build_kernel_transformer(mc, grad_checkpoint=tc.grad_checkpoint, beta=use_beta)
+        if getattr(args, "act_group", 0):
+            from .layers import ACT_GROUP as _AG
+            _AG[0] = args.act_group
+        if getattr(args, "act_bits", 0):   # --act-bits B [--act-bits-on norm]: the ternary layers' input codes in B bits
+            _ab_n = 0
+            for _n, _m in model.named_modules():
+                if hasattr(_m, "act_bits") and (args.act_bits_on == "all" or _n.split(".")[-1] in ("wq", "wk", "wv", "w_gate", "w_up")):
+                    _m.act_bits = args.act_bits; _ab_n += 1
+            print(f"--act-bits {args.act_bits} ({args.act_bits_on}): {_ab_n} ternary layers' input codes in {args.act_bits} "
+                  f"bits (int8 storage)", flush=True)
     elif args.mode == "fp32":
         # full-precision reference (no ternary, no activation quantization): plain nn.Linear,
         # fp32 weights + AdamW, bf16 autocast in the forward like every other mode
@@ -1153,7 +1163,12 @@ def main():
         _why = [w_ for w_, bad in (("not CUDA", device != "cuda"), ("--pipe", _PP),
                                    ("--tern-emb", bool(te)),
                                    ("--intk-emb", bool(args.intk_emb)), ("data parallel", _WS > 1),
-                                   ("--ttf-offload", ttf and args.ttf_offload != "none")) if bad]
+                                   ("--ttf-offload", ttf and args.ttf_offload != "none"),
+                                   # (one micro-batch per step: the one-batch update reads Python numbers, so the graph
+                                   # would be captured again every step and never replayed; 20 Nov, 4070 Ti Super,
+                                   # 16 x 2048 x accum 1: 110M 1.112 vs 0.818 s/step eager, 340M 2.733 vs 2.127)
+                                   ("--accum 1 (a graph per step would be captured and never replayed)",
+                                    ttf and tc.grad_accum < 2)) if bad]
         _cg_ok = not _why
         print("--cuda-graph: " + ("on (micro-batches captured once per step, the middle one replayed)" if _cg_ok
               else "off for this run (" + ", ".join(_why) + ")"), flush=True)
@@ -1161,6 +1176,23 @@ def main():
             from . import update as _UPD
             from . import layers as _LYR
             _UPD.GRAPH_STATE[0] = True; _LYR.GRAPH_INPLACE[0] = True
+    if getattr(args, "ttf_24", 0):
+        from . import kernel as _K24
+        _K24.SPARSE24[0] = args.ttf_24
+        _n24 = 0; _d0 = _d1 = 0
+        with torch.no_grad():
+            for _m in model.modules():
+                if hasattr(_m, "wpacked") and _m.K % 4 == 0 and (args.ttf_24 == 1 or _m.N % 4 == 0):
+                    _w = _K24.unpack_rows(_m.wpacked, _m.K).to(torch.int8)
+                    _d0 += int((_w != 0).sum()); _w = _K24.enforce24(_w, args.ttf_24); _d1 += int((_w != 0).sum())
+                    _m.wpacked.copy_(_K24.pack_rows(_w)); _n24 += 1
+                    if hasattr(_m, "_invalidate"):
+                        _m._invalidate()
+        print(f"--ttf-24 {args.ttf_24}: {_n24} ternary layers pruned to 2:4 (nonzeros {_d0} -> {_d1})", flush=True)
+    if getattr(args, "ttf_upd_i8", False):
+        from .layers import UPD_I8 as _UI8
+        _UI8[0] = True
+        print("--ttf-upd-i8: the factored update's products on the int8 tensor cores (i8upd)", flush=True)
     if args.fused_layer:
         from .layers import FUSED_LAYER as _FLY
         _FLY[0] = True

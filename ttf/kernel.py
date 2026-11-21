@@ -677,6 +677,50 @@ FIRE_SLOTS = 32           # ttf_fire: listed (uncertain) entries per tile before
 FIRE_EB = 2.0 ** -7 * 1.05    # the bf16 bound's factor: two roundings of 2^-8 each (+ their product, the fp32 sums: 5%)
 
 
+SPARSE24 = [0]     # --ttf-24: 1 = 2:4 along K (the forward GEMM's sparse operand), 2 = also along N (transposable, dx)
+
+
+def enforce24(w, mode, gen=None):
+    """int8 trits [N, K] -> the same with at most 2 nonzeros in each group of 4 along K (mode 2: then also along N),
+    extra nonzeros zeroed at random"""
+    N, K = w.shape
+    for ax in ((1,) if mode == 1 else (1, 0)):
+        x = w if ax == 1 else w.t().contiguous()
+        R_, C_ = x.shape
+        g = x.view(R_, C_ // 4, 4)
+        nz = g != 0
+        sc = torch.rand(g.shape, device=w.device, generator=gen).masked_fill_(~nz, -1.0)
+        rk = sc.argsort(-1, descending=True).argsort(-1)          # rank of each entry by its random score
+        g = torch.where(nz & (rk < 2), g, torch.zeros_like(g))
+        x = g.view(R_, C_)
+        w = x if ax == 1 else x.t().contiguous()
+    return w
+
+
+def filter24(D, packed, K, mode):
+    """the moves D [N, K] int8, minus the births (0 -> +-1) that would leave a group of 4 with more than 2 nonzeros
+    (along K; mode 2 also along N); which births stay is random. Deaths and sign flips always stay"""
+    w = unpack_rows(packed, K).to(torch.int8)
+    nw = w + D
+    birth = (w == 0) & (D != 0)
+    for ax in ((1,) if mode == 1 else (1, 0)):
+        if ax == 0:
+            nw, birth, D = nw.t(), birth.t(), D.t()
+        R_, C_ = nw.shape
+        g = nw.reshape(R_, C_ // 4, 4); b = birth.reshape(R_, C_ // 4, 4)
+        excess = ((g != 0).sum(-1, keepdim=True) - 2).clamp_min(0)
+        sc = torch.rand(g.shape, device=D.device).masked_fill_(~b, -1.0)
+        rk = sc.argsort(-1, descending=True).argsort(-1)
+        nb = b.sum(-1, keepdim=True)
+        drop = b & (rk >= nb - excess)                           # the lowest-scored births beyond the room
+        Dg = D.reshape(R_, C_ // 4, 4).masked_fill(drop, 0)
+        D = Dg.reshape(R_, C_)
+        nw = (g.masked_fill(drop, 0)).reshape(R_, C_); birth = (b & ~drop).reshape(R_, C_)
+        if ax == 0:
+            nw, birth, D = nw.t(), birth.t(), D.t()
+    return D.contiguous()
+
+
 def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, theta: float, Vs=None):
     """TTF firing: A = U V^T, every legal move (|A| >= theta, the trit stays in {-1, 0, 1}) applied to the packed trits
     in place; returns D V (D the moves, {-1, 0, 1}) for the spend, the number of moves and the change of the nonzero
@@ -701,6 +745,8 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     _fire_fix_kernel[(triton.cdiv(S.numel(), BE),)](U, V, packed, D, S, S.numel(), K, R, U.stride(0), V.stride(0),
                                                      packed.stride(0), D.stride(0), _sc(theta), BE=BE, RC=64,
                                                      TH_PTR=torch.is_tensor(theta))
+    if SPARSE24[0]:      # --ttf-24: no move may leave more than 2 nonzeros in a group of 4 (along K)
+        D = filter24(D, packed, K, SPARSE24[0])
     cnt = torch.zeros(2, dtype=torch.int32, device=U.device)          # (the number of moves, the change of nonzeros)
     AN, AK5, SL = 16, 32, 16                                           # (the apply tile: the spend's band and list)
     ga = (triton.cdiv(N, AN), triton.cdiv(K5, AK5))
@@ -1301,6 +1347,30 @@ def _pro_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, xo_ptr, K, sxm, qp, 
         tl.store(q_ptr + row * K + offs, q.to(tl.int8), mask=offs < K)
 
 
+@triton.jit
+def _pro1_kernel(x_ptr, mu_ptr, c_ptr, q_ptr, s_ptr, xc_ptr, xo_ptr, M, K, sxm, qp, rqp, lo, HAS_MU: tl.constexpr,
+                 SAVE_XC: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr, SAVE_XS: tl.constexpr = False):
+    """_pro_kernel for K <= BK: BM whole rows per program, x read once (the same arithmetic, so the same codes)"""
+    rows = tl.program_id(0) * BM + tl.arange(0, BM); offs = tl.arange(0, BK)
+    m = (rows[:, None] < M) & (offs[None, :] < K)
+    x = tl.load(x_ptr + rows[:, None] * sxm + offs[None, :], mask=m, other=0.0).to(tl.float32)
+    if HAS_MU:
+        x = _rbf(x - tl.load(mu_ptr + offs, mask=offs < K, other=0.0).to(tl.float32)[None, :])
+        if SAVE_XC:
+            tl.store(xc_ptr + rows[:, None] * K + offs[None, :], x.to(tl.bfloat16), mask=m)
+    x = _rbf(x * tl.load(c_ptr + offs, mask=offs < K, other=0.0).to(tl.float32)[None, :])
+    if SAVE_XS:
+        tl.store(xo_ptr + rows[:, None] * K + offs[None, :], x.to(tl.bfloat16), mask=m)
+    scale = tl.maximum(tl.max(tl.abs(x), axis=1), lo) * rqp
+    tl.store(s_ptr + rows, scale, mask=rows < M)
+    q = tl.extra.cuda.libdevice.rint(tl.div_rn(x, scale[:, None]))
+    q = tl.minimum(tl.maximum(q, -qp - 1.0), qp)
+    tl.store(q_ptr + rows[:, None] * K + offs[None, :], q.to(tl.int8), mask=m)
+
+
+PRO1 = [True]   # (the one-read prologue where K <= 4096; False: the two-pass _pro_kernel)
+
+
 def fused_prologue(x2, mu_b, c_b, bits, save_xc, save_xs=False):
     """x2 [M, K] bf16 -> (int8 codes, fp32 row scales, xc = bf16(x - mu) if save_xc and mu_b is not None else None);
     save_xs: a fourth output, the scaled input bf16(bf16(x - mu) c) (the float adapter's input)"""
@@ -1310,9 +1380,15 @@ def fused_prologue(x2, mu_b, c_b, bits, save_xc, save_xs=False):
     xc = torch.empty(M, K, dtype=torch.bfloat16, device=x2.device) if (save_xc and mu_b is not None) else None
     xo = torch.empty(M, K, dtype=torch.bfloat16, device=x2.device) if save_xs else None
     qp, rqp, lo = _actq_consts(bits, x2.dtype)
-    _pro_kernel[(M,)](x2, mu_b if mu_b is not None else c_b, c_b, q, sc, xc if xc is not None else q,
-                      xo if xo is not None else q, K, x2.stride(0), qp, rqp, lo, HAS_MU=mu_b is not None,
-                      SAVE_XC=xc is not None, BK=1024, SAVE_XS=save_xs)
+    a = (x2, mu_b if mu_b is not None else c_b, c_b, q, sc, xc if xc is not None else q, xo if xo is not None else q)
+    if PRO1[0] and K <= 4096:
+        BK = triton.next_power_of_2(K); BM = max(1, 4096 // BK)
+        _pro1_kernel[(triton.cdiv(M, BM),)](*a, M, K, x2.stride(0), qp, rqp, lo, HAS_MU=mu_b is not None,
+                                            SAVE_XC=xc is not None, BM=BM, BK=BK, SAVE_XS=save_xs,
+                                            num_warps=4 if BK * BM <= 2048 else 8)
+    else:
+        _pro_kernel[(M,)](*a, K, x2.stride(0), qp, rqp, lo, HAS_MU=mu_b is not None,
+                          SAVE_XC=xc is not None, BK=1024, SAVE_XS=save_xs)
     return (q, sc, xc, xo) if save_xs else (q, sc, xc)
 
 
@@ -1541,7 +1617,8 @@ def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t, pre=None):
 @triton.jit
 def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, pb_ptr, pr_ptr, gt_ptr, M, N,
                      SLICES: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, SAVE_GT: tl.constexpr = False,
-                     a_ptr=None, gh_ptr=None, R=0, RA: tl.constexpr = 16, HAS_GH: tl.constexpr = False):
+                     a_ptr=None, gh_ptr=None, R=0, RA: tl.constexpr = 16, HAS_GH: tl.constexpr = False,
+                     SAVE_F: tl.constexpr = True):
     """from the output gradient g [M, N]: gyf = bf16(bf16(g * r) * bf16(beta)) (the GEMM's gradient, stored), the
     column sums of g (bias) and of bf16(g * t) (row scale) per row block, and with SLICES = 2 gyf's two int8 slices
     (_slice2_kernel's arithmetic), SLICES = 1 the first only (--dx int8). HAS_GH: also the float adapter's
@@ -1567,7 +1644,8 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
             av = tl.load(a_ptr + cols[:, None] * R + ra[None, :], mask=(cols[:, None] < N) & (ra[None, :] < R), other=0.0)
             gh = tl.dot(gr_.to(tl.bfloat16), av, gh)
         f = _rbf(gr_ * bb)
-        tl.store(f_ptr + off, f.to(tl.bfloat16), mask=m)
+        if SAVE_F:       # (off with --ttf-upd-i8: the update reads gy through q1; i8upd.I8Factors.gy forms it on demand)
+            tl.store(f_ptr + off, f.to(tl.bfloat16), mask=m)
         amax = tl.maximum(amax, tl.max(tl.abs(f), axis=1))
         tl.store(pb_ptr + pm * N + cols, tl.sum(g, axis=0), mask=cols < N)
         tl.store(pr_ptr + pm * N + cols, tl.sum(_rbf(g * t), axis=0), mask=cols < N)
@@ -1590,16 +1668,18 @@ def _bwd_rows_kernel(g_ptr, t_ptr, r_ptr, bb_ptr, f_ptr, q1_ptr, q2_ptr, s_ptr, 
                 tl.store(q2_ptr + off, tl.minimum(tl.maximum(q2, -127.0), 127.0).to(tl.int8), mask=m)
 
 
-def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None):
+def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None, save_f=True):
     """-> (gyf bf16 [M, N], q1, q2, s (None without slices; q2 None with one), bias gradient fp32 [N], row-scale
     gradient fp32 [N]); slices: 0, 1 or 2 int8 slices of gyf. save_gt: a seventh output, bf16(g * r); a_b (the float
-    adapter's A [N, R] bf16, with save_gt): an eighth, gh = bf16(bf16(g * r) A) [M, R]"""
+    adapter's A [N, R] bf16, with save_gt): an eighth, gh = bf16(bf16(g * r) A) [M, R]. save_f False (with slices):
+    gyf not written, returned as None (bwd_gyf(g, r_b, beta_b) forms the same tensor)"""
     M, N = g.shape
+    assert save_f or slices
     if a_b is not None:
         assert save_gt
         R = a_b.shape[1]; a_b = a_b.contiguous()
         gh = torch.empty(M, R, dtype=torch.bfloat16, device=g.device)
-    f = torch.empty_like(g)
+    f = torch.empty_like(g) if save_f else g    # (g: a placeholder pointer, never written)
     BM, BN = 16, 256
     nb = triton.cdiv(M, BM)
     pb = torch.empty(nb, N, dtype=torch.float32, device=g.device); pr = torch.empty_like(pb)
@@ -1612,8 +1692,14 @@ def fused_bwd_rows(g, t, r_b, beta_b, slices, save_gt=False, a_b=None):
     gk = dict(a_ptr=a_b, gh_ptr=gh, R=R, RA=max(16, triton.next_power_of_2(R)), HAS_GH=True) if a_b is not None else {}
     _bwd_rows_kernel[(nb,)](g, t, r_b, beta_b, f, q1 if slices else f, q2 if q2 is not None else f,
                             s if slices else pb, pb, pr, gt if gt is not None else f, M, N, SLICES=int(slices), BM=BM,
-                            BN=BN, SAVE_GT=save_gt, **gk)
-    return (f, q1, q2, s, pb.sum(0), pr.sum(0)) + ((gt,) if save_gt else ()) + ((gh,) if a_b is not None else ())
+                            BN=BN, SAVE_GT=save_gt, SAVE_F=save_f, **gk)
+    return (f if save_f else None, q1, q2, s, pb.sum(0), pr.sum(0)) + ((gt,) if save_gt else ()) + ((gh,) if a_b is not None else ())
+
+
+def bwd_gyf(g, r_b, beta_b):
+    """fused_bwd_rows' gyf = bf16(bf16(g * r) * bf16(beta)) (bf16 x bf16 products are exact in fp32, and torch rounds
+    each bf16 product once: the same tensor)"""
+    return (g * r_b) * beta_b
 
 
 @triton.jit

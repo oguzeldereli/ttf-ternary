@@ -92,6 +92,21 @@ def build_parser():
                         "steps, oscillating). A resume below the checkpoint's rank keeps each accumulator's best rank-r "
                         "part (truncated SVD). A layer whose rank r has r (N + K) >= N K (ratio 0.5 of a square matrix, "
                         "~0.77 of a 1:3.4 one) is held dense instead: U V^T would take as much memory")
+    g.add_argument("--act-bits", type=int, default=0, choices=[0, 3, 4, 5, 6, 8], help="the ternary layers' input codes "
+                   "(per-token absmax) in this many bits instead of 8 (numerics study for 4-bit tensor cores: storage "
+                   "and GEMM stay int8)")
+    g.add_argument("--act-group", type=int, default=0, help="--act-bits < 8: one scale per this many input columns "
+                   "instead of one per token (fake-quant study for a group-scaled int4 GEMM)")
+    g.add_argument("--act-bits-on", default="all", choices=["all", "norm"], help="--act-bits on all ternary layers, or "
+                   "only those reading a normed input (q, k, v, gate, up; not o / down, whose inputs carry outliers)")
+    g.add_argument("--ttf-24", type=int, default=0, choices=[0, 1, 2], help="2:4 structured trits (numerics study for "
+                   "the sparse tensor cores): 1 = at most 2 nonzeros in each group of 4 along K (the forward GEMM), "
+                   "2 = also along N (transposable: the input gradient too); the init is pruned at random to it and a "
+                   "move that would break it is dropped (random choice among a group's births)")
+    g.add_argument("--ttf-upd-i8", action=ON, default=False, help="the factored update's products (the v sketches and "
+                   "the accumulator's projections) on the int8 tensor cores from the layer's own int8 factors (x's codes, "
+                   "gy's int8 slice; --dx int8 / int8x2), the thin operands in int8 with per-column / per-128-token "
+                   "scales (i8upd; 20 Nov: 2-2.7x the bf16 products' speed, 8-bit rounding of the thin operands)")
     g.add_argument("--ttf-step-fp32", action=ON, default=False, help="--accum M > 1: keep U in fp32 between a step's "
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
     g.add_argument("--ttf-orth", default="auto", choices=["auto", "qr", "spanqr"],

@@ -631,7 +631,10 @@ def _mmb(A, B):
 
 def _fg_mm_r(fg, a, W):
     """u @ W for u = -lr diag(a) g diag(b), g = gy^T x, without g: -lr a * (gy^T (x (b W))) (fp32; W is K x r)"""
-    gy, x, b = fg
+    gy, x, b = fg[:3]
+    if len(fg) > 3 and fg[3] is not None:      # --ttf-upd-i8: on the int8 tensor cores (i8upd)
+        from . import i8upd
+        return i8upd.mm_r(fg[3], a, b, W)
     return a[:, None] * _mmb(gy.T, _mmb(x, b[:, None] * W))
 
 
@@ -640,8 +643,8 @@ def _fg_add_r(U, fg, a, W, alpha, cs=1.0):
     one): with bf16 factors in fewer passes (b W written straight to bf16, x (b W) out of the GEMM in bf16, the second
     product, the scale and the add in one kernel: kernel.acc_gemm); the same products, rounded at the same points,
     except the GEMM's bf16 output and the fp32 order"""
-    gy, x, b = fg
-    if gy.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
+    gy, x, b = fg[:3]
+    if (len(fg) > 3 and fg[3] is not None) or gy.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
         return cs * U + alpha * _fg_mm_r(fg, a, W)
     bw = torch.empty(W.shape, dtype=torch.bfloat16, device=W.device)
     torch.mul(b[:, None], W, out=bw)
@@ -653,7 +656,10 @@ def _fg_add_r(U, fg, a, W, alpha, cs=1.0):
 
 def _fg_mm_l(fg, a, W):
     """u^T @ W (W is N x r) without g: -lr b * (x^T (gy (a W))) (the -lr is applied by the caller)"""
-    gy, x, b = fg
+    gy, x, b = fg[:3]
+    if len(fg) > 3 and fg[3] is not None:
+        from . import i8upd
+        return i8upd.mm_l(fg[3], a, b, W)
     return b[:, None] * _mmb(x.T, _mmb(gy, a[:, None] * W))
 
 
@@ -755,13 +761,21 @@ def _ts_layer_factored(l, fg, state, c):
     dense path: the sums of g^2 are sketch estimates (relative noise sqrt(2 / K) per row and step, before v's EMA), and
     the 1e-8 in sqrt(v) + 1e-8 is left out (a scale factor needs a product form). Cost per call 2 T (N + K)(K_s + 2 r)
     instead of the dense gradient's 2 T N K."""
-    gy, x = fg                                # [T, N], [T, K] (bf16; products accumulate in fp32: _mmb)
+    gy, x = fg[:2]                            # [T, N], [T, K] (bf16; products accumulate in fp32: _mmb)
+    F8 = fg[2] if len(fg) > 2 else None       # --ttf-upd-i8: the same factors in int8 (i8upd.I8Factors), or None
+    if F8 is not None:
+        from . import i8upd as _I8
+        if x is None and (c.get("band") or c.get("hspend") or dense_acc(l, min(getattr(l, "ts_rank", None) or c["r"], l.N, l.K))
+                          or (key_ := id(l)) in state and is_dense_state(state[key_])):
+            x = F8.x()                        # (the paths that read x itself: the int8 factors dequantized)
+            if gy is None:
+                gy = F8.gy()
     r, lr_ratio, theta, tau, b2 = c["r"], c["lr_ratio"], c["theta"], c["tau"], c["b2"]
     r = getattr(l, "ts_rank", None) or r
     M_ = int(c.get("micro") or 1)
     final_ = getattr(l, "_ts_final", True) if M_ > 1 else True
     st = state.setdefault("_ts", {})
-    dev = gy.device
+    dev = (gy if gy is not None else F8.q1).device
     off = c.get("offload", False) if getattr(l, "_ts_host", True) else False
     sa = _store_codec(c.get("store_a", ""))
     key = id(l); t = _micro_t(l, st, key, M_, c)
@@ -788,8 +802,11 @@ def _ts_layer_factored(l, fg, state, c):
         # running sum, v's EMA, the scale and its bounded reciprocal) in two kernels (kernel.micro_sketch) instead of
         # ~50 small ops; the running sum of the column side is kept as (Sc g)^T [K, k], so no transpose copy
         from .kernel import micro_sketch
-        gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                # g Sr  [N, k]
-        SgT = _dpm(_mmb(x.T, _mmb(gy, Sc.T)))                             # (Sc g)^T  [K, k]
+        if F8 is not None:
+            gS, SgT = _dpm(_I8.g_right(F8, Sr)), _dpm(_I8.g_left_t(F8, Sc))
+        else:
+            gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                            # g Sr  [N, k]
+            SgT = _dpm(_mmb(x.T, _mmb(gy, Sc.T)))                         # (Sc g)^T  [K, k]
         R0 = C0 = None
         if ("v", key) in st and ts_ > 0:
             R0, C0 = _host_get(st, ("v", key), dev, off)
@@ -812,8 +829,11 @@ def _ts_layer_factored(l, fg, state, c):
             _keep(st, ("mx", key), (PS, SP, rs, cs, ds, es))
         del PS, SP
     else:
-        gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                    # g Sr  [N, k]
-        Sg = _dpm(_mmb(x.T, _mmb(gy, Sc.T)).T.contiguous())                   # Sc g  [k, K]
+        if F8 is not None:
+            gS, Sg = _dpm(_I8.g_right(F8, Sr)), _dpm(_I8.g_left_t(F8, Sc).T.contiguous())
+        else:
+            gS = _dpm(_mmb(gy.T, _mmb(x, Sr)))                                # g Sr  [N, k]
+            Sg = _dpm(_mmb(x.T, _mmb(gy, Sc.T)).T.contiguous())               # Sc g  [k, K]
         rsq, csq = gS.square().sum(1), Sg.square().sum(0)                     # ~ row / column sums of g^2
         if M_ > 1:   # as ts_layer's micro-batch branch, with the sketched own squares
             r0, c0 = rsq * (M_ * M_ / l.K), csq * (M_ * M_ / l.N)
@@ -858,7 +878,7 @@ def _ts_layer_factored(l, fg, state, c):
         del gS, Sg
         ia = 1.0 / torch.maximum(a, a.max() * 1e-12 + 1e-30)                 # 1 / a_i, 1 / b_j (zero rows: g is zero there;
         ib = 1.0 / torch.maximum(b, b.max() * 1e-12 + 1e-30)                 # device-side bounds: no host sync per call)
-    fgb = (gy, x, ib)
+    fgb = (gy, x, ib, F8)
     if c.get("start") and c.get("step", 0) < c["start"]:                  # --ttf-start: frozen, v keeps learning
         return
     ra = min(r, l.N, l.K)
@@ -979,7 +999,7 @@ def _ts_dense_acc(l, fgb, ia, state, st, key, t, M_, final_, lk, lr_ratio, theta
     the last the firing on A itself (|A| >= theta, legal moves; A -= spend theta D). Stored as the low-rank pair is (the
     --ttf-store codec, fp32 within the step with --ttf-step-fp32)"""
     from .kernel import unpack_rows, pack_rows
-    gy, x, ib = fgb
+    gy, x, ib = fgb[:3]
     A = load_dense(_host_get(state, key, dev, off), l) if key in state else None
     cs = lk if (t - 1) % M_ == 0 else 1.0
     if gy.is_cuda and gy.dtype == x.dtype == torch.bfloat16:   # (kernel.acc_gemm: x diag(ib) rounded to bf16 on load)

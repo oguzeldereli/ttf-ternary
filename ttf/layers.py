@@ -69,6 +69,8 @@ class _AddRowFn(torch.autograd.Function):
 
 
 FACTORED = [False]           # --dw factored: on for this step (off on --ttf-vdiag steps, which read dense g)
+ACT_GROUP = [0]    # --act-group G: --act-bits codes with one scale per G input columns (fake-quant study)
+UPD_I8 = [False]   # --ttf-upd-i8: the factored TTF update's products from the int8 factors (i8upd), where gy's int8 slice exists
 DX_MODE = ["bf16"]             # --dx int8x2: the input gradient on the int8 tensor cores, gy in two int8 slices (int8: one)
 GRAD_BITS = [0]                # --grad-bits b: gy (the gradient entering each ternary product) in b-bit integers, below
 GRAD_GROUP = [0]               # --grad-group G: one scale per G consecutive entries of a row instead of one per row
@@ -204,13 +206,24 @@ def _fused_fwd(l, x2, acc2, save):
     # (the input itself is kept for the backward, which re-forms bf16(x - mu): one tensor for all the readers of one
     # input, bit-identical)
     mag = getattr(l, "mag_A", None) is not None
+    if ACT_GROUP[0] and l.act_bits < 8:   # --act-group G (study): the scaled input in act_bits codes with one scale per G
+        # columns, round to nearest; the values then go through the normal 8-bit prologue (near lossless on them)
+        G = ACT_GROUP[0]; qp = 2 ** (l.act_bits - 1) - 1
+        xc_ = (x2.float() - (mu_b.float() if mu_b is not None else 0.0)) * cb.float()
+        g_ = xc_.view(-1, l.K // G, G)
+        sc_ = g_.abs().amax(-1, keepdim=True).clamp_min(1e-8) / qp
+        x2 = ((g_ / sc_).round().clamp(-qp, qp) * sc_).view_as(xc_).div(cb.float()).add(
+            mu_b.float() if mu_b is not None else 0.0).to(torch.bfloat16)
+        abits = 8
+    else:
+        abits = l.act_bits
     if mag:
-        xq, xs, _, xo = _K.fused_prologue(x2, mu_b, cb, l.act_bits, False, True)
+        xq, xs, _, xo = _K.fused_prologue(x2, mu_b, cb, abits, False, True)
         Ab, Bb = l.mag_A.to(torch.bfloat16), l.mag_B.to(torch.bfloat16)
         h = xo @ Bb
         a = h @ Ab.T
     else:
-        xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, l.act_bits, False)
+        xq, xs, _ = _K.fused_prologue(x2, mu_b, cb, abits, False)
         a = None
     beta = l._cached_beta(l.wpacked) if l.use_beta else None
     t, o = _K.fused_fwd_gemm(xq, l.w8(), xs, beta if beta is not None else 1.0, rb, bb, acc2, save, a)
@@ -251,6 +264,9 @@ class _FusedTernFn(torch.autograd.Function):
         bb = (ctx.beta if ctx.beta is not None else torch.ones((), device=g.device)).reshape(()).to(torch.bfloat16)
         sl = {"int8x2": 2, "int8": 1}.get(DX_MODE[0], 0)
         gA = gB = gxa = None
+        # --ttf-upd-i8: the update reads gy through its int8 slice q1, so the bf16 gy is not written (formed on demand)
+        skip_f = bool(UPD_I8[0] and sl and not GRAD_BITS[0] and not ctx.has_mag and l.capture
+                      and getattr(l, "on_grad", None) is not None)
         with _rf("tern.dx"):
             lr = None
             if ctx.has_mag and sl:   # the float adapter a = (xs B) A^T: gh = bf16(g r) A from the row pass, its input
@@ -261,7 +277,8 @@ class _FusedTernFn(torch.autograd.Function):
                 lr = (gh, Bb)
                 del gt
             else:
-                f, q1, q2, s, gbias, grow, *gt = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=ctx.has_mag)
+                f, q1, q2, s, gbias, grow, *gt = _K.fused_bwd_rows(g2, t, rb, bb, sl, save_gt=ctx.has_mag,
+                                                                   save_f=not skip_f)
             if GRAD_BITS[0]:   # --grad-bits: f (the gradient entering the ternary product) quantized; the float adapter's
                 q1, s, f = grad_quant(f, GRAD_BITS[0], GRAD_GROUP[0])   # own gradients (gt, gh) stay bf16
                 q2 = None
@@ -275,6 +292,10 @@ class _FusedTernFn(torch.autograd.Function):
                 gB = torch.mm(xo.t(), gh).to(ctx.mdt[1])
                 gxa = torch.mm(gh, Bb.t())                    # (added to the ternary input gradient before the scale)
                 del gt, gh
+            F8 = None
+            if UPD_I8[0] and q1 is not None and not GRAD_BITS[0] and l.capture and getattr(l, "on_grad", None) is not None:
+                from .i8upd import I8Factors
+                F8 = I8Factors(q1, s, xq, xs, (lambda: _K.bwd_gyf(g2, rb, bb)) if skip_f else None)
             if sl and q1 is not None:
                 gx, gc = _K.dx2_col(q1, q2, s, l.w8(t=True), cb, xc, ctx.mu_b, None, lr)
                 del q1, q2
@@ -286,7 +307,10 @@ class _FusedTernFn(torch.autograd.Function):
         if l.capture and getattr(l, "on_grad", None) is not None:    # (_fused_ok: the factored TTF update)
             if getattr(l, "cap_accum", False):
                 l._ts_final = getattr(l, "cap_final", True); l._ts_micro = getattr(l, "cap_micro", None)
-            l.on_grad(l, (f, _K.dequant_i8(xq, xs)))
+            from .update import GRAD_HOOKS as _GH
+            if f is None and (F8 is None or _GH):
+                f = _K.bwd_gyf(g2, rb, bb)
+            l.on_grad(l, (f, _K.dequant_i8(xq, xs) if F8 is None or _GH else None) + ((F8,) if F8 is not None else ()))
         return (gx.view(ctx.xshape), gc.to(ctx.cdt), grow.to(ctx.rdt), gbias.to(ctx.bdt) if ctx.has_bias else None,
                 g if ctx.has_acc else None, None, gA, gB)
 
