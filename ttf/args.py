@@ -216,6 +216,8 @@ def build_parser():
                    "accumulator per sub-layer (needs --ttf-dense-g), shared one for the group (rank of the group's min(N, K))")
     g.add_argument("--attn-fp8", action=ON, default=False, help="training attention's forward on FP8 tensor cores "
                    "(e4m3, per-tile scales; fp8attn.py), the backward aten's bf16 flash backward at that output")
+    g.add_argument("--head-f16", action="store_true", help="with --head-fused: the head's three GEMMs on fp16 MMA with "
+                   "fp16 sums per K block (fp32 across blocks; 2x the fp32-accumulate rate on GeForce); W in fp16")
     g.add_argument("--fuse-swiglu", action="store_true", help="silu(gate) up formed in w_down's int8 prologue and its "
                    "backward in w_down's dx epilogue (no swiglu kernels; with a fused gate-up layer its output read in "
                    "place: no split copies). Bit-identical; needs --save-lean and int8 dx")

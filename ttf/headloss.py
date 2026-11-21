@@ -268,6 +268,9 @@ class TrainHeadCE(torch.autograd.Function):
         return dh, dw, None
 
 
+HEAD_F16 = [False]   # --head-f16 (TrainHeadAll's GEMMs on f16mm)
+
+
 class TrainHeadAll(torch.autograd.Function):
     """--head-fused (21 Nov): the from-scratch model's whole chunked head + cross-entropy as one Function, the
     backward's GEMMs done in the forward. Per chunk: z = bf16(h W^T), the loss and dz in z's memory (kernel.ce_rows_),
@@ -279,11 +282,27 @@ class TrainHeadAll(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hf, w, tgt, n):
         from .kernel import ce_rows_
-        wb = w.to(hf.dtype)
         T = hf.shape[0]
         dh = torch.empty(T, hf.shape[1], dtype=torch.float32, device=hf.device)
         dw = torch.zeros(w.shape, dtype=torch.float32, device=hf.device)
         total = torch.zeros((), dtype=torch.float32, device=hf.device)
+        if HEAD_F16[0]:   # --head-f16: the three GEMMs on f16mm (fp16 MMA, fp16 sums per K block, fp32 across): W in
+            from .f16mm import mm16, prescale   # fp16 (finer than bf16), dz (|dz| <= 1) prescaled by a power of two
+            wh = w.to(torch.float16)            # so its small entries' products stay out of fp16's subnormals
+            one = torch.ones((), device=hf.device)
+            s_dh = prescale(one, w.detach().abs().amax().float())
+            s_dw = prescale(one, hf.detach().abs().amax().float())
+            for i in range(0, T, n):
+                hc = hf[i:i + n]
+                z = mm16(hc, wh.t(), out_dtype=torch.bfloat16)
+                total = total + ce_rows_(z, tgt[i:i + n]).sum()
+                mm16(z, wh, out=dh[i:i + n], sa=s_dh)
+                mm16(z.t(), hc, out=dw, acc=True, sa=s_dw)
+                del z
+            ctx.save_for_backward(dh, dw)
+            ctx.hdt = hf.dtype
+            return total
+        wb = w.to(hf.dtype)
         for i in range(0, T, n):
             hc = hf[i:i + n]
             z = torch.mm(hc, wb.t())
