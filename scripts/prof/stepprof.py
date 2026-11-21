@@ -184,6 +184,15 @@ def mark():
 
 
 # ---- attribution
+XR = set(x for x in os.environ.get("SP_RANGES", "").split(",") if x)   # e.g. tern.fwd,tern.dx,ttf.update,ttf.dense_g
+KT = collections.Counter()                                               # (label, kernel name) -> GPU us
+
+
+def dump_kt(nsteps):
+    rows = sorted(KT.items(), key=lambda kv: -kv[1])
+    open(OUT + ".kt.txt", "w").write("\n".join(f"{v / 1e3 / nsteps:9.2f} ms  {k[0][:50]:<50} {k[1]}" for k, v in rows) + "\n")
+
+
 def attribute(prof):
     ev = prof.events()
     seq_lab = {}
@@ -196,6 +205,8 @@ def attribute(prof):
         while p is not None:
             if p.name.startswith("g:"):
                 out = p.name[2:]; break
+            if p.name in XR:                       # SP_RANGES: plain record_function ranges as innermost labels
+                out = p.name; break
             p = p.cpu_parent
         lab[id(e)] = out
         return out
@@ -206,6 +217,9 @@ def attribute(prof):
                 seq_lab.setdefault((e.fwd_thread or e.thread, e.sequence_nr), l_)
     cpu = collections.Counter(); gpu = collections.Counter(); nk = collections.Counter(); syncs = collections.Counter()
     for e in ev:
+        if e.name in XR:
+            cpu[e.name] += e.self_cpu_time_total
+            continue
         if e.name.startswith("g:"):
             l_ = e.name[2:]
             cpu[l_] += e.self_cpu_time_total       # Python time inside the range not in any op
@@ -229,6 +243,7 @@ def attribute(prof):
         cpu[l_] += e.self_cpu_time_total
         for kk in e.kernels:
             gpu[l_] += kk.duration; nk[l_] += 1
+            KT[(l_.split("/")[-1] if l_.split("/")[-1] in XR else l_, kk.name[:90])] += kk.duration
         if "Synchronize" in e.name or e.name in ("aten::_local_scalar_dense", "aten::item"):
             syncs[e.name] += 1
     return cpu, gpu, nk, syncs
@@ -408,6 +423,8 @@ def report_light():
     json.dump({"head": head, "wall_profiled": wall / N, "unprofiled": dts, "components": comp,
                "labels_cpu_us": dict(cpu), "labels_gpu_us": dict(gpu), "syncs": dict(syncs)}, open(OUT + ".groups.json", "w"))
     open(OUT + ".groups.txt", "w").write("\n".join(lines) + "\n"); print("\n".join(lines[:60]), flush=True)
+    if XR:
+        dump_kt(N)
     ST["prof"] = None; del p; gc.collect()
 
 

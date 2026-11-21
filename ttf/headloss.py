@@ -289,7 +289,7 @@ class TrainHeadAll(torch.autograd.Function):
             z = torch.mm(hc, wb.t())
             total = total + ce_rows_(z, tgt[i:i + n]).sum()
             dh[i:i + n] = torch.mm(z, wb, out_dtype=torch.float32)
-            dw.add_(torch.mm(z.t(), hc, out_dtype=torch.float32))
+            torch.addmm(dw, z.t(), hc, out_dtype=torch.float32, out=dw)   # (beta 1 in the GEMM: no separate fp32 add pass)
             del z
         ctx.save_for_backward(dh, dw)
         ctx.hdt = hf.dtype
