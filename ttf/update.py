@@ -559,6 +559,9 @@ def ts_layer(l, g, state, c):
     from .kernel import unpack_rows, pack_rows
     if getattr(l, "ts_frozen", False):   # (a plug-in's frozen layer: its trits stay, no state)
         return
+    _tm = getattr(l, "ts_theta_mult", 1.0)   # (--tern-adapter-theta-mult: the adapter layers' own bar)
+    if _tm != 1.0 and "theta" in c:
+        c = dict(c, theta=c["theta"] * _tm)
     if DEFER[0] is not None and getattr(l, "_ts_final", True) and int(c.get("micro") or 1) > 1:
         DEFER[0].append((l, g, state, c))   # (run after the stage's input gradient is sent: same inputs, later)
         return

@@ -532,6 +532,9 @@ def main():
             if getattr(args, "tern_adapter", 0):
                 from . import tern_ad as _TA
                 _TA.UP_INIT[0] = args.tern_adapter_up; _TA.init_up_scales(model)
+                for m_ in model.modules():
+                    if isinstance(m_, _TA.TernAd):
+                        m_.ad[0].ts_theta_mult = m_.ad[1].ts_theta_mult = args.tern_adapter_theta_mult
     _resume_path = os.path.join(tc.out_dir, "ckpt.pt")
     if (_PP or _WS > 1) and not os.path.exists(_resume_path) and os.path.exists(os.path.join(_base_out, "ckpt.pt")):
         _resume_path = os.path.join(_base_out, "ckpt.pt")    # --pipe: a single-GPU checkpoint (or stage 0's) for all;
