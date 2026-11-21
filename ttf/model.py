@@ -39,6 +39,7 @@ FUSED_ELEM = [True]   # bf16 CUDA activations: the RMSNorm and the SwiGLU in one
 ATTN_FP8 = [False]    # --attn-fp8 (fp8attn.py)
 FUSE_PROJ = [""]      # --fuse-proj split | shared: q/k/v and gate/up each one ternary layer ("" off)
 HEAD_ALL = [False]    # --head-fused: headloss.TrainHeadAll (the head's backward in the forward; fp32 weight-gradient sum)
+ATTN_F16 = [False]    # --attn-f16 (f16attn.py)
 FUSE_SWI = [False]    # --fuse-swiglu: silu(gate) up formed in w_down's prologue, its backward in w_down's dx epilogue
 FUSE_RES = [False]    # --fuse-res: the residual add in the sublayer's last ternary GEMM, its gradient in the norm's backward
 FUSED_HEAD = [True]   # training, no teacher, bf16 CUDA: headloss.TrainHeadCE per loss chunk (else the checkpointed autograd chunk)
@@ -129,7 +130,10 @@ class Attention(nn.Module):
             k = k.repeat_interleave(self.rep, dim=2)
             v = v.repeat_interleave(self.rep, dim=2)
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))  # [B,H,T,hd]
-        if ATTN_FP8[0] and q.is_cuda and q.dtype == torch.bfloat16 and torch.is_grad_enabled():
+        if ATTN_F16[0] and q.is_cuda and q.dtype == torch.bfloat16 and torch.is_grad_enabled():
+            from .f16attn import attention as _fa16     # --attn-f16: own flash fwd+bwd, fp16-accumulated softmax side
+            out = _fa16(q, k, v)
+        elif ATTN_FP8[0] and q.is_cuda and q.dtype == torch.bfloat16 and torch.is_grad_enabled():
             from .fp8attn import attention as _fa8      # --attn-fp8: the forward on FP8 tensor cores
             out = _fa8(q, k, v)
         else:

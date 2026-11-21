@@ -1271,6 +1271,9 @@ def main():
             "--ttf-batch-update: with --ttf-dense-g, one batch per step, no --pipe / --ttf-offload"
         _UPDB.BATCH[0] = True; _UPDB.BATCH_N[0] = int(args.ttf_batch_n); _UPDB.BATCH_BF16[0] = bool(args.ttf_batch_bf16)
         print("--ttf-batch-update: turn, orth and firing after the backward, batched by layer shape", flush=True)
+    if getattr(args, "attn_f16", False):
+        from .model import ATTN_F16 as _AF
+        _AF[0] = True
     if getattr(args, "ttf_rqx_fused", False):
         from .layers import RQX_FUSED as _RQ
         _RQ[0] = True
