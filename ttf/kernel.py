@@ -1699,7 +1699,8 @@ def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t, pre=None, t_rows=
     if lr is not None:
         h_, a_ = lr[0].contiguous(), lr[1].contiguous()
         lk = dict(h_ptr=h_, at_ptr=a_, R=h_.shape[1], RA=max(16, triton.next_power_of_2(h_.shape[1])), HAS_LR=True)
-    BM, BN, BK, nw = (64, 128, 64, 8) if N >= 16384 else (128, 64, 64, 4)
+    # (t_gemm_tune.py 21 Nov, 4070 Ti Super, M 32768: 128 x 128 x 64 w4 -2..-7% on the 110M shapes, the same output)
+    BM, BN, BK, nw = FWD_TILE[0] if FWD_TILE[0] is not None else ((64, 128, 64, 8) if N >= 16384 else (128, 128, 64, 4))
     _fwd_gemm_kernel[(triton.cdiv(M, BM) * triton.cdiv(N, BN),)](
         xq, w8, xs, _dev_scalar(beta, xq.device), r_b, bias_b if bias_b is not None else r_b,
         acc if acc is not None else o, pre if pre is not None else o, t if t is not None else o, o, M, N, K,
@@ -1871,9 +1872,15 @@ def _dx2_col_kernel(a1_ptr, a2_ptr, b_ptr, s_ptr, c_ptr, x_ptr, mu_ptr, add_ptr,
         tl.store(pc_ptr + pm * K + cols, tl.sum(_rbf(g * x), axis=0), mask=cols < K)
 
 
+DX2_TILE = [None]    # (BM, BK, BN, num_warps) override (tuning)
+FWD_TILE = [None]    # fused_fwd_gemm's (BM, BN, BK, num_warps) override (tuning)
+
+
 def _dx2_tile(N, K):
     """(BM, BK, BN, num_warps): fixed per shape (laptop 4080, the 27B shapes; a fixed choice keeps the column sums'
-    order the same on every run)"""
+    order the same on every run; 110M-sized shapes: t_gemm_tune.py 21 Nov, 4070 Ti Super, 128 x 128 x 64 w4 -7..-8%)"""
+    if N * K <= 2048 * 2048:
+        return 128, 128, 64, 4
     if K >= 12288 and N >= 4096:
         return 128, 128, 128, 8
     if N >= 16384 and K >= 4096:
@@ -1889,7 +1896,7 @@ def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None):
     M, N = q1.shape
     K = w8t.shape[0]
     gx = torch.empty(M, K, dtype=torch.bfloat16, device=q1.device)
-    BM, BK, BN, nw = _dx2_tile(N, K)
+    BM, BK, BN, nw = DX2_TILE[0] if DX2_TILE[0] is not None else _dx2_tile(N, K)
     nb = triton.cdiv(M, BM)
     pc = torch.empty(nb, K, dtype=torch.float32, device=q1.device)
     lk = {}
