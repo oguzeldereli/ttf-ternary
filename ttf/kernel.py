@@ -513,8 +513,10 @@ def micro_sketch(G, P, rs, ds, v, M, n_other, b2, bc, norm):
 @triton.jit
 def _fire_kernel(ub_ptr, vb_ptr, u_ptr, v_ptr, un_ptr, vn_ptr, p_ptr, d_ptr, s_ptr, N, K, K5, R, sun, svk, spn, sdn,
                  theta, eb, NPK, SLOTS: tl.constexpr, RC: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr,
-                 TH_PTR: tl.constexpr = False):
-    """one tile of packed bytes, for each of the 5 trit digits: A = U V^T on those columns from bf16 copies (fp32
+                 TH_PTR: tl.constexpr = False, GROUP: tl.constexpr = 0):
+    """(GROUP > 0: a 1-D grid in grouped tile order, GROUP row blocks per group: a wave's tiles share U's and V's
+    blocks in L2 when U / V are larger than it; the same tiles, the same decisions.)
+    one tile of packed bytes, for each of the 5 trit digits: A = U V^T on those columns from bf16 copies (fp32
     accumulation), with the entry's bound on the bf16 error, eb |u_n| |v_k| (Cauchy-Schwarz; eb covers the two bf16
     roundings and the fp32 sums). Sure entries are decided here (|A| - bound >= theta: the move, the sign is certain;
     |A| + bound < theta: none) and written to D; the rest (real data: 1e-6 .. 6e-4 of the entries) are listed in the
@@ -522,7 +524,13 @@ def _fire_kernel(ub_ptr, vb_ptr, u_ptr, v_ptr, un_ptr, vn_ptr, p_ptr, d_ptr, s_p
     would overflow the slots is decided here with tf32x3 instead. The trits are not written (_fire_apply_kernel)."""
     if TH_PTR:                                                  # (theta from a device scalar: --cuda-graph)
         theta = tl.load(theta)
-    pn = tl.program_id(0); pk = tl.program_id(1)
+    if GROUP > 0:
+        pid = tl.program_id(0)
+        nm = tl.cdiv(N, BN)
+        gid = pid // (GROUP * NPK); fm = gid * GROUP; gs = tl.minimum(nm - fm, GROUP)
+        pn = fm + (pid % (GROUP * NPK)) % gs; pk = (pid % (GROUP * NPK)) // gs
+    else:
+        pn = tl.program_id(0); pk = tl.program_id(1)
     rows = pn * BN + tl.arange(0, BN)
     k5 = pk * BK5 + tl.arange(0, BK5)
     rm = rows[:, None] < N
@@ -673,6 +681,7 @@ def _spend_kernel(d_ptr, v_ptr, o_ptr, ek_ptr, er_ptr, n_ptr, N, K, R, sdn, svk,
 
 
 FIRE_TILE = None          # ttf_fire tiles (rows, packed bytes of 5 columns, rank chunk); None: by rank
+FIRE_GROUP = [8]          # ttf_fire's grouped tile order (0: the 2-D grid); the same tiles and decisions
 FIRE_SLOTS = 32           # ttf_fire: listed (uncertain) entries per tile before the tile decides itself in tf32x3
 FIRE_EB = 2.0 ** -7 * 1.05    # the bf16 bound's factor: two roundings of 2^-8 each (+ their product, the fp32 sums: 5%)
 
@@ -740,9 +749,10 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     BN, BK5, RC = FIRE_TILE if FIRE_TILE else ((32, 32, 32) if R <= 512 else (64, 32, 64))
     g = (triton.cdiv(N, BN), triton.cdiv(K5, BK5))
     S = torch.full((g[0] * g[1] * FIRE_SLOTS,), -1, dtype=torch.int64, device=U.device)
-    _fire_kernel[g](Ub, Vb, U, V, un, vn, packed, D, S, N, K, K5, R, U.stride(0), V.stride(0), packed.stride(0),
-                    D.stride(0), _sc(theta), FIRE_EB, g[1], SLOTS=FIRE_SLOTS, RC=RC, BN=BN, BK5=BK5,
-                    num_warps=4, num_stages=3, TH_PTR=torch.is_tensor(theta))
+    _fire_kernel[(g[0] * g[1],) if FIRE_GROUP[0] else g](
+        Ub, Vb, U, V, un, vn, packed, D, S, N, K, K5, R, U.stride(0), V.stride(0), packed.stride(0), D.stride(0),
+        _sc(theta), FIRE_EB, g[1], SLOTS=FIRE_SLOTS, RC=RC, BN=BN, BK5=BK5, num_warps=4, num_stages=3,
+        TH_PTR=torch.is_tensor(theta), GROUP=FIRE_GROUP[0])
     BE = 64
     _fire_fix_kernel[(triton.cdiv(S.numel(), BE),)](U, V, packed, D, S, S.numel(), K, R, U.stride(0), V.stride(0),
                                                      packed.stride(0), D.stride(0), _sc(theta), BE=BE, RC=64,
