@@ -46,7 +46,7 @@ def _rq_kernel(a_ptr, bt_ptr, sb_ptr, rs_ptr, yt_ptr, sy_ptr, T, D, J, BM: tl.co
 
 @triton.jit
 def _tn_kernel(at_ptr, yt_ptr, sy_ptr, o_ptr, T, D, J, NB_SPLIT, BM: tl.constexpr, BN: tl.constexpr,
-               BTK: tl.constexpr, SA=None, SY=None):
+               BTK: tl.constexpr, SA=None, SY=None, GROUP: tl.constexpr = 0):
     """partial[split, d, j] = sum over this split's token blocks of sY[blk, j] * sum_t A8[t, d] Y8[t, j], from the
     transposed int8 A8^T [D, T] and Y8^T [J, T] (both contiguous along the tokens, the reduction; row strides SA, SY,
     default T: a token-subset view of wider rows)"""
@@ -54,7 +54,14 @@ def _tn_kernel(at_ptr, yt_ptr, sy_ptr, o_ptr, T, D, J, NB_SPLIT, BM: tl.constexp
         SA = T
     if SY is None:
         SY = T
-    pm = tl.program_id(0); pn = tl.program_id(1); ps = tl.program_id(2)
+    if GROUP > 0:   # (grouped tile order on a 1-D grid: a wave's tiles share GROUP row blocks of A^T and their
+        # column blocks of Y^T, so both stay in L2 when A^T is larger than it; 13824 x 5120: 82 -> ~200 TOPS)
+        pid = tl.program_id(0); ps = tl.program_id(1)
+        nm = tl.cdiv(D, BM); nn = tl.cdiv(J, BN)
+        gid = pid // (GROUP * nn); fm = gid * GROUP; gs = tl.minimum(nm - fm, GROUP)
+        pm = fm + (pid % (GROUP * nn)) % gs; pn = (pid % (GROUP * nn)) // gs
+    else:
+        pm = tl.program_id(0); pn = tl.program_id(1); ps = tl.program_id(2)
     rd = pm * BM + tl.arange(0, BM); cj = pn * BN + tl.arange(0, BN); rt = tl.arange(0, BTK)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     b0 = ps * NB_SPLIT
@@ -114,6 +121,7 @@ def _n_sm(dev):
     return torch.cuda.get_device_properties(dev).multi_processor_count
 
 
+TN_GROUP = [8]     # tn without split: grouped tile order, GROUP row blocks per group (0: the 2-D grid; same sums)
 TN_WIDE = [None]   # tn for wide J (the dense gradient, J = K >= 512): BM, BN, warps, stages, split x SMs
 
 
@@ -134,9 +142,13 @@ def tn(At, Yt, sY, T=None):
     split = max(1, min(nb, (sm * _n_sm(At.device)) // max(tiles, 1)))
     per = triton.cdiv(nb, split); split = triton.cdiv(nb, per)
     part = torch.empty(split, D, J, dtype=torch.float32, device=At.device)
-    _tn_kernel[(triton.cdiv(D, BM), triton.cdiv(J, BN), split)](At, Yt, sY, part, T, D, J, per, BM=BM, BN=BN, BTK=BT,
-                                                                SA=At.stride(0), SY=Yt.stride(0),
-                                                                num_warps=nw, num_stages=ns)
+    if TN_GROUP[0] and split == 1:
+        _tn_kernel[(tiles, 1)](At, Yt, sY, part, T, D, J, per, BM=BM, BN=BN, BTK=BT, SA=At.stride(0), SY=Yt.stride(0),
+                               GROUP=TN_GROUP[0], num_warps=nw, num_stages=ns)
+    else:
+        _tn_kernel[(triton.cdiv(D, BM), triton.cdiv(J, BN), split)](At, Yt, sY, part, T, D, J, per, BM=BM, BN=BN,
+                                                                    BTK=BT, SA=At.stride(0), SY=Yt.stride(0),
+                                                                    num_warps=nw, num_stages=ns)
     return part[0] if split == 1 else part.sum(0)
 
 
