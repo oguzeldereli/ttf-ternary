@@ -27,6 +27,8 @@ def build_parser():
                    help="ttf: packed trits trained by TTF; bitnet: BitNet b1.58 (latent weights, STE, AdamW); "
                         "fp32: the full-precision model")
     g.add_argument("--preset", default=DEFAULT_PRESET, choices=list(PRESETS), help="model shape (without --arch-hf)")
+    g.add_argument("--layers", type=int, default=0, help="override the preset's layer count (timing slices of a large "
+                   "shape: per-layer cost = the step-time difference of two depths)")
     g.add_argument("--out-dir", default=None)
     g.add_argument("--resume", action="store_true", help="continue from <out-dir>/ckpt.pt if it exists")
     g.add_argument("--seed", type=int, default=None, help="init and data order (default TrainConfig.seed, 1337)")

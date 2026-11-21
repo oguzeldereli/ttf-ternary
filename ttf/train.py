@@ -361,6 +361,9 @@ def main():
     TIME = os.environ.get("TERN_TIME") == "1"   # time the forward/backward vs the momentum step (synchronizes)
 
     mc: ModelConfig = PRESETS[args.preset]
+    if getattr(args, "layers", 0):
+        import dataclasses
+        mc = dataclasses.replace(mc, n_layers=args.layers)
     _QWEN = False
     if args.arch_hf:
         from .qwen import is_qwen35
