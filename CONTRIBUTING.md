@@ -1,12 +1,15 @@
 # Contributing
 
-Contributions are welcome. Before a contribution can be accepted, its author must agree to the Contributor Licence
-Agreement below, by stating in the pull request: "I agree to the Contributor Licence Agreement in CONTRIBUTING.md."
+Contributions are welcome. By submitting a contribution to this repository (a pull request, a patch, or code or text
+in an issue or discussion meant for inclusion), you agree to the Contributor Licence Agreement below for that
+contribution, and the licences in it take effect when you submit it. Nothing else is needed; the pull request
+template restates this so it is visible when you open one.
 
 ## Contributor Licence Agreement
 
 This agreement is between you (the contributor) and Özgür Güzeldereli (the maintainer), for any code, documentation or
-other material you submit to this repository (your contribution).
+other material you submit to this repository (your contribution). If you do not agree to it, do not submit a
+contribution.
 
 1. **Copyright licence.** You grant the maintainer and anyone the maintainer licenses a perpetual, worldwide,
    non-exclusive, royalty-free, irrevocable licence to use, copy, modify, distribute, sublicense and relicense your
