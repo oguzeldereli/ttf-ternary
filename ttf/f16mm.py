@@ -58,7 +58,7 @@ def _tile(M, N, K):
     t = TILE.get((M, N, K))
     if t is not None:
         return t
-    # (t_f16mm_tune.py, lab 4070 Ti Super, 21 Nov, the 110M head n 2048 V 32768 d 768: z = h W^T 0.91 ms vs bf16 1.23;
+    # (t_f16mm_tune.py, 4070 Ti Super, 21 Nov, the 110M head n 2048 V 32768 d 768: z = h W^T 0.91 ms vs bf16 1.23;
     # dh = dz W (long K) 1.01 vs 1.25; dW += dz^T h 1.00 vs 1.22)
     if K <= 1024:
         return 128, 128, 32, 4, 3
@@ -70,7 +70,7 @@ def _tile(M, N, K):
 def prescale(amax_a, amax_b, BK=64, cap=2.0 ** 14):
     """device fp32 scalar: the largest power of two s <= cap with BK * s * amax_a * amax_b <= 2^14 (an fp16 block sum
     of BK products stays 4x below fp16's max); no host sync"""
-    lim = torch.as_tensor(2.0 ** 14 / BK, device=amax_b.device) / (amax_a * amax_b).clamp_min(1e-30)
+    lim = (2.0 ** 14 / BK) / (amax_a * amax_b).clamp_min(1e-30)   # (a Python scalar: no host-to-device copy, capturable)
     return torch.exp2(torch.floor(torch.log2(lim))).clamp_(1.0, cap).float().reshape(1)
 
 
