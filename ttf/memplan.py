@@ -39,6 +39,7 @@ class CkptAuto:
         # step's peak falls where the last block's activations are already freed (0.8B 2 x 8, 9 Nov: 0.14 GiB read,
         # 0.41 x 2 actual; 17 blocks chosen, OOM)
         self.kept, self._m0 = 0, {}
+        self.need = None
         lay = list(model.layers)[lo:hi]
         for j, l_ in enumerate(lay):
             l_.register_forward_pre_hook(self._pre(j)); l_.register_forward_hook(self._post(j))
@@ -69,6 +70,8 @@ class CkptAuto:
         torch.cuda.reset_peak_memory_stats()
         self.hist.append((self.skip, self.L.W8_CACHE[0], peak))
         k, w8 = self.skip, self.L.W8_CACHE[0]
+        if k == 0 and not w8:   # (every block recomputed, no trit cache: what the step needs; the rest of the peak is
+            self.need = peak if self.need is None else min(self.need, peak)   # activations kept to skip recompute)
         if len(self.hist) >= 2:
             (k0, w0, p0), (k1, w1, p1) = self.hist[-2], self.hist[-1]
             if k1 != k0 and w1 == w0:
@@ -93,7 +96,9 @@ class CkptAuto:
             self.L.W8_CACHE[0] = True
         self.settled = len(self.hist) >= 2 and (self.skip, self.L.W8_CACHE[0]) == (k, w8)
         if (self.skip, self.L.W8_CACHE[0]) != (k, w8):
-            self.log(f"--ckpt-skip auto: peak {peak / 2**30:.2f} of {self.budget / 2**30:.2f} GiB -> {self.skip} of "
+            self.log(f"--ckpt-skip auto (spends free memory on skipping recompute; --mem-cap-gib caps it"
+                     + (f", needs {self.need / 2**30:.2f} GiB" if self.need else "") + f"): peak {peak / 2**30:.2f} of "
+                     f"{self.budget / 2**30:.2f} GiB -> {self.skip} of "
                      f"{self.n} blocks without recompute{', int8 trit cache' if self.L.W8_CACHE[0] else ''}"
                      + (f" (a block: {self.d / 2**30:.2f} GiB)" if self.d else ""))
         return peak

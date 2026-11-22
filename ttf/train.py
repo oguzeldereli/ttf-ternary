@@ -1515,7 +1515,8 @@ def main():
                 extra += (f"| flip {fs['flip_frac_total']*100:.3f}% "
                           f"| never {fs['never_frac_total']*100:.1f}% ")
             print(f"step {step:6d} | loss {last_loss:6.3f} (mean {sum_loss / tc.grad_accum:6.3f}) | lr {lr:.2e} {extra}"
-                  f"| {dt:6.1f}s | peakVRAM {mem:.2f}GiB", flush=True)
+                  f"| {dt:6.1f}s | peakVRAM {mem:.2f}GiB"
+                  + (f" (needs {_ck_auto.need / 1024**3:.2f})" if _ck_auto is not None and _ck_auto.need else ""), flush=True)
             if ttf and step in (10, 1000):
                 print(f"  TTF state: {_ts_state_bytes(lr_state) / 2**20:.1f} MiB stored", flush=True)
             if args.mem_report and step in (10, 50, 100, 1000):

@@ -329,16 +329,20 @@ def parse(argv=None):
 
 def resolve_auto(a, cuda, world=1):
     """the auto options (None / "auto"): the validated fast path (21 Nov 2026: each A/B'd at 110M over 3 seeds, or exact)
-    on for a native --mode ttf model (a --preset, not --arch-hf: the conversion recipes keep their own settings) where
-    its conditions hold; off elsewhere (--mode fp32 / bitnet: the plain bf16 / BitNet baselines)"""
-    nat = a.mode == "ttf" and not getattr(a, "arch_hf", "") and cuda
+    on for --mode ttf where its conditions hold: the ternary layers' and the update's parts for any model (native or
+    --arch-hf conversions), the fused residual / SwiGLU / head / attention parts for the native model only (written into
+    model.py); off for --mode fp32 / bitnet (the plain bf16 / BitNet baselines)"""
+    lay = a.mode == "ttf" and cuda                              # the ternary layers' and the update's parts (any model)
+    nat = lay and not getattr(a, "arch_hf", "")                 # the parts written into the native model's code
     from .config import TrainConfig
-    one = nat and (a.accum if a.accum is not None else TrainConfig.grad_accum) == 1 and not a.pipe and a.ttf_offload == "none" and world == 1
+    one = lay and (a.accum if a.accum is not None else TrainConfig.grad_accum) == 1 and not a.pipe and a.ttf_offload == "none" and world == 1
 
     def auto(name, cond):
         if getattr(a, name) is None:
             setattr(a, name, bool(cond))
-    auto("ttf_upd_i8", nat and a.dx in ("int8", "int8x2") and a.dw == "factored")
+    # (one batch per step only: at --accum 16 x 1 the update runs per 2048-token micro-batch, where the int8 products
+    # and the 12-bit store cost time: 0.8B conversion 11.9 s/step off, 17.95 with both, 13.8 / 15.3 with one; 22 Nov)
+    auto("ttf_upd_i8", one and a.dx in ("int8", "int8x2") and a.dw == "factored")
     auto("ttf_dense_g", one and a.ttf_upd_i8 and not getattr(a, "ttf_band", 0))
     auto("ttf_batch_update", one and a.ttf_dense_g)
     auto("ttf_batch_bf16", a.ttf_batch_update)
@@ -346,7 +350,7 @@ def resolve_auto(a, cuda, world=1):
     auto("mag_fused", a.ttf_dense_g and a.ttf_upd_i8 and a.dx in ("int8", "int8x2") and a.adapter_rank > 0)
     if a.save_lean is None:
         a.save_lean = 8 if one else 0
-    auto("save_lean_mag", nat and a.save_lean > 0 and a.adapter_rank > 0)
+    auto("save_lean_mag", lay and a.save_lean > 0 and a.adapter_rank > 0)
     auto("ttf_rqx_fused", a.ttf_dense_g and a.ttf_upd_i8)
     auto("head_fused", nat)
     auto("head_f16", a.head_fused)
@@ -355,7 +359,7 @@ def resolve_auto(a, cuda, world=1):
     auto("fuse_swiglu", nat)
     auto("attn_f16", nat)
     if a.ttf_store == "auto":
-        a.ttf_store = "fp12s" if nat else "fp32"
+        a.ttf_store = "fp12s" if one else "fp32"
     return a
 
 
