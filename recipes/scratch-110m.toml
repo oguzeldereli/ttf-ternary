@@ -3,7 +3,10 @@
 # 2.6888), measured with the step scale p 0.75 and the annealed leak, which are gone (7 Nov 2026: the fixed leak
 # 1 - 1/tau, p 0, the theta schedule). On the current trainer with the theta defaults (4 / 1 / 5 x the base: 64 -> 16 -> 80, cosines in the
 # step base / theta) it ends at 2.6741 / 2.6695 (8 Nov, seeds 1337 / 2); with the cosines in theta (7 Nov) at 2.7320. The options
-# not set here are the trainer's defaults.
+# not set here are the trainer's defaults (21 Nov 2026: the fast path is on by default for a native ttf model: int8
+# dense gradient, batched update, fused adapter / residual / swiglu, fp16-accumulated head and attention forward, fp12s
+# store; each A/B'd at 110M over 3 seeds or exact). The accumulator rank is 0.4 min(N, K) per layer (the paper's runs
+# used a fixed rank 512); ckpt-skip auto keeps as many blocks' activations as fit.
 #   python -m ttf.train --recipe scratch-110m --out-dir runs/scratch-110m
 mode = "ttf"
 preset = "small"
@@ -18,7 +21,6 @@ lr = 1.5e-3
 min-lr = 1.5e-4
 eval-interval = 250
 eval-iters = 30
-ckpt-skip = 2
 save-secs = 1800
-ttf-rank = 512
+ttf-rank-ratio = 0.4
 ttf-theta = 16

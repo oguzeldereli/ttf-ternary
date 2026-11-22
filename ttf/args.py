@@ -107,41 +107,31 @@ def build_parser():
                    "instead of one per token (fake-quant study for a group-scaled int4 GEMM)")
     g.add_argument("--act-bits-on", default="all", choices=["all", "norm"], help="--act-bits on all ternary layers, or "
                    "only those reading a normed input (q, k, v, gate, up; not o / down, whose inputs carry outliers)")
-    g.add_argument("--ttf-24", type=int, default=0, choices=[0, 1, 2], help="2:4 structured trits (numerics study for "
-                   "the sparse tensor cores): 1 = at most 2 nonzeros in each group of 4 along K (the forward GEMM), "
-                   "2 = also along N (transposable: the input gradient too); the init is pruned at random to it and a "
-                   "move that would break it is dropped (random choice among a group's births)")
-    g.add_argument("--ttf-upd-i8", action=ON, default=False, help="the factored update's products (the v sketches and "
+    g.add_argument("--ttf-upd-i8", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-ttf-upd-i8: off) the factored update's products (the v sketches and "
                    "the accumulator's projections) on the int8 tensor cores from the layer's own int8 factors (x's codes, "
                    "gy's int8 slice; --dx int8 / int8x2), the thin operands in int8 with per-column / per-128-token "
                    "scales (i8upd; 20 Nov: 2-2.7x the bf16 products' speed, 8-bit rounding of the thin operands)")
-    g.add_argument("--ttf-batch-update", action=ON, default=False, help="--ttf-dense-g: each layer's dense g kept "
+    g.add_argument("--ttf-batch-update", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-ttf-batch-update: off) --ttf-dense-g: each layer's dense g kept "
                    "through the backward, then v, the basis turn (u never formed), the orth (batched Cholesky QR) and "
                    "the firing per group of layers of one shape (fewer, larger kernels; the same update up to rounding)")
-    g.add_argument("--ttf-batch-f16", action="store_true", help="--ttf-batch-update: the turn's r x r products and the "
+    g.add_argument("--ttf-batch-f16", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-ttf-batch-f16: off) --ttf-batch-update: the turn's r x r products and the "
                    "orth on the fp16 tensor cores (power-of-two scaled operands, fp32 sums; orthogonality ~3e-4 vs the fp12s "
                    "store's 1.9e-3); not loss-validated")
     g.add_argument("--ttf-batch-n", type=int, default=12, help="--ttf-batch-update: layers per batched group (a group "
                    "runs inside the backward once this many of one shape are queued)")
-    g.add_argument("--ttf-batch-bf16", action=ON, default=False, help="--ttf-batch-update: the turn's products of g with "
+    g.add_argument("--ttf-batch-bf16", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-ttf-batch-bf16: off) --ttf-batch-update: the turn's products of g with "
                    "the bases on the bf16 tensor cores (fp32 sums; g is an int8 product)")
-    g.add_argument("--ttf-side-stream", action=ON, default=False, help="each layer's TTF update on a second CUDA "
-                   "stream, overlapping the rest of the backward (same kernels, same order per stream: the same "
-                   "result); the main stream waits for it after the backward")
-    g.add_argument("--ttf-dense-g", action=ON, default=False, help="--dw factored: the update from the dense gradient "
+    g.add_argument("--ttf-dense-g", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-ttf-dense-g: off) --dw factored: the update from the dense gradient "
                    "g = gy^T x, formed per layer (one int8 GEMM from the layer's int8 factors with --ttf-upd-i8, else one "
                    "bf16 GEMM; a transient fp32 [N, K]) instead of the factored products: exact row / column sums of g^2 "
                    "(no sketch); cheaper than the factored products from rank ratio ~0.25 up")
-    g.add_argument("--ttf-upd-tokens", type=float, default=1.0, help="--ttf-dense-g: the update's gradient from this "
-                   "share of each step's tokens (x 1 / share; the input gradient keeps all)")
-    g.add_argument("--ttf-turn-every", type=int, default=1, help="the accumulator's basis turns on every m-th update "
-                   "(one batch per step) and is held between (U += u V; no orthonormalisation)")
     g.add_argument("--ttf-step-fp32", action=ON, default=False, help="--accum M > 1: keep U in fp32 between a step's "
                    "micro-batches (encoded with --ttf-store once per step, not per micro-batch; more memory, not bit-identical)")
-    g.add_argument("--ttf-orth", default="auto", choices=["auto", "qr", "spanqr", "c2", "c1"],
-                   help="the accumulator basis' orthonormalisation: auto (default: spanqr when the package imports and "
-                        "the run is on CUDA, else qr), Householder QR, or spanqr (the spanqr package on PYTHONPATH, github.com/oguzeldereli/spanqr; any "
-                        "rank, padded to its widths; 110M 1.41 -> 1.37 s/step)")
+    g.add_argument("--ttf-orth", default="auto", choices=["auto", "qr", "spanqr", "c2"],
+                   help="the accumulator basis' orthonormalisation (layers outside --ttf-batch-update): auto (default: c2 "
+                        "when the spanqr package imports and the run is on CUDA, else qr), Householder QR, spanqr's robust "
+                        "QR, or c2: two Cholesky-QR passes on spanqr's kernels (github.com/oguzeldereli/spanqr on "
+                        "PYTHONPATH; 0.31 vs spanqr 0.87 ms, same accuracy)")
     g.add_argument("--ttf-theta", type=float, default=16.0, help="the base firing threshold (in units of the step); the "
                    "theta schedule: --ttf-theta-start at step 0, this at the end of the lr warmup, --ttf-theta-end at the "
                    "last step, cosines between them in the step (rescale form: the bar stays here, the step base / "
@@ -170,7 +160,7 @@ def build_parser():
                    "2026 with a step scale (lr / peak lr)^p, p > 0, and its annealed leak 1 - rho^p / tau (this core: "
                    "step scale 1, leak 1 - 1 / tau), or one from before 7 Nov 2026 (constant theta) under the theta "
                    "schedule")
-    g.add_argument("--ttf-store", default="fp32", choices=["fp32", "bf16", "fp12s"],
+    g.add_argument("--ttf-store", default="auto", choices=["auto", "fp32", "bf16", "fp12s"],
                    help="storage of U and V (fp12s: 1.5 bytes per value)")
     g.add_argument("--ttf-offload", default="none", choices=["none", "async"],
                    help="async: the state in pinned host memory, its copies on side streams, prefetched in the update's "
@@ -219,30 +209,28 @@ def build_parser():
     g.add_argument("--fuse-proj", default="", choices=["", "split", "shared"], help="q/k/v and gate/up each as one "
                    "ternary layer (one prologue, GEMM and input-gradient GEMM per group; one column scale): split keeps an "
                    "accumulator per sub-layer (needs --ttf-dense-g), shared one for the group (rank of the group's min(N, K))")
-    g.add_argument("--attn-fp8", action=ON, default=False, help="training attention's forward on FP8 tensor cores "
-                   "(e4m3, per-tile scales; fp8attn.py), the backward aten's bf16 flash backward at that output")
-    g.add_argument("--ttf-rqx-fused", action="store_true", help="with --ttf-dense-g and --save-lean: the dense gradient's "
+    g.add_argument("--ttf-rqx-fused", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-ttf-rqx-fused: off) with --ttf-dense-g and --save-lean: the dense gradient's "
                    "requantized input (s xs) xq formed in the dx kernel's epilogue (xq read once; identical codes)")
-    g.add_argument("--attn-f16", action="store_true", help="training attention on f16attn (own flash forward + backward: "
+    g.add_argument("--attn-f16", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-attn-f16: off) training attention on f16attn (own flash forward + backward: "
                    "scores and dP fp32-accumulated, PV / dV / dK / dQ on fp16 MMA with fp16 tile sums)")
-    g.add_argument("--head-i8f", action="store_true", help="with --head-f16: the logits GEMM z = h W^T W8A8 (h int8 per token, "
+    g.add_argument("--head-i8f", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-head-i8f: off) with --head-f16: the logits GEMM z = h W^T W8A8 (h int8 per token, "
                    "W int8 per row, int32 sums); the backward stays f16")
-    g.add_argument("--head-f16", action="store_true", help="with --head-fused: the head's three GEMMs on fp16 MMA with "
+    g.add_argument("--head-f16", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-head-f16: off) with --head-fused: the head's three GEMMs on fp16 MMA with "
                    "fp16 sums per K block (fp32 across blocks; 2x the fp32-accumulate rate on GeForce); W in fp16")
-    g.add_argument("--fuse-swiglu", action="store_true", help="silu(gate) up formed in w_down's int8 prologue and its "
+    g.add_argument("--fuse-swiglu", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-fuse-swiglu: off) silu(gate) up formed in w_down's int8 prologue and its "
                    "backward in w_down's dx epilogue (no swiglu kernels; with a fused gate-up layer its output read in "
                    "place: no split copies). Bit-identical; needs --save-lean and int8 dx")
-    g.add_argument("--fuse-res", action="store_true", help="the residual add of each sublayer in its last ternary layer's "
+    g.add_argument("--fuse-res", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-fuse-res: off) the residual add of each sublayer in its last ternary layer's "
                    "GEMM epilogue, and its gradient added inside the norm's backward kernel (bit-identical; fused kernels)")
-    g.add_argument("--mag-fused", action="store_true", help="the float adapter inside the fused ternary kernels: h = "
+    g.add_argument("--mag-fused", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-mag-fused: off) the float adapter inside the fused ternary kernels: h = "
                    "xs (xq B) from the int8 codes, a = h A^T in the GEMM's epilogue, gh in the row pass, gh B^T in dx2_col, "
                    "and its gradients G B / beta, G^T A / beta from the dense TTF gradient (needs --ttf-dense-g "
                    "--ttf-upd-i8, --dx int8)")
-    g.add_argument("--save-lean-mag", action="store_true", help="--save-lean also on the layers with a float adapter (its input re-formed from the int8 codes)")
-    g.add_argument("--save-lean", type=int, default=0, help="S > 0: the fused ternary layer saves no bf16 copy of its "
+    g.add_argument("--save-lean-mag", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-save-lean-mag: off) --save-lean also on the layers with a float adapter (its input re-formed from the int8 codes)")
+    g.add_argument("--save-lean", type=int, default=None, help="(auto: 8 for a native --mode ttf model with --accum 1, else 0) S > 0: the fused ternary layer saves no bf16 copy of its "
                    "input (the column-scale gradient from the int8 codes, x = xq xs / c) and its pre-row-scale output on "
                    "the first 1 / S of the tokens (the row-scale gradient's sum x S): less activation memory, less recompute")
-    g.add_argument("--head-fused", action=ON, default=False, help="the from-scratch head's backward GEMMs done in its "
+    g.add_argument("--head-fused", action=ON, default=None, help="(auto: on for a native --mode ttf model where it applies; --no-head-fused: off) the from-scratch head's backward GEMMs done in its "
                    "forward (dh and the weight gradient kept, the [tokens, vocab] logits gradient not: 110M -2.1 GB), the "
                    "weight gradient summed over the loss chunks in fp32 (was bf16)")
     g.add_argument("--cuda-graph", action=ON, default=False,
@@ -337,6 +325,38 @@ def parse(argv=None):
         ap.set_defaults(**rec)
     a = ap.parse_args(argv)
     return resolve(a)
+
+
+def resolve_auto(a, cuda, world=1):
+    """the auto options (None / "auto"): the validated fast path (21 Nov 2026: each A/B'd at 110M over 3 seeds, or exact)
+    on for a native --mode ttf model (a --preset, not --arch-hf: the conversion recipes keep their own settings) where
+    its conditions hold; off elsewhere (--mode fp32 / bitnet: the plain bf16 / BitNet baselines)"""
+    nat = a.mode == "ttf" and not getattr(a, "arch_hf", "") and cuda
+    from .config import TrainConfig
+    one = nat and (a.accum if a.accum is not None else TrainConfig.grad_accum) == 1 and not a.pipe and a.ttf_offload == "none" and world == 1
+
+    def auto(name, cond):
+        if getattr(a, name) is None:
+            setattr(a, name, bool(cond))
+    auto("ttf_upd_i8", nat and a.dx in ("int8", "int8x2") and a.dw == "factored")
+    auto("ttf_dense_g", one and a.ttf_upd_i8 and not getattr(a, "ttf_band", 0))
+    auto("ttf_batch_update", one and a.ttf_dense_g)
+    auto("ttf_batch_bf16", a.ttf_batch_update)
+    auto("ttf_batch_f16", a.ttf_batch_update)
+    auto("mag_fused", a.ttf_dense_g and a.ttf_upd_i8 and a.dx in ("int8", "int8x2") and a.adapter_rank > 0)
+    if a.save_lean is None:
+        a.save_lean = 8 if one else 0
+    auto("save_lean_mag", nat and a.save_lean > 0 and a.adapter_rank > 0)
+    auto("ttf_rqx_fused", a.ttf_dense_g and a.ttf_upd_i8)
+    auto("head_fused", nat)
+    auto("head_f16", a.head_fused)
+    auto("head_i8f", a.head_f16)
+    auto("fuse_res", nat)
+    auto("fuse_swiglu", nat)
+    auto("attn_f16", nat)
+    if a.ttf_store == "auto":
+        a.ttf_store = "fp12s" if nat else "fp32"
+    return a
 
 
 def resolve(a):

@@ -12,7 +12,7 @@ Output: OUT/parts.pt = {"D", "parts": {name: {...}}, "index": [(name, kind, K, N
   python -m ttf.export.refdump core [--dtype bf16]
 Other models (conversions): build the model with its own code and call dump_parts(model, run, out, D).       a random-init core BitTransformer on CUDA (spec-vs-training self test)
 """
-import os, sys, math, tempfile
+import os, sys, tempfile
 import torch
 
 from ..layers import KernelTernaryLinear

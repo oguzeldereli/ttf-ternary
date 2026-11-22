@@ -686,50 +686,6 @@ FIRE_SLOTS = 32           # ttf_fire: listed (uncertain) entries per tile before
 FIRE_EB = 2.0 ** -7 * 1.05    # the bf16 bound's factor: two roundings of 2^-8 each (+ their product, the fp32 sums: 5%)
 
 
-SPARSE24 = [0]     # --ttf-24: 1 = 2:4 along K (the forward GEMM's sparse operand), 2 = also along N (transposable, dx)
-
-
-def enforce24(w, mode, gen=None):
-    """int8 trits [N, K] -> the same with at most 2 nonzeros in each group of 4 along K (mode 2: then also along N),
-    extra nonzeros zeroed at random"""
-    N, K = w.shape
-    for ax in ((1,) if mode == 1 else (1, 0)):
-        x = w if ax == 1 else w.t().contiguous()
-        R_, C_ = x.shape
-        g = x.view(R_, C_ // 4, 4)
-        nz = g != 0
-        sc = torch.rand(g.shape, device=w.device, generator=gen).masked_fill_(~nz, -1.0)
-        rk = sc.argsort(-1, descending=True).argsort(-1)          # rank of each entry by its random score
-        g = torch.where(nz & (rk < 2), g, torch.zeros_like(g))
-        x = g.view(R_, C_)
-        w = x if ax == 1 else x.t().contiguous()
-    return w
-
-
-def filter24(D, packed, K, mode):
-    """the moves D [N, K] int8, minus the births (0 -> +-1) that would leave a group of 4 with more than 2 nonzeros
-    (along K; mode 2 also along N); which births stay is random. Deaths and sign flips always stay"""
-    w = unpack_rows(packed, K).to(torch.int8)
-    nw = w + D
-    birth = (w == 0) & (D != 0)
-    for ax in ((1,) if mode == 1 else (1, 0)):
-        if ax == 0:
-            nw, birth, D = nw.t(), birth.t(), D.t()
-        R_, C_ = nw.shape
-        g = nw.reshape(R_, C_ // 4, 4); b = birth.reshape(R_, C_ // 4, 4)
-        excess = ((g != 0).sum(-1, keepdim=True) - 2).clamp_min(0)
-        sc = torch.rand(g.shape, device=D.device).masked_fill_(~b, -1.0)
-        rk = sc.argsort(-1, descending=True).argsort(-1)
-        nb = b.sum(-1, keepdim=True)
-        drop = b & (rk >= nb - excess)                           # the lowest-scored births beyond the room
-        Dg = D.reshape(R_, C_ // 4, 4).masked_fill(drop, 0)
-        D = Dg.reshape(R_, C_)
-        nw = (g.masked_fill(drop, 0)).reshape(R_, C_); birth = (b & ~drop).reshape(R_, C_)
-        if ax == 0:
-            nw, birth, D = nw.t(), birth.t(), D.t()
-    return D.contiguous()
-
-
 def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, theta: float, Vs=None):
     """TTF firing: A = U V^T, every legal move (|A| >= theta, the trit stays in {-1, 0, 1}) applied to the packed trits
     in place; returns D V (D the moves, {-1, 0, 1}) for the spend, the number of moves and the change of the nonzero
@@ -757,8 +713,6 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     _fire_fix_kernel[(triton.cdiv(S.numel(), BE),)](U, V, packed, D, S, S.numel(), K, R, U.stride(0), V.stride(0),
                                                      packed.stride(0), D.stride(0), _sc(theta), BE=BE, RC=64,
                                                      TH_PTR=torch.is_tensor(theta))
-    if SPARSE24[0]:      # --ttf-24: no move may leave more than 2 nonzeros in a group of 4 (along K)
-        D = filter24(D, packed, K, SPARSE24[0])
     cnt = torch.zeros(2, dtype=torch.int32, device=U.device)          # (the number of moves, the change of nonzeros)
     AN, AK5, SL = 16, 32, 16                                           # (the apply tile: the spend's band and list)
     ga = (triton.cdiv(N, AN), triton.cdiv(K5, AK5))

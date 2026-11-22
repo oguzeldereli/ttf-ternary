@@ -7,7 +7,6 @@ is the plain partial NEOX one (`style half`, `dims` = head_dim x partial_rotary_
   python -m ttf.export.qwen35 HF_DIR CKPT OUT.ttf [--check]   (a ttfconv-converted or ttf-trained Qwen3.5 checkpoint)
 """
 import json
-import math
 import os
 import sys
 

@@ -21,7 +21,6 @@ import torch.nn.functional as F
 
 from . import update as _UPDB   # (--ttf-batch-update: BATCH, ts_flush)
 
-SIDE = [None]   # --ttf-side-stream: the CUDA stream the per-layer TTF updates run on
 
 
 def _rec_stream(g, st):
@@ -331,6 +330,8 @@ def mem_report(model, tail_opt, lr_state):
 
 def main():
     args = parse()
+    from .args import resolve_auto
+    resolve_auto(args, torch.cuda.is_available(), int(os.environ.get("WORLD_SIZE", "1")))
     from . import ext as _X
     _X.load(args.ext)   # --ext plug-ins (ttf/ext.py), before the model is built
     kmode = {"ttf": "kernel", "bitnet": "master", "fp32": "fp32"}[args.mode]   # the checkpoint's and hf_load's names
@@ -1180,12 +1181,6 @@ def main():
                 m_.on_grad = _og
             else:
                 def _og1(layer, g, _c=ts_cfg):
-                    if SIDE[0] is not None:    # --ttf-side-stream: the update on its own stream, overlapping the backward
-                        SIDE[0].wait_stream(torch.cuda.current_stream())
-                        _rec_stream(g, SIDE[0])
-                        with torch.cuda.stream(SIDE[0]), _rf("ttf.update"):
-                            ts_layer(layer, g, lr_state, _c)
-                        return
                     with _rf("ttf.update"):    # (a range per layer call: only while a profiler runs)
                         ts_layer(layer, g, lr_state, _c)
                 m_.on_grad = _og1
@@ -1193,17 +1188,16 @@ def main():
             from .update import STEP_FP32 as _SF
             _SF[0] = True
             print("--ttf-step-fp32: U in fp32 between micro-batches, encoded once per step", flush=True)
-        if args.ttf_orth == "auto":   # spanqr where it can run (the package on the path, CUDA), else Householder
-            try:
+        if args.ttf_orth == "auto":   # c2 on spanqr's kernels where they import (CUDA), else Householder (21 Nov:
+            try:                      # c2 0.31 vs spanqr 0.87 ms, same accuracy; A/B'd at 110M)
                 import orth as _sq   # noqa: F401  (the spanqr package)
-                args.ttf_orth = "spanqr" if device == "cuda" else "qr"
+                from candidates import kchol as _kc   # noqa: F401  (its Cholesky kernels, c2's)
+                args.ttf_orth = "c2" if device == "cuda" else "qr"
             except ImportError:
                 args.ttf_orth = "qr"
         if args.ttf_orth != "qr":
-            from .update import ORTH as _OR, ORTH_C2_PASSES as _OCP
-            _OR[0] = "c2" if args.ttf_orth == "c1" else args.ttf_orth
-            if args.ttf_orth == "c1":   # (one Cholesky-QR pass: orth error ~ eps cond(X)^2, re-done every step)
-                _OCP[0] = 1
+            from .update import ORTH as _OR
+            _OR[0] = args.ttf_orth
         print(f"--ttf-orth {args.ttf_orth}", flush=True)
         if args.factored_k:
             print(f"--dw factored {args.factored_k}: TTF from the gradient's factors (no dense weight gradient)", flush=True)
@@ -1233,35 +1227,10 @@ def main():
             from . import update as _UPD
             from . import layers as _LYR
             _UPD.GRAPH_STATE[0] = True; _LYR.GRAPH_INPLACE[0] = True
-    if getattr(args, "ttf_24", 0):
-        from . import kernel as _K24
-        _K24.SPARSE24[0] = args.ttf_24
-        _n24 = 0; _d0 = _d1 = 0
-        with torch.no_grad():
-            for _m in model.modules():
-                if hasattr(_m, "wpacked") and _m.K % 4 == 0 and (args.ttf_24 == 1 or _m.N % 4 == 0):
-                    _w = _K24.unpack_rows(_m.wpacked, _m.K).to(torch.int8)
-                    _d0 += int((_w != 0).sum()); _w = _K24.enforce24(_w, args.ttf_24); _d1 += int((_w != 0).sum())
-                    _m.wpacked.copy_(_K24.pack_rows(_w)); _n24 += 1
-                    if hasattr(_m, "_invalidate"):
-                        _m._invalidate()
-        print(f"--ttf-24 {args.ttf_24}: {_n24} ternary layers pruned to 2:4 (nonzeros {_d0} -> {_d1})", flush=True)
-    if ttf and (args.ttf_dense_g or args.ttf_upd_tokens < 1 or args.ttf_turn_every > 1):
+    if ttf and args.ttf_dense_g:
         from . import update as _UPD2
-        _UPD2.DENSE_G[0] = bool(args.ttf_dense_g); _UPD2.UPD_TOKENS[0] = float(args.ttf_upd_tokens)
-        _UPD2.TURN_EVERY[0] = int(args.ttf_turn_every)
-        assert args.ttf_upd_tokens >= 1 or args.ttf_dense_g, "--ttf-upd-tokens: with --ttf-dense-g"
-        assert args.ttf_turn_every == 1 or tc.grad_accum == 1, "--ttf-turn-every: one batch per step (--accum 1)"
-        print(f"--ttf-dense-g {args.ttf_dense_g} (tokens {args.ttf_upd_tokens:g}), --ttf-turn-every {args.ttf_turn_every}",
-              flush=True)
-    if ttf and args.ttf_side_stream and device == "cuda":
-        assert tc.grad_accum == 1 and _WS == 1 and not _PP, "--ttf-side-stream: one batch per step, one process"
-        SIDE[0] = torch.cuda.Stream()
-        print("--ttf-side-stream: the TTF updates on a second CUDA stream", flush=True)
-    if getattr(args, "attn_fp8", False):
-        from .model import ATTN_FP8 as _AF8
-        _AF8[0] = True
-        print("--attn-fp8: attention forward on FP8 tensor cores", flush=True)
+        _UPD2.DENSE_G[0] = True
+        print("--ttf-dense-g: the update from the dense int8 gradient", flush=True)
     if getattr(args, "save_lean", 0):
         from .layers import SAVE_LEAN as _SL
         _SL[0] = int(args.save_lean)
@@ -1298,8 +1267,8 @@ def main():
         _FR[0] = True
         print("--fuse-res: residual adds in the GEMM epilogues / norm backward", flush=True)
     if getattr(args, "mag_fused", False):
-        assert args.ttf_dense_g and args.ttf_upd_i8 and args.dx in ("int8", "int8x2") and not args.ttf_side_stream, \
-            "--mag-fused: with --ttf-dense-g --ttf-upd-i8, --dx int8 / int8x2, no --ttf-side-stream"
+        assert args.ttf_dense_g and args.ttf_upd_i8 and args.dx in ("int8", "int8x2"), \
+            "--mag-fused: with --ttf-dense-g --ttf-upd-i8, --dx int8 / int8x2"
         from .layers import MAG_FUSED as _MF
         _MF[0] = True
         print("--mag-fused: the float adapters in the fused kernels, their gradients from the dense TTF g", flush=True)
@@ -1434,8 +1403,6 @@ def main():
                 _, loss = model(x, y)
             with torch.profiler.record_function("model.bwd"):   # includes the fused TTF updates (ttf.update)
                 (loss / tc.grad_accum).backward()
-            if SIDE[0] is not None:   # (--ttf-side-stream: the trits / state the updates wrote, before anything reads them)
-                torch.cuda.current_stream().wait_stream(SIDE[0])
             model.kd_logp = None
             if args.kd_cache:
                 model.kd_topk = None

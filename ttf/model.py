@@ -36,7 +36,6 @@ FUSED_ELEM = [True]   # bf16 CUDA activations: the RMSNorm and the SwiGLU in one
                       # the CPU / fp32 path and the tests' reference)
 
 
-ATTN_FP8 = [False]    # --attn-fp8 (fp8attn.py)
 FUSE_PROJ = [""]      # --fuse-proj split | shared: q/k/v and gate/up each one ternary layer ("" off)
 HEAD_ALL = [False]    # --head-fused: headloss.TrainHeadAll (the head's backward in the forward; fp32 weight-gradient sum)
 ATTN_F16 = [False]    # --attn-f16 (f16attn.py)
@@ -133,9 +132,6 @@ class Attention(nn.Module):
         if ATTN_F16[0] and q.is_cuda and q.dtype == torch.bfloat16 and torch.is_grad_enabled():
             from .f16attn import attention as _fa16     # --attn-f16: own flash fwd+bwd, fp16-accumulated softmax side
             out = _fa16(q, k, v)
-        elif ATTN_FP8[0] and q.is_cuda and q.dtype == torch.bfloat16 and torch.is_grad_enabled():
-            from .fp8attn import attention as _fa8      # --attn-fp8: the forward on FP8 tensor cores
-            out = _fa8(q, k, v)
         else:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)

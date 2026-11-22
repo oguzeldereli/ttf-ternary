@@ -435,16 +435,7 @@ def _orth_(X):
 
 DENSE_G = [False]   # --ttf-dense-g: the update from the dense gradient g = gy^T x (one int8 GEMM from the layer's int8
                     # factors with --ttf-upd-i8, else one bf16 GEMM), through the dense path (exact v sums, no sketch)
-UPD_TOKENS = [1.0]  # --ttf-upd-tokens F: the dense gradient from the first F of the step's tokens (x 1 / F)
-TURN_EVERY = [1]    # --ttf-turn-every m: the accumulator's basis turns on every m-th update (one batch per step), held
-                    # between (U += u V: no orthonormalisation, no u^T U product)
 FAST1 = [True]      # the dense path's one-batch v sums and u in fused kernels (False: the torch expressions; tests)
-
-
-def _hold_basis(t):
-    """--ttf-turn-every m: True on the updates that keep the basis (all but every m-th; the first update turns)"""
-    m = TURN_EVERY[0]
-    return m > 1 and (t - 1) % m != 0
 
 
 class _RowBlock:
@@ -484,26 +475,20 @@ def _dense_g_of(fg, c):
     """--ttf-dense-g: g = gy^T x fp32 [N, K] from the backward's factors (gy, x[, I8Factors]); data parallel: the mean"""
     gy, x = fg[:2]
     F8 = fg[2] if len(fg) > 2 else None
-    fr = UPD_TOKENS[0]
     with _rf("ttf.dense_g"):
         if F8 is not None:
             from . import i8upd
-            g = i8upd.dense_g(F8, fr)
+            g = i8upd.dense_g(F8)
         else:
-            T = gy.shape[0]
-            Tu = T if fr >= 1 else max(128, (int(T * fr) // 128) * 128)
-            g = (torch.mm(gy[:Tu].T, x[:Tu], out_dtype=torch.float32) if gy.is_cuda and gy.dtype == torch.bfloat16
-                 else gy[:Tu].T.float() @ x[:Tu].float())
-            if Tu != T:
-                g.mul_(T / Tu)
+            g = (torch.mm(gy.T, x, out_dtype=torch.float32) if gy.is_cuda and gy.dtype == torch.bfloat16
+                 else gy.T.float() @ x.float())
     return _dpm(g)
 
 
-ORTH_C2_PASSES = [2]
 
 
 def _orth_c2(X):
-    """--ttf-orth c2: Cholesky QR, ORTH_C2_PASSES passes on spanqr's kernels (its cooperative Cholesky with clamped
+    """--ttf-orth c2: Cholesky QR, two passes on spanqr's kernels (its cooperative Cholesky with clamped
     pivots: no breakdown, no host sync; its triangular solve), the Gram by cuBLAS in fp32, the first pass shifted by
     1e-7 ||G||_F. Two passes leave orthogonality at fp32 rounding for cond(X) up to ~1e3-1e4 (measured on the 110M
     combo checkpoint 21 Nov: cond(U) <= 42, so cond(X) ~ cond(U^T U) <= ~2e3); spanqr's 3 passes + 2 polish steps are
@@ -514,7 +499,7 @@ def _orth_c2(X):
     K, r = X.shape
     s = _pow2_scale(torch.linalg.vector_norm(X, ord=float("inf"))).reshape(1)
     Y = X
-    for p in range(ORTH_C2_PASSES[0]):
+    for p in range(2):
         G = tri.gram_f(Y, s=s) if p == 0 else Y.T @ Y
         nrm = torch.linalg.matrix_norm(G)
         if p == 0:
@@ -562,14 +547,14 @@ def _bkey(l, state, c):
 
 def _batchable(l, g, state, c):
     """the one-batch dense path with its fused kernels, a layer with state already (not its first update), nothing
-    that needs the per-layer path (micro-batches, offload, int-k codes, flip tracking, held basis, frozen start, --pipe)"""
+    that needs the per-layer path (micro-batches, offload, int-k codes, flip tracking, frozen start, --pipe)"""
     if not (g.is_cuda and g.dtype == torch.float32 and FAST1[0] and FIRE_FUSED[0] and DEFER[0] is None):
         return False
     if int(c.get("micro") or 1) > 1 or c.get("vdiag") or c.get("offload") or c.get("band") or c.get("hspend"):
         return False
     if getattr(l, "codes", None) is not None or not hasattr(l, "_after_fire") or getattr(l, "track", False):
         return False
-    if TURN_EVERY[0] > 1 or (c.get("start") and c.get("step", 0) < c["start"]):
+    if c.get("start") and c.get("step", 0) < c["start"]:
         return False
     key = id(l)
     return key in state and not is_dense_state(state[key])
@@ -882,11 +867,8 @@ def ts_layer(l, g, state, c):
     else:
         U, V = _load_pair(_host_get(state, key, dev, off))
         U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
-        if _hold_basis(t):                            # --ttf-turn-every m: V held, the step's u projected on it
-            U = U + u @ V
-        else:
-            Vn = _orth(V @ (U.T @ U) + u.T @ U)
-            U = U @ (V.T @ Vn) + u @ Vn; V = Vn
+        Vn = _orth(V @ (U.T @ U) + u.T @ U)
+        U = U @ (V.T @ Vn) + u @ Vn; V = Vn
     if mic_nm and not final_:   # --accum M > 1: not the last micro-batch: keep the accumulator, no firing
         _host_put(state, key, _store_pair(sa, U, V) if sa else (U, V), off)
         return
@@ -1221,11 +1203,8 @@ def _ts_layer_factored(l, fg, state, c):
         U, V = _load_pair(_host_get(state, key, dev, off))
         A_prev = U @ V.T if c.get("band") else None
         U = U * lk                                    # the step is one batch: the turn from U_0 (_acc_turn), exact
-        if _hold_basis(t):                            # --ttf-turn-every m: V held, the step's u projected on it
-            U = U - lr_ratio * _dpm(_fg_mm_r(fgb, ia, V))
-        else:
-            Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
-            U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
+        Vn = _orth(V @ (U.T @ U) - lr_ratio * _dpm(_fg_mm_l(fgb, ia, U)))
+        U = U @ (V.T @ Vn) - lr_ratio * _dpm(_fg_mm_r(fgb, ia, Vn)); V = Vn
     if not final_:
         if STEP_FP32[0] and sa and not off:   # --ttf-step-fp32: within the step U stays fp32 (V is fixed until the last
             # micro-batch: kept as stored); encoded once, on the last micro-batch. Skips U's encode / decode per micro-batch

@@ -178,15 +178,11 @@ def rqx(X8, rs):
     return Yt, sY
 
 
-def dense_g(F, frac=1.0):
+def dense_g(F):
     """g = gy^T x fp32 [N, K] from the int8 factors: q1^T (block-quantized rs * xq), one int8 GEMM (2 T N K) instead of
-    the factored update's four product chains (2 T (N + K)(2 k + 2 r)). frac < 1: the first frac of the tokens only,
-    scaled by 1 / frac (--ttf-upd-tokens)"""
-    T = F.q1.shape[0]
-    Tu = T if frac >= 1 else max(BT, (int(T * frac) // BT) * BT)
-    Yt, sY = F.yq if (F.yq is not None and Tu == T) else rqx(F.xq[:Tu], F.rs[:Tu])
-    g = tn(F.q1t_(), Yt, sY, T=Tu)
-    return g if Tu == T else g.mul_(T / Tu)
+    the factored update's four product chains (2 T (N + K)(2 k + 2 r))"""
+    Yt, sY = F.yq if F.yq is not None else rqx(F.xq, F.rs)
+    return tn(F.q1t_(), Yt, sY)
 
 
 class I8Factors:

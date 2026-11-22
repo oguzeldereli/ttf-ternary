@@ -8,7 +8,6 @@ weight-derived constants (`<p>.beta`, `layers.i.attn.qk_scale`).
   python -m ttf.export.emit core CKPT.safetensors OUT.ttf --float-check           (the float-path end-to-end test)
 """
 import json, math, os, sys
-import numpy as np
 import torch
 
 from ..layers import KernelTernaryLinear
