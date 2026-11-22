@@ -594,8 +594,10 @@ def test_dp_factored(fp32):
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
 
 
-@pytest.mark.parametrize("K,N,dx", [(1024, 3584, "int8x2"), (3584, 1024, "int8x2"), (1024, 3584, "bf16"), (1024, 48, "int8x2")])
-def test_fused_layer(K, N, dx):
+@pytest.mark.parametrize("K,N,dx,r", [(1024, 3584, "int8x2", 64), (3584, 1024, "int8x2", 64), (1024, 3584, "bf16", 64),
+                                     (1024, 48, "int8x2", 64), (1024, 3584, "int8x2", 104), (3584, 1024, "int8", 104),
+                                     (1024, 3584, "bf16", 40)])
+def test_fused_layer(K, N, dx, r):
     """--fused-layer against the unfused path on a centred layer with row / column scales and bias, plus a second layer
     and a thin pair summed into it through acc (a converted site): output (with and without grad), input gradient and
     the TTF factors bit-identical; the scales' / bias' gradients within bf16 rounding (fp32 sums)"""
@@ -614,7 +616,6 @@ def test_fused_layer(K, N, dx):
             with torch.no_grad():
                 l.row_scale.uniform_(0.5, 1.5); l.col_scale.uniform_(0.5, 1.5)
             return l
-        r = 64
         a, b, d, u = mk(K, N), mk(K, N), mk(K, r), mk(r, N)
         a.enable_centering(torch.randn(K, device=dev) * 0.3, torch.randn(N, device=dev) * 0.1)
         ls = [a, b, d, u]; cap = {}

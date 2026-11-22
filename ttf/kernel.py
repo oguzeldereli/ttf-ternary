@@ -1739,7 +1739,7 @@ def fused_fwd_gemm(xq, w8, xs, beta, r_b, bias_b, acc, save_t, pre=None, t_rows=
     trip saved: 5.98 -> 6.05 s on the laptop 4080). Tiles fixed by shape"""
     M, K = xq.shape
     N = w8.shape[0]
-    if K > 2048:
+    if K > 2048 and K % 16 == 0:   # (cuBLASLt int8; K % 8 only: the Triton kernel)
         if lr is not None:
             pre = torch.mm(lr[0], lr[1].t())
         t, o = fused_epilogue(torch._int_mm(xq, w8.t()), xs, beta, r_b, bias_b, acc, save_t, pre)

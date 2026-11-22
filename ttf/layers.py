@@ -189,7 +189,9 @@ def _fused_ok(l, x):
     if not (FUSED_LAYER[0] and x.is_cuda and x.dtype == torch.bfloat16
             and l.col_scale is not None and l.row_scale is not None
             and (getattr(l, "mag_A", None) is None or getattr(l, "mag_kind", "add") == "add")
-            and l.K % 16 == 0 and l.N % 8 == 0 and x.numel() // l.K > 16):   # (K % 16: kernel.tern_gemm_i8)
+            and l.K % 8 == 0 and l.N % 8 == 0 and x.numel() // l.K > 16):   # (K % 8: the converted adapters' up
+        # layers have K = rank, e.g. 104 = 0.1 x 1024; K % 16 sent them to the unfused path, ~5 passes over [M, N]:
+        # 0.8B conversion r0.1 5.14 -> 3.81 s/step, outputs / dx / TTF factors bit-identical (test_fused_layer r 104))
         return False
     if l.capture and torch.is_grad_enabled():
         return FACTORED[0] and getattr(l, "on_grad", None) is not None and not getattr(l, "_dw_dense", False)
