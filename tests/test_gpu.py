@@ -104,6 +104,29 @@ def test_fire_fused(slots):
         K_.FIRE_SLOTS = 32
 
 
+@pytest.mark.parametrize("N,K,R,rate", [(1024, 1536, 768, 1e-3), (1000, 1283, 600, 3e-3), (768, 1024, 1024, 3e-2)])
+def test_fire_gemm_matches_fire_kernel(N, K, R, rate):
+    """FIRE_GEMM (rank > 512: A = U V^T by cuBLAS in row chunks, then _fire_dec_kernel) moves exactly the entries
+    _fire_kernel moves: the same packed trits, move and nnz counts, dU"""
+    from ttf import kernel as K_
+    g = torch.Generator(device=dev).manual_seed(5)
+    w = torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8, generator=g); pk = K_.pack_rows(w)
+    U = torch.randn(N, R, device=dev, generator=g); V = torch.linalg.qr(torch.randn(K, R, device=dev, generator=g))[0]
+    A = U[:256] @ V.T; th = A.abs().flatten().kthvalue(int(A.numel() * (1 - rate))).values.item(); U *= 16 / th
+    old = K_.FIRE_GEMM[0]
+    try:
+        out = {}
+        for mode in (0, 384):                          # 384: several row chunks, a ragged last one
+            K_.FIRE_GEMM[0] = mode
+            p2 = pk.clone(); dU, nmv, dnz = K_.ttf_fire(U, V, p2, K, 16.0)
+            out[mode] = (p2, dU, int(nmv), int(dnz))
+    finally:
+        K_.FIRE_GEMM[0] = old
+    a, b = out[0], out[384]
+    assert a[2] > 0 and a[2] == b[2] and a[3] == b[3]
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+
 def test_fire_near_theta():
     """entries placed within 1e-4 .. 1e-2 of theta (relative), far inside the bf16 error: the decisions are the fp64
     ones except within 1e-6 of theta"""

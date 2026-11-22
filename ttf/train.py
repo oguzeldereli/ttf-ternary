@@ -134,8 +134,31 @@ _CG = {"pool": None, "graphs": None}   # --cuda-graph: one memory pool for every
 FUSED_KD_LOGP = [True]   # --distill: the teacher's log-softmax as one Triton kernel (kernel.log_softmax_bf16)
 
 
+class _ChunkLogp:
+    """--distill (Qwen): the teacher's next-token log-probabilities as the loss's chunks read them, kd[i:j]: the
+    teacher's final hidden states h [B T, d] are kept and each chunk's rows go through its head and log-softmax when the
+    loss reaches them (the same per-row values as the full [B T, V] tensor, which at 16 x 2048 tokens and a 248k
+    vocabulary is 16 GiB: --batch-size 16 --accum 1 with a live teacher, so the one-batch update's fast path; 22 Nov)"""
+    def __init__(self, h, w):
+        self.h, self.w = h, w
+        self.shape = (h.shape[0], w.shape[0])
+
+    def __getitem__(self, s):
+        with torch.no_grad():
+            z = F.linear(self.h[s], self.w)
+            if z.is_cuda and FUSED_KD_LOGP[0]:
+                from .kernel import log_softmax_bf16
+                return log_softmax_bf16(z.contiguous())
+            return F.log_softmax(z.float(), -1).to(torch.bfloat16)
+
+
 def _teacher_logp(teacher, x, device):
-    """--distill: the full-precision model's next-token log-probabilities for batch x, bf16 [B T, V]"""
+    """--distill: the full-precision model's next-token log-probabilities for batch x, bf16 [B T, V] (a teacher with
+    .hidden: a _ChunkLogp, computed per loss chunk)"""
+    if hasattr(teacher, "hidden"):
+        with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
+            h_ = teacher.hidden(x)
+        return _ChunkLogp(h_.reshape(-1, h_.shape[-1]).to(torch.bfloat16), teacher.head_w)
     with torch.no_grad(), torch.autocast(device_type=device.split(":")[0], dtype=torch.bfloat16):
         tz_, _ = teacher(x)
     tz_ = tz_.reshape(-1, tz_.shape[-1])
@@ -663,7 +686,15 @@ def main():
         _qt = _QT.from_pretrained(args.teacher, dtype=torch.bfloat16).to(device).eval()
         for p_ in _qt.parameters():
             p_.requires_grad_(False)
-        _teacher = lambda x_: (_qt(input_ids=x_, use_cache=False).logits, None)   # (no KV cache: same logits)
+        class _QTeach:   # (the final hidden states and the head: the loss's chunks form the log-probabilities)
+            head_w = _qt.lm_head.weight.detach().to(torch.bfloat16)
+
+            def __call__(self, x_):
+                return _qt(input_ids=x_, use_cache=False).logits, None   # (no KV cache: same logits)
+
+            def hidden(self, x_):
+                return _qt.model(input_ids=x_, use_cache=False).last_hidden_state
+        _teacher = _QTeach()
         model.kd_w = args.kd_weight
         print(f"--distill {args.teacher} (Qwen): teacher in bf16, loss (1 - {args.kd_weight}) CE + {args.kd_weight} KL", flush=True)
     elif args.teacher:   # --distill HF_DIR: the run learns the full-precision model's distribution (KL), not only the labels

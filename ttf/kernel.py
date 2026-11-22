@@ -577,6 +577,57 @@ def _fire_kernel(ub_ptr, vb_ptr, u_ptr, v_ptr, un_ptr, vn_ptr, p_ptr, d_ptr, s_p
 
 
 @triton.jit
+def _fire_dec_kernel(a_ptr, u_ptr, v_ptr, un_ptr, vn_ptr, p_ptr, d_ptr, s_ptr, N, K, K5, R, row0, sa, sun, svk, spn, sdn,
+                     theta, eb, NPK, SLOTS: tl.constexpr, RC: tl.constexpr, BN: tl.constexpr, BK5: tl.constexpr,
+                     TH_PTR: tl.constexpr = False):
+    """_fire_kernel's decisions with A = U V^T read from a row chunk (rows row0 ..) that cuBLAS formed from the same bf16
+    copies with fp32 sums (FIRE_GEMM): the same bound, slots, tf32x3 fallback and D; only the sums' order differs (the
+    bound's 5% covers it, and the listed entries are the fp32 dot either way). A's columns are digit-major (V's rows
+    permuted: column i K5 + b is k = 5 b + i), so each digit's loads are contiguous"""
+    if TH_PTR:
+        theta = tl.load(theta)
+    pl = tl.program_id(0); pk = tl.program_id(1)
+    pn = row0 // BN + pl
+    rows = pn * BN + tl.arange(0, BN)
+    k5 = pk * BK5 + tl.arange(0, BK5)
+    rm = rows[:, None] < N
+    pm = rm & (k5[None, :] < K5)
+    b = tl.load(p_ptr + rows[:, None] * spn + k5[None, :], mask=pm, other=0).to(tl.int32)
+    un = tl.load(un_ptr + rows, mask=rows < N, other=0.0)
+    sbase = (pn * NPK + pk).to(tl.int64) * SLOTS
+    nsl = 0
+    pw = 1
+    for i in tl.static_range(5):
+        k = k5 * 5 + i
+        km = k[None, :] < K
+        dig = (b // pw) % 3
+        a = tl.load(a_ptr + (rows[:, None] - row0).to(tl.int64) * sa + (i * K5 + k5)[None, :], mask=rm & km, other=0.0)
+        vn = tl.load(vn_ptr + k, mask=k < K, other=0.0)
+        bd = eb * un[:, None] * vn[None, :]
+        ok = pm & km
+        amb = ok & (tl.abs(a) + bd >= theta) & (tl.abs(a) - bd < theta)
+        flat = tl.reshape(amb.to(tl.int32), (BN * BK5,))
+        na = tl.sum(flat, axis=0)
+        if nsl + na > SLOTS:                                  # (rare: the digit decided with tf32x3 here)
+            a = tl.zeros((BN, BK5), dtype=tl.float32)
+            for r0 in range(0, R, RC):
+                rr = r0 + tl.arange(0, RC)
+                u = tl.load(u_ptr + rows[:, None] * sun + rr[None, :], mask=rm & (rr[None, :] < R), other=0.0)
+                v = tl.load(v_ptr + k[:, None] * svk + rr[None, :], mask=(k[:, None] < K) & (rr[None, :] < R), other=0.0)
+                a += tl.dot(u, tl.trans(v), input_precision="tf32x3")
+            bd = tl.zeros((BN, BK5), dtype=tl.float32)
+        else:
+            pos = nsl + tl.cumsum(flat, axis=0) - 1
+            ent = tl.reshape(rows[:, None].to(tl.int64) * K + k[None, :], (BN * BK5,))
+            tl.store(s_ptr + sbase + pos, ent, mask=flat > 0)
+            nsl += na
+        d = tl.where(a > 0, 1, tl.where(a < 0, -1, 0))
+        fire = ok & (tl.abs(a) - bd >= theta) & (tl.abs(dig - 1 + d) <= 1)
+        tl.store(d_ptr + rows[:, None] * sdn + k[None, :], tl.where(fire, d, 0).to(tl.int8), mask=rm & km)
+        pw = pw * 3
+
+
+@triton.jit
 def _fire_fix_kernel(u_ptr, v_ptr, p_ptr, d_ptr, s_ptr, n_slots, K, R, sun, svk, spn, sdn, theta,
                      BE: tl.constexpr, RC: tl.constexpr, TH_PTR: tl.constexpr = False):
     """the listed entries: A_nk = u_n . v_k in fp32 (FMAs), the move decided as in _fire_kernel, written to D"""
@@ -684,6 +735,10 @@ FIRE_TILE = None          # ttf_fire tiles (rows, packed bytes of 5 columns, ran
 FIRE_GROUP = [8]          # ttf_fire's grouped tile order (0: the 2-D grid); the same tiles and decisions
 FIRE_SLOTS = 32           # ttf_fire: listed (uncertain) entries per tile before the tile decides itself in tf32x3
 FIRE_EB = 2.0 ** -7 * 1.05    # the bf16 bound's factor: two roundings of 2^-8 each (+ their product, the fp32 sums: 5%)
+FIRE_GEMM = [2048]            # ttf_fire at rank > 512: A = U V^T by cuBLAS (bf16 copies, fp32 out) in chunks of this many
+                              # rows, then _fire_dec_kernel: bit-identical moves / trits / dU on 7 shapes; in a real b27
+                              # step ~3-4 ms/layer faster (184 -> 181 ms/layer), 1.6x on non-pow2 shapes in isolation
+                              # (22 Nov); 0: _fire_kernel
 
 
 def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, theta: float, Vs=None):
@@ -705,10 +760,24 @@ def ttf_fire(U: torch.Tensor, V: torch.Tensor, packed: torch.Tensor, K: int, the
     BN, BK5, RC = FIRE_TILE if FIRE_TILE else ((32, 32, 32) if R <= 512 else (64, 32, 64))
     g = (triton.cdiv(N, BN), triton.cdiv(K5, BK5))
     S = torch.full((g[0] * g[1] * FIRE_SLOTS,), -1, dtype=torch.int64, device=U.device)
-    _fire_kernel[(g[0] * g[1],) if FIRE_GROUP[0] else g](
-        Ub, Vb, U, V, un, vn, packed, D, S, N, K, K5, R, U.stride(0), V.stride(0), packed.stride(0), D.stride(0),
-        _sc(theta), FIRE_EB, g[1], SLOTS=FIRE_SLOTS, RC=RC, BN=BN, BK5=BK5, num_warps=4, num_stages=3,
-        TH_PTR=torch.is_tensor(theta), GROUP=FIRE_GROUP[0])
+    if FIRE_GEMM[0] and R > 512 and FIRE_TILE is None:
+        CH = max(BN, FIRE_GEMM[0] // BN * BN)
+        Vbp = Vb.new_zeros(5 * K5, R)                                    # digit-major rows: i K5 + b <- 5 b + i
+        Vpad = Vb.new_zeros(5 * K5, R); Vpad[:K] = Vb
+        Vbp.view(5, K5, R).copy_(Vpad.view(K5, 5, R).transpose(0, 1)); del Vpad
+        for r0_ in range(0, N, CH):
+            nr = min(CH, N - r0_)
+            Ac = torch.mm(Ub[r0_:r0_ + nr], Vbp.t(), out_dtype=torch.float32)
+            _fire_dec_kernel[(triton.cdiv(nr, BN), g[1])](
+                Ac, U, V, un, vn, packed, D, S, N, K, K5, R, r0_, Ac.stride(0), U.stride(0), V.stride(0),
+                packed.stride(0), D.stride(0), _sc(theta), FIRE_EB, g[1], SLOTS=FIRE_SLOTS, RC=RC, BN=BN, BK5=BK5,
+                num_warps=4, TH_PTR=torch.is_tensor(theta))
+            del Ac
+    else:
+        _fire_kernel[(g[0] * g[1],) if FIRE_GROUP[0] else g](
+            Ub, Vb, U, V, un, vn, packed, D, S, N, K, K5, R, U.stride(0), V.stride(0), packed.stride(0), D.stride(0),
+            _sc(theta), FIRE_EB, g[1], SLOTS=FIRE_SLOTS, RC=RC, BN=BN, BK5=BK5, num_warps=4, num_stages=3,
+            TH_PTR=torch.is_tensor(theta), GROUP=FIRE_GROUP[0])
     BE = 64
     _fire_fix_kernel[(triton.cdiv(S.numel(), BE),)](U, V, packed, D, S, S.numel(), K, R, U.stride(0), V.stride(0),
                                                      packed.stride(0), D.stride(0), _sc(theta), BE=BE, RC=64,

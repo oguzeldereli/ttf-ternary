@@ -120,6 +120,19 @@ def enable_fused_norm():
             return gated_norm_qwen(hidden_states, gate, self.weight, self.variance_epsilon)
         return gorig(self, hidden_states, gate)
     Q.Qwen3_5RMSNormGated.forward = gnorm
+    try:                  # the DeltaNet's short causal conv: fla's Triton kernel on the [B, T, D] layout the projection
+        from fla.modules.convolution import causal_conv1d as _fcc   # wrote (transformers' fallback is F.conv1d on
+    except ImportError:   # the transposed [B, D, T] tensor plus two [B, D, T] copies: 0.8B GDN layer fwd+bwd at 16 x 2048 103 -> 75 ms,
+        # outputs and gradients within 7e-3 (fla sums in fp32); 22 Nov)
+        return
+    corig = Q.causal_conv1d_fn
+
+    def cconv(hidden_states, weight, bias=None, activation=None, **kw):
+        if hidden_states.is_cuda and FUSED_NORM[0] and activation in (None, "silu", "swish"):
+            y = _fcc(hidden_states.transpose(1, 2), weight=weight, bias=bias, activation=activation)
+            return (y[0] if isinstance(y, tuple) else y).transpose(1, 2)
+        return corig(hidden_states, weight, bias, activation=activation, **kw)
+    Q.causal_conv1d_fn = cconv
 
 
 @contextlib.contextmanager
