@@ -180,6 +180,15 @@ weight at every size: about one byte per weight at the 12 bits the accumulator t
 
 ## Memory and speed
 
+- **The fast path is on by default** for a native `--mode ttf` model with one micro-batch per step: the update from one
+  int8 dense gradient, turn / orthonormalisation / firing batched by layer shape (fp16 tensor-core Grams), the float
+  adapter, residual adds and SwiGLU inside the int8 kernels, the head's GEMMs and the attention forward on fp16 MMA
+  with fp16 sums per block, a 12-bit state. Each part was A/B'd at 110M over three seeds (or is exact); `--no-NAME`
+  turns one off. Per layer at 16 x 2048 tokens on a 4070 Ti Super, against bf16 AdamW (bf16 autocast, flash
+  attention) without recompute on either side: 110M 20.5 vs 28.8 ms (full step 0.34 vs 0.44 s); 1.3B width 103 vs
+  156; 2.9B width 205 vs 293; 23B width (5120) ~560 vs 691, where the per-step update is ~125 ms a layer and fades
+  at larger batches (per token 27 vs 40 ms per sequence). The 110M step with the adapters is 2.4x the old default
+  path's speed.
 - **23.0B parameters on one 16 GB GPU** (22.85B ternary; 11.1-11.6 GiB at ranks 256-1024) with the TTF state in host
   memory and copies overlapped with the backward (`--ttf-offload async`).
 - **Qwen3.8-27B on one 24 GB GPU:** 32k tokens per step (2 x 8 x 2048), peak 19.7 GB (`--recipe continue-27b`).
@@ -202,8 +211,9 @@ weight at every size: about one byte per weight at the 12 bits the accumulator t
   With CUDA graphs on, 110M steps (16 x 2048 tokens) drop from 1.21 to 1.12 s, and d1536 steps from 4.23 to 3.78 s,
   faster there than bf16 AdamW on the same model code (4.04 s). The final loss is unchanged within noise (four paired
   seeds).
-- **Orthonormal bases** come from [spanqr](https://github.com/oguzeldereli/spanqr) at accumulator ranks of 64 and up
-  when it is installed (`--ttf-orth auto`). Below 64, Householder QR is as fast.
+- **Orthonormal bases** outside the batched update come from two Cholesky-QR passes on
+  [spanqr](https://github.com/oguzeldereli/spanqr)'s kernels at accumulator ranks of 64 and up when it is installed
+  (`--ttf-orth auto`). Below 64, Householder QR is as fast.
 
 ## Main options
 
@@ -215,14 +225,15 @@ weight at every size: about one byte per weight at the 12 bits the accumulator t
 | `--mode ttf / bitnet / fp32` | TTF; BitNet b1.58 (latent weights, STE, AdamW); the full-precision model |
 | `--recipe NAME` | demo-15m, scratch-110m, continue-27b |
 | `--preset NAME` | model shape without `--arch-hf` (s15, small = 110M, d1024_l24 = 340M, d2048_l24 = 1.3B, b3, b27, ...) |
-| `--ttf-rank R` | rank of each layer's accumulator (512) |
+| `--ttf-rank-ratio R`, `--ttf-rank R` | each layer's accumulator rank R min(N, K) (recipes: 0.4), or a fixed rank (512) |
 | `--ttf-theta`, `--ttf-tau` | base threshold (θ alone sets the step), leak 1 − 1/τ |
 | `--ttf-theta-start`, `--ttf-theta-end` | θ schedule: start at step 0, base at the warmup's end, end at the last step, cosines between them in the step base/θ (default 4θ → θ → 5θ; start = end = base for a constant θ) |
 | `--accum M`, `--batch-size B` | M micro-batches of B sequences per step |
 | `--dw-sketch K`, `--dw-sketch-warm F` | the update from the gradient's factors (no dense weight gradient), sketch size K |
-| `--ttf-store fp32 / bf16 / fp12s` | accumulator format |
+| `--ttf-store auto / fp32 / bf16 / fp12s` | accumulator format (auto: fp12s for a native ttf model) |
 | `--ttf-offload async` | TTF state in pinned host memory, copies overlapped with the backward |
-| `--ttf-orth auto / qr / spanqr` | the accumulator basis' orthonormalisation |
+| `--ttf-orth auto / qr / spanqr / c2` | the accumulator basis' orthonormalisation (auto: c2 on spanqr's kernels when installed) |
+| `--no-ttf-batch-update`, `--no-mag-fused`, `--no-head-fused`, `--no-attn-f16`, ... | turn one part of the fast path off |
 | `--cuda-graph` | each step's micro-batches as CUDA graphs (also with `--teacher` / `--kd-cache`) |
 | `--adapter-rank R` | rank-R float adapter beside the trits (16) |
 | `--arch-hf DIR`, `--init-ckpt CKPT` | a Hugging Face architecture (Llama, Qwen3.5 / 3.8) and a ternary checkpoint of it |

@@ -1882,16 +1882,17 @@ DX2_TILE = [None]    # (BM, BK, BN, num_warps) override (tuning)
 FWD_TILE = [None]    # fused_fwd_gemm's (BM, BN, BK, num_warps) override (tuning)
 
 
-def _dx2_tile(N, K):
-    """(BM, BK, BN, num_warps): fixed per shape (laptop 4080, the 27B shapes; a fixed choice keeps the column sums'
-    order the same on every run; 110M-sized shapes: t_gemm_tune.py 21 Nov, 4070 Ti Super, 128 x 128 x 64 w4 -7..-8%)"""
-    if N * K <= 2048 * 2048:
-        return 128, 128, 64, 4
-    if K >= 12288 and N >= 4096:
-        return 128, 128, 128, 8
+def _dx2_tile(N, K, swi=False):
+    """(BM, BK, BN, num_warps): fixed per shape (a fixed choice keeps the column sums' order the same on every run).
+    BM 128 lets --ttf-rqx-fused fuse (the token block is the row tile). t_dxrule.py 22 Nov, 4070 Ti Super, M 8192-32768,
+    rqx counted, outputs identical: 1.3B -0..-12% a layer, 2.9B -8%, 23B -15% (qkv / wo / gate-up / down 21.5 -> 18.3
+    ms at 4 x 2048 tokens); 110M / 340M unchanged. The swiglu epilogue (w_down): BM 64 below K 12288 (5.5 -> 1.1 ms,
+    t_swi_tune.py 21 Nov)"""
+    if swi:
+        return (128, 64, 128, 4) if K >= 12288 else (64, 64, 128, 4)
     if N >= 16384 and K >= 4096:
-        return 128, 64, 64, 4
-    return 64, 128, 64, 4
+        return 128, 256, 128, 8
+    return 128, 128, 64, 4
 
 
 LAST_RQX = [None]   # dx2_col(rqx=True): (Y^T int8 [K, M], sY [M / 128, K]), i8upd.rqx(xq, s xs)'s output
@@ -1905,8 +1906,7 @@ def dx2_col(q1, q2, s, w8t, c_b, x, mu_b=None, add=None, lr=None, xs=None, swi=N
     M, N = q1.shape
     K = w8t.shape[0]
     gx = torch.empty(M, K, dtype=torch.bfloat16, device=q1.device) if swi is None else None
-    BM, BK, BN, nw = DX2_TILE[0] if DX2_TILE[0] is not None else (
-        (64, 64, 128, 4) if swi is not None else _dx2_tile(N, K))   # (the swiglu epilogue: t_swi_tune.py 21 Nov, 5.5 -> 1.1 ms)
+    BM, BK, BN, nw = DX2_TILE[0] if DX2_TILE[0] is not None else _dx2_tile(N, K, swi is not None)
     nb = triton.cdiv(M, BM)
     pc = torch.empty(nb, K, dtype=torch.float32, device=q1.device)
     lk = {}
