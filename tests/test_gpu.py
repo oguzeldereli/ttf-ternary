@@ -127,6 +127,51 @@ def test_fire_gemm_matches_fire_kernel(N, K, R, rate):
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
 
+@pytest.mark.parametrize("store,n,f16", [("fp12s", 5, False), ("fp12s", 3, True), ("", 4, False), ("bf16", 2, False)])
+def test_batch_group_vec_matches_loop(store, n, f16):
+    """--ttf-batch-update: the group's stacked bookkeeping (BATCH_VEC: v sums, scales, the fp12s store packed side by
+    side) gives bit-identical trits, stored pairs, v sums and move counts to the per-layer loops, over two turns (the
+    first without v sums)"""
+    import ttf.kernel as KN
+    import ttf.update as U_
+    from ttf.layers import KernelTernaryLinear
+    K, N, r = 384, 256, 48
+    old = (U_.BATCH_VEC[0], U_.BATCH_F16[0])
+
+    def run(vec):
+        U_.BATCH_VEC[0], U_.BATCH_F16[0] = vec, f16
+        torch.manual_seed(11)
+        ls = []
+        for _ in range(n):
+            l = KernelTernaryLinear(K, N, 8, beta=True).to(dev)
+            l.wpacked.copy_(KN.pack_rows(torch.randint(-1, 2, (N, K), device=dev, dtype=torch.int8)))
+            ls.append(l)
+        state = {}
+        enc = U_._store_codec(store)
+        for l in ls:
+            Uq = torch.randn(N, r, device=dev) * 3; Vq = torch.linalg.qr(torch.randn(K, r, device=dev))[0]
+            state[id(l)] = U_._store_pair(enc, Uq, Vq) if enc else (Uq, Vq)
+        c = {"lr_ratio": 0.5, "tau": 100.0, "b2": 0.95, "theta": 4.0, "spend": 1.0, "store_a": store}
+        out = []
+        for turn in range(2):
+            gs = [(torch.randn(N, K, device=dev) * 30).round().to(torch.bfloat16) for _ in ls]
+            U_._flush_group([(l, g, state, dict(c)) for l, g in zip(ls, gs)])
+        st = state["_ts"]
+        for l in ls:
+            out.append((l.wpacked.clone(), tuple(t.clone() for t in state[id(l)]),
+                        tuple(t.clone() for t in st[("v", id(l))]), st[("t", id(l))]))
+        return out, st["_nf"]
+    try:
+        A, nfa = run(False); B, nfb = run(True)
+    finally:
+        U_.BATCH_VEC[0], U_.BATCH_F16[0] = old
+    assert nfa == nfb and nfa > 0
+    for a, b in zip(A, B):
+        assert torch.equal(a[0], b[0]) and a[3] == b[3] == 2
+        for x, y in zip(a[1] + a[2], b[1] + b[2]):
+            assert x.shape == y.shape and x.dtype == y.dtype and torch.equal(x, y)
+
+
 def test_fire_near_theta():
     """entries placed within 1e-4 .. 1e-2 of theta (relative), far inside the bf16 error: the decisions are the fp64
     ones except within 1e-6 of theta"""

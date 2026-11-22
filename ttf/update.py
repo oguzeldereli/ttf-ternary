@@ -534,6 +534,9 @@ def remove_grad_hook(fn):
 
 BATCH = [False]   # --ttf-batch-update
 BATCH_N = [12]    # --ttf-batch-update N: a group's update runs once N layers of one shape are queued
+BATCH_VEC = [True]     # --ttf-batch-update: the group's per-layer bookkeeping (the v sums, the scales, the fp12s store) as
+# stacked tensor ops: the same elementwise arithmetic, about half the kernel launches (the 0.8B conversion step was
+# CPU-bound on ~20k small update kernels; 22 Nov); False: the per-layer loops
 BATCH_BF16 = [False]   # --ttf-batch-bf16: the turn's two big products (g with the bases) on the bf16 tensor cores
 BATCH_F16 = [False]    # --ttf-batch-f16: the turn's r x r products and the batched orth on the fp16 tensor cores (fp32 sums,
                        # each operand scaled by a power of two per matrix; Cholesky and the triangular inverse in fp32)
@@ -621,6 +624,17 @@ def ts_flush():
             _flush_group(its)
 
 
+def _enc12_stack(Xs):
+    """the fp12s store of each matrix of Xs [n, N, r] (r even): [(codes, scale)] as _store_codec("fp12s") gives them one
+    matrix at a time (the same per-column scales and codes), the group packed in one kernel call side by side"""
+    from .kernel import pack12_scaled
+    n, N, r = Xs.shape
+    sc = Xs.abs().amax(1, keepdim=True).clamp_min(1e-30) / 32768                  # [n, 1, r]
+    P = pack12_scaled(Xs.float().permute(1, 0, 2).reshape(N, n * r), sc.reshape(1, n * r))
+    w = 3 * (r // 2)
+    return [(P[:, i * w:(i + 1) * w].contiguous(), sc[i]) for i in range(n)]
+
+
 def _flush_group(its):
     from .kernel import sq_sums, ttf_fire
     l0, g0, state, c0 = its[0]
@@ -630,7 +644,32 @@ def _flush_group(its):
     dev = g0.device
     sa = _store_codec(c0.get("store_a", ""))
     a_, b_, Us, Vs = [], [], [], []
-    for l, g, _, c in its:
+    vec = BATCH_VEC[0] and g0.is_cuda
+    if vec:
+        tt = [_micro_t(l, st, id(l), 1, c) for l, _, _, c in its]
+        have = [("v", id(l)) in st for l, _, _, _ in its]
+        vec = len(set(tt)) == 1 and (all(have) or not any(have))
+        if not vec:      # (undo the counts: the loop below takes them again)
+            for (l, _, _, _), t_ in zip(its, tt):
+                st[("t", id(l))] = t_ - 1
+    if vec:
+        sq = [sq_sums(g) for _, g, _, _ in its]
+        rsq = torch.stack([q[0] for q in sq]); csq = torch.stack([q[1] for q in sq]); del sq
+        if have[0]:
+            pr = [_host_get(st, ("v", id(l)), dev, False) for l, _, _, _ in its]
+            R = torch.stack([q[0] for q in pr]); C = torch.stack([q[1] for q in pr]); del pr
+            R = b2 * R + (1 - b2) * (rsq / l0.K); C = b2 * C + (1 - b2) * (csq / l0.N)
+        else:
+            R, C = (1 - b2) * (rsq / l0.K), (1 - b2) * (csq / l0.N)
+        for i, (l, _, _, _) in enumerate(its):
+            _host_put(st, ("v", id(l)), (R[i], C[i]), False)
+        m = torch.stack([R[i].mean() for i in range(len(its))]).clamp_min(1e-30)
+        A = (m[:, None] / R.clamp_min(1e-30)).sqrt()[:, :, None]
+        Bc = (C / (1 - b2 ** tt[0])).clamp_min(1e-30).rsqrt()[:, :, None]
+        for l, _, _, _ in its:
+            U, V = _load_pair(_host_get(state, id(l), dev, False))
+            Us.append(U); Vs.append(V)
+    for l, g, _, c in (() if vec else its):
         key = id(l); t = _micro_t(l, st, key, 1, c)
         _rsq, _csq = sq_sums(g)
         if ("v", key) in st:
@@ -647,7 +686,8 @@ def _flush_group(its):
     for i, it in enumerate(its):
         G[i].copy_(it[1])
     its = [(l, None, s_, c) for l, _, s_, c in its]     # (the per-layer g freed)
-    A = torch.stack(a_)[:, :, None]; Bc = torch.stack(b_)[:, :, None]
+    if not vec:
+        A = torch.stack(a_)[:, :, None]; Bc = torch.stack(b_)[:, :, None]
     U = torch.stack(Us).float().mul_(lk); V = torch.stack(Vs).float()
     del Us, Vs, a_, b_
     P = torch.bmm(G.transpose(1, 2), (A * U).to(lp), out_dtype=torch.float32) if lp != torch.float32 else \
@@ -672,6 +712,8 @@ def _flush_group(its):
     else:
         U = torch.baddbmm(Q.mul_(A).mul_(-lr_ratio), U, torch.bmm(V.transpose(1, 2), Vn))
     del G, V, Q
+    e12 = vec and sa is not None and c0.get("store_a", "") == "fp12s" and U.shape[-1] % 2 == 0
+    Un = []
     for i, (l, g, _, c) in enumerate(its):
         key = id(l)
         th_ = _dv(c, "theta", c["theta"])
@@ -680,8 +722,16 @@ def _flush_group(its):
         DV = _dpm(DV)
         l._after_fire(dnnz)
         Ui = Ui - c["spend"] * (th_ * DV); del DV
-        _host_put(state, key, _store_pair(sa, Ui, Vi.clone()) if sa else (Ui, Vi.clone()), False)
+        if e12:
+            Un.append(Ui)
+        else:
+            _host_put(state, key, _store_pair(sa, Ui, Vi.clone()) if sa else (Ui, Vi.clone()), False)
         st["_nf"] = st.get("_nf", 0) + nf; st["_nt"] = st.get("_nt", 0) + l.N * l.K
+    if e12:
+        with _rf("ttf.codec"):
+            cu, cv = _enc12_stack(torch.stack(Un)), _enc12_stack(Vn)
+        for i, (l, _, _, _) in enumerate(its):
+            _host_put(state, id(l), cu[i] + cv[i], False)
 
 
 def _mag_grads(l, g):
